@@ -25,9 +25,11 @@ urls = { Homepage = "https://github.com/flashinfer-ai/flashinfer" }
 license-files = ["LICENSE", "LICENSE*.txt"]
 
 [project.optional-dependencies]
-# Keep these CUDA-extra floors in sync with ci/cuda-versions.json.
-cu12 = ["nvidia-cutlass-dsl>=4.7.0a0"]
-cu13 = ["nvidia-cutlass-dsl[cu13]>=4.7.0a0"]
+# The b12x snapshot requires the 4.6.2 compiler and matching runtime libraries.
+# Keep both CUDA extras installable with those base pins; selecting an extra
+# must not upgrade the compiler independently of the snapshot.
+cu12 = ["nvidia-cutlass-dsl==4.6.2"]
+cu13 = ["nvidia-cutlass-dsl[cu13]==4.6.2"]
 # DEPRECATED alias, kept so existing `pip install ".[nvep]"` commands keep
 # working. The moe_ep runtime deps (cuda-python, nccl4py) are now part of the
 # BASE dependencies (requirements.txt) and the NIXL-EP submodule build runs by
@@ -40,6 +42,12 @@ nvep = []
 
 [project.scripts]
 flashinfer = "flashinfer.__main__:cli"
+b12x-generate-gpu-profile = "flashinfer.b12x.tools.generate_gpu_profile:main"
+b12x-inspect-model-policy = "flashinfer.b12x.tools.inspect_model_policy:main"
+
+[project.entry-points."vllm.general_plugins"]
+b12x_fp6 = "flashinfer.b12x.integration.vllm.plugin:register_b12x_fp6"
+b12x_loader = "flashinfer.b12x.integration.vllm.loader:register_b12x_loader"
 
 [build-system]
 requires = ["setuptools>=77", "packaging>=24", "apache-tvm-ffi>=0.1.6,!=0.1.8,!=0.1.8.post0,<0.2"]
@@ -60,7 +68,7 @@ dependencies = { file = ["requirements.txt"] }
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["flashinfer*"]
+include = ["flashinfer*", "b12x"]
 exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*"]
 
 [tool.setuptools.package-dir]
@@ -71,6 +79,9 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*"]
 
 [tool.setuptools.package-data]
 "flashinfer" = ["_build_meta.py"]
+"flashinfer.b12x.policy._profiles" = ["data/*.json.gz"]
+"flashinfer.b12x.comm.roce" = ["*.c"]
+"flashinfer.b12x.loader" = ["*.c"]
 # Workload registry of the experimental fused GDN decode backends, loaded at
 # runtime via importlib.resources.
 "flashinfer.gdn_kernels.experimental" = ["*.json"]

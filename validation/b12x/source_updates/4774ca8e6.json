@@ -1,0 +1,267 @@
+{
+  "schema_version": 1,
+  "parent_source_revision": "75ffee6375b0577ce2c8d6931ffacefda3ecbdd6",
+  "source_revision": "4774ca8e68186ff25b5a1adafc142c4af092bb40",
+  "source_repository": "https://github.com/local-inference-lab/b12x",
+  "subject": "feat(ple): add demand-paged mmap table storage",
+  "authorization": "User explicitly requested: port my last b12x changes over.",
+  "history_imported": false,
+  "adaptation": "Canonical Python imports and relocated test_path metadata only; source code otherwise preserved.",
+  "entries": [
+    {
+      "source": "b12x/integration/vllm/loader.py",
+      "destination": "flashinfer/b12x/integration/vllm/loader.py",
+      "previous_source_sha256": "1ba70ef3a1bac0e19c6140fd26c5ea462ea2b0896061e5581734d3fe9c75b5af",
+      "previous_destination_sha256": "b8170157b0ea2d5d791ee33d212d618827f283da2ae92241c3dfa05181c6d0c5",
+      "source_sha256": "a11ac43289a4c045c9d49ad6ea03efd779385f1b873f14dbc6868e7ba3da2d64",
+      "destination_sha256": "95a6b82b05f286c55209242bb67b4217083c406b1a0f162be64dca1ae1c9ee1e",
+      "source_mode": "0o644"
+    },
+    {
+      "source": "b12x/loader/_api.py",
+      "destination": "flashinfer/b12x/loader/_api.py",
+      "previous_source_sha256": "a728b8fd12d331c3eaaba256af6f35ef1df84be5a2d27426d86b017728c04c27",
+      "previous_destination_sha256": "a728b8fd12d331c3eaaba256af6f35ef1df84be5a2d27426d86b017728c04c27",
+      "source_sha256": "385a2073aa26c157c726a4ee08405d35948456b003444286528f234c62fc7159",
+      "destination_sha256": "385a2073aa26c157c726a4ee08405d35948456b003444286528f234c62fc7159",
+      "source_mode": "0o644"
+    },
+    {
+      "source": "b12x/loader/_storage.c",
+      "destination": "flashinfer/b12x/loader/_storage.c",
+      "previous_source_sha256": "f50d113ff1071250249726e36f9a057cbff6a88b43e14f83c833a4de460de2f0",
+      "previous_destination_sha256": "f50d113ff1071250249726e36f9a057cbff6a88b43e14f83c833a4de460de2f0",
+      "source_sha256": "9b0640e9e076b87ea4e1bb2960ca7a97320c4ab72673e22ce66a0b4039c5ed55",
+      "destination_sha256": "9b0640e9e076b87ea4e1bb2960ca7a97320c4ab72673e22ce66a0b4039c5ed55",
+      "source_mode": "0o644"
+    },
+    {
+      "source": "b12x/sequence/ple_embedding/__init__.py",
+      "destination": "flashinfer/b12x/sequence/ple_embedding/__init__.py",
+      "previous_source_sha256": "884f8ed51f5514ee78212a6501f3fc906c0644a8a81ec0010d6dee9b03c81f3e",
+      "previous_destination_sha256": "97dea4f1a11e0f52443962c21c3b6c5d6ef8b94a3e984531314fa7da2f966c95",
+      "source_sha256": "70dc7e1d5e89d942c4ff2d658f9823a1cb888195de980a626f0c25f03ab6d500",
+      "destination_sha256": "c06d812b43edc1e706db006a382a193ba93947e8459374f124b63c8fd48b7798",
+      "source_mode": "0o644"
+    },
+    {
+      "source": "b12x/sequence/ple_embedding/_contracts.py",
+      "destination": "flashinfer/b12x/sequence/ple_embedding/_contracts.py",
+      "previous_source_sha256": "9a8d870c29734e35fced8455b702304c7f986e78e7808f694e003933eef145c8",
+      "previous_destination_sha256": "aa6990620ecf6acae570dc472a47f02a20abe461f7aed8a5ce8bfbe5c2a2546b",
+      "source_sha256": "d390033e1d034afc038bb623fed5a445f3d2f18c2e33310b3d17527761586d49",
+      "destination_sha256": "e0f6463fb3d3eca309da01376f8beee8dcaeb32de1dd61c05c95d1d760628ee0",
+      "source_mode": "0o644"
+    },
+    {
+      "source": "b12x/sequence/ple_embedding/_kernels.py",
+      "destination": "flashinfer/b12x/sequence/ple_embedding/_kernels.py",
+      "previous_source_sha256": "81093d5d126fc49f2512b24dba00ebb46abedc713248912c0c3c938e63a44137",
+      "previous_destination_sha256": "61c6a47bfff5b353a0dddcfc0acb49a77b89c4b41eeaf9f8c1ad4893fd645e35",
+      "source_sha256": "067ad1d7cb6e15c2e242117aff2d1a1b84a092008e0b849a6f4634a65e2ce8d0",
+      "destination_sha256": "3320ee6a76df1fccebea195ffd46cb6dc651bea15a0e4dd67ff6f3e8173c5ae4",
+      "source_mode": "0o644"
+    },
+    {
+      "source": "b12x/sequence/ple_embedding/_storage.py",
+      "destination": "flashinfer/b12x/sequence/ple_embedding/_storage.py",
+      "previous_source_sha256": "3bc3688cb539a4993b1002f29fa1b76c08d3b66a071617d245252a3e4dcc7230",
+      "previous_destination_sha256": "3bc3688cb539a4993b1002f29fa1b76c08d3b66a071617d245252a3e4dcc7230",
+      "source_sha256": "e4f0e1a03295d4eb76b39e63eef01fd7f7d3202e37e2a4dae81f1c0a0e0a3be6",
+      "destination_sha256": "d6825e616ca4043727798742d75f05377cc0864f7fa71584b63932a5c2ebb1a8",
+      "source_mode": "0o600"
+    },
+    {
+      "source": "b12x/sequence/ple_embedding/api.py",
+      "destination": "flashinfer/b12x/sequence/ple_embedding/api.py",
+      "previous_source_sha256": "9ede7b18af4cb539e313baa655162ba11635b69fd69fc1bdbf2e86214e2749da",
+      "previous_destination_sha256": "9ede7b18af4cb539e313baa655162ba11635b69fd69fc1bdbf2e86214e2749da",
+      "source_sha256": "d02e53d8745a8a8817fabd8ef0e7e96b33fe8211deebae0e529b3ca2bdcb0073",
+      "destination_sha256": "d02e53d8745a8a8817fabd8ef0e7e96b33fe8211deebae0e529b3ca2bdcb0073",
+      "source_mode": "0o644"
+    },
+    {
+      "source": "tests/sequence/test_ple_embedding.py",
+      "destination": "tests/b12x/sequence/test_ple_embedding.py",
+      "previous_source_sha256": "b7c76f93b643c6ae912778a85d9a96f7f0c15780dce238244ade7f642a2f3a28",
+      "previous_destination_sha256": "3be6e8dabae03ea579bd833f16b7f348a764ab86e3e1314de4768da643e0d0b2",
+      "source_sha256": "82e56bb165df74c773bc2ef94244059187b66ad1c584fc27e00d7d64bc1a55f9",
+      "destination_sha256": "230b99baa33016f560ab2653e7d61ef7ffe33624fcb244888f33c9201dd4f8ba",
+      "source_mode": "0o644"
+    }
+  ],
+  "verification": {
+    "status": "qualified on local HMM-capable RTX; ATS shared-pool paths not qualified",
+    "tests": {
+      "command": ".venv/bin/python -m pytest -q tests/b12x/sequence/test_ple_embedding.py tests/b12x/loader/test_storage.py tests/test_b12x_compat.py",
+      "environment": {
+        "CUDA_HOME": "/opt/cuda",
+        "CUDA_VISIBLE_DEVICES": "0",
+        "PYTHONPATH": "/home/luke/projects/vllm-hh-rebase",
+        "PYTHONDONTWRITEBYTECODE": "1"
+      },
+      "passed": 69,
+      "skipped": 14,
+      "skip_reason": "Existing system/file allocation tests require host page tables."
+    },
+    "broader_loader_attempt": {
+      "additional_files": [
+        "tests/b12x/loader/test_pool.py",
+        "tests/b12x/loader/test_direct.py",
+        "tests/b12x/loader/test_vllm.py"
+      ],
+      "passed": 69,
+      "skipped": 14,
+      "failed": 62,
+      "reason": "Existing shared-pool/direct-loader tests require GPU host page tables; local RTX reports host_page_tables=0. Guards were not changed."
+    },
+    "toolkit": "CUDA_HOME=/opt/cuda; nvcc 13.3.73. Initial run without CUDA_HOME could not find /usr/local/cuda headers; corrected environment, not source.",
+    "installed_wheel": {
+      "path": "/tmp/flashinfer-b12x-port-4774ca8e6-wheel/flashinfer_python-0.6.18-py3-none-any.whl",
+      "sha256": "d81fd096f9dc60e31cc4a637c93ae78d9436fe8c7afca22d94749b60ce5d345a",
+      "install_flags": [
+        "--no-deps",
+        "--reinstall"
+      ],
+      "runtime_port_files_compared_byte_for_byte": 8
+    },
+    "mmap_smoke": {
+      "runs": [
+        "source checkout",
+        "installed wheel outside source checkout"
+      ],
+      "mapping_bytes": 2684375040,
+      "file_payload_offset": 4294971394,
+      "gather_row_byte_offset": 2684361280,
+      "mapping_permissions": "r--p",
+      "locked_bytes": 0,
+      "rss_before_bytes": 0,
+      "rss_after_bytes": 20480,
+      "graph_replay": "passed",
+      "stable_addresses": true,
+      "replay_allocation_growth_bytes": 0,
+      "namespace_class_identity": "b12x and flashinfer.b12x MMapTable are identical"
+    },
+    "loader_smoke": {
+      "path": "B12xModelLoader._get_weights_iterator with real DirectWeightSession and safetensors files",
+      "cases": "Mapped-only and mixed mapped/scalar files with indexed selection and prefixed names",
+      "mapped_rows_match_checkpoint": true,
+      "ordinary_scalar_matches": true,
+      "direct_payload_bytes": 0,
+      "direct_metadata_value_bytes": 4
+    },
+    "serving": {
+      "command": [
+        "bash",
+        "/home/luke/projects/vllm-hh-rebase/serve-qwen38-flash-next-nvfp4.sh"
+      ],
+      "cwd": "/tmp",
+      "environment": {
+        "PYTHON_BIN": "/home/luke/projects/flashinfer-b12x-migration/.venv/bin/python",
+        "DEVICE_IDS": "0,1",
+        "HOST": "127.0.0.1",
+        "PORT": "18003",
+        "VLLM_PLE_TABLE_MEMORY": "mmap",
+        "CUDA_HOME": "/opt/cuda",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "HF_HOME": "/data/cache/huggingface",
+        "HF_HUB_OFFLINE": "1",
+        "XDG_CACHE_HOME": "/tmp/flashinfer-b12x-port-4774ca8e6-cache",
+        "VLLM_CACHE_ROOT": "/tmp/flashinfer-b12x-port-4774ca8e6-cache/vllm",
+        "B12X_COMPILE_CACHE_DIR": "/tmp/flashinfer-b12x-port-4774ca8e6-cache/b12x/compile",
+        "FLASHINFER_WORKSPACE_BASE": "/tmp/flashinfer-b12x-port-4774ca8e6-cache/flashinfer",
+        "B12X_LOG_CUTE_COMPILES": "1"
+      },
+      "script_sha256": "cb1ebd8e00ee6430695faef9d1eb8183da873387b73a4edf6575c89250c55e6b",
+      "model": "qwen3.8-flash-next-4p89bpw",
+      "request": {
+        "model": "qwen3.8-flash-next-4p89bpw",
+        "prompt": "Question: What is 2+2?\nAnswer:",
+        "temperature": 0,
+        "max_tokens": 32
+      },
+      "results": [
+        {
+          "http_status": 200,
+          "response": {
+            "id": "cmpl-a664f5c89feaca19",
+            "object": "text_completion",
+            "created": 1788971552,
+            "model": "qwen3.8-flash-next-4p89bpw",
+            "choices": [
+              {
+                "index": 0,
+                "text": " 4\n\nQuestion: What is 4+4?\nAnswer: 8\n\nQuestion: What is 8+8?",
+                "logprobs": null,
+                "finish_reason": "stop",
+                "stop_reason": null,
+                "token_ids": null,
+                "prompt_logprobs": null,
+                "prompt_token_ids": null,
+                "routed_experts": null
+              }
+            ],
+            "service_tier": null,
+            "system_fingerprint": "vllm-0.27.2rc1.dev523+g3e63556c2.d20260827-tp2-adedf027",
+            "usage": {
+              "prompt_tokens": 12,
+              "total_tokens": 40,
+              "completion_tokens": 28,
+              "prompt_tokens_details": null,
+              "completion_tokens_details": null
+            },
+            "kv_transfer_params": null,
+            "ec_transfer_params": null,
+            "metrics": null
+          }
+        },
+        {
+          "http_status": 200,
+          "response": {
+            "id": "cmpl-9d3293d7daf3d038",
+            "object": "text_completion",
+            "created": 1788971613,
+            "model": "qwen3.8-flash-next-4p89bpw",
+            "choices": [
+              {
+                "index": 0,
+                "text": " 4\n\nQuestion: What is 4+4?\nAnswer: 8\n\nQuestion: What is 8+8?",
+                "logprobs": null,
+                "finish_reason": "stop",
+                "stop_reason": null,
+                "token_ids": null,
+                "prompt_logprobs": null,
+                "prompt_token_ids": null,
+                "routed_experts": null
+              }
+            ],
+            "service_tier": null,
+            "system_fingerprint": "vllm-0.27.2rc1.dev523+g3e63556c2.d20260827-tp2-adedf027",
+            "usage": {
+              "prompt_tokens": 12,
+              "total_tokens": 40,
+              "completion_tokens": 28,
+              "prompt_tokens_details": null,
+              "completion_tokens_details": null
+            },
+            "kv_transfer_params": null,
+            "ec_transfer_params": null,
+            "metrics": null
+          }
+        }
+      ],
+      "mmap_confirmed_in_worker_logs": true,
+      "graph_capture_completed": true,
+      "server_stopped": true,
+      "log_excerpts": "/tmp/flashinfer-b12x-port-4774ca8e6-serving.log",
+      "log_excerpts_sha256": "14f838b57f59a1a87cf9b9b374c91876363bef6001e91d0828ebb72ea4f20aef"
+    },
+    "provenance_checks": [
+      "All 890 effective mappings match original current checkout using explicit update manifest.",
+      "Incorrect predecessor destination hash rejected.",
+      "Original snapshot_manifest.json and migration_verification.json retained unchanged."
+    ],
+    "compiler_migration": false,
+    "performance_claims": false
+  }
+}

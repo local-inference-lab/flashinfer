@@ -149,9 +149,9 @@ def _validate_dependency_policy(
 
         versions = {}
         expected_operators = {
-            "provider_build_specifier": ">=",
-            "cuda_extra_specifier": ">=",
-            "ci_image_specifier": "==",
+            "provider_build_specifier": (">=", "=="),
+            "cuda_extra_specifier": (">=", "=="),
+            "ci_image_specifier": ("==",),
         }
         for field, expected_operator in expected_operators.items():
             specifier = _string(
@@ -159,9 +159,9 @@ def _validate_dependency_policy(
             )
             match = DEPENDENCY_SPECIFIER_PATTERN.fullmatch(specifier)
             assert match is not None
-            if match.group("operator") != expected_operator:
+            if match.group("operator") not in expected_operator:
                 raise ConfigError(
-                    f"{context}.{field} must use {expected_operator!r}, "
+                    f"{context}.{field} must use one of {expected_operator!r}, "
                     f"got {specifier!r}"
                 )
             versions[field] = match.group("version")
@@ -178,6 +178,13 @@ def _validate_dependency_policy(
             raise ConfigError(
                 f"{context}.ci_image_specifier must satisfy the CUDA-extra specifier"
             )
+        for field in ("provider_build_specifier", "cuda_extra_specifier"):
+            if dependency[field].startswith("==") and _version_key(
+                versions[field]
+            ) != _version_key(versions["ci_image_specifier"]):
+                raise ConfigError(
+                    f"{context}.ci_image_specifier must satisfy the exact {field} pin"
+                )
 
         extras_by_major = _mapping(
             dependency["cuda_major_extras"], f"{context}.cuda_major_extras"

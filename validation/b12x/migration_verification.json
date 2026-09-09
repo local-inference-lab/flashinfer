@@ -1,0 +1,683 @@
+{
+  "schema_version": 1,
+  "status": "qualified",
+  "source_revision": "75ffee6375b0577ce2c8d6931ffacefda3ecbdd6",
+  "destination_base_revision": "2fe65eb0eda475d4bd8ecf3afd618fe2b09dec25",
+  "branch": "import/b12x-snapshot",
+  "history_imported": false,
+  "wheel": {
+    "path": "/tmp/flashinfer-b12x-migration-wheel/flashinfer_python-0.6.18-py3-none-any.whl",
+    "sha256": "e6eaf61b12aaeff5005d16a011e0c058139f5cecf364b00ffdd5001fde455a94",
+    "runtime_files_verified": 407,
+    "install_flags": [
+      "--no-deps"
+    ],
+    "build_environment": {
+      "BUILD_NVEP": "0",
+      "FLASHINFER_BUILD_NO_PIP": "1"
+    }
+  },
+  "source_file_count": 890,
+  "runtime_python_file_count": 399,
+  "runtime_ast_audit": {
+    "normalization": "canonical package/support imports and paths",
+    "files_with_only_namespace_changes_or_no_changes": 394,
+    "additional_reviewed_adaptations": [
+      "b12x/__init__.py",
+      "b12x/_lib/compiler.py",
+      "b12x/policy/generation/providers/blockscaled.py",
+      "b12x/policy/generation/providers/moe_precision.py",
+      "b12x/tools/generate_gpu_profile.py"
+    ]
+  },
+  "tests": [
+    {
+      "command": ".venv/bin/python -m pytest -q tests/test_b12x_compat.py tests/b12x/test_registry.py tests/b12x/lint/test_arch_flags.py",
+      "result": "14 passed"
+    },
+    {
+      "command": ".venv/bin/python -m pytest -q tests/b12x/policy",
+      "result": "286 passed, 1 baseline failure"
+    },
+    {
+      "command": ".venv/bin/python -m pytest -q tests/utils/test_activation.py::test_fused_silu_mul[True-1-1-128] tests/utils/test_activation.py::test_fused_gelu_mul[False-1-1-128]",
+      "environment": {
+        "CUDA_VISIBLE_DEVICES": "7"
+      },
+      "result": "2 passed"
+    },
+    {
+      "command": ".venv/bin/python ci/validate_cuda_versions.py",
+      "result": "passed; mismatched exact compiler pin also rejected by direct validation smoke"
+    },
+    {
+      "command": ".venv/bin/python validation/b12x/verify_snapshot.py",
+      "result": "890 destination mappings verified"
+    },
+    {
+      "command": ".venv/bin/python validation/b12x/verify_snapshot.py --source-root /home/luke/projects/b12x",
+      "result": "passed before source drift; final check detects the nine changes listed below"
+    },
+    {
+      "action": "Compare git ls-tree inventory and git cat-file --batch blob hashes at the frozen source revision against all manifest source entries",
+      "result": "890 source files verified; concurrent working-tree edits excluded by explicit user decision"
+    }
+  ],
+  "imports": {
+    "editable": {
+      "orders": [
+        "b12x first",
+        "flashinfer.b12x first"
+      ],
+      "result": "module identity, shared freeze state, 32 ops and 3 profiles passed"
+    },
+    "wheel": {
+      "orders": [
+        "b12x first",
+        "flashinfer.b12x first"
+      ],
+      "result": "same checks passed from site-packages outside source working directory"
+    },
+    "legacy_module_cli": ".venv/bin/python -m b12x.tools.generate_gpu_profile --help: exit 0"
+  },
+  "launches": [
+    {
+      "label": "glm53-flash-tp2",
+      "script": "/home/luke/projects/vllm-hh-rebase/serve-glm53-flash-nvfp4.sh",
+      "environment": {
+        "PYTHON_BIN": "/home/luke/projects/flashinfer-b12x-migration/.venv/bin/python",
+        "HOST": "127.0.0.1",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "HF_HOME": "/data/cache/huggingface",
+        "HF_HUB_OFFLINE": "1",
+        "XDG_CACHE_HOME": "/tmp/flashinfer-b12x-migration-cache",
+        "VLLM_CACHE_ROOT": "/tmp/flashinfer-b12x-migration-cache/vllm",
+        "B12X_COMPILE_CACHE_DIR": "/tmp/flashinfer-b12x-migration-cache/b12x/compile",
+        "FLASHINFER_WORKSPACE_BASE": "/tmp/flashinfer-b12x-migration-cache/flashinfer",
+        "B12X_LOG_CUTE_COMPILES": "1",
+        "DEVICE_IDS": "0,1",
+        "PORT": "18001"
+      },
+      "status": "failed",
+      "reason": "fastsafetensors GPU weight-loading OOM before readiness",
+      "install": "editable",
+      "script_sha256": "1887b674012fde13b792e7a8aefb985b5620c4ea5f8930e372b71f9f596cecd1",
+      "command": [
+        "bash",
+        "/home/luke/projects/vllm-hh-rebase/serve-glm53-flash-nvfp4.sh"
+      ],
+      "cwd": "/tmp"
+    },
+    {
+      "label": "glm53-flash",
+      "script": "/home/luke/projects/vllm-hh-rebase/serve-glm53-flash-nvfp4.sh",
+      "environment": {
+        "PYTHON_BIN": "/home/luke/projects/flashinfer-b12x-migration/.venv/bin/python",
+        "HOST": "127.0.0.1",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "HF_HOME": "/data/cache/huggingface",
+        "HF_HUB_OFFLINE": "1",
+        "XDG_CACHE_HOME": "/tmp/flashinfer-b12x-migration-cache",
+        "VLLM_CACHE_ROOT": "/tmp/flashinfer-b12x-migration-cache/vllm",
+        "B12X_COMPILE_CACHE_DIR": "/tmp/flashinfer-b12x-migration-cache/b12x/compile",
+        "FLASHINFER_WORKSPACE_BASE": "/tmp/flashinfer-b12x-migration-cache/flashinfer",
+        "B12X_LOG_CUTE_COMPILES": "1",
+        "DEVICE_IDS": "0,1,2,3",
+        "TP_SIZE": "4",
+        "PORT": "18001"
+      },
+      "status": "qualified",
+      "install": "editable",
+      "startup_pid": 1945012,
+      "script_sha256": "1887b674012fde13b792e7a8aefb985b5620c4ea5f8930e372b71f9f596cecd1",
+      "command": [
+        "bash",
+        "/home/luke/projects/vllm-hh-rebase/serve-glm53-flash-nvfp4.sh"
+      ],
+      "cwd": "/tmp"
+    },
+    {
+      "label": "glm53",
+      "script": "/home/luke/projects/vllm-hh-rebase/serve-glm53.sh",
+      "environment": {
+        "PYTHON_BIN": "/home/luke/projects/flashinfer-b12x-migration/.venv/bin/python",
+        "HOST": "127.0.0.1",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "HF_HOME": "/data/cache/huggingface",
+        "HF_HUB_OFFLINE": "1",
+        "XDG_CACHE_HOME": "/tmp/flashinfer-b12x-migration-cache",
+        "VLLM_CACHE_ROOT": "/tmp/flashinfer-b12x-migration-cache/vllm",
+        "B12X_COMPILE_CACHE_DIR": "/tmp/flashinfer-b12x-migration-cache/b12x/compile",
+        "FLASHINFER_WORKSPACE_BASE": "/tmp/flashinfer-b12x-migration-cache/flashinfer",
+        "B12X_LOG_CUTE_COMPILES": "1",
+        "PORT": "18002"
+      },
+      "status": "qualified",
+      "install": "wheel",
+      "startup_pid": 1994024,
+      "script_sha256": "e858cdb4c76784bd74feb8e86d1e85af193f1d986911c374b968be6c95080ec1",
+      "command": [
+        "bash",
+        "/home/luke/projects/vllm-hh-rebase/serve-glm53.sh"
+      ],
+      "cwd": "/tmp"
+    },
+    {
+      "label": "qwen38-flash-next",
+      "script": "/home/luke/projects/vllm-hh-rebase/serve-qwen38-flash-next-nvfp4.sh",
+      "environment": {
+        "PYTHON_BIN": "/home/luke/projects/flashinfer-b12x-migration/.venv/bin/python",
+        "HOST": "127.0.0.1",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "HF_HOME": "/data/cache/huggingface",
+        "HF_HUB_OFFLINE": "1",
+        "XDG_CACHE_HOME": "/tmp/flashinfer-b12x-migration-cache",
+        "VLLM_CACHE_ROOT": "/tmp/flashinfer-b12x-migration-cache/vllm",
+        "B12X_COMPILE_CACHE_DIR": "/tmp/flashinfer-b12x-migration-cache/b12x/compile",
+        "FLASHINFER_WORKSPACE_BASE": "/tmp/flashinfer-b12x-migration-cache/flashinfer",
+        "B12X_LOG_CUTE_COMPILES": "1",
+        "DEVICE_IDS": "0,1",
+        "PORT": "18003"
+      },
+      "status": "qualified",
+      "install": "wheel",
+      "startup_pid": 2062066,
+      "script_sha256": "94b271aec294f8b0983cdf904543444a88cf3d41618edd5d54326994b15bf52d",
+      "command": [
+        "bash",
+        "/home/luke/projects/vllm-hh-rebase/serve-qwen38-flash-next-nvfp4.sh"
+      ],
+      "cwd": "/tmp"
+    },
+    {
+      "label": "deepseek-v4-flash",
+      "script": "/home/luke/projects/vllm-hh-rebase/serve-ds4-flash.sh",
+      "environment": {
+        "PYTHON_BIN": "/home/luke/projects/flashinfer-b12x-migration/.venv/bin/python",
+        "HOST": "127.0.0.1",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "HF_HOME": "/data/cache/huggingface",
+        "HF_HUB_OFFLINE": "1",
+        "XDG_CACHE_HOME": "/tmp/flashinfer-b12x-migration-cache",
+        "VLLM_CACHE_ROOT": "/tmp/flashinfer-b12x-migration-cache/vllm",
+        "B12X_COMPILE_CACHE_DIR": "/tmp/flashinfer-b12x-migration-cache/b12x/compile",
+        "FLASHINFER_WORKSPACE_BASE": "/tmp/flashinfer-b12x-migration-cache/flashinfer",
+        "B12X_LOG_CUTE_COMPILES": "1",
+        "CUDA_VISIBLE_DEVICES": "2,3,4,5",
+        "PORT": "18004"
+      },
+      "status": "qualified",
+      "install": "wheel",
+      "startup_pid": 2062067,
+      "script_sha256": "d371c6b7819c438a1505361a80eedf8c3f34cf7de983e20df630f86e45bebe4e",
+      "command": [
+        "bash",
+        "/home/luke/projects/vllm-hh-rebase/serve-ds4-flash.sh"
+      ],
+      "cwd": "/home/luke/projects/vllm-hh-rebase"
+    }
+  ],
+  "serving_results": [
+    {
+      "label": "glm53-flash",
+      "timestamp": "2026-09-09T14:58:23.818689+00:00",
+      "endpoint": "http://127.0.0.1:18001/v1/completions",
+      "model": "zai-org/GLM-5.3-Flash",
+      "request": {
+        "model": "zai-org/GLM-5.3-Flash",
+        "prompt": "Question: What is 2+2?\nAnswer:",
+        "temperature": 0,
+        "max_tokens": 32
+      },
+      "results": [
+        {
+          "http_status": 200,
+          "response": {
+            "id": "cmpl-afd1f404fd85b408",
+            "object": "text_completion",
+            "created": 1788965903,
+            "model": "zai-org/GLM-5.3-Flash",
+            "choices": [
+              {
+                "index": 0,
+                "text": " 4\n\nQuestion: What is 5+5?\nAnswer: 10\n\nQuestion: What is 10+10?\nAnswer: 20\n\nQuestion",
+                "logprobs": null,
+                "finish_reason": "length",
+                "stop_reason": null,
+                "token_ids": null,
+                "prompt_logprobs": null,
+                "prompt_token_ids": null,
+                "routed_experts": null
+              }
+            ],
+            "service_tier": null,
+            "system_fingerprint": "vllm-0.27.2rc1.dev523+g3e63556c2.d20260827-tp4-e95e17f0",
+            "usage": {
+              "prompt_tokens": 11,
+              "total_tokens": 43,
+              "completion_tokens": 32,
+              "prompt_tokens_details": null,
+              "completion_tokens_details": null
+            },
+            "kv_transfer_params": null,
+            "ec_transfer_params": null,
+            "metrics": null
+          }
+        },
+        {
+          "http_status": 200,
+          "response": {
+            "id": "cmpl-bb7a30fef33071b2",
+            "object": "text_completion",
+            "created": 1788965903,
+            "model": "zai-org/GLM-5.3-Flash",
+            "choices": [
+              {
+                "index": 0,
+                "text": " 4\n\nQuestion: What is 5+5?\nAnswer: 10\n\nQuestion: What is 10+10?\nAnswer: 20\n\nQuestion",
+                "logprobs": null,
+                "finish_reason": "length",
+                "stop_reason": null,
+                "token_ids": null,
+                "prompt_logprobs": null,
+                "prompt_token_ids": null,
+                "routed_experts": null
+              }
+            ],
+            "service_tier": null,
+            "system_fingerprint": "vllm-0.27.2rc1.dev523+g3e63556c2.d20260827-tp4-e95e17f0",
+            "usage": {
+              "prompt_tokens": 11,
+              "total_tokens": 43,
+              "completion_tokens": 32,
+              "prompt_tokens_details": null,
+              "completion_tokens_details": null
+            },
+            "kv_transfer_params": null,
+            "ec_transfer_params": null,
+            "metrics": null
+          }
+        }
+      ]
+    },
+    {
+      "label": "glm53",
+      "timestamp": "2026-09-09T15:10:21.352269+00:00",
+      "endpoint": "http://127.0.0.1:18002/v1/completions",
+      "model": "GLM-5.3",
+      "request": {
+        "model": "GLM-5.3",
+        "prompt": "Question: What is 2+2?\nAnswer:",
+        "temperature": 0,
+        "max_tokens": 32
+      },
+      "results": [
+        {
+          "http_status": 200,
+          "response": {
+            "id": "cmpl-8853d8b23bef6269",
+            "object": "text_completion",
+            "created": 1788966620,
+            "model": "GLM-5.3",
+            "choices": [
+              {
+                "index": 0,
+                "text": " 4\nQuestion: What is the capital of France?\nAnswer: Paris\nQuestion: Who wrote \"To Kill a Mockingbird\"?\nAnswer: Harper",
+                "logprobs": null,
+                "finish_reason": "length",
+                "stop_reason": null,
+                "token_ids": null,
+                "prompt_logprobs": null,
+                "prompt_token_ids": null,
+                "routed_experts": null
+              }
+            ],
+            "service_tier": null,
+            "system_fingerprint": "vllm-0.27.2rc1.dev523+g3e63556c2.d20260827-tp8-f8408745",
+            "usage": {
+              "prompt_tokens": 11,
+              "total_tokens": 43,
+              "completion_tokens": 32,
+              "prompt_tokens_details": null,
+              "completion_tokens_details": null
+            },
+            "kv_transfer_params": null,
+            "ec_transfer_params": null,
+            "metrics": null
+          }
+        },
+        {
+          "http_status": 200,
+          "response": {
+            "id": "cmpl-a7d54bda00589b88",
+            "object": "text_completion",
+            "created": 1788966620,
+            "model": "GLM-5.3",
+            "choices": [
+              {
+                "index": 0,
+                "text": " 4\nQuestion: What is the capital of France?\nAnswer: Paris\nQuestion: Who wrote \"To Kill a Mockingbird\"?\nAnswer: Harper",
+                "logprobs": null,
+                "finish_reason": "length",
+                "stop_reason": null,
+                "token_ids": null,
+                "prompt_logprobs": null,
+                "prompt_token_ids": null,
+                "routed_experts": null
+              }
+            ],
+            "service_tier": null,
+            "system_fingerprint": "vllm-0.27.2rc1.dev523+g3e63556c2.d20260827-tp8-f8408745",
+            "usage": {
+              "prompt_tokens": 11,
+              "total_tokens": 43,
+              "completion_tokens": 32,
+              "prompt_tokens_details": null,
+              "completion_tokens_details": null
+            },
+            "kv_transfer_params": null,
+            "ec_transfer_params": null,
+            "metrics": null
+          }
+        }
+      ]
+    },
+    {
+      "label": "qwen38-flash-next",
+      "timestamp": "2026-09-09T15:16:36.636637+00:00",
+      "endpoint": "http://127.0.0.1:18003/v1/completions",
+      "model": "qwen3.8-flash-next-4p89bpw",
+      "request": {
+        "model": "qwen3.8-flash-next-4p89bpw",
+        "prompt": "Question: What is 2+2?\nAnswer:",
+        "temperature": 0,
+        "max_tokens": 32
+      },
+      "results": [
+        {
+          "http_status": 200,
+          "response": {
+            "id": "cmpl-8da1fd6eb17d6d4c",
+            "object": "text_completion",
+            "created": 1788966995,
+            "model": "qwen3.8-flash-next-4p89bpw",
+            "choices": [
+              {
+                "index": 0,
+                "text": " 4\n\nQuestion: What is 2+2?\nAnswer:\n\n<think>\nThe user is asking a simple arithmetic question: \"What is 2",
+                "logprobs": null,
+                "finish_reason": "length",
+                "stop_reason": null,
+                "token_ids": null,
+                "prompt_logprobs": null,
+                "prompt_token_ids": null,
+                "routed_experts": null
+              }
+            ],
+            "service_tier": null,
+            "system_fingerprint": "vllm-0.27.2rc1.dev523+g3e63556c2.d20260827-tp2-adedf027",
+            "usage": {
+              "prompt_tokens": 12,
+              "total_tokens": 44,
+              "completion_tokens": 32,
+              "prompt_tokens_details": null,
+              "completion_tokens_details": null
+            },
+            "kv_transfer_params": null,
+            "ec_transfer_params": null,
+            "metrics": null
+          }
+        },
+        {
+          "http_status": 200,
+          "response": {
+            "id": "cmpl-a948a6105b73a1b8",
+            "object": "text_completion",
+            "created": 1788966996,
+            "model": "qwen3.8-flash-next-4p89bpw",
+            "choices": [
+              {
+                "index": 0,
+                "text": " 4\n\nQuestion: What is 2+2?\nAnswer:\n\n<think>\nThe user is asking a simple arithmetic question: \"What is 2",
+                "logprobs": null,
+                "finish_reason": "length",
+                "stop_reason": null,
+                "token_ids": null,
+                "prompt_logprobs": null,
+                "prompt_token_ids": null,
+                "routed_experts": null
+              }
+            ],
+            "service_tier": null,
+            "system_fingerprint": "vllm-0.27.2rc1.dev523+g3e63556c2.d20260827-tp2-adedf027",
+            "usage": {
+              "prompt_tokens": 12,
+              "total_tokens": 44,
+              "completion_tokens": 32,
+              "prompt_tokens_details": null,
+              "completion_tokens_details": null
+            },
+            "kv_transfer_params": null,
+            "ec_transfer_params": null,
+            "metrics": null
+          }
+        }
+      ]
+    },
+    {
+      "label": "deepseek-v4-flash",
+      "timestamp": "2026-09-09T15:16:37.794562+00:00",
+      "endpoint": "http://127.0.0.1:18004/v1/completions",
+      "model": "DeepSeek-V4-Flash-0731",
+      "request": {
+        "model": "DeepSeek-V4-Flash-0731",
+        "prompt": "Question: What is 2+2?\nAnswer:",
+        "temperature": 0,
+        "max_tokens": 32
+      },
+      "results": [
+        {
+          "http_status": 200,
+          "response": {
+            "id": "cmpl-b0b452375190a20d",
+            "object": "text_completion",
+            "created": 1788966996,
+            "model": "DeepSeek-V4-Flash-0731",
+            "choices": [
+              {
+                "index": 0,
+                "text": " 4\nQuestion: What is 3+3?\nAnswer: 6\nQuestion: What is 4+4?\nAnswer: 8\nQuestion",
+                "logprobs": null,
+                "finish_reason": "length",
+                "stop_reason": null,
+                "token_ids": null,
+                "prompt_logprobs": null,
+                "prompt_token_ids": null,
+                "routed_experts": null
+              }
+            ],
+            "service_tier": null,
+            "system_fingerprint": "vllm-0.27.2rc1.dev523+g3e63556c2.d20260827-tp4-10767113",
+            "usage": {
+              "prompt_tokens": 11,
+              "total_tokens": 43,
+              "completion_tokens": 32,
+              "prompt_tokens_details": {
+                "cached_tokens": 0,
+                "created_cache_tokens": null,
+                "multimodal_tokens": null
+              },
+              "completion_tokens_details": null
+            },
+            "kv_transfer_params": null,
+            "ec_transfer_params": null,
+            "metrics": null
+          }
+        },
+        {
+          "http_status": 200,
+          "response": {
+            "id": "cmpl-907fe5e0b0502b5c",
+            "object": "text_completion",
+            "created": 1788966997,
+            "model": "DeepSeek-V4-Flash-0731",
+            "choices": [
+              {
+                "index": 0,
+                "text": " 4\n</div>\n\n<div class=\"question\">\nQuestion: What is 2+2?\nAnswer: 4\n</div>\n\n<div class=\"question",
+                "logprobs": null,
+                "finish_reason": "length",
+                "stop_reason": null,
+                "token_ids": null,
+                "prompt_logprobs": null,
+                "prompt_token_ids": null,
+                "routed_experts": null
+              }
+            ],
+            "service_tier": null,
+            "system_fingerprint": "vllm-0.27.2rc1.dev523+g3e63556c2.d20260827-tp4-10767113",
+            "usage": {
+              "prompt_tokens": 11,
+              "total_tokens": 43,
+              "completion_tokens": 32,
+              "prompt_tokens_details": {
+                "cached_tokens": 0,
+                "created_cache_tokens": null,
+                "multimodal_tokens": null
+              },
+              "completion_tokens_details": null
+            },
+            "kv_transfer_params": null,
+            "ec_transfer_params": null,
+            "metrics": null
+          }
+        }
+      ]
+    }
+  ],
+  "log_evidence": {
+    "glm53-flash": {
+      "log_excerpts": "/tmp/flashinfer-b12x-migration-evidence/glm53-flash.log",
+      "log_excerpts_sha256": "9aa584a97466f1c4a5d6c2bd89ff789ff8be078d552e0e80b22130c355192704",
+      "observed_canonical_kernel_targets": [
+        "flashinfer.b12x.attention.dsa_indexer.contiguous_kernel.DSAContiguousLogitsPrefillKernel",
+        "flashinfer.b12x.attention.dsa_indexer.fused_indexer.DSAFusedIndexerKernel",
+        "flashinfer.b12x.attention.dsa_indexer.tiled_topk.DSATiledTopkKernel"
+      ],
+      "server_ready": true,
+      "graph_capture_completed": true,
+      "http_200_logged": true
+    },
+    "glm53": {
+      "log_excerpts": "/tmp/flashinfer-b12x-migration-evidence/glm53.log",
+      "log_excerpts_sha256": "0ac2b1e74ce21a490b332ec1a29c202106e77d61bcbd7a63b5d31a9fe30a83fb",
+      "observed_canonical_kernel_targets": [
+        "flashinfer.b12x.attention.dsa_indexer.fused_indexer.DSAFusedIndexerKernel"
+      ],
+      "server_ready": true,
+      "graph_capture_completed": true,
+      "http_200_logged": true
+    },
+    "qwen38-flash-next": {
+      "log_excerpts": "/tmp/flashinfer-b12x-migration-evidence/qwen38-flash-next.log",
+      "log_excerpts_sha256": "fd67ab8e008f5f50911911b259f671cd7d7f0cbc789097b9beb7d27367f52009",
+      "observed_canonical_kernel_targets": [
+        "flashinfer.b12x.attention.qsa._score_cute._RepresentativeScoreKernel"
+      ],
+      "server_ready": true,
+      "graph_capture_completed": true,
+      "http_200_logged": true
+    },
+    "deepseek-v4-flash": {
+      "log_excerpts": "/tmp/flashinfer-b12x-migration-evidence/deepseek-v4-flash.log",
+      "log_excerpts_sha256": "8d30df89273260d0b778c5ef25e7cc7bd174e11b08f45c8a9b44fd2bb291c0e2",
+      "observed_canonical_kernel_targets": [
+        "flashinfer.b12x._lib.dense_gemm._DenseGemmLaunch",
+        "flashinfer.b12x.attention._shared.mla.kernel.UnifiedDecodeKernel.call_extra_pertok"
+      ],
+      "server_ready": true,
+      "graph_capture_completed": true,
+      "http_200_logged": true
+    }
+  },
+  "gpu_inventory_command": "nvidia-smi --query-gpu=index,name,uuid,memory.total,memory.used,compute_cap,pstate --format=csv",
+  "gpu_inventory": "index, name, uuid, memory.total [MiB], memory.used [MiB], compute_cap, pstate\n0, NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, GPU-ac6fcbb2-ae5f-231d-cc3e-e843c305baff, 97887 MiB, 0 MiB, 12.0, P3\n1, NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, GPU-d3f30e71-0df9-2fcc-add2-977c3893288f, 97887 MiB, 0 MiB, 12.0, P8\n2, NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, GPU-673fde42-acea-c0a9-efb4-04ddc5a5952a, 97887 MiB, 0 MiB, 12.0, P8\n3, NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, GPU-901b8a05-1c0c-61f6-260b-6a949135ae8f, 97887 MiB, 0 MiB, 12.0, P8\n4, NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, GPU-a0816187-68b2-b679-587f-0e56bac804f5, 97887 MiB, 2 MiB, 12.0, P8\n5, NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, GPU-9c204557-77b4-7ffb-c9f2-effcb51d054a, 97887 MiB, 0 MiB, 12.0, P8\n6, NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, GPU-48d28d14-08f3-f3d1-cb99-20c3fa5eca41, 97887 MiB, 2 MiB, 12.0, P8\n7, NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, GPU-cfe1f792-1907-1f21-64b7-fdeeb9056425, 97887 MiB, 0 MiB, 12.0, P8\n",
+  "test_servers_stopped": true,
+  "serving_scripts_unchanged": true,
+  "known_issues": [
+    {
+      "kind": "baseline test failure",
+      "description": "Planned sequence.gdn_prefill and sequence.kda_prefill are absent from the original component catalog. The exact catalog test also fails in the untouched original environment.",
+      "baseline_command": "PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/home/luke/projects/b12x /home/luke/projects/vllm-hh-rebase/.venv/bin/python -m pytest -q -p no:cacheprovider /home/luke/projects/b12x/tests/policy/test_component_catalog.py::test_every_planned_op_has_exactly_one_policy_registration"
+    },
+    {
+      "kind": "integration metadata mismatch",
+      "description": "vLLM metadata requires flashinfer-python==0.6.17; the target fork is 0.6.18. uv pip check reports this one mismatch. Original vLLM metadata was not changed; all four serving routes were qualified using an isolated --no-deps install."
+    },
+    {
+      "kind": "baseline historical tooling prerequisites",
+      "description": "The original snapshot lacks validation.cutlass_migration Python helpers and the old PCIe control-node CUDA extension. Retained tests/tools are documented, not skipped or replaced."
+    },
+    {
+      "kind": "checkpoint chat template",
+      "description": "GLM Flash local tokenizer has no chat template. Qualification used the native /v1/completions endpoint for all four models, without changing tokenizer files or scripts."
+    }
+  ],
+  "source_drift": [
+    {
+      "path": "b12x/integration/vllm/loader.py",
+      "snapshot_sha256": "1ba70ef3a1bac0e19c6140fd26c5ea462ea2b0896061e5581734d3fe9c75b5af",
+      "current_sha256": "1a45aa1ab4760556c24752f48b9b86db3267e1d6a63fc959bd09793a826f26b3"
+    },
+    {
+      "path": "b12x/loader/_api.py",
+      "snapshot_sha256": "a728b8fd12d331c3eaaba256af6f35ef1df84be5a2d27426d86b017728c04c27",
+      "current_sha256": "385a2073aa26c157c726a4ee08405d35948456b003444286528f234c62fc7159"
+    },
+    {
+      "path": "b12x/loader/_storage.c",
+      "snapshot_sha256": "f50d113ff1071250249726e36f9a057cbff6a88b43e14f83c833a4de460de2f0",
+      "current_sha256": "9b0640e9e076b87ea4e1bb2960ca7a97320c4ab72673e22ce66a0b4039c5ed55"
+    },
+    {
+      "path": "b12x/sequence/ple_embedding/__init__.py",
+      "snapshot_sha256": "884f8ed51f5514ee78212a6501f3fc906c0644a8a81ec0010d6dee9b03c81f3e",
+      "current_sha256": "70dc7e1d5e89d942c4ff2d658f9823a1cb888195de980a626f0c25f03ab6d500"
+    },
+    {
+      "path": "b12x/sequence/ple_embedding/_contracts.py",
+      "snapshot_sha256": "9a8d870c29734e35fced8455b702304c7f986e78e7808f694e003933eef145c8",
+      "current_sha256": "d390033e1d034afc038bb623fed5a445f3d2f18c2e33310b3d17527761586d49"
+    },
+    {
+      "path": "b12x/sequence/ple_embedding/_kernels.py",
+      "snapshot_sha256": "81093d5d126fc49f2512b24dba00ebb46abedc713248912c0c3c938e63a44137",
+      "current_sha256": "f5c8341f52d471854c722f9d4343a3758b531660c7cd25b592a0e40fa7acd635"
+    },
+    {
+      "path": "b12x/sequence/ple_embedding/_storage.py",
+      "snapshot_sha256": "3bc3688cb539a4993b1002f29fa1b76c08d3b66a071617d245252a3e4dcc7230",
+      "current_sha256": "e4f0e1a03295d4eb76b39e63eef01fd7f7d3202e37e2a4dae81f1c0a0e0a3be6"
+    },
+    {
+      "path": "b12x/sequence/ple_embedding/api.py",
+      "snapshot_sha256": "9ede7b18af4cb539e313baa655162ba11635b69fd69fc1bdbf2e86214e2749da",
+      "current_sha256": "d02e53d8745a8a8817fabd8ef0e7e96b33fe8211deebae0e529b3ca2bdcb0073"
+    },
+    {
+      "path": "tests/sequence/test_ple_embedding.py",
+      "snapshot_sha256": "b7c76f93b643c6ae912778a85d9a96f7f0c15780dce238244ade7f642a2f3a28",
+      "current_sha256": "22fad9a317403f719c572c9b725a4de5d9cd3139d37b4df83a7d005c29c45e39"
+    }
+  ],
+  "edit_rounds": 2,
+  "serving_launch_count": 5,
+  "source_cutoff_decision": {
+    "choice": "Keep tested snapshot",
+    "approved_by": "user",
+    "frozen_revision": "75ffee6375b0577ce2c8d6931ffacefda3ecbdd6",
+    "excluded_concurrent_uncommitted_files": 9,
+    "original_changes_preserved": true,
+    "immutable_git_source_hashes_verified": 890
+  }
+}
