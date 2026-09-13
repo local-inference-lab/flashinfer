@@ -52,7 +52,23 @@ test -n "${python_wheel}"
 test -n "${jit_wheel}"
 
 wheel_metadata() {
-  unzip -p "$1" '*/METADATA' | awk -F': ' -v field="$2" '$1 == field {print $2; exit}'
+  python3 - "$1" "$2" <<'PY'
+import email
+import sys
+import zipfile
+
+wheel, field = sys.argv[1:]
+with zipfile.ZipFile(wheel) as archive:
+    metadata_paths = [
+        name
+        for name in archive.namelist()
+        if name.endswith(".dist-info/METADATA")
+    ]
+    if len(metadata_paths) != 1:
+        raise RuntimeError(f"Expected one METADATA file in {wheel}, found {metadata_paths}")
+    message = email.message_from_bytes(archive.read(metadata_paths[0]))
+print(message[field])
+PY
 }
 
 test "$(wheel_metadata "${python_wheel}" Name)" = flashinfer-python
