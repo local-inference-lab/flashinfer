@@ -109,31 +109,35 @@ organization administrator whose GitHub token has runner-group permission:
 ci/lil_wheels/configure_org_runner_group.sh
 ```
 
-Generate a short-lived organization registration token on the same machine and
-pass it to the provisioning command without storing it in Git:
+Stream a short-lived organization registration token over SSH standard input.
+The token is not placed in a local or remote process argument and is not stored
+in Git:
 
 ```bash
-GITHUB_RUNNER_TOKEN=$(gh api --method POST \
+gh api --method POST \
   orgs/local-inference-lab/actions/runners/registration-token \
-  --jq .token)
-ssh root@192.168.66.14 env GITHUB_RUNNER_TOKEN="${GITHUB_RUNNER_TOKEN}" \
-  /path/to/flashinfer/ci/lil_wheels/provision_frank2_runner.sh
+  --jq .token |
+  ssh root@192.168.66.14 \
+    'IFS= read -r GITHUB_RUNNER_TOKEN; export GITHUB_RUNNER_TOKEN;
+     exec /path/to/flashinfer/ci/lil_wheels/provision_frank2_runner.sh'
 ```
 
 Migrating an existing repository-scoped registration also requires its
 short-lived removal token:
 
 ```bash
-GITHUB_RUNNER_REMOVE_TOKEN=$(gh api --method POST \
-  repos/local-inference-lab/flashinfer/actions/runners/remove-token \
-  --jq .token)
-GITHUB_RUNNER_TOKEN=$(gh api --method POST \
-  orgs/local-inference-lab/actions/runners/registration-token \
-  --jq .token)
-ssh root@192.168.66.14 env \
-  GITHUB_RUNNER_REMOVE_TOKEN="${GITHUB_RUNNER_REMOVE_TOKEN}" \
-  GITHUB_RUNNER_TOKEN="${GITHUB_RUNNER_TOKEN}" \
-  /path/to/flashinfer/ci/lil_wheels/provision_frank2_runner.sh
+{
+  gh api --method POST \
+    repos/local-inference-lab/flashinfer/actions/runners/remove-token \
+    --jq .token
+  gh api --method POST \
+    orgs/local-inference-lab/actions/runners/registration-token \
+    --jq .token
+} | ssh root@192.168.66.14 \
+  'IFS= read -r GITHUB_RUNNER_REMOVE_TOKEN;
+   IFS= read -r GITHUB_RUNNER_TOKEN;
+   export GITHUB_RUNNER_REMOVE_TOKEN GITHUB_RUNNER_TOKEN;
+   exec /path/to/flashinfer/ci/lil_wheels/provision_frank2_runner.sh'
 ```
 
 The registration token expires after one hour. The runner receives its own
