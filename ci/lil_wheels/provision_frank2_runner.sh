@@ -15,9 +15,9 @@ lock_path="${repo_root}/ci/lil_wheels/runtime.lock"
 runner_user=github-flashinfer
 runner_home=/var/lib/github-flashinfer
 runner_dir=/opt/actions-runner-flashinfer
-runner_name=frank2-cu133-sm120-wheel-builder
+runner_name=frank2-cu134-sm120-wheel-builder
 runner_scope_url=${GITHUB_RUNNER_SCOPE_URL:-https://github.com/local-inference-lab}
-runner_group=${GITHUB_RUNNER_GROUP:-LIL CUDA 13.3 SM120 wheel builders}
+runner_group=${GITHUB_RUNNER_GROUP:-LIL CUDA 13.4 SM120 wheel builders}
 
 lock_value() {
   local key=$1

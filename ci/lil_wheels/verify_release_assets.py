@@ -55,7 +55,7 @@ def verify_release(
     package_files = {package["file"] for package in manifest["packages"]}
     if len(package_files) != 2:
         raise ValueError("manifest must declare exactly two package files")
-    archive = f"flashinfer-cu133-sm120-{source_commit}.tar.zst"
+    archive = f"flashinfer-cu134-sm120-{source_commit}.tar.zst"
     expected = FIXED_ASSETS | package_files | {archive, f"{archive}.sha256"}
     if promotion:
         expected.add("stable-promotion.json")

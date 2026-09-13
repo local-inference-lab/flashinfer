@@ -1,17 +1,17 @@
-name: LIL FlashInfer CUDA 13.3 SM120 wheels
+name: LIL FlashInfer CUDA 13.4 SM120 wheels
 
 on:
   push:
     branches:
-      - community/jovian-judgement-cu133-sm120
+      - community/jovian-judgement-cu134-sm120
     tags:
-      - flashinfer-cu133-sm120-stable-*
+      - flashinfer-cu134-sm120-stable-*
 
 permissions:
   contents: write
 
 concurrency:
-  group: lil-flashinfer-cu133-sm120-${{ github.ref }}
+  group: lil-flashinfer-cu134-sm120-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -35,7 +35,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          tag="flashinfer-cu133-sm120-beta-${GITHUB_SHA}"
+          tag="flashinfer-cu134-sm120-beta-${GITHUB_SHA}"
           if gh release view "${tag}" >/dev/null 2>&1; then
             mkdir existing-release
             gh release download "${tag}" --dir existing-release
@@ -49,7 +49,7 @@ jobs:
           gh release create "${tag}" \
             --target "${GITHUB_SHA}" \
             --prerelease \
-            --title "FlashInfer CUDA 13.3 SM120 beta ${GITHUB_SHA:0:12}" \
+            --title "FlashInfer CUDA 13.4 SM120 beta ${GITHUB_SHA:0:12}" \
             --notes-file dist/lil-flashinfer-wheels/release-notes.md \
             dist/lil-flashinfer-wheels/bundle/wheels/*.whl \
             dist/lil-flashinfer-wheels/bundle/manifest.json \
@@ -57,8 +57,8 @@ jobs:
             dist/lil-flashinfer-wheels/bundle/requirements-github.txt \
             dist/lil-flashinfer-wheels/bundle/install.sh \
             dist/lil-flashinfer-wheels/bundle/runtime.lock \
-            dist/lil-flashinfer-wheels/flashinfer-cu133-sm120-*.tar.zst \
-            dist/lil-flashinfer-wheels/flashinfer-cu133-sm120-*.tar.zst.sha256
+            dist/lil-flashinfer-wheels/flashinfer-cu134-sm120-*.tar.zst \
+            dist/lil-flashinfer-wheels/flashinfer-cu134-sm120-*.tar.zst.sha256
 
   promote-stable:
     if: github.repository == 'local-inference-lab/flashinfer' && github.ref_type == 'tag'
@@ -76,7 +76,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          beta_tag="flashinfer-cu133-sm120-beta-${GITHUB_SHA}"
+          beta_tag="flashinfer-cu134-sm120-beta-${GITHUB_SHA}"
           stable_tag="${GITHUB_REF_NAME}"
           mkdir assets
           gh release download "${beta_tag}" \
@@ -112,6 +112,6 @@ jobs:
           gh release create "${stable_tag}" \
             --repo "${GITHUB_REPOSITORY}" \
             --target "${GITHUB_SHA}" \
-            --title "FlashInfer CUDA 13.3 SM120 stable ${GITHUB_SHA:0:12}" \
+            --title "FlashInfer CUDA 13.4 SM120 stable ${GITHUB_SHA:0:12}" \
             --notes "Qualified promotion of ${beta_tag}. Wheel bytes were not rebuilt." \
             assets/*

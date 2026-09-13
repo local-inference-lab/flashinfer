@@ -11,7 +11,7 @@ ARG NVCC_THREADS
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-ENV PATH=/opt/venv/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+ENV PATH=/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     CUDA_HOME=/usr/local/cuda \
     TORCH_CUDA_ARCH_LIST=12.0a \
     FLASHINFER_CUDA_ARCH_LIST=12.0f \
@@ -21,25 +21,25 @@ ENV PATH=/opt/venv/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/s
     BUILD_NCCL_EP=0 \
     BUILD_NIXL_EP=0
 
-RUN /opt/venv/bin/python - <<'PY'
+RUN python - <<'PY'
 import importlib.metadata
 import torch
 
-assert torch.__version__ == "2.13.0"
-assert torch.version.cuda == "13.3"
+assert importlib.metadata.version("torch") == "2.14.0a0+4fdf77b940.nv26.8.63802676"
+assert torch.__version__ == "2.14.0a0+4fdf77b940.nv26.08"
+assert torch.version.cuda == "13.4"
 assert torch._C._GLIBCXX_USE_CXX11_ABI
 expected = {
     "pip": "26.2.1",
-    "setuptools": "80.10.2",
+    "setuptools": "81.0.0",
     "packaging": "26.2",
-    "wheel": "0.47.0",
-    "build": "1.5.0",
-    "tqdm": "4.69.1",
+    "wheel": "0.48.0",
+    "tqdm": "4.70.0",
     "ninja": "1.13.0",
     "requests": "2.34.2",
     "numpy": "2.1.0",
     "nvidia-ml-py": "13.610.43",
-    "apache-tvm-ffi": "0.1.11",
+    "apache-tvm-ffi": "0.1.13.post3",
     "nvidia-cutlass-dsl": "4.6.2",
     "nvidia-cutlass-dsl-libs-cu13": "4.6.2",
 }
@@ -55,26 +55,26 @@ WORKDIR /src/flashinfer
 # keys depend on mutable repository metadata.
 RUN FLASHINFER_LOCAL_VERSION="${FLASHINFER_LOCAL_VERSION}" \
     FLASHINFER_SOURCE_COMMIT="${FLASHINFER_SOURCE_COMMIT}" \
-    /opt/venv/bin/python ci/lil_wheels/write_build_metadata.py
+    python ci/lil_wheels/write_build_metadata.py
 
-RUN --mount=type=cache,id=lil-flashinfer-pip-cu133-py312,target=/root/.cache/pip,sharing=locked \
+RUN --mount=type=cache,id=lil-flashinfer-pip-cu134-py312,target=/root/.cache/pip,sharing=locked \
     mkdir -p /wheelhouse \
  && FLASHINFER_LOCAL_VERSION="${FLASHINFER_LOCAL_VERSION}" \
     SOURCE_DATE_EPOCH="${FLASHINFER_SOURCE_DATE_EPOCH}" \
     MAX_JOBS="${MAX_JOBS}" \
     FLASHINFER_NVCC_THREADS="${NVCC_THREADS}" \
     NVCC_THREADS="${NVCC_THREADS}" \
-    /opt/venv/bin/python -m pip wheel --no-build-isolation --no-deps \
+    python -m pip wheel --no-build-isolation --no-deps \
       --wheel-dir /wheelhouse .
 
-RUN --mount=type=cache,id=lil-flashinfer-aot-cu133-sm120f,target=/src/flashinfer/build,sharing=locked \
-    --mount=type=cache,id=lil-flashinfer-pip-cu133-py312,target=/root/.cache/pip,sharing=locked \
+RUN --mount=type=cache,id=lil-flashinfer-aot-cu134-sm120f,target=/src/flashinfer/build,sharing=locked \
+    --mount=type=cache,id=lil-flashinfer-pip-cu134-py312,target=/root/.cache/pip,sharing=locked \
     FLASHINFER_LOCAL_VERSION="${FLASHINFER_LOCAL_VERSION}" \
     SOURCE_DATE_EPOCH="${FLASHINFER_SOURCE_DATE_EPOCH}" \
     MAX_JOBS="${MAX_JOBS}" \
     FLASHINFER_NVCC_THREADS="${NVCC_THREADS}" \
     NVCC_THREADS="${NVCC_THREADS}" \
-    /opt/venv/bin/python -m pip wheel --no-build-isolation --no-deps \
+    python -m pip wheel --no-build-isolation --no-deps \
       --wheel-dir /wheelhouse ./flashinfer-jit-cache \
  && test "$(find /wheelhouse -maxdepth 1 -name 'flashinfer_python-*.whl' | wc -l)" -eq 1 \
  && test "$(find /wheelhouse -maxdepth 1 -name 'flashinfer_jit_cache-*.whl' | wc -l)" -eq 1
