@@ -75,11 +75,11 @@ different limits:
 - memory: 256 GiB;
 - memory plus swap: 256 GiB.
 
-The AOT compiler starts at most 16 concurrent jobs with four CUDA compiler
-frontend threads per job. This uses no more than 64 compiler threads and budgets
-128 GiB for compiler jobs, leaving 128 GiB inside the BuildKit limit for Python,
-linkers, and filesystem cache. If the build exceeds 256 GiB, the kernel kills
-the BuildKit container rather than reclaiming unbounded host memory. frank2 has
+The AOT compiler starts at most 48 concurrent CUDA compilation jobs. Each `nvcc`
+process uses one frontend thread because device compilation is predominantly
+single-threaded for this wheel. The BuildKit CPU quota remains the absolute
+64-CPU ceiling. If the build exceeds 256 GiB, the kernel kills the BuildKit
+container rather than reclaiming unbounded host memory. frank2 has
 no swap, so the memory-plus-swap limit also prevents hidden swap pressure.
 
 The BuildKit worker owns persistent pip and AOT object caches keyed by the CUDA,
