@@ -14,7 +14,7 @@ Environment=DOCKER_HOST=unix:///run/lil-flashinfer-docker/docker.sock
 ExecStart=/opt/actions-runner-flashinfer/run.sh
 Restart=always
 RestartSec=5
-KillMode=process
+KillMode=control-group
 TimeoutStopSec=5min
 TasksMax=4096
 CPUQuota=200%
