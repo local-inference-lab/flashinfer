@@ -26,9 +26,6 @@ jit_metadata = (
     f'__git_version__ = "{source_commit}"\n'
 )
 jit_metadata_path = (
-    source_root
-    / "flashinfer-jit-cache"
-    / "flashinfer_jit_cache"
-    / "_build_meta.py"
+    source_root / "flashinfer-jit-cache" / "flashinfer_jit_cache" / "_build_meta.py"
 )
 jit_metadata_path.write_text(jit_metadata)
