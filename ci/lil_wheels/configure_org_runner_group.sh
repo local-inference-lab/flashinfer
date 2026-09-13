@@ -4,7 +4,14 @@ set -euo pipefail
 
 organization=local-inference-lab
 group_name='LIL CUDA 13.3 SM120 wheel builders'
-repositories=(flashinfer vllm b12x LMCache)
+repositories=(
+  flashinfer
+  vllm
+  b12x
+  LMCache
+  nccl-canonical
+  blackwell-llm-docker
+)
 
 group_id=$(gh api "orgs/${organization}/actions/runner-groups" \
   --jq ".runner_groups[] | select(.name == \"${group_name}\") | .id" | head -n1)
