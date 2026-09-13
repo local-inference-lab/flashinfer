@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build and verify source-addressed FlashInfer wheels for CUDA 13.3 and SM120.
+# Build and verify source-addressed FlashInfer wheels for CUDA 13.4 and SM120.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -17,11 +17,11 @@ source_commit=$(git -C "${repo_root}" rev-parse HEAD)
 source_tree=$(git -C "${repo_root}" rev-parse 'HEAD^{tree}')
 source_date_epoch=$(git -C "${repo_root}" show -s --format=%ct HEAD)
 base_version=$(tr -d '[:space:]' < "${repo_root}/version.txt")
-local_version="lil.cu133.sm120.g${source_commit:0:12}"
+local_version="lil.cu134.sm120.g${source_commit:0:12}"
 package_version="${base_version}+${local_version}"
 builder=$(lock_value buildx.builder)
 repository=${GITHUB_REPOSITORY:-local-inference-lab/flashinfer}
-release_tag=${FLASHINFER_RELEASE_TAG:-"flashinfer-cu133-sm120-beta-${source_commit}"}
+release_tag=${FLASHINFER_RELEASE_TAG:-"flashinfer-cu134-sm120-beta-${source_commit}"}
 
 test -z "$(git -C "${repo_root}" status --porcelain)"
 "${tool_dir}/ensure_builder.sh"
@@ -152,7 +152,7 @@ chmod 0755 "${output_dir}/bundle/install.sh"
   sha256sum manifest.json requirements-github.txt runtime.lock install.sh
 ) > "${output_dir}/bundle/SHA256SUMS"
 
-archive="${output_dir}/flashinfer-cu133-sm120-${source_commit}.tar.zst"
+archive="${output_dir}/flashinfer-cu134-sm120-${source_commit}.tar.zst"
 tar --sort=name \
   --mtime="@${source_date_epoch}" \
   --owner=0 \
@@ -169,8 +169,8 @@ tar --sort=name \
 cat > "${output_dir}/release-notes.md" <<EOF
 Status: **research-only**
 
-These wheels contain FlashInfer ${package_version} for Python 3.12, CUDA 13.3,
-PyTorch 2.13.0, and SM120. The release does not contain CUDA or PyTorch.
+These wheels contain FlashInfer ${package_version} for Python 3.12, CUDA 13.4,
+NVIDIA PyTorch 26.08, and SM120. The release does not contain CUDA or PyTorch.
 
 - Source commit: \`${source_commit}\`
 - Source tree: \`${source_tree}\`

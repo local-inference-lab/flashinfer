@@ -3,7 +3,7 @@
 set -euo pipefail
 
 organization=local-inference-lab
-group_name='LIL CUDA 13.3 SM120 wheel builders'
+group_name='LIL CUDA 13.4 SM120 wheel builders'
 repositories=(
   flashinfer
   vllm
@@ -13,12 +13,12 @@ repositories=(
   blackwell-llm-docker
 )
 workflows=(
-  local-inference-lab/flashinfer/.github/workflows/lil-cu133-sm120-wheel-release.yml@community/jovian-judgement-cu133-sm120
+  local-inference-lab/flashinfer/.github/workflows/lil-cu134-sm120-wheel-release.yml@community/jovian-judgement-cu134-sm120
   local-inference-lab/vllm/.github/workflows/jovian-judgement-wheel-release.yml@dev/jovian-judgement
-  local-inference-lab/b12x/.github/workflows/lil-cu133-sm120-wheel-release.yml@master
-  local-inference-lab/LMCache/.github/workflows/lil-cu133-sm120-wheel-release.yml@dev
-  local-inference-lab/nccl-canonical/.github/workflows/lil-cu133-sm120-release.yml@canonical/cu133-nccl2312-amd-turin
-  local-inference-lab/blackwell-llm-docker/.github/workflows/jovian-wheel-runtime-release.yml@master
+  local-inference-lab/b12x/.github/workflows/lil-cu134-sm120-wheel-release.yml@master
+  local-inference-lab/LMCache/.github/workflows/lil-cu134-sm120-wheel-release.yml@dev
+  local-inference-lab/nccl-canonical/.github/workflows/lil-cu134-sm120-release.yml@canonical/cu134-nccl2312-amd-turin
+  local-inference-lab/blackwell-llm-docker/.github/workflows/jovian-wheel-runtime-release.yml@main
 )
 workflow_json=$(printf '%s\n' "${workflows[@]}" | jq -Rsc 'split("\n")[:-1]')
 

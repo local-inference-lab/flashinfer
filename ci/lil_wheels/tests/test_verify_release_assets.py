@@ -10,7 +10,7 @@ from ci.lil_wheels.verify_release_assets import verify_release
 
 
 COMMIT = "1" * 40
-BETA_TAG = f"flashinfer-cu133-sm120-beta-{COMMIT}"
+BETA_TAG = f"flashinfer-cu134-sm120-beta-{COMMIT}"
 
 
 def digest(payload: bytes) -> str:
@@ -47,7 +47,7 @@ def write_release(directory: Path, promotion: bool = False) -> None:
             for name in checksum_names
         )
     )
-    archive = f"flashinfer-cu133-sm120-{COMMIT}.tar.zst"
+    archive = f"flashinfer-cu134-sm120-{COMMIT}.tar.zst"
     (directory / archive).write_bytes(b"archive")
     (directory / f"{archive}.sha256").write_text(
         f"{digest(b'archive')}  /build/{archive}\n"

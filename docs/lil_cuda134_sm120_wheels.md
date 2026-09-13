@@ -1,18 +1,19 @@
-# FlashInfer CUDA 13.3 and SM120 wheel releases
+# FlashInfer CUDA 13.4 and SM120 wheel releases
 
 Status: **research-only**
 
-The `LIL FlashInfer CUDA 13.3 SM120 wheels` GitHub Actions workflow produces
+The `LIL FlashInfer CUDA 13.4 SM120 wheels` GitHub Actions workflow produces
 source-addressed `flashinfer-python` and `flashinfer-jit-cache` wheels for the
-CUDA 13.3, PyTorch 2.13.0, Python 3.12, and SM120 runtime declared in
+CUDA 13.4, NVIDIA PyTorch 26.08, Python 3.12, and SM120 runtime declared in
 `ci/lil_wheels/runtime.lock`. The wheels are application packages; they do not
 contain CUDA, PyTorch, or an NVIDIA driver.
 
-The source branch `community/jovian-judgement-cu133-sm120` preserves the
-FlashInfer implementation used by the Jovian Judgement CUDA 13.3 community
-containers. Each push to that branch produces one immutable GitHub prerelease.
-Its tag contains the full source commit. A source commit is never rebuilt under
-the same tag and release assets are never overwritten.
+The source branch `community/jovian-judgement-cu134-sm120` begins at FlashInfer
+commit `803c4664f4771ddc418f20a57f752469a237a825`, the source revision selected
+for the Jovian Judgement serving runtime. Each push to that branch produces one
+immutable GitHub prerelease. Its tag contains the full source commit. A source
+commit is never rebuilt under the same tag and release assets are never
+overwritten.
 
 ## Release channels
 
@@ -20,15 +21,15 @@ Beta releases are built once by the resource-bounded self-hosted runner. A beta
 release is identified by:
 
 ```text
-flashinfer-cu133-sm120-beta-<full-source-commit>
+flashinfer-cu134-sm120-beta-<full-source-commit>
 ```
 
 Stable promotion does not compile source. After correctness and performance
 qualification, a maintainer creates a tag at the qualified source commit:
 
 ```bash
-git tag flashinfer-cu133-sm120-stable-v0.6.18-g<short-source-commit> <full-source-commit>
-git push origin flashinfer-cu133-sm120-stable-v0.6.18-g<short-source-commit>
+git tag flashinfer-cu134-sm120-stable-v0.6.18-g<short-source-commit> <full-source-commit>
+git push origin flashinfer-cu134-sm120-stable-v0.6.18-g<short-source-commit>
 ```
 
 The promotion job downloads the corresponding beta release, verifies its
@@ -57,7 +58,7 @@ added later if installing only by package name is required.
 ## frank2 resource isolation
 
 The organization-scoped runner uses the unique `lil-wheel-builder` label. Its
-`LIL CUDA 13.3 SM120 wheel builders` runner group is restricted to the
+`LIL CUDA 13.4 SM120 wheel builders` runner group is restricted to the
 `flashinfer`, `vllm`, `b12x`, `LMCache`, `nccl-canonical`, and
 `blackwell-llm-docker` repositories. Their native-wheel jobs execute serially
 through one runner and share the same foundation layers and BuildKit caches.
@@ -72,7 +73,7 @@ Automatic runner updates are disabled so the executable remains pinned. Update
 grace period expires.
 
 Compilation runs inside a dedicated Docker BuildKit worker named
-`lil-flashinfer-cu133-sm120`. The rootless Docker daemon and its containers
+`lil-wheel-cu134-sm120`. The rootless Docker daemon and its containers
 inherit the build limits from a dedicated systemd user slice. The
 `ci/lil_wheels/ensure_builder.sh` command verifies the parent cgroup and the
 BuildKit worker's membership in the bounded user slice before building:
