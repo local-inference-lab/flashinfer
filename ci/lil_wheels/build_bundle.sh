@@ -77,7 +77,7 @@ while IFS= read -r wheel; do
     <<<"${packages_json}")
 done < <(find "${output_dir}/bundle/wheels" -maxdepth 1 -name '*.whl' | sort)
 
-submodules_json=$(git -C "${repo_root}" submodule status --recursive | python -c '
+submodules_json=$(git -C "${repo_root}" submodule status --recursive | python3 -c '
 import json
 import sys
 
