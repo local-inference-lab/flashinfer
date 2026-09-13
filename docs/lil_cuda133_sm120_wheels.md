@@ -66,9 +66,10 @@ Automatic runner updates are disabled so the executable remains pinned. Update
 grace period expires.
 
 Compilation runs inside a dedicated Docker BuildKit worker named
-`lil-flashinfer-cu133-sm120`. The rootless Docker systemd unit applies these
-hard limits to the daemon, BuildKit, and every build child. The
-`ci/lil_wheels/ensure_builder.sh` command verifies the limits before building:
+`lil-flashinfer-cu133-sm120`. The rootless Docker daemon and the systemd user
+slice containing its containers both enforce the build limits. The
+`ci/lil_wheels/ensure_builder.sh` command verifies both parent cgroups and the
+BuildKit worker's membership in the bounded user slice before building:
 
 - CPU affinity: logical CPUs 64 through 127;
 - CPU quota: 64 logical CPUs;

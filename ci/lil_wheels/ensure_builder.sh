@@ -47,6 +47,9 @@ if (( rootless )); then
   service=lil-flashinfer-rootless-docker.service
   control_group=$(systemctl show --value --property ControlGroup "${service}")
   cgroup_path="/sys/fs/cgroup${control_group}"
+  user_slice="user-$(id -u).slice"
+  user_control_group=$(systemctl show --value --property ControlGroup "${user_slice}")
+  user_cgroup_path="/sys/fs/cgroup${user_control_group}"
   daemon_pid=$(systemctl show --value --property MainPID "${service}")
   actual_memory_high=$(<"${cgroup_path}/memory.high")
   actual_memory=$(<"${cgroup_path}/memory.max")
@@ -59,9 +62,30 @@ if (( rootless )); then
   test "${actual_cpuset}" = "${cpuset}"
   test "${actual_quota}" = "${quota}"
   test "${actual_period}" = "${period}"
-  printf 'builder=%s rootless_service=%s memory_high=%s memory_max=%s swap_max=%s cpuset=%s cpu_quota=%s cpu_period=%s\n' \
-    "${builder}" "${service}" "${actual_memory_high}" "${actual_memory}" \
-    "${actual_swap}" "${actual_cpuset}" "${actual_quota}" "${actual_period}"
+  test "$(<"${user_cgroup_path}/memory.high")" = \
+    "$(lock_value buildx.memory-high-bytes)"
+  test "$(<"${user_cgroup_path}/memory.max")" = "${memory}"
+  test "$(<"${user_cgroup_path}/memory.swap.max")" = \
+    "$(lock_value buildx.swap-max-bytes)"
+  read -r user_quota user_period < "${user_cgroup_path}/cpu.max"
+  test "${user_quota}" = "${quota}"
+  test "${user_period}" = "${period}"
+  test "$(<"${user_cgroup_path}/pids.max")" = "$(lock_value buildx.tasks-max)"
+  test "$(<"${user_cgroup_path}/cpuset.cpus.effective")" = "${cpuset}"
+  container_pid=$(docker inspect --format '{{.State.Pid}}' "${container}")
+  container_cgroup=$(awk -F: '$1 == "0" {print $3}' "/proc/${container_pid}/cgroup")
+  case "${container_cgroup}" in
+    "${user_control_group}"/*) ;;
+    *)
+      printf 'BuildKit cgroup %s is outside bounded user slice %s.\n' \
+        "${container_cgroup}" "${user_control_group}" >&2
+      exit 1
+      ;;
+  esac
+  printf 'builder=%s rootless_service=%s build_slice=%s memory_high=%s memory_max=%s swap_max=%s cpuset=%s cpu_quota=%s cpu_period=%s\n' \
+    "${builder}" "${service}" "${user_slice}" "${actual_memory_high}" \
+    "${actual_memory}" "${actual_swap}" "${actual_cpuset}" "${actual_quota}" \
+    "${actual_period}"
   exit 0
 fi
 
