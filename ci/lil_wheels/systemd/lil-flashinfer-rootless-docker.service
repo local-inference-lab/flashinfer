@@ -1,0 +1,24 @@
+[Unit]
+Description=Rootless Docker daemon for FlashInfer wheel builds
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+User=github-flashinfer
+Group=github-flashinfer
+Environment=HOME=/var/lib/github-flashinfer
+Environment=XDG_RUNTIME_DIR=/run/lil-flashinfer-docker
+RuntimeDirectory=lil-flashinfer-docker
+RuntimeDirectoryMode=0700
+ExecStart=/usr/bin/dockerd-rootless.sh --host=unix:///run/lil-flashinfer-docker/docker.sock
+Restart=always
+RestartSec=3
+Delegate=yes
+TasksMax=infinity
+LimitNOFILE=1048576
+MemoryHigh=290G
+MemoryMax=300G
+
+[Install]
+WantedBy=multi-user.target
