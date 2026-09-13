@@ -58,10 +58,10 @@ added later if installing only by package name is required.
 
 The organization-scoped runner uses the unique `lil-wheel-builder` label. Its
 `LIL CUDA 13.3 SM120 wheel builders` runner group is restricted to the
-`flashinfer`, `vllm`, `b12x`, and `LMCache` repositories. Their native-wheel
-jobs execute serially through one runner and share the same foundation layers
-and BuildKit caches. Workflows assigned to this label must not accept
-pull-request jobs.
+`flashinfer`, `vllm`, `b12x`, `LMCache`, `nccl-canonical`, and
+`blackwell-llm-docker` repositories. Their native-wheel jobs execute serially
+through one runner and share the same foundation layers and BuildKit caches.
+Workflows assigned to this label must not accept pull-request jobs.
 
 The runner opens outbound TLS connections to GitHub on TCP port 443; GitHub
 does not connect to frank2 and no inbound firewall rule is required.
