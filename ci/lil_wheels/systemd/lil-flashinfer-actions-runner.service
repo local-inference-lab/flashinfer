@@ -16,6 +16,7 @@ Restart=always
 RestartSec=5
 KillMode=process
 TimeoutStopSec=5min
+TasksMax=4096
 CPUQuota=200%
 MemoryHigh=3G
 MemoryMax=4G

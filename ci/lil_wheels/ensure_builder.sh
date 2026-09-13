@@ -45,14 +45,23 @@ docker buildx inspect --bootstrap "${builder}" >/dev/null
 
 if (( rootless )); then
   service=lil-flashinfer-rootless-docker.service
-  actual_memory=$(systemctl show --value --property MemoryMax "${service}")
+  control_group=$(systemctl show --value --property ControlGroup "${service}")
+  cgroup_path="/sys/fs/cgroup${control_group}"
   daemon_pid=$(systemctl show --value --property MainPID "${service}")
+  actual_memory_high=$(<"${cgroup_path}/memory.high")
+  actual_memory=$(<"${cgroup_path}/memory.max")
+  actual_swap=$(<"${cgroup_path}/memory.swap.max")
+  read -r actual_quota actual_period < "${cgroup_path}/cpu.max"
   actual_cpuset=$(awk '/^Cpus_allowed_list:/ {print $2}' "/proc/${daemon_pid}/status")
+  test "${actual_memory_high}" = "$(lock_value buildx.memory-high-bytes)"
   test "${actual_memory}" = "${memory}"
+  test "${actual_swap}" = "$(lock_value buildx.swap-max-bytes)"
   test "${actual_cpuset}" = "${cpuset}"
-  test "$(systemctl show --value --property CPUQuotaPerSecUSec "${service}")" = 64s
-  printf 'builder=%s rootless_service=%s memory=%s cpuset=%s cpu_quota=64\n' \
-    "${builder}" "${service}" "${actual_memory}" "${actual_cpuset}"
+  test "${actual_quota}" = "${quota}"
+  test "${actual_period}" = "${period}"
+  printf 'builder=%s rootless_service=%s memory_high=%s memory_max=%s swap_max=%s cpuset=%s cpu_quota=%s cpu_period=%s\n' \
+    "${builder}" "${service}" "${actual_memory_high}" "${actual_memory}" \
+    "${actual_swap}" "${actual_cpuset}" "${actual_quota}" "${actual_period}"
   exit 0
 fi
 

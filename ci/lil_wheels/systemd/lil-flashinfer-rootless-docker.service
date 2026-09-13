@@ -15,10 +15,11 @@ ExecStart=/usr/bin/dockerd-rootless.sh --host=unix:///run/lil-flashinfer-docker/
 Restart=always
 RestartSec=3
 Delegate=yes
-TasksMax=infinity
+TasksMax=8192
 LimitNOFILE=1048576
 MemoryHigh=240G
 MemoryMax=256G
+MemorySwapMax=0
 CPUAffinity=64-127
 CPUQuota=6400%
 
