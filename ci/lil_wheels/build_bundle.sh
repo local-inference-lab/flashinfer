@@ -161,7 +161,10 @@ tar --sort=name \
   --zstd \
   -C "${output_dir}/bundle" \
   -cf "${archive}" .
-sha256sum "${archive}" > "${archive}.sha256"
+(
+  cd "${output_dir}"
+  sha256sum "$(basename "${archive}")"
+) > "${archive}.sha256"
 
 cat > "${output_dir}/release-notes.md" <<EOF
 Status: **research-only**
