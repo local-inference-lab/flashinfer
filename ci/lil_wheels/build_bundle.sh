@@ -26,8 +26,10 @@ release_tag=${FLASHINFER_RELEASE_TAG:-"flashinfer-cu133-sm120-beta-${source_comm
 test -z "$(git -C "${repo_root}" status --porcelain --untracked-files=no)"
 "${tool_dir}/ensure_builder.sh"
 
-if test -e "${output_dir}"; then
-  printf 'Output path already exists: %s\n' "${output_dir}" >&2
+mkdir -p "$(dirname "${output_dir}")"
+if ! mkdir "${output_dir}"; then
+  printf 'Output path already exists or is being built: %s\n' \
+    "${output_dir}" >&2
   exit 1
 fi
 mkdir -p "${output_dir}/raw" "${output_dir}/bundle/wheels"
