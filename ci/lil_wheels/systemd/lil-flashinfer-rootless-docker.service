@@ -5,23 +5,12 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=github-flashinfer
-Group=github-flashinfer
 Environment=HOME=/var/lib/github-flashinfer
-Environment=XDG_RUNTIME_DIR=/run/lil-flashinfer-docker
-RuntimeDirectory=lil-flashinfer-docker
-RuntimeDirectoryMode=0700
 ExecStart=/usr/bin/dockerd-rootless.sh --host=unix:///run/lil-flashinfer-docker/docker.sock
 Restart=always
 RestartSec=3
 Delegate=yes
-TasksMax=8192
 LimitNOFILE=1048576
-MemoryHigh=240G
-MemoryMax=256G
-MemorySwapMax=0
-CPUAffinity=64-127
-CPUQuota=6400%
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target

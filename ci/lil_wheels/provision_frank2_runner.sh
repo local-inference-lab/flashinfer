@@ -69,6 +69,32 @@ systemctl set-property --runtime "${user_slice}" \
   "MemoryMax=$(lock_value buildx.memory-bytes)" \
   "MemorySwapMax=$(lock_value buildx.swap-max-bytes)" \
   "TasksMax=$(lock_value buildx.tasks-max)"
+user_runtime="/run/user/${runner_uid}"
+user_systemctl=(
+  runuser -u "${runner_user}" -- env
+  "HOME=${runner_home}"
+  "XDG_RUNTIME_DIR=${user_runtime}"
+  "DBUS_SESSION_BUS_ADDRESS=unix:path=${user_runtime}/bus"
+  systemctl --user
+)
+
+# A user service gives rootless runc access to the delegated user manager.
+# The bounded user slice remains the resource-control parent of every container
+# scope even though Docker creates those scopes as siblings of the daemon.
+systemctl disable --now lil-flashinfer-rootless-docker.service 2>/dev/null || true
+rm -f /etc/systemd/system/lil-flashinfer-rootless-docker.service
+install -m 0644 \
+  "${repo_root}/ci/lil_wheels/systemd/lil-flashinfer-rootless-docker.tmpfiles" \
+  /etc/tmpfiles.d/lil-flashinfer-rootless-docker.conf
+systemd-tmpfiles --create /etc/tmpfiles.d/lil-flashinfer-rootless-docker.conf
+user_unit_dir="${runner_home}/.config/systemd/user"
+install -d -o "${runner_user}" -g "${runner_user}" "${user_unit_dir}"
+install -o "${runner_user}" -g "${runner_user}" -m 0644 \
+  "${repo_root}/ci/lil_wheels/systemd/lil-flashinfer-rootless-docker.service" \
+  "${user_unit_dir}/lil-flashinfer-rootless-docker.service"
+"${user_systemctl[@]}" daemon-reload
+"${user_systemctl[@]}" enable lil-flashinfer-rootless-docker.service
+"${user_systemctl[@]}" restart lil-flashinfer-rootless-docker.service
 
 install -d -o "${runner_user}" -g "${runner_user}" "${runner_dir}"
 if [[ ! -e ${runner_dir}/config.sh ]]; then
@@ -99,13 +125,9 @@ if [[ ! -e ${runner_dir}/.runner ]]; then
       --replace
 fi
 
-install -m 0644 "${repo_root}/ci/lil_wheels/systemd/lil-flashinfer-rootless-docker.service" \
-  /etc/systemd/system/lil-flashinfer-rootless-docker.service
 install -m 0644 "${repo_root}/ci/lil_wheels/systemd/lil-flashinfer-actions-runner.service" \
   /etc/systemd/system/lil-flashinfer-actions-runner.service
 systemctl daemon-reload
-systemctl enable lil-flashinfer-rootless-docker.service
-systemctl restart lil-flashinfer-rootless-docker.service
 
 for _ in $(seq 1 60); do
   if runuser -u "${runner_user}" -- env \
@@ -119,6 +141,8 @@ runuser -u "${runner_user}" -- env \
   DOCKER_HOST=unix:///run/lil-flashinfer-docker/docker.sock \
   docker info >/dev/null
 
-systemctl enable --now lil-flashinfer-actions-runner.service
-systemctl --no-pager --full status lil-flashinfer-rootless-docker.service
+systemctl enable lil-flashinfer-actions-runner.service
+systemctl restart lil-flashinfer-actions-runner.service
+"${user_systemctl[@]}" --no-pager --full status \
+  lil-flashinfer-rootless-docker.service
 systemctl --no-pager --full status lil-flashinfer-actions-runner.service
