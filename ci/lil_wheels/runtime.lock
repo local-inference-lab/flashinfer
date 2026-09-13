@@ -24,6 +24,7 @@ buildx.builder=lil-flashinfer-cu133-sm120
 buildx.memory-high-bytes=257698037760
 buildx.memory-bytes=274877906944
 buildx.swap-max-bytes=0
+buildx.tasks-max=8192
 buildx.cpuset=64-127
 buildx.cpu-quota=6400000
 buildx.cpu-period=100000

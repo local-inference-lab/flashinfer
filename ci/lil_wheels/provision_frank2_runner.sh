@@ -49,6 +49,26 @@ fi
 if ! grep -q "^${runner_user}:" /etc/subgid; then
   usermod --add-subgids 200000-265535 "${runner_user}"
 fi
+runner_uid=$(id -u "${runner_user}")
+user_slice="user-${runner_uid}.slice"
+user_slice_dropin="/etc/systemd/system/${user_slice}.d"
+install -d -m 0755 "${user_slice_dropin}"
+install -m 0644 \
+  "${repo_root}/ci/lil_wheels/systemd/lil-flashinfer-build-user-slice.conf" \
+  "${user_slice_dropin}/lil-flashinfer-build.conf"
+systemctl daemon-reload
+loginctl enable-linger "${runner_user}"
+systemctl start "user@${runner_uid}.service"
+cpu_percent=$((
+  $(lock_value buildx.cpu-quota) * 100 / $(lock_value buildx.cpu-period)
+))
+systemctl set-property --runtime "${user_slice}" \
+  "AllowedCPUs=$(lock_value buildx.cpuset)" \
+  "CPUQuota=${cpu_percent}%" \
+  "MemoryHigh=$(lock_value buildx.memory-high-bytes)" \
+  "MemoryMax=$(lock_value buildx.memory-bytes)" \
+  "MemorySwapMax=$(lock_value buildx.swap-max-bytes)" \
+  "TasksMax=$(lock_value buildx.tasks-max)"
 
 install -d -o "${runner_user}" -g "${runner_user}" "${runner_dir}"
 if [[ ! -e ${runner_dir}/config.sh ]]; then
