@@ -8,12 +8,11 @@ CUDA 13.4, NVIDIA PyTorch 26.08, Python 3.12, and SM120 runtime declared in
 `ci/lil_wheels/runtime.lock`. The wheels are application packages; they do not
 contain CUDA, PyTorch, or an NVIDIA driver.
 
-The source branch `community/jovian-judgement-cu134-sm120` begins at FlashInfer
-commit `803c4664f4771ddc418f20a57f752469a237a825`, the source revision selected
-for the Jovian Judgement serving runtime. Each push to that branch produces one
-immutable GitHub prerelease. Its tag contains the full source commit. A source
-commit is never rebuilt under the same tag and release assets are never
-overwritten.
+The source branch `community/jovian-judgement-cu134-sm120` contains the
+CUDA 13.4 wheel publisher and excludes B12X from the FlashInfer package.
+Each push produces a source-addressed GitHub prerelease whose tag contains
+the full source commit. Repeated workflow runs verify existing releases;
+published release assets are not overwritten.
 
 ## Release channels
 
@@ -57,12 +56,14 @@ added later if installing only by package name is required.
 
 ## frank2 resource isolation
 
-The organization-scoped runner uses the unique `lil-wheel-builder` label. Its
-`LIL CUDA 13.4 SM120 wheel builders` runner group is restricted to the
-`flashinfer`, `vllm`, `b12x`, `LMCache`, `nccl-canonical`, and
-`blackwell-llm-docker` repositories. Their native-wheel jobs execute serially
-through one runner and share the same foundation layers and BuildKit caches.
-Workflows assigned to this label must not accept pull-request jobs.
+Repository-scoped runners for `flashinfer`, `vllm`, `b12x`, `LMCache`,
+`InstantTensor`, `nccl-canonical`, and `blackwell-llm-docker` use the
+`lil-wheel-builder` label. Their native-wheel jobs share one BuildKit worker,
+foundation layers, and build caches. The file lock
+`/var/lib/github-flashinfer/locks/cu134-sm120-build.lock` serializes builds
+across repositories. These runners must not execute untrusted pull-request
+jobs. An organization-scoped runner group is also supported by the
+provisioning scripts; it is not required for this deployment.
 
 The runner opens outbound TLS connections to GitHub on TCP port 443; GitHub
 does not connect to frank2 and no inbound firewall rule is required.
@@ -103,7 +104,7 @@ rootful Docker daemon used for model serving. The dedicated user slice has a
 4,096 tasks. Do not enable workflows from untrusted pull requests on the
 self-hosted label even with this isolation.
 
-Create or reconcile the selected-repository runner group with an authenticated
+For an organization-scoped deployment, create the selected-repository runner group with an authenticated
 organization administrator whose GitHub token has runner-group permission:
 
 ```bash
@@ -144,7 +145,7 @@ short-lived removal token:
 The registration token expires after one hour. The runner receives its own
 organization-scoped credentials during registration; neither short-lived token
 is retained by the service definition.
-# B12X package ownership
+## B12X package ownership
 
 Status: **implemented**.
 
