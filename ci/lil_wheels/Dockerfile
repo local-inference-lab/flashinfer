@@ -81,6 +81,9 @@ RUN --mount=type=cache,id=lil-flashinfer-aot-cu133-sm120f,target=/src/flashinfer
 
 FROM build AS validate
 
+ARG FLASHINFER_LOCAL_VERSION
+ARG FLASHINFER_SOURCE_COMMIT
+
 RUN rm -rf /tmp/flashinfer-wheel-test \
  && python -m venv --system-site-packages /tmp/flashinfer-wheel-test \
  && /tmp/flashinfer-wheel-test/bin/pip install --no-deps /wheelhouse/*.whl \
