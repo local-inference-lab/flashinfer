@@ -68,13 +68,13 @@ different limits:
 
 - CPU affinity: logical CPUs 64 through 127;
 - CPU quota: 64 logical CPUs;
-- memory: 128 GiB;
-- memory plus swap: 128 GiB.
+- memory: 256 GiB;
+- memory plus swap: 256 GiB.
 
-The AOT compiler starts at most 12 concurrent jobs with four CUDA compiler
-frontend threads per job. This uses no more than 48 compiler threads and budgets
-96 GiB for compiler jobs, leaving 32 GiB inside the BuildKit limit for Python,
-linkers, and filesystem cache. If the build exceeds 128 GiB, the kernel kills
+The AOT compiler starts at most 16 concurrent jobs with four CUDA compiler
+frontend threads per job. This uses no more than 64 compiler threads and budgets
+128 GiB for compiler jobs, leaving 128 GiB inside the BuildKit limit for Python,
+linkers, and filesystem cache. If the build exceeds 256 GiB, the kernel kills
 the BuildKit container rather than reclaiming unbounded host memory. frank2 has
 no swap, so the memory-plus-swap limit also prevents hidden swap pressure.
 
