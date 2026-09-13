@@ -56,11 +56,17 @@ added later if installing only by package name is required.
 
 ## frank2 resource isolation
 
-The repository-scoped runner uses the unique `lil-flashinfer-builder` label and
-accepts no pull-request jobs. It opens outbound TLS connections to GitHub on TCP
-port 443; GitHub does not connect to frank2 and no inbound firewall rule is
-required. `ci/lil_wheels/provision_frank2_runner.sh` installs the pinned GitHub
-Actions runner release and verifies its published SHA-256 digest.
+The organization-scoped runner uses the unique `lil-wheel-builder` label. Its
+`LIL CUDA 13.3 SM120 wheel builders` runner group is restricted to the
+`flashinfer`, `vllm`, `b12x`, and `LMCache` repositories. Their native-wheel
+jobs execute serially through one runner and share the same foundation layers
+and BuildKit caches. Workflows assigned to this label must not accept
+pull-request jobs.
+
+The runner opens outbound TLS connections to GitHub on TCP port 443; GitHub
+does not connect to frank2 and no inbound firewall rule is required.
+`ci/lil_wheels/provision_frank2_runner.sh` installs the pinned GitHub Actions
+runner release and verifies its published SHA-256 digest.
 Automatic runner updates are disabled so the executable remains pinned. Update
 `runner.version`, its URL, and its digest before GitHub's 30-day disabled-update
 grace period expires.
@@ -96,17 +102,40 @@ rootful Docker daemon used for model serving. The dedicated user slice has a
 4,096 tasks. Do not enable workflows from untrusted pull requests on the
 self-hosted label even with this isolation.
 
-Generate a short-lived repository registration token on an authenticated admin
-machine and pass it to the provisioning command without storing it in Git:
+Create or reconcile the selected-repository runner group with an authenticated
+organization administrator whose GitHub token has runner-group permission:
+
+```bash
+ci/lil_wheels/configure_org_runner_group.sh
+```
+
+Generate a short-lived organization registration token on the same machine and
+pass it to the provisioning command without storing it in Git:
 
 ```bash
 GITHUB_RUNNER_TOKEN=$(gh api --method POST \
-  repos/local-inference-lab/flashinfer/actions/runners/registration-token \
+  orgs/local-inference-lab/actions/runners/registration-token \
   --jq .token)
 ssh root@192.168.66.14 env GITHUB_RUNNER_TOKEN="${GITHUB_RUNNER_TOKEN}" \
   /path/to/flashinfer/ci/lil_wheels/provision_frank2_runner.sh
 ```
 
+Migrating an existing repository-scoped registration also requires its
+short-lived removal token:
+
+```bash
+GITHUB_RUNNER_REMOVE_TOKEN=$(gh api --method POST \
+  repos/local-inference-lab/flashinfer/actions/runners/remove-token \
+  --jq .token)
+GITHUB_RUNNER_TOKEN=$(gh api --method POST \
+  orgs/local-inference-lab/actions/runners/registration-token \
+  --jq .token)
+ssh root@192.168.66.14 env \
+  GITHUB_RUNNER_REMOVE_TOKEN="${GITHUB_RUNNER_REMOVE_TOKEN}" \
+  GITHUB_RUNNER_TOKEN="${GITHUB_RUNNER_TOKEN}" \
+  /path/to/flashinfer/ci/lil_wheels/provision_frank2_runner.sh
+```
+
 The registration token expires after one hour. The runner receives its own
-repository-scoped credentials during registration; the token is not retained
-by the service definition.
+organization-scoped credentials during registration; neither short-lived token
+is retained by the service definition.

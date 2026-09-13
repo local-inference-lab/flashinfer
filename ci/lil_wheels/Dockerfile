@@ -79,5 +79,30 @@ RUN --mount=type=cache,id=lil-flashinfer-aot-cu133-sm120f,target=/src/flashinfer
  && test "$(find /wheelhouse -maxdepth 1 -name 'flashinfer_python-*.whl' | wc -l)" -eq 1 \
  && test "$(find /wheelhouse -maxdepth 1 -name 'flashinfer_jit_cache-*.whl' | wc -l)" -eq 1
 
+FROM build AS validate
+
+RUN rm -rf /tmp/flashinfer-wheel-test \
+ && python -m venv --system-site-packages /tmp/flashinfer-wheel-test \
+ && /tmp/flashinfer-wheel-test/bin/pip install --no-deps /wheelhouse/*.whl \
+ && EXPECTED_VERSION="$(tr -d '[:space:]' < version.txt)+${FLASHINFER_LOCAL_VERSION}" \
+    EXPECTED_COMMIT="${FLASHINFER_SOURCE_COMMIT}" \
+    /tmp/flashinfer-wheel-test/bin/python -I - <<'PY'
+import importlib.metadata
+import os
+
+import flashinfer
+import flashinfer_jit_cache
+
+expected_version = os.environ["EXPECTED_VERSION"]
+expected_commit = os.environ["EXPECTED_COMMIT"]
+assert flashinfer.__version__ == expected_version
+assert flashinfer.__git_commit__ == expected_commit
+assert flashinfer_jit_cache.__version__ == expected_version
+assert flashinfer_jit_cache.__git_version__ == expected_commit
+assert importlib.metadata.version("flashinfer-python") == expected_version
+assert importlib.metadata.version("flashinfer-jit-cache") == expected_version
+print(f"FlashInfer {expected_version} ({expected_commit})")
+PY
+
 FROM scratch AS wheels
-COPY --from=build /wheelhouse/ /wheels/
+COPY --from=validate /wheelhouse/ /wheels/
