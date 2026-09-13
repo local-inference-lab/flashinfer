@@ -23,7 +23,7 @@ builder=$(lock_value buildx.builder)
 repository=${GITHUB_REPOSITORY:-local-inference-lab/flashinfer}
 release_tag=${FLASHINFER_RELEASE_TAG:-"flashinfer-cu133-sm120-beta-${source_commit}"}
 
-test -z "$(git -C "${repo_root}" status --porcelain --untracked-files=no)"
+test -z "$(git -C "${repo_root}" status --porcelain)"
 "${tool_dir}/ensure_builder.sh"
 
 mkdir -p "$(dirname "${output_dir}")"

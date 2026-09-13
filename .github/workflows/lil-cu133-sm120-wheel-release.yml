@@ -24,6 +24,7 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0
+          persist-credentials: false
           submodules: recursive
 
       - name: Build and verify the source-addressed wheels
@@ -36,7 +37,13 @@ jobs:
           set -euo pipefail
           tag="flashinfer-cu133-sm120-beta-${GITHUB_SHA}"
           if gh release view "${tag}" >/dev/null 2>&1; then
-            echo "Immutable release ${tag} already exists; no assets were replaced."
+            mkdir existing-release
+            gh release download "${tag}" --dir existing-release
+            python ci/lil_wheels/verify_release_assets.py \
+              --directory existing-release \
+              --source-commit "${GITHUB_SHA}" \
+              --beta-tag "${tag}"
+            echo "Immutable release ${tag} exists and satisfies the asset contract."
             exit 0
           fi
           gh release create "${tag}" \
@@ -58,6 +65,12 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
+      - name: Check out the tagged release verifier
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
       - name: Promote the wheel bytes produced for the tagged source commit
         env:
           GH_TOKEN: ${{ github.token }}
@@ -69,13 +82,21 @@ jobs:
           gh release download "${beta_tag}" \
             --repo "${GITHUB_REPOSITORY}" \
             --dir assets
-          jq -r '.packages[] | [.sha256, .file] | @tsv' assets/manifest.json |
-            while IFS=$'\t' read -r expected file; do
-              actual=$(sha256sum "assets/${file}" | awk '{print $1}')
-              test "${actual}" = "${expected}"
-            done
+          python ci/lil_wheels/verify_release_assets.py \
+            --directory assets \
+            --source-commit "${GITHUB_SHA}" \
+            --beta-tag "${beta_tag}"
           if gh release view "${stable_tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-            echo "Immutable stable release ${stable_tag} already exists; no assets were replaced."
+            mkdir existing-stable-release
+            gh release download "${stable_tag}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --dir existing-stable-release
+            python ci/lil_wheels/verify_release_assets.py \
+              --directory existing-stable-release \
+              --source-commit "${GITHUB_SHA}" \
+              --beta-tag "${beta_tag}" \
+              --promotion
+            echo "Immutable stable release ${stable_tag} satisfies the asset contract."
             exit 0
           fi
           jq -n \
