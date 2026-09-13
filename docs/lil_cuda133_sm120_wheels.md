@@ -59,7 +59,11 @@ added later if installing only by package name is required.
 The repository-scoped runner uses the unique `lil-flashinfer-builder` label and
 accepts no pull-request jobs. It opens outbound TLS connections to GitHub on TCP
 port 443; GitHub does not connect to frank2 and no inbound firewall rule is
-required.
+required. `ci/lil_wheels/provision_frank2_runner.sh` installs the pinned GitHub
+Actions runner release and verifies its published SHA-256 digest.
+Automatic runner updates are disabled so the executable remains pinned. Update
+`runner.version`, its URL, and its digest before GitHub's 30-day disabled-update
+grace period expires.
 
 Compilation runs inside a dedicated Docker BuildKit worker named
 `lil-flashinfer-cu133-sm120`. `ci/lil_wheels/ensure_builder.sh` creates the worker
@@ -83,8 +87,24 @@ Python, and architecture identity. A FlashInfer source change reuses unchanged
 objects. A CUDA, PyTorch, CUTLASS DSL, Python ABI, or target-architecture change
 requires new cache identifiers in the Dockerfile.
 
-The runner account can control only this repository through its registration,
-but access to a rootful Docker socket is effective root access to frank2. Do not
-enable workflows from untrusted pull requests on the self-hosted label. Moving
-the runner to a rootless Docker daemon or a dedicated virtual machine is
-required before broadening its trigger policy.
+The runner and BuildKit worker use a dedicated rootless Docker daemon whose
+storage, socket, container namespace, and build cache are separate from the
+rootful Docker daemon used for model serving. The Docker daemon's systemd unit
+has a 300 GiB memory ceiling in addition to the BuildKit worker's 256 GiB
+ceiling. The runner process has a 4 GiB memory ceiling. Do not enable workflows
+from untrusted pull requests on the self-hosted label even with this isolation.
+
+Generate a short-lived repository registration token on an authenticated admin
+machine and pass it to the provisioning command without storing it in Git:
+
+```bash
+GITHUB_RUNNER_TOKEN=$(gh api --method POST \
+  repos/local-inference-lab/flashinfer/actions/runners/registration-token \
+  --jq .token)
+ssh root@192.168.66.14 env GITHUB_RUNNER_TOKEN="${GITHUB_RUNNER_TOKEN}" \
+  /path/to/flashinfer/ci/lil_wheels/provision_frank2_runner.sh
+```
+
+The registration token expires after one hour. The runner receives its own
+repository-scoped credentials during registration; the token is not retained
+by the service definition.
