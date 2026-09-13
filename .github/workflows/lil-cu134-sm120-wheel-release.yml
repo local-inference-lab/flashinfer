@@ -28,7 +28,10 @@ jobs:
           submodules: recursive
 
       - name: Build and verify the source-addressed wheels
-        run: ci/lil_wheels/build_bundle.sh
+        run: >-
+          flock --exclusive --wait 21600
+          /var/lib/github-flashinfer/locks/cu134-sm120-build.lock
+          ci/lil_wheels/build_bundle.sh
 
       - name: Publish the immutable beta release
         env:
