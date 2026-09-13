@@ -45,28 +45,21 @@ docker buildx inspect --bootstrap "${builder}" >/dev/null
 
 if (( rootless )); then
   service=lil-flashinfer-rootless-docker.service
-  control_group=$(systemctl show --value --property ControlGroup "${service}")
-  cgroup_path="/sys/fs/cgroup${control_group}"
   user_slice="user-$(id -u).slice"
   user_control_group=$(systemctl show --value --property ControlGroup "${user_slice}")
   user_cgroup_path="/sys/fs/cgroup${user_control_group}"
-  daemon_pid=$(systemctl show --value --property MainPID "${service}")
-  actual_memory_high=$(<"${cgroup_path}/memory.high")
-  actual_memory=$(<"${cgroup_path}/memory.max")
-  actual_swap=$(<"${cgroup_path}/memory.swap.max")
-  read -r actual_quota actual_period < "${cgroup_path}/cpu.max"
+  user_runtime="/run/user/$(id -u)"
+  daemon_pid=$(XDG_RUNTIME_DIR="${user_runtime}" \
+    DBUS_SESSION_BUS_ADDRESS="unix:path=${user_runtime}/bus" \
+    systemctl --user show --value --property MainPID "${service}")
   actual_cpuset=$(awk '/^Cpus_allowed_list:/ {print $2}' "/proc/${daemon_pid}/status")
+  test "${actual_cpuset}" = "${cpuset}"
+  actual_memory_high=$(<"${user_cgroup_path}/memory.high")
+  actual_memory=$(<"${user_cgroup_path}/memory.max")
+  actual_swap=$(<"${user_cgroup_path}/memory.swap.max")
   test "${actual_memory_high}" = "$(lock_value buildx.memory-high-bytes)"
   test "${actual_memory}" = "${memory}"
   test "${actual_swap}" = "$(lock_value buildx.swap-max-bytes)"
-  test "${actual_cpuset}" = "${cpuset}"
-  test "${actual_quota}" = "${quota}"
-  test "${actual_period}" = "${period}"
-  test "$(<"${user_cgroup_path}/memory.high")" = \
-    "$(lock_value buildx.memory-high-bytes)"
-  test "$(<"${user_cgroup_path}/memory.max")" = "${memory}"
-  test "$(<"${user_cgroup_path}/memory.swap.max")" = \
-    "$(lock_value buildx.swap-max-bytes)"
   read -r user_quota user_period < "${user_cgroup_path}/cpu.max"
   test "${user_quota}" = "${quota}"
   test "${user_period}" = "${period}"
@@ -84,8 +77,8 @@ if (( rootless )); then
   esac
   printf 'builder=%s rootless_service=%s build_slice=%s memory_high=%s memory_max=%s swap_max=%s cpuset=%s cpu_quota=%s cpu_period=%s\n' \
     "${builder}" "${service}" "${user_slice}" "${actual_memory_high}" \
-    "${actual_memory}" "${actual_swap}" "${actual_cpuset}" "${actual_quota}" \
-    "${actual_period}"
+    "${actual_memory}" "${actual_swap}" "${actual_cpuset}" "${user_quota}" \
+    "${user_period}"
   exit 0
 fi
 

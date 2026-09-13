@@ -1,8 +1,7 @@
 [Unit]
 Description=Repository-scoped GitHub Actions runner for FlashInfer wheels
-After=network-online.target lil-flashinfer-rootless-docker.service
+After=network-online.target
 Wants=network-online.target
-Requires=lil-flashinfer-rootless-docker.service
 
 [Service]
 Type=simple
@@ -11,6 +10,7 @@ Group=github-flashinfer
 WorkingDirectory=/opt/actions-runner-flashinfer
 Environment=HOME=/var/lib/github-flashinfer
 Environment=DOCKER_HOST=unix:///run/lil-flashinfer-docker/docker.sock
+ExecStartPre=/usr/bin/test -S /run/lil-flashinfer-docker/docker.sock
 ExecStart=/opt/actions-runner-flashinfer/run.sh
 Restart=always
 RestartSec=5

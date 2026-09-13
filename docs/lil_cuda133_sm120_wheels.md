@@ -66,9 +66,9 @@ Automatic runner updates are disabled so the executable remains pinned. Update
 grace period expires.
 
 Compilation runs inside a dedicated Docker BuildKit worker named
-`lil-flashinfer-cu133-sm120`. The rootless Docker daemon and the systemd user
-slice containing its containers both enforce the build limits. The
-`ci/lil_wheels/ensure_builder.sh` command verifies both parent cgroups and the
+`lil-flashinfer-cu133-sm120`. The rootless Docker daemon and its containers
+inherit the build limits from a dedicated systemd user slice. The
+`ci/lil_wheels/ensure_builder.sh` command verifies the parent cgroup and the
 BuildKit worker's membership in the bounded user slice before building:
 
 - CPU affinity: logical CPUs 64 through 127;
@@ -80,9 +80,9 @@ BuildKit worker's membership in the bounded user slice before building:
 The AOT compiler starts at most 48 concurrent CUDA compilation jobs. Each `nvcc`
 process uses one frontend thread because device compilation is predominantly
 single-threaded for this wheel. The BuildKit CPU quota remains the absolute
-64-CPU ceiling. If the build exceeds 256 GiB, the kernel kills the BuildKit
-container rather than reclaiming unbounded host memory. frank2 has
-no swap, so the memory-plus-swap limit also prevents hidden swap pressure.
+64-CPU ceiling. If the build exceeds 256 GiB, the kernel selects processes from
+the bounded build slice instead of reclaiming unbounded host memory. Swap is
+disabled for the slice independently of frank2's host configuration.
 
 The BuildKit worker owns persistent pip and AOT object caches keyed by the CUDA,
 Python, and architecture identity. A FlashInfer source change reuses unchanged
@@ -91,9 +91,9 @@ requires new cache identifiers in the Dockerfile.
 
 The runner and BuildKit worker use a dedicated rootless Docker daemon whose
 storage, socket, container namespace, and build cache are separate from the
-rootful Docker daemon used for model serving. The Docker daemon's systemd unit
-has a 256 GiB memory ceiling. The runner process has separate ceilings of 4 GiB
-and 4,096 tasks. Do not enable workflows from untrusted pull requests on the
+rootful Docker daemon used for model serving. The dedicated user slice has a
+256 GiB memory ceiling. The runner process has separate ceilings of 4 GiB and
+4,096 tasks. Do not enable workflows from untrusted pull requests on the
 self-hosted label even with this isolation.
 
 Generate a short-lived repository registration token on an authenticated admin
