@@ -152,9 +152,27 @@ chmod 0755 "${output_dir}/bundle/install.sh"
 
 docker run --rm \
   --entrypoint /bin/bash \
+  --env "EXPECTED_VERSION=${package_version}" \
+  --env "EXPECTED_COMMIT=${source_commit}" \
   -v "${output_dir}/bundle:/bundle:ro" \
   "$(lock_value builder.image)" \
-  -lc 'set -euo pipefail; rm -rf /tmp/flashinfer-wheel-test; python -m venv --system-site-packages /tmp/flashinfer-wheel-test; /tmp/flashinfer-wheel-test/bin/pip install --no-deps /bundle/wheels/*.whl; /tmp/flashinfer-wheel-test/bin/python -c '\''import flashinfer, flashinfer_jit_cache; print(flashinfer.__version__); print(flashinfer_jit_cache.__version__)'\'''
+  -lc 'set -euo pipefail; rm -rf /tmp/flashinfer-wheel-test; python -m venv --system-site-packages /tmp/flashinfer-wheel-test; /tmp/flashinfer-wheel-test/bin/pip install --no-deps /bundle/wheels/*.whl; /tmp/flashinfer-wheel-test/bin/python -I - <<'"'"'PY'"'"'
+import importlib.metadata
+import os
+
+import flashinfer
+import flashinfer_jit_cache
+
+expected_version = os.environ["EXPECTED_VERSION"]
+expected_commit = os.environ["EXPECTED_COMMIT"]
+assert flashinfer.__version__ == expected_version
+assert flashinfer.__git_commit__ == expected_commit
+assert flashinfer_jit_cache.__version__ == expected_version
+assert flashinfer_jit_cache.__git_version__ == expected_commit
+assert importlib.metadata.version("flashinfer-python") == expected_version
+assert importlib.metadata.version("flashinfer-jit-cache") == expected_version
+print(f"FlashInfer {expected_version} ({expected_commit})")
+PY'
 
 archive="${output_dir}/flashinfer-cu133-sm120-${source_commit}.tar.zst"
 tar --sort=name \

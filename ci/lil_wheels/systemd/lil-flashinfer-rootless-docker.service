@@ -4,7 +4,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=notify
+Type=simple
 User=github-flashinfer
 Group=github-flashinfer
 Environment=HOME=/var/lib/github-flashinfer
@@ -17,8 +17,10 @@ RestartSec=3
 Delegate=yes
 TasksMax=infinity
 LimitNOFILE=1048576
-MemoryHigh=290G
-MemoryMax=300G
+MemoryHigh=240G
+MemoryMax=256G
+CPUAffinity=64-127
+CPUQuota=6400%
 
 [Install]
 WantedBy=multi-user.target

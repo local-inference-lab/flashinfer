@@ -10,11 +10,6 @@ if [[ $(hostname -s) != frank2 ]]; then
   printf 'This resource profile is qualified only for host frank2.\n' >&2
   exit 1
 fi
-if [[ -z ${GITHUB_RUNNER_TOKEN:-} ]]; then
-  printf 'GITHUB_RUNNER_TOKEN must contain a repository registration token.\n' >&2
-  exit 1
-fi
-
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 lock_path="${repo_root}/ci/lil_wheels/runtime.lock"
 runner_user=github-flashinfer
@@ -56,17 +51,22 @@ if ! grep -q "^${runner_user}:" /etc/subgid; then
 fi
 
 install -d -o "${runner_user}" -g "${runner_user}" "${runner_dir}"
-archive=$(mktemp --tmpdir actions-runner.XXXXXX.tar.gz)
-trap 'rm -f "${archive}"' EXIT
-curl --fail --location --retry 3 "$(lock_value runner.archive.url)" --output "${archive}"
-printf '%s  %s\n' "$(lock_value runner.archive.sha256)" "${archive}" | sha256sum --check -
-
 if [[ ! -e ${runner_dir}/config.sh ]]; then
+  archive=$(mktemp --tmpdir actions-runner.XXXXXX.tar.gz)
+  trap 'rm -f "${archive}"' EXIT
+  curl --fail --location --retry 3 "$(lock_value runner.archive.url)" --output "${archive}"
+  printf '%s  %s\n' "$(lock_value runner.archive.sha256)" "${archive}" | sha256sum --check -
   tar -xzf "${archive}" -C "${runner_dir}"
   chown -R "${runner_user}:${runner_user}" "${runner_dir}"
 fi
+test "$(runuser -u "${runner_user}" -- "${runner_dir}/bin/Runner.Listener" --version)" = \
+  "$(lock_value runner.version)"
 
 if [[ ! -e ${runner_dir}/.runner ]]; then
+  if [[ -z ${GITHUB_RUNNER_TOKEN:-} ]]; then
+    printf 'GITHUB_RUNNER_TOKEN must contain a repository registration token.\n' >&2
+    exit 1
+  fi
   runuser -u "${runner_user}" -- env HOME="${runner_home}" \
     "${runner_dir}/config.sh" \
       --unattended \
@@ -84,7 +84,8 @@ install -m 0644 "${repo_root}/ci/lil_wheels/systemd/lil-flashinfer-rootless-dock
 install -m 0644 "${repo_root}/ci/lil_wheels/systemd/lil-flashinfer-actions-runner.service" \
   /etc/systemd/system/lil-flashinfer-actions-runner.service
 systemctl daemon-reload
-systemctl enable --now lil-flashinfer-rootless-docker.service
+systemctl enable lil-flashinfer-rootless-docker.service
+systemctl restart lil-flashinfer-rootless-docker.service
 
 for _ in $(seq 1 60); do
   if runuser -u "${runner_user}" -- env \
