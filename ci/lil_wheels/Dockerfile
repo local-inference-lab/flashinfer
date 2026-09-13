@@ -11,7 +11,8 @@ ARG NVCC_THREADS
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-ENV PATH=/opt/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+ENV PATH=/opt/venv/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    CUDA_HOME=/usr/local/cuda \
     TORCH_CUDA_ARCH_LIST=12.0a \
     FLASHINFER_CUDA_ARCH_LIST=12.0f \
     FLASHINFER_DISABLE_VERSION_CHECK=1 \
