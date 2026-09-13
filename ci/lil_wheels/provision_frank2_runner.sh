@@ -15,8 +15,9 @@ lock_path="${repo_root}/ci/lil_wheels/runtime.lock"
 runner_user=github-flashinfer
 runner_home=/var/lib/github-flashinfer
 runner_dir=/opt/actions-runner-flashinfer
-runner_name=frank2-flashinfer-cu133-sm120
-repository_url=https://github.com/local-inference-lab/flashinfer
+runner_name=frank2-cu133-sm120-wheel-builder
+runner_scope_url=${GITHUB_RUNNER_SCOPE_URL:-https://github.com/local-inference-lab}
+runner_group=${GITHUB_RUNNER_GROUP:-LIL CUDA 13.3 SM120 wheel builders}
 
 lock_value() {
   local key=$1
@@ -108,6 +109,24 @@ fi
 test "$(runuser -u "${runner_user}" -- "${runner_dir}/bin/Runner.Listener" --version)" = \
   "$(lock_value runner.version)"
 
+if [[ -e ${runner_dir}/.runner ]]; then
+  configured_scope=$(jq -r .gitHubUrl "${runner_dir}/.runner")
+  configured_name=$(jq -r .agentName "${runner_dir}/.runner")
+  if [[ ${configured_scope} != "${runner_scope_url}" || \
+        ${configured_name} != "${runner_name}" ]]; then
+    if [[ -z ${GITHUB_RUNNER_REMOVE_TOKEN:-} || -z ${GITHUB_RUNNER_TOKEN:-} ]]; then
+      printf 'Runner registration is %s/%s; migration to %s/%s requires GITHUB_RUNNER_REMOVE_TOKEN and GITHUB_RUNNER_TOKEN.\n' \
+        "${configured_scope}" "${configured_name}" \
+        "${runner_scope_url}" "${runner_name}" >&2
+      exit 1
+    fi
+    systemctl stop lil-flashinfer-actions-runner.service 2>/dev/null || true
+    runuser -u "${runner_user}" -- env HOME="${runner_home}" \
+      "${runner_dir}/config.sh" remove \
+        --token "${GITHUB_RUNNER_REMOVE_TOKEN}"
+  fi
+fi
+
 if [[ ! -e ${runner_dir}/.runner ]]; then
   if [[ -z ${GITHUB_RUNNER_TOKEN:-} ]]; then
     printf 'GITHUB_RUNNER_TOKEN must contain a repository registration token.\n' >&2
@@ -116,10 +135,11 @@ if [[ ! -e ${runner_dir}/.runner ]]; then
   runuser -u "${runner_user}" -- env HOME="${runner_home}" \
     "${runner_dir}/config.sh" \
       --unattended \
-      --url "${repository_url}" \
+      --url "${runner_scope_url}" \
       --token "${GITHUB_RUNNER_TOKEN}" \
       --name "${runner_name}" \
-      --labels lil-flashinfer-builder \
+      --runnergroup "${runner_group}" \
+      --labels lil-wheel-builder \
       --work "${runner_home}/work" \
       --disableupdate \
       --replace

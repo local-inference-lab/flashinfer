@@ -17,7 +17,7 @@ concurrency:
 jobs:
   build-beta:
     if: github.repository == 'local-inference-lab/flashinfer' && github.ref_type == 'branch'
-    runs-on: [self-hosted, lil-flashinfer-builder]
+    runs-on: [self-hosted, lil-wheel-builder]
     timeout-minutes: 360
     steps:
       - name: Check out the exact FlashInfer source and submodules
