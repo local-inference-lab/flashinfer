@@ -92,6 +92,8 @@ RUN rm -rf /tmp/flashinfer-wheel-test \
     /tmp/flashinfer-wheel-test/bin/python -I - <<'PY'
 import importlib.metadata
 import os
+import zipfile
+from pathlib import Path
 
 import flashinfer
 import flashinfer_jit_cache
@@ -104,6 +106,15 @@ assert flashinfer_jit_cache.__version__ == expected_version
 assert flashinfer_jit_cache.__git_version__ == expected_commit
 assert importlib.metadata.version("flashinfer-python") == expected_version
 assert importlib.metadata.version("flashinfer-jit-cache") == expected_version
+for wheel in Path("/wheelhouse").glob("*.whl"):
+    with zipfile.ZipFile(wheel) as archive:
+        for name in archive.namelist():
+            if name.startswith(("b12x/", "flashinfer/b12x/")):
+                raise RuntimeError(f"FlashInfer wheel contains standalone B12X files: {name}")
+            if name.endswith(".dist-info/entry_points.txt"):
+                entries = archive.read(name).decode()
+                if "b12x" in entries:
+                    raise RuntimeError("FlashInfer wheel claims B12X entry points")
 print(f"FlashInfer {expected_version} ({expected_commit})")
 PY
 

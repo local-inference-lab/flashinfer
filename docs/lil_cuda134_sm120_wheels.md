@@ -144,3 +144,18 @@ short-lived removal token:
 The registration token expires after one hour. The runner receives its own
 organization-scoped credentials during registration; neither short-lived token
 is retained by the service definition.
+# B12X package ownership
+
+Status: **implemented**.
+
+The `community/jovian-judgement-cu134-sm120` branch builds FlashInfer wheels
+for composition with the independently released `local-inference-lab/b12x`
+package. B12X is built from a resolved `master` commit. Its wheel owns the
+`b12x` import namespace, GPU profiles, command-line tools, and vLLM plugins.
+
+FlashInfer wheels exclude both `b12x/` and `flashinfer/b12x/`, and publish no
+B12X entry points. This prevents installation order from replacing the B12X
+package with FlashInfer's migration snapshot. The build inspects the wheel
+archive and rejects any overlapping package payload or entry point.
+The migration sources remain in the checkout for provenance; executing that
+checkout through `PYTHONPATH` is not the community wheel deployment contract.
