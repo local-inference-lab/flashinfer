@@ -66,9 +66,9 @@ Automatic runner updates are disabled so the executable remains pinned. Update
 grace period expires.
 
 Compilation runs inside a dedicated Docker BuildKit worker named
-`lil-flashinfer-cu133-sm120`. `ci/lil_wheels/ensure_builder.sh` creates the worker
-with these hard container limits and refuses to build if an existing worker has
-different limits:
+`lil-flashinfer-cu133-sm120`. The rootless Docker systemd unit applies these
+hard limits to the daemon, BuildKit, and every build child. The
+`ci/lil_wheels/ensure_builder.sh` command verifies the limits before building:
 
 - CPU affinity: logical CPUs 64 through 127;
 - CPU quota: 64 logical CPUs;
@@ -90,8 +90,8 @@ requires new cache identifiers in the Dockerfile.
 The runner and BuildKit worker use a dedicated rootless Docker daemon whose
 storage, socket, container namespace, and build cache are separate from the
 rootful Docker daemon used for model serving. The Docker daemon's systemd unit
-has a 300 GiB memory ceiling in addition to the BuildKit worker's 256 GiB
-ceiling. The runner process has a 4 GiB memory ceiling. Do not enable workflows
+has a 256 GiB memory ceiling. The runner process has a separate 4 GiB memory
+ceiling. Do not enable workflows
 from untrusted pull requests on the self-hosted label even with this isolation.
 
 Generate a short-lived repository registration token on an authenticated admin
