@@ -43,6 +43,7 @@ def verify_release(
     source_commit: str,
     beta_tag: str,
     promotion: bool,
+    reference_directory: Path | None = None,
 ) -> None:
     """Verify identity, asset membership, and content hashes for one release."""
     manifest_path = directory / "manifest.json"
@@ -52,19 +53,36 @@ def verify_release(
     if manifest["release_tag"] != beta_tag:
         raise ValueError("manifest release tag does not match the requested beta tag")
 
-    package_files = {package["file"] for package in manifest["packages"]}
-    if len(package_files) != 2:
+    packages = manifest["packages"]
+    package_files = {package["file"] for package in packages}
+    if len(packages) != 2 or len(package_files) != 2:
         raise ValueError("manifest must declare exactly two package files")
+    for prefix in ("flashinfer_python-", "flashinfer_jit_cache-"):
+        matches = [name for name in package_files if name.startswith(prefix)]
+        if (
+            len(matches) != 1
+            or not matches[0].endswith(".whl")
+            or not all(
+                char.isascii() and (char.isalnum() or char in "_.+-")
+                for char in matches[0]
+            )
+        ):
+            raise ValueError(
+                "manifest must declare distinct FlashInfer wheel filenames"
+            )
     archive = f"flashinfer-cu134-sm120-{source_commit}.tar.zst"
     expected = FIXED_ASSETS | package_files | {archive, f"{archive}.sha256"}
+    beta_assets = expected.copy()
     if promotion:
         expected.add("stable-promotion.json")
-    actual = {path.name for path in directory.iterdir() if path.is_file()}
+    actual = {path.name for path in directory.iterdir()}
     if actual != expected:
         raise ValueError(
             f"release asset set mismatch: missing={sorted(expected - actual)}, "
             f"extra={sorted(actual - expected)}"
         )
+    if any(not path.is_file() or path.is_symlink() for path in directory.iterdir()):
+        raise ValueError("release assets must be regular files")
 
     package_hashes = {
         package["file"]: package["sha256"] for package in manifest["packages"]
@@ -92,13 +110,24 @@ def verify_release(
     if sha256(directory / archive) != archive_checksum[archive]:
         raise ValueError("release archive digest mismatch")
 
+    if reference_directory is not None:
+        if {path.name for path in reference_directory.iterdir()} != beta_assets:
+            raise ValueError("reference asset set mismatch")
+        for name in beta_assets:
+            reference = reference_directory / name
+            if not reference.is_file() or reference.is_symlink():
+                raise ValueError("reference assets must be regular files")
+            if sha256(directory / name) != sha256(reference):
+                raise ValueError(f"independent reference mismatch: {name}")
     if promotion:
+        if reference_directory is None:
+            raise ValueError("stable promotion requires the source beta reference")
         promotion_record = json.loads(
             (directory / "stable-promotion.json").read_text(encoding="utf-8")
         )
         expected_promotion = {
             "schema": "local-inference-flashinfer-promotion/v1",
-            "status": "qualified",
+            "status": "byte-identical-promotion",
             "source_release": beta_tag,
             "source_commit": source_commit,
             "source_manifest_sha256": sha256(manifest_path),
@@ -118,12 +147,14 @@ def main() -> None:
     parser.add_argument("--source-commit", required=True)
     parser.add_argument("--beta-tag", required=True)
     parser.add_argument("--promotion", action="store_true")
+    parser.add_argument("--reference-directory", type=Path)
     args = parser.parse_args()
     verify_release(
         args.directory,
         args.source_commit,
         args.beta_tag,
         args.promotion,
+        reference_directory=args.reference_directory,
     )
 
 

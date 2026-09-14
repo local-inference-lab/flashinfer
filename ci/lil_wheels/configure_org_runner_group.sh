@@ -9,6 +9,7 @@ repositories=(
   vllm
   b12x
   LMCache
+  InstantTensor
   nccl-canonical
   blackwell-llm-docker
 )
@@ -16,9 +17,11 @@ workflows=(
   local-inference-lab/flashinfer/.github/workflows/lil-cu134-sm120-wheel-release.yml@community/jovian-judgement-cu134-sm120
   local-inference-lab/vllm/.github/workflows/jovian-judgement-wheel-release.yml@dev/jovian-judgement
   local-inference-lab/b12x/.github/workflows/lil-cu134-sm120-wheel-release.yml@master
-  local-inference-lab/LMCache/.github/workflows/lil-cu134-sm120-wheel-release.yml@dev
+  local-inference-lab/LMCache/.github/workflows/lil-cu134-sm120-wheel-release.yml@integration/local-inference-lab
+  local-inference-lab/InstantTensor/.github/workflows/lil-cu134-wheel-release.yml@main
   local-inference-lab/nccl-canonical/.github/workflows/lil-cu134-sm120-release.yml@canonical/cu134-nccl2312-amd-turin
   local-inference-lab/blackwell-llm-docker/.github/workflows/jovian-wheel-runtime-release.yml@main
+  local-inference-lab/blackwell-llm-docker/.github/workflows/community-container-release.yml@main
 )
 workflow_json=$(printf '%s\n' "${workflows[@]}" | jq -Rsc 'split("\n")[:-1]')
 
@@ -40,11 +43,7 @@ for repository in "${repositories[@]}"; do
   repository_ids=$(jq --argjson id "${repository_id}" '. + [$id]' \
     <<<"${repository_ids}")
 done
-jq -n --argjson ids "${repository_ids}" '{selected_repository_ids: $ids}' |
-  gh api --method PUT \
-    "orgs/${organization}/actions/runner-groups/${group_id}/repositories" \
-    --input - >/dev/null
-
+# Restrict eligible workflows before granting access to additional repositories.
 jq -n \
   --arg name "${group_name}" \
   --argjson workflows "${workflow_json}" \
@@ -52,6 +51,11 @@ jq -n \
     restricted_to_workflows: true, selected_workflows: $workflows}' |
   gh api --method PATCH \
     "orgs/${organization}/actions/runner-groups/${group_id}" \
+    --input - >/dev/null
+
+jq -n --argjson ids "${repository_ids}" '{selected_repository_ids: $ids}' |
+  gh api --method PUT \
+    "orgs/${organization}/actions/runner-groups/${group_id}/repositories" \
     --input - >/dev/null
 
 printf 'runner_group=%s id=%s repositories=%s workflows=%s\n' \

@@ -45,11 +45,19 @@ if ! id "${runner_user}" >/dev/null 2>&1; then
     --shell /usr/sbin/nologin "${runner_user}"
 fi
 if ! grep -q "^${runner_user}:" /etc/subuid; then
+  python3 "${repo_root}/ci/lil_wheels/validate_subids.py" \
+    --file /etc/subuid --user "${runner_user}" --candidate
   usermod --add-subuids 200000-265535 "${runner_user}"
 fi
 if ! grep -q "^${runner_user}:" /etc/subgid; then
+  python3 "${repo_root}/ci/lil_wheels/validate_subids.py" \
+    --file /etc/subgid --user "${runner_user}" --candidate
   usermod --add-subgids 200000-265535 "${runner_user}"
 fi
+for mapping_file in /etc/subuid /etc/subgid; do
+  python3 "${repo_root}/ci/lil_wheels/validate_subids.py" \
+    --file "${mapping_file}" --user "${runner_user}"
+done
 runner_uid=$(id -u "${runner_user}")
 user_slice="user-${runner_uid}.slice"
 user_slice_dropin="/etc/systemd/system/${user_slice}.d"

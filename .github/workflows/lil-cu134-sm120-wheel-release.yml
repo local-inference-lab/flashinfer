@@ -18,8 +18,8 @@ jobs:
   build-beta:
     if: github.repository == 'local-inference-lab/flashinfer' && github.ref_type == 'branch'
     runs-on: [self-hosted, lil-wheel-builder]
-    # Six hours for the shared-worker lock plus six hours for compilation.
-    timeout-minutes: 720
+    # Lock and compilation budgets plus one hour for checkout and publication.
+    timeout-minutes: 780
     steps:
       - name: Check out the exact FlashInfer source and submodules
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -40,13 +40,21 @@ jobs:
         run: |
           set -euo pipefail
           tag="flashinfer-cu134-sm120-beta-${GITHUB_SHA}"
+          output=dist/lil-flashinfer-wheels
+          mkdir built-release
+          cp "${output}"/bundle/wheels/*.whl "${output}"/bundle/manifest.json \
+            "${output}"/bundle/SHA256SUMS "${output}"/bundle/requirements-github.txt \
+            "${output}"/bundle/install.sh "${output}"/bundle/runtime.lock \
+            "${output}"/flashinfer-cu134-sm120-*.tar.zst* built-release/
+          python3 ci/lil_wheels/verify_release_assets.py --directory built-release \
+            --source-commit "${GITHUB_SHA}" --beta-tag "${tag}"
           if gh release view "${tag}" >/dev/null 2>&1; then
             mkdir existing-release
             gh release download "${tag}" --dir existing-release
             python3 ci/lil_wheels/verify_release_assets.py \
               --directory existing-release \
               --source-commit "${GITHUB_SHA}" \
-              --beta-tag "${tag}"
+              --beta-tag "${tag}" --reference-directory built-release
             echo "Immutable release ${tag} exists and satisfies the asset contract."
             exit 0
           fi
@@ -99,12 +107,13 @@ jobs:
               --directory existing-stable-release \
               --source-commit "${GITHUB_SHA}" \
               --beta-tag "${beta_tag}" \
-              --promotion
+              --promotion --reference-directory assets
             echo "Immutable stable release ${stable_tag} satisfies the asset contract."
             exit 0
           fi
+          cp -a assets source-beta
           jq -n \
-            --arg status qualified \
+            --arg status byte-identical-promotion \
             --arg source_release "${beta_tag}" \
             --arg source_commit "${GITHUB_SHA}" \
             --arg source_manifest_sha256 "$(sha256sum assets/manifest.json | awk '{print $1}')" \
@@ -113,9 +122,12 @@ jobs:
               source_manifest_sha256: $source_manifest_sha256,
               invariant: "Wheel files and wheel SHA-256 digests are unchanged from the source beta release."}' \
             > assets/stable-promotion.json
+          python3 ci/lil_wheels/verify_release_assets.py --directory assets \
+            --source-commit "${GITHUB_SHA}" --beta-tag "${beta_tag}" \
+            --promotion --reference-directory source-beta
           gh release create "${stable_tag}" \
             --repo "${GITHUB_REPOSITORY}" \
             --target "${GITHUB_SHA}" \
             --title "FlashInfer CUDA 13.4 SM120 stable ${GITHUB_SHA:0:12}" \
-            --notes "Qualified promotion of ${beta_tag}. Wheel bytes were not rebuilt." \
+            --notes "Byte-identical promotion of ${beta_tag}. Runtime qualification is separate." \
             assets/*
