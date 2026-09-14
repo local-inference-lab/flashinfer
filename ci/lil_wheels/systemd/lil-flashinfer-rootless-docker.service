@@ -1,0 +1,16 @@
+[Unit]
+Description=Rootless Docker daemon for FlashInfer wheel builds
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=HOME=/var/lib/github-flashinfer
+ExecStart=/usr/bin/dockerd-rootless.sh --host=unix:///run/lil-flashinfer-docker/docker.sock
+Restart=always
+RestartSec=3
+Delegate=yes
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=default.target
