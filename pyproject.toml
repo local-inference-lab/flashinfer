@@ -25,11 +25,11 @@ urls = { Homepage = "https://github.com/flashinfer-ai/flashinfer" }
 license-files = ["LICENSE", "LICENSE*.txt"]
 
 [project.optional-dependencies]
-# The b12x snapshot requires the 4.6.2 compiler and matching runtime libraries.
+# The b12x snapshot requires the 4.7.1 compiler and matching runtime libraries.
 # Keep both CUDA extras installable with those base pins; selecting an extra
 # must not upgrade the compiler independently of the snapshot.
-cu12 = ["nvidia-cutlass-dsl==4.6.2"]
-cu13 = ["nvidia-cutlass-dsl[cu13]==4.6.2"]
+cu12 = ["nvidia-cutlass-dsl==4.7.1"]
+cu13 = ["nvidia-cutlass-dsl[cu13]==4.7.1"]
 # DEPRECATED alias, kept so existing `pip install ".[nvep]"` commands keep
 # working. The moe_ep runtime deps (cuda-python, nccl4py) are now part of the
 # BASE dependencies (requirements.txt) and the NIXL-EP submodule build runs by
