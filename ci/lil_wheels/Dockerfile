@@ -21,6 +21,11 @@ ENV PATH=/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/
     BUILD_NCCL_EP=0 \
     BUILD_NIXL_EP=0
 
+# The builder ships CUTLASS DSL 4.6.2; B12X and the runtime image use 4.7.1.
+COPY ci/lil_wheels/cutlass-dsl.lock /tmp/cutlass-dsl.lock
+RUN --mount=type=cache,id=lil-flashinfer-pip-cu134-py312,target=/root/.cache/pip,sharing=locked \
+    python -m pip install --no-deps --require-hashes -r /tmp/cutlass-dsl.lock
+
 RUN python - <<'PY'
 import importlib.metadata
 import torch
@@ -40,8 +45,8 @@ expected = {
     "numpy": "2.1.0",
     "nvidia-ml-py": "13.610.43",
     "apache-tvm-ffi": "0.1.13.post3",
-    "nvidia-cutlass-dsl": "4.6.2",
-    "nvidia-cutlass-dsl-libs-cu13": "4.6.2",
+    "nvidia-cutlass-dsl": "4.7.1",
+    "nvidia-cutlass-dsl-libs-cu13": "4.7.1",
 }
 for package, version in expected.items():
     assert importlib.metadata.version(package) == version, package
