@@ -8,12 +8,16 @@ ARG FLASHINFER_SOURCE_COMMIT
 ARG FLASHINFER_SOURCE_DATE_EPOCH
 ARG MAX_JOBS
 ARG NVCC_THREADS
+ARG TORCH_CUDA_ARCH_LIST=12.0a
+ARG CUTLASS_DSL_LOCK=ci/lil_wheels/cutlass-dsl.lock
+# Empty for linux/amd64 so its existing caches stay valid.
+ARG CACHE_PLATFORM=
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 ENV PATH=/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     CUDA_HOME=/usr/local/cuda \
-    TORCH_CUDA_ARCH_LIST=12.0a \
+    TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST} \
     FLASHINFER_CUDA_ARCH_LIST=12.0f \
     FLASHINFER_DISABLE_VERSION_CHECK=1 \
     FLASHINFER_ENABLE_SM90=0 \
@@ -22,7 +26,7 @@ ENV PATH=/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/
     BUILD_NIXL_EP=0
 
 # The builder ships CUTLASS DSL 4.6.2; B12X and the runtime image use 4.7.1.
-COPY ci/lil_wheels/cutlass-dsl.lock /tmp/cutlass-dsl.lock
+COPY ${CUTLASS_DSL_LOCK} /tmp/cutlass-dsl.lock
 RUN --mount=type=cache,id=lil-flashinfer-pip-cu134-py312,target=/root/.cache/pip,sharing=locked \
     python -m pip install --no-deps --require-hashes -r /tmp/cutlass-dsl.lock
 
@@ -72,7 +76,7 @@ RUN --mount=type=cache,id=lil-flashinfer-pip-cu134-py312,target=/root/.cache/pip
     python -m pip wheel --no-build-isolation --no-deps \
       --wheel-dir /wheelhouse .
 
-RUN --mount=type=cache,id=lil-flashinfer-aot-cu134-sm120f,target=/src/flashinfer/build,sharing=locked \
+RUN --mount=type=cache,id=lil-flashinfer-aot-cu134-sm120f${CACHE_PLATFORM},target=/src/flashinfer/build,sharing=locked \
     --mount=type=cache,id=lil-flashinfer-pip-cu134-py312,target=/root/.cache/pip,sharing=locked \
     FLASHINFER_LOCAL_VERSION="${FLASHINFER_LOCAL_VERSION}" \
     SOURCE_DATE_EPOCH="${FLASHINFER_SOURCE_DATE_EPOCH}" \

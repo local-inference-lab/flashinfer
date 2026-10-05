@@ -4,7 +4,16 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 tool_dir="${repo_root}/ci/lil_wheels"
-lock_path="${tool_dir}/runtime.lock"
+# linux/amd64 uses the locks next to this script; another platform keeps its
+# own runtime and CUTLASS DSL locks in a directory named after the platform.
+platform=${LIL_WHEEL_PLATFORM:-linux/amd64}
+case "${platform}" in
+  linux/amd64) lock_dir="${tool_dir}" ;;
+  linux/arm64) lock_dir="${tool_dir}/linux-arm64" ;;
+  *) printf 'Unsupported wheel platform: %s\n' "${platform}" >&2; exit 1 ;;
+esac
+lock_path="${lock_dir}/runtime.lock"
+cutlass_dsl_lock="${lock_dir#"${repo_root}/"}/cutlass-dsl.lock"
 output_dir=${1:-"${repo_root}/dist/lil-flashinfer-wheels"}
 
 lock_value() {
@@ -24,7 +33,19 @@ repository=${GITHUB_REPOSITORY:-local-inference-lab/flashinfer}
 release_tag=${FLASHINFER_RELEASE_TAG:-"flashinfer-cu134-sm120-beta-${source_commit}"}
 
 test -z "$(git -C "${repo_root}" status --porcelain)"
-"${tool_dir}/ensure_builder.sh"
+# Locks without a platform key predate arm64 and describe linux/amd64.
+test "$(lock_value platform 2>/dev/null || echo linux/amd64)" = "${platform}"
+cache_platform=
+platform_args=()
+if [[ ${platform} == linux/amd64 ]]; then
+  # The bounded BuildKit worker contract applies to the amd64 CI runners.
+  "${tool_dir}/ensure_builder.sh"
+else
+  # Separate platforms must never share native objects in BuildKit caches.
+  cache_platform="-${platform#linux/}"
+  # Torch extension builds follow the precompiled family target off amd64.
+  platform_args=(--build-arg "TORCH_CUDA_ARCH_LIST=$(lock_value cuda.arch-list)")
+fi
 
 mkdir -p "$(dirname "${output_dir}")"
 if ! mkdir "${output_dir}"; then
@@ -36,7 +57,11 @@ mkdir -p "${output_dir}/raw" "${output_dir}/bundle/wheels"
 
 docker buildx build \
   --builder "${builder}" \
+  --platform "${platform}" \
   --file "${tool_dir}/Dockerfile" \
+  --build-arg "CUTLASS_DSL_LOCK=${cutlass_dsl_lock}" \
+  "${platform_args[@]}" \
+  --build-arg "CACHE_PLATFORM=${cache_platform}" \
   --build-arg "BUILDER_IMAGE=$(lock_value builder.image)" \
   --build-arg "FLASHINFER_LOCAL_VERSION=${local_version}" \
   --build-arg "FLASHINFER_SOURCE_COMMIT=${source_commit}" \
