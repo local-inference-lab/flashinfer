@@ -559,19 +559,24 @@ def compile_projection(
             output_dtype,
         )
     )
-    kernel = (
-        SmallNGemvKernel(
+    if backend not in ("simt", "mma", "tc"):
+        raise ValueError(
+            "projection compiler requires a selected SIMT, MMA or TC backend"
+        )
+    if backend == "simt":
+        kernel = SmallNGemvKernel(
             n,
             k,
             x_type == w_type == torch.bfloat16,
             bias_dtype is not None,
             rows_per_tile,
         )
-        if backend == "simt"
-        else Bf16GemmKernel(n, k, bias_dtype is not None)
-    )
-    if backend not in ("simt", "mma"):
-        raise ValueError("projection compiler requires a selected SIMT or MMA backend")
+    elif backend == "tc":
+        from ._tensor_core import TensorCoreGemvKernel
+
+        kernel = TensorCoreGemvKernel(n, k)
+    else:
+        kernel = Bf16GemmKernel(n, k, bias_dtype is not None)
     types = (
         x_type,
         w_type,

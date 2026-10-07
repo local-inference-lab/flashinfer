@@ -237,6 +237,7 @@ def _weight_payload(experts: PreparedExperts) -> dict[str, object]:
         "source_format": plan.source_format,
         "nvfp4_inline_scales": plan.nvfp4_inline_scales,
         "w4a16_compressed_scales": plan.w4a16_compressed_scales,
+        "w4a16_csf_inline_words": plan.w4a16_csf_inline_words,
         "w4a8_csf_inline": plan.w4a8_csf_inline,
         "activation": plan.activation,
         "params_dtype": plan.io_dtype,
@@ -752,7 +753,10 @@ def _compact_launches(plan, caps):
         )
         for dtype in (torch.int32, torch.int64)
     }
-    topk_sum = compile_w4a16_topk_sum(m=m, topk=plan.num_topk, hidden_size=plan.k)
+    # Compact kernels already apply router weights to each route.
+    topk_sum = compile_w4a16_topk_sum(
+        m=m, topk=plan.num_topk, hidden_size=plan.k, apply_topk_weights=False
+    )
     return attach_programs(
         _CompactLaunches(MappingProxyType(kernels), quantize, topk_sum, csf_inline),
         tuple(kernels.values()),

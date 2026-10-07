@@ -101,7 +101,7 @@ def session(tmp_path, **kwargs):
     """Build a CPU preparation session with an isolated selection cache."""
     value = PreparationSession(device=DetectedDevice(None, None), **kwargs)
     value._cache = SelectionCache(
-        tmp_path, {"schema_version": 6, "tuning_cache_version": 1}
+        tmp_path, {"schema_version": 22, "tuning_cache_version": 1}
     )
     return value
 
@@ -641,6 +641,26 @@ def test_persistent_memory_counts_shared_keys_once_and_rejects_conflicts():
                 ),
             )
         )
+
+
+@pytest.mark.parametrize("sizes", [(257, 321), (321, 257)])
+def test_sequential_scratch_covers_variants_with_equal_aligned_sizes(sizes):
+    requirements = tuple(
+        MemoryRequirements(
+            scratch=(
+                ScratchBufferSpec(
+                    name="workspace",
+                    shape=(size,),
+                    dtype=torch.uint8,
+                    device=torch.device("cpu"),
+                ),
+            )
+        )
+        for size in sizes
+    )
+    combined = MemoryRequirements.sequential(requirements)
+    assert combined.scratch_nbytes == 512
+    assert sum(spec.nbytes for spec in combined.scratch) >= max(sizes)
 
 
 def _deterministic_timer(monkeypatch, *, stop=None, batches=None):

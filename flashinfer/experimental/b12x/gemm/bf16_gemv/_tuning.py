@@ -67,6 +67,22 @@ def _mma_eligible(query):
     )
 
 
+def _tc_eligible(query):
+    from ._tensor_core import TC_K_MULTIPLE, TC_MAX_ROWS
+
+    return (
+        query.source_dtype == query.weight_dtype == query.output_dtype == "bfloat16"
+        and query.bias_dtype is None
+        and query.max_rows <= TC_MAX_ROWS
+        and query.in_features % TC_K_MULTIPLE == 0
+        and query.source_contiguous
+        and query.source_aligned
+        and query.weight_contiguous
+        and query.weight_aligned
+        and query.output_contiguous
+    )
+
+
 def _torch_eligible(query):
     return (
         query.source_dtype == query.weight_dtype == query.output_dtype == "bfloat16"
@@ -134,6 +150,8 @@ def validate_config(query, config, device):
         raise ValueError("rows_per_tile only configures SIMT projection")
     if config.backend == "mma" and _mma_eligible(query):
         return
+    if config.backend == "tc" and _tc_eligible(query):
+        return
     if config.backend == "torch" and _torch_eligible(query):
         return
     if config.backend == "prefill" and _prefill_eligible(query):
@@ -147,6 +165,8 @@ def _parameters(query, device):
     backends = ["simt"]
     if _mma_eligible(query):
         backends.append("mma")
+    if _tc_eligible(query):
+        backends.append("tc")
     if _prefill_eligible(query):
         backends.append("prefill")
     if _torch_eligible(query):
@@ -164,8 +184,8 @@ def _eligible(choice):
 
 TUNING = TuningContract(
     component_id="gemm.bf16_gemv",
-    query_schema_version=4,
-    config_schema_version=5,
+    query_schema_version=22,
+    config_schema_version=22,
     query_fields=frozenset(field.name for field in fields(GemvQuery)),
     config_fields=frozenset(field.name for field in fields(GemvConfig)),
     encode_query=asdict,
@@ -180,7 +200,7 @@ TUNING = TuningContract(
             name="rows_per_tile", values=(1, 2, 4, 8), binding=ParameterBinding.COMPILE
         ),
     ),
-    candidate_contract_version=3,
+    candidate_contract_version=4,
     parameters=_parameters,
     materialize=lambda query, device, choice: GemvConfig(**dict(choice)),
 )

@@ -789,6 +789,10 @@ def _fixed_lowering(query, device):
             sm_count=device.identity.sm_count,
         )
         recipe = "block_fp8" if use_block else "tensor_fp8"
+    expected_m = query.expected_m
+    if query.recipe == "block_fp8" and expected_m is not None:
+        # Dense scheduling uses this bound to select single-row load/store paths.
+        expected_m = max(expected_m, query.max_rows)
     inner = DenseGemmQuery(
         recipe=recipe,
         entry_point="gemm.blockscaled.mm",
@@ -800,7 +804,7 @@ def _fixed_lowering(query, device):
         out_features=query.out_features,
         output_mode="functional",
         alpha_mode=query.alpha_mode,
-        expected_m=query.expected_m,
+        expected_m=expected_m,
     )
     return _default_lowering(inner, device.identity), use_block
 
@@ -843,6 +847,7 @@ class _FixedExecutionState:
     quantizer: object | None
     unit_scale: torch.Tensor | None
     use_block: bool
+    gemv: object | None = None
 
     def _check(self, source, weight, output_dtype, *, serialized=False):
         q = self.query
@@ -912,6 +917,25 @@ class _FixedExecutionState:
             return lhs_values.new_empty(
                 (0, q.out_features), dtype=getattr(torch, c_dtype)
             )
+        if self.gemv is not None:
+            if alpha is not None:
+                raise ValueError("block-FP8 GEMV requires unit alpha")
+            for name, tensor, dtype, alignment in (
+                ("lhs", lhs_values, torch.float8_e4m3fn, 16),
+                ("rhs", rhs_values, torch.float8_e4m3fn, 16),
+                ("lhs_scale", lhs_scale_storage, torch.float32, 4),
+                ("rhs_scale", rhs_scale_storage, torch.float32, 4),
+            ):
+                if tensor.device != self.device or tensor.dtype != dtype:
+                    raise ValueError(
+                        f"block-FP8 GEMV {name} differs from prepared dtype/device"
+                    )
+                if not tensor.is_contiguous():
+                    raise ValueError(f"block-FP8 GEMV {name} must be contiguous")
+                if tensor.data_ptr() % alignment:
+                    raise ValueError(
+                        f"block-FP8 GEMV {name} must be {alignment}-byte aligned"
+                    )
         with torch.cuda.device(self.device), _stream_context(stream, self.device):
             if q.recipe == "block_fp8":
                 sfa, sfb = lhs_scale_storage, rhs_scale_storage
@@ -922,6 +946,19 @@ class _FixedExecutionState:
                     raise ValueError(
                         "block-FP8 scale geometry differs from preparation"
                     )
+                if self.gemv is not None:
+                    out = torch.empty(
+                        (m, q.out_features), dtype=torch.bfloat16, device=self.device
+                    )
+                    self.gemv(
+                        lhs_values,
+                        sfa,
+                        rhs_values,
+                        sfb,
+                        out,
+                        cuda_stream_to_int(stream),
+                    )
+                    return out
             else:
                 view = (
                     as_grouped_scale_view
@@ -1050,11 +1087,60 @@ class _FixedExecutionState:
             )[:, :, 0]
 
 
+def _uses_block_fp8_gemv(query) -> bool:
+    """Whether the small-row block-FP8 GEMV serves this fixed plan."""
+    from ._block_fp8_gemv import supports
+
+    return (
+        query.recipe == "block_fp8"
+        and query.call_kind == "serialized"
+        and query.expected_m is not None
+        and query.output_dtype == "bfloat16"
+        and query.alpha_mode == "unit"
+        and supports(query.max_rows, query.out_features, query.in_features)
+    )
+
+
+def _plan_fixed_block_fp8_gemv(query, *, invocation, override):
+    from ._tuning import FIXED_TUNING
+
+    def materialize(selection, device):
+        from ._block_fp8_gemv import compile_block_fp8_gemv
+
+        program = compile_block_fp8_gemv(
+            device.ordinal, query.out_features, query.in_features
+        )
+        target = torch.device("cuda", device.ordinal)
+        return _FixedExecutionState(query, target, None, None, None, True, gemv=program)
+
+    return Plan(
+        shared=True,
+        contract=FIXED_TUNING,
+        query=query,
+        invocation=FrozenMapping(invocation),
+        override=override,
+        _compile_jobs=lambda config, device: (
+            CompileJob.create(
+                "b12x.gemm.blockscaled._block_fp8_gemv:compile_block_fp8_gemv",
+                device.ordinal,
+                query.out_features,
+                query.in_features,
+            ),
+        ),
+        _memory_requirements=lambda config, device: MemoryRequirements(),
+        _materialize=materialize,
+    )
+
+
 def _plan_fixed(query, *, invocation=FrozenMapping(), override=None):
     from ._tuning import FIXED_TUNING
 
     if invocation:
         raise ValueError("fixed packed semantics belong in FixedBlockscaledQuery")
+    if _uses_block_fp8_gemv(query):
+        return _plan_fixed_block_fp8_gemv(
+            query, invocation=invocation, override=override
+        )
     cache = {}
 
     def lower(device):

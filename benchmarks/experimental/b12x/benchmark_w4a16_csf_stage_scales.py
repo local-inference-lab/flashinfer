@@ -31,7 +31,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT))
 
 from b12x._lib.quant.nvfp4_csf import make_nvfp4_csf_batch  # noqa: E402
@@ -53,13 +53,17 @@ def logical_scales(rng, experts, rows, columns, outliers):
 
 
 def swizzled(logical, device):
-    """F8_128x4 memory order of logical [E, rows, columns] scales."""
+    """F8_128x4 memory order of logical [E, rows, columns] scales, padded to the grid."""
     e, rows, columns = logical.shape
-    order = logical.reshape(e, rows // 128, 4, 32, columns // 4, 4).transpose(
-        0, 1, 4, 3, 2, 5
-    )
+    padded_rows, padded_columns = -(-rows // 128) * 128, -(-columns // 4) * 4
+    padded = np.zeros((e, padded_rows, padded_columns), dtype=np.uint8)
+    padded[:, :rows, :columns] = logical
+    order = padded.reshape(e, padded_rows // 128, 4, 32, padded_columns // 4, 4)
+    order = order.transpose(0, 1, 4, 3, 2, 5)
     return (
-        torch.from_numpy(np.ascontiguousarray(order).reshape(e, rows, columns))
+        torch.from_numpy(
+            np.ascontiguousarray(order).reshape(e, padded_rows, padded_columns)
+        )
         .to(device)
         .view(torch.float8_e4m3fn)
     )
