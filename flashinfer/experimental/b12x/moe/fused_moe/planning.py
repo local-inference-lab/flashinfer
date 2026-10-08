@@ -54,7 +54,8 @@ class ActivationSpec:
     independently of BF16/FP16 public inputs. None retains the I/O dtype.
     Only the FP16 full-rotation implementation is supported explicitly.
 
-    ``a16_max_tokens`` forces A16 up to an inclusive token capacity; zero
+    ``a16_max_tokens`` forces A16 up to an inclusive token capacity, except
+    for an explicit hybrid ``bind(a4_prefill=True)`` selection; zero
     disables the constraint. Larger calls retain ``mode``.
     """
 
@@ -815,13 +816,13 @@ def prepare_weights(
         input_scale = weights.input_scale
         intermediate_scale = weights.intermediate_scale
         from b12x.moe._shared.kernels.w4a16.prefill_a4 import (
-            a4_prefill_min_tokens,
+            a4_prefill_enabled,
             a4_prefill_supported,
         )
 
         keep_activation_scales = (
             plan.activation.mode is ActivationMode.A16
-            and a4_prefill_min_tokens() > 0
+            and a4_prefill_enabled()
             and a4_prefill_supported(
                 prepared_layout=plan._impl.w4a16_weight_layout or "packed",
                 scale_format=plan._impl.w4a16_scale_format or "e4m3_k16",

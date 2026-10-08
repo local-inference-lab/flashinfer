@@ -5,8 +5,8 @@ NVFP4 activation GEMMs during prefill. Activation quantization changes model
 outputs and requires model quality validation before deployment. The default
 remains W4A16.
 
-Set `B12X_W4A16_A4_PREFILL_MIN_TOKENS` to a positive integer before preparing
-weights and execution plans to enable this path. Preparation requires finite,
+Set `B12X_W4A16_A4_PREFILL=1` before preparing weights and execution plans to
+enable this capability. Preparation requires finite,
 positive input and intermediate calibration scales; absent scales and a pair
 of all-one placeholder scales retain W4A16. The shared input global scale is
 the minimum across experts. Intermediate scales remain per expert. Ordinary
@@ -22,19 +22,34 @@ weighting, activation-amax collection, and unsupported layouts retain W4A16.
 
 The execution binding accepts `a4_prefill`:
 
-- `None` applies the prepared token threshold.
-- `True` selects prepared A4 launches even below that threshold.
-- `False` selects W4A16.
+- `True` selects prepared A4 launches.
+- `False` or `None` selects W4A16.
 
-`ActivationSpec.a16_max_tokens` remains an inclusive A16 cutoff for every
-choice. Callers that know request boundaries must select prefill semantically;
-a token count alone cannot distinguish prefill from batched decode. Each call
-must fit its prepared capacity and caller-owned scratch buffers.
+The caller selects precision from request semantics: prefill may use A4;
+decode and speculative verification use A16. Token count does not select
+hybrid precision, and `ActivationSpec.a16_max_tokens` does not override an
+explicit `a4_prefill=True`. Each call must fit its prepared capacity and
+caller-owned scratch buffers. When an exact decode variant lacks the padded
+A4 workspace, a composite plan reuses a larger fitting prepared variant in
+the same scratch arena. A plan with no fitting A4 variant retains W4A16.
+
+For stage-readable NVFP4-CSF storage, the A4 GEMMs reconstruct their scale
+tiles in shared memory from the same compressed bytes used by A16. The
+selected stage-decoding launches bypass full expansion into global scratch.
+Other consumers can still require that scratch; selecting an in-kernel
+decoder does not remove the shared allocation from the prepared owner.
+
+`uses_expanded_nvfp4_scales(plan, num_tokens=..., a4_prefill=...,
+route_ids_dtype=...)` reports whether the selected call reads expanded
+NVFP4-CSF scales. It requires a prepared execution plan and performs no GPU
+work. Serving integrations can omit scale prefetch when every following-layer
+span uses a compressed-scale reader. Outstanding writes to shared scale
+scratch still require synchronization before reusing that scratch.
 
 `B12X_W4A16_A4_PREFILL_TERMS=1` uses one NVFP4 activation plane. A value of `2`
 adds an independently quantized residual plane. `B12X_W4A16_A4_PREFILL_WARPS`
-accepts `8` (default) or `16`. These controls and the threshold are immutable
-execution-plan inputs and are part of tuning query schema 23. Changing the
+accepts `8` (default) or `16`. These controls and the capability flag are immutable
+execution-plan inputs and are part of tuning query schema 24. Changing the
 environment requires preparing another execution plan. Kernel compilation
 retains device-owned callables; replay performs no compilation or tensor
 allocation. A4 always applies router weights in the FP32 final sum. Set

@@ -854,10 +854,10 @@ class TPMoEScratchCaps:
     trellis_decode_table: str = "auto"
     w4a16_skip_empty_m_blocks: bool = True
     w4a16_small_m_occupancy: int = 1
-    w4a16_a4_prefill_min_tokens: int = 0
+    w4a16_a4_prefill_enabled: bool = False
     w4a16_a4_prefill_terms: int = 1
     w4a16_a4_prefill_warps: int = 8
-    w4a16_a16_max_tokens: int = 0
+    w4a16_a4_csf_inline_words: int | None = None
     w4a8_csf_inline: bool = False
     frozen: bool = True
 
@@ -1022,9 +1022,9 @@ class TPMoEScratchPlan:
         call's stream (or one it waits for) after the last other use of the
         shared NVFP4-CSF scratch; the call then skips its own expansion.
 
-        ``a4_prefill`` selects prepared NVFP4 activation launches: None uses
-        their token threshold, True bypasses the threshold, and False keeps
-        W4A16. Unsupported calls and uncalibrated weights remain W4A16.
+        ``a4_prefill=True`` selects prepared NVFP4 activation launches.
+        False and None keep W4A16 regardless of token count. Unsupported
+        calls and uncalibrated weights remain W4A16.
         """
         if not isinstance(experts, B12XFP4ExpertWeights):
             raise TypeError("experts must come from prepare_b12x_fp4_moe_weights")
@@ -1121,20 +1121,12 @@ class TPMoEScratchPlan:
                     ),
                     activation_amax=activation_amax,
                     apply_router_weight_on_input=self.caps.apply_router_weight_on_input,
+                    cache13_bytes=tensors["intermediate_cache13"].numel()
+                    * tensors["intermediate_cache13"].element_size(),
+                    cache2_bytes=tensors["intermediate_cache2"].numel()
+                    * tensors["intermediate_cache2"].element_size(),
                     force=a4_prefill,
                 )
-                if a4_prefill_launches is not None:
-                    from b12x.moe._shared.kernels.w4a16.prefill_a4 import (
-                        a4_prefill_fits,
-                    )
-
-                    if not a4_prefill_fits(
-                        a4_prefill_launches,
-                        tokens=int(a.shape[0]),
-                        intermediate_cache13=tensors["intermediate_cache13"],
-                        intermediate_cache2=tensors["intermediate_cache2"],
-                    ):
-                        a4_prefill_launches = None
         elif (
             self.caps.quant_mode == "w4a16" and self._core_workspace_plan.full_rotation
         ):
@@ -13275,9 +13267,10 @@ W4A8_CSF_INLINE_MAX_TOKENS = int(
 )
 
 
-def _w4a16_reads_stage_scales(binding) -> bool:
+def _w4a16_reads_stage_scales(launch, a4_launches=None) -> bool:
     """Whether this W4A16 call reads compressed scales per stage (its planned launch's format)."""
-    launch = getattr(binding, "fused_launch", None)
+    if a4_launches is not None:
+        return a4_launches.csf_inline_words is not None
     if launch is not None:
         return str(getattr(launch, "scale_format", None)).startswith("e4m3_k16_csf")
     raise RuntimeError("Compressed W4A16 scales require a prepared fused launch")
@@ -13354,11 +13347,9 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
         csf_inline = None
     if experts.mxfp4_csf is not None and csf_inline is None:
         experts.mxfp4_csf.decode(topk_ids, w1_blockscale, w2_blockscale)
-    # The A4 prefill path (when present) reads expanded (W4A16-layout) scales.
-    stage_scales = (
-        experts.w4a16_expanded is not None
-        and getattr(binding, "a4_prefill_launches", None) is None
-        and _w4a16_reads_stage_scales(binding)
+    a4_launches = getattr(binding, "a4_prefill_launches", None)
+    stage_scales = experts.w4a16_expanded is not None and (
+        _w4a16_reads_stage_scales(binding.fused_launch, a4_launches)
     )
     csf_reset_barriers = (
         experts.nvfp4_csf is not None

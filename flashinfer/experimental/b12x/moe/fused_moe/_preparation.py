@@ -120,22 +120,22 @@ def _control_snapshot() -> FrozenMapping:
         _w4a16_small_m_occupancy,
     )
     from b12x.moe._shared.kernels.w4a16.prefill_a4 import (
-        a4_prefill_min_tokens,
+        a4_prefill_enabled,
         a4_prefill_terms,
         a4_prefill_warps,
     )
 
     tile = _impl._dynamic_tile_mn_override()
     raw_materialized = _impl.os.environ.get(_impl._DYNAMIC_NVFP4_MATERIALIZED_ENV)
-    a4_min_tokens = a4_prefill_min_tokens()
+    a4_enabled = a4_prefill_enabled()
     return FrozenMapping(
         {
             "trellis_decode_table": trellis_decode_table(),
             "w4a16_small_m_occupancy": _w4a16_small_m_occupancy(),
             "w4a16_fp32_topk_weights": _FP32_TOPK_WEIGHTS,
-            "w4a16_a4_prefill_min_tokens": a4_min_tokens,
-            "w4a16_a4_prefill_terms": a4_prefill_terms() if a4_min_tokens > 0 else 1,
-            "w4a16_a4_prefill_warps": a4_prefill_warps() if a4_min_tokens > 0 else 8,
+            "w4a16_a4_prefill_enabled": a4_enabled,
+            "w4a16_a4_prefill_terms": a4_prefill_terms() if a4_enabled else 1,
+            "w4a16_a4_prefill_warps": a4_prefill_warps() if a4_enabled else 8,
             "w4a8_csf_inline_max_tokens": _impl.W4A8_CSF_INLINE_MAX_TOKENS,
             "w4a16_prefill_fused_sum": prefill_fused_sum_enabled(),
             "w4a16_csf_stage_max_tokens": _impl.W4A16_CSF_STAGE_MAX_TOKENS,
@@ -233,12 +233,7 @@ def _query(
         w4a16_block_size_m=invocation.get("w4a16_block_size_m"),
         fast_math=bool(invocation.get("fast_math", True)),
         numerical_recipe=invocation.get("numerical_recipe"),
-        controls=FrozenMapping(
-            {
-                **controls.to_dict(),
-                "w4a16_a16_max_tokens": experts.plan.activation.a16_max_tokens,
-            }
-        ),
+        controls=controls,
         shared_input_scales=experts._impl.can_share_input(input_scales_static=True),
         nvfp4_inline_scales=plan.nvfp4_inline_scales,
     )
@@ -310,6 +305,11 @@ def _lower_caps(
     device: torch.device,
 ) -> TPMoEScratchCaps:
     """One config-to-Caps lowering shared by compilation, sizing and serving."""
+    a4_csf_inline_words = (
+        weight_plan.w4a16_csf_inline_words
+        if weight_plan.w4a16_compressed_scales
+        else None
+    )
     if getattr(
         weight_plan, "w4a16_compressed_scales", False
     ) and query.num_tokens > int(
@@ -337,6 +337,7 @@ def _lower_caps(
         weight_plan=weight_plan,
         quant_mode=mode,
         decode_config=config,
+        w4a16_a4_csf_inline_words=a4_csf_inline_words,
         core_token_counts=(query.num_tokens,),
         route_num_experts=query.route_num_experts,
         route_logits_dtype=(
@@ -368,12 +369,11 @@ def _lower_caps(
         ),
         trellis_decode_table=str(query.controls.get("trellis_decode_table", "auto")),
         w4a16_small_m_occupancy=int(query.controls.get("w4a16_small_m_occupancy", 1)),
-        w4a16_a4_prefill_min_tokens=int(
-            query.controls.get("w4a16_a4_prefill_min_tokens", 0)
+        w4a16_a4_prefill_enabled=bool(
+            query.controls.get("w4a16_a4_prefill_enabled", False)
         ),
         w4a16_a4_prefill_terms=int(query.controls.get("w4a16_a4_prefill_terms", 1)),
         w4a16_a4_prefill_warps=int(query.controls.get("w4a16_a4_prefill_warps", 8)),
-        w4a16_a16_max_tokens=int(query.controls.get("w4a16_a16_max_tokens", 0)),
         w4a16_skip_empty_m_blocks=bool(
             query.controls.get("w4a16_skip_empty_m_blocks", True)
         ),
@@ -396,7 +396,6 @@ class _W4A16PrimaryLaunches:
     route_pack: object | None
     native_direct: object | None = None
     a4_prefill: object | None = None
-    a16_max_tokens: int = 0
 
     def select_a4(
         self,
@@ -406,20 +405,21 @@ class _W4A16PrimaryLaunches:
         has_route_map: bool,
         activation_amax: object | None,
         apply_router_weight_on_input: bool,
+        cache13_bytes: int,
+        cache2_bytes: int,
         force: bool | None = None,
     ) -> object | None:
         """Select compatible A4 calls, preserving explicit caller precision."""
         launches = self.a4_prefill
         if (
             launches is None
-            or force is False
-            or (force is None and int(tokens) < launches.min_tokens)
+            or force is not True
             or not 0 < int(tokens) <= launches.tokens
-            or int(tokens) <= self.a16_max_tokens
             or route_ids_dtype not in (torch.int32, torch.int64)
             or has_route_map
             or activation_amax is not None
             or apply_router_weight_on_input
+            or not launches.fits_buffers(tokens, cache13_bytes, cache2_bytes)
         ):
             return None
         return launches
@@ -711,10 +711,8 @@ def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
             compile_w4a16_a4_prefill,
         )
 
-        a4_min = caps.w4a16_a4_prefill_min_tokens
         if (
-            a4_min > 0
-            and tokens > caps.w4a16_a16_max_tokens
+            caps.w4a16_a4_prefill_enabled
             and core.route_E == core.weight_E
             and not caps.apply_router_weight_on_input
             and a4_prefill_supported(
@@ -730,7 +728,6 @@ def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
         ):
             a4_prefill = compile_w4a16_a4_prefill(
                 tokens=tokens,
-                min_tokens=a4_min,
                 topk=core.num_topk,
                 hidden_size=core.k,
                 intermediate_size=core.n,
@@ -741,6 +738,7 @@ def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
                 terms=caps.w4a16_a4_prefill_terms,
                 warps=caps.w4a16_a4_prefill_warps,
                 swiglu_limit=core.swiglu_limit,
+                csf_inline_words=caps.w4a16_a4_csf_inline_words,
             )
     # Direct routing requires exact M; packed routing accepts live M up to capacity.
     return _W4A16PrimaryLaunches(
@@ -755,7 +753,6 @@ def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
         route_pack=route_pack,
         native_direct=native_direct,
         a4_prefill=a4_prefill,
-        a16_max_tokens=caps.w4a16_a16_max_tokens,
     )
 
 
@@ -1213,6 +1210,74 @@ class _FusedMoeState:
     w4a16_launches: _W4A16PrimaryLaunches | None = None
     compact_launches: _CompactLaunches | None = None
 
+    def _a4_launch_for(
+        self,
+        *,
+        num_tokens,
+        a4_prefill,
+        route_ids_dtype,
+        has_route_map,
+        collect_activation_amax,
+    ):
+        if self.w4a16_launches is None or not self.experts._impl.a4_prefill_scales:
+            return None
+        sizes = {
+            spec.name: math.prod(spec.shape) * spec.dtype.itemsize
+            for spec in self.scratch._core_workspace_plan.tensor_specs
+            if spec.name in ("intermediate_cache13", "intermediate_cache2")
+        }
+        return self.w4a16_launches.select_a4(
+            tokens=num_tokens,
+            route_ids_dtype=route_ids_dtype,
+            has_route_map=has_route_map,
+            activation_amax=True if collect_activation_amax else None,
+            apply_router_weight_on_input=self.scratch.caps.apply_router_weight_on_input,
+            cache13_bytes=sizes.get("intermediate_cache13", 0),
+            cache2_bytes=sizes.get("intermediate_cache2", 0),
+            force=a4_prefill,
+        )
+
+    def uses_expanded_nvfp4_scales(
+        self,
+        *,
+        num_tokens,
+        a4_prefill,
+        route_ids_dtype,
+        has_route_map,
+        collect_activation_amax,
+    ) -> bool:
+        from ._impl import _w4a16_reads_stage_scales
+
+        if not 0 < int(num_tokens) <= self.scratch.caps.max_tokens:
+            raise ValueError("token count exceeds prepared MoE capacity")
+        experts = self.experts._impl
+        if experts.nvfp4_csf is None:
+            return False
+        if self.w4a16_launches is None:
+            return not (
+                self.scratch.caps.quant_mode == "nvfp4"
+                and self.config.backend == "dynamic"
+                and self.config.nvfp4_inline_scales
+                and experts.nvfp4_csf.inline_scales is not None
+            )
+        activation_amax = True if collect_activation_amax else None
+        fused, _, _ = self.w4a16_launches.select(
+            tokens=num_tokens,
+            route_ids_dtype=route_ids_dtype,
+            has_route_map=has_route_map,
+            activation_amax=activation_amax,
+        )
+        a4 = self._a4_launch_for(
+            num_tokens=num_tokens,
+            a4_prefill=a4_prefill,
+            route_ids_dtype=route_ids_dtype,
+            has_route_map=has_route_map,
+            collect_activation_amax=collect_activation_amax,
+        )
+        return not (
+            experts.w4a16_expanded is not None and _w4a16_reads_stage_scales(fused, a4)
+        )
+
     def bind(self, **kwargs):
         experts = kwargs.pop("experts", self.experts)
         if experts is not self.experts:
@@ -1302,14 +1367,51 @@ class _FusedMoeCapacityState:
     variants: MappingProxyType
     a16_max_tokens: int = 0
 
+    def for_tokens(
+        self,
+        tokens,
+        *,
+        a4_prefill=None,
+        route_ids_dtype=torch.int32,
+        has_route_map=False,
+        collect_activation_amax=False,
+    ):
+        if 0 < tokens <= self.a16_max_tokens and tokens not in self.variants:
+            state = self.variants[self.a16_max_tokens]
+        else:
+            state = variant_for(self.variants, tokens)
+        if a4_prefill is True:
+            selection = dict(
+                num_tokens=tokens,
+                a4_prefill=True,
+                route_ids_dtype=route_ids_dtype,
+                has_route_map=has_route_map,
+                collect_activation_amax=collect_activation_amax,
+            )
+            if state._a4_launch_for(**selection) is None:
+                # Exact decode variants may lack A4's padded route workspace.
+                # Reuse a fitting prepared variant within the same scratch arena.
+                for capacity, candidate in sorted(self.variants.items()):
+                    if (
+                        capacity > state.scratch.caps.max_tokens
+                        and candidate._a4_launch_for(**selection) is not None
+                    ):
+                        return candidate
+        return state
+
     def bind(self, **kwargs):
         activations = kwargs.get("a")
         if not isinstance(activations, torch.Tensor) or activations.ndim != 2:
             raise TypeError("fused MoE binding requires a rank-two activation tensor")
         tokens = activations.shape[0]
-        if 0 < tokens <= self.a16_max_tokens and tokens not in self.variants:
-            return self.variants[self.a16_max_tokens].bind(**kwargs)
-        return variant_for(self.variants, tokens).bind(**kwargs)
+        return self.for_tokens(
+            tokens,
+            a4_prefill=kwargs.get("a4_prefill"),
+            route_ids_dtype=kwargs["topk_ids"].dtype,
+            has_route_map=kwargs.get("route_expert_map") is not None
+            or kwargs.get("output_expert_map") is not None,
+            collect_activation_amax=kwargs.get("activation_amax") is not None,
+        ).bind(**kwargs)
 
     def run(self, binding):
         return binding.run()

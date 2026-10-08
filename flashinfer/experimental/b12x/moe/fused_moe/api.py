@@ -214,6 +214,42 @@ def expand_scales(experts: PreparedExperts) -> bool:
     return True
 
 
+def uses_expanded_nvfp4_scales(
+    plan: Plan,
+    *,
+    num_tokens: int,
+    a4_prefill: bool | None = None,
+    route_ids_dtype: torch.dtype = torch.int32,
+    has_route_map: bool = False,
+    collect_activation_amax: bool = False,
+) -> bool:
+    """Whether a prepared invocation consumes the shared NVFP4-CSF expansion.
+
+    This metadata-only query uses the same variant, precision, scratch-fit,
+    and scale-consumer selection as binding. It does not prepare a plan or
+    launch GPU work. A caller may skip scale prefetch when it returns False.
+    Route mappings and activation calibration must describe the later bind.
+    """
+    if getattr(plan, "_prepared", None) is None:
+        raise RuntimeError("scale-consumer queries require a prepared MoE plan")
+    state = require_prepared(plan, "moe.decode")
+    if hasattr(state, "for_tokens"):
+        state = state.for_tokens(
+            num_tokens,
+            a4_prefill=a4_prefill,
+            route_ids_dtype=route_ids_dtype,
+            has_route_map=has_route_map,
+            collect_activation_amax=collect_activation_amax,
+        )
+    return state.uses_expanded_nvfp4_scales(
+        num_tokens=num_tokens,
+        a4_prefill=a4_prefill,
+        route_ids_dtype=route_ids_dtype,
+        has_route_map=has_route_map,
+        collect_activation_amax=collect_activation_amax,
+    )
+
+
 def _state_for(plan: Plan, hidden_states: torch.Tensor):
     root = require_prepared(plan, "moe.decode", hidden_states.device)
     if hasattr(root, "variants"):
@@ -341,6 +377,7 @@ __all__ = [
     "bind_route",
     "bind_sparse",
     "expand_scales",
+    "uses_expanded_nvfp4_scales",
     "is_supported",
     "plan_execution",
     "plan_route_topk",

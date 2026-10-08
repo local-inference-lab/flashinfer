@@ -230,7 +230,7 @@ def test_moe_a4_prefill_options_are_immutable_numerical_controls(monkeypatch):
     from b12x.moe.fused_moe import _preparation
     from b12x.moe.fused_moe._tuning import TUNING
 
-    monkeypatch.setenv("B12X_W4A16_A4_PREFILL_MIN_TOKENS", "128")
+    monkeypatch.setenv("B12X_W4A16_A4_PREFILL", "1")
     monkeypatch.setenv("B12X_W4A16_A4_PREFILL_TERMS", "1")
     monkeypatch.setenv("B12X_W4A16_A4_PREFILL_WARPS", "8")
     weight_plan = moe.plan_weights(
@@ -253,7 +253,7 @@ def test_moe_a4_prefill_options_are_immutable_numerical_controls(monkeypatch):
     )
     config = TUNING.configure(query, device=DEVICE, search=False).default
     for variable, value in (
-        ("B12X_W4A16_A4_PREFILL_MIN_TOKENS", "256"),
+        ("B12X_W4A16_A4_PREFILL", "0"),
         ("B12X_W4A16_A4_PREFILL_TERMS", "2"),
         ("B12X_W4A16_A4_PREFILL_WARPS", "16"),
     ):
@@ -265,13 +265,13 @@ def test_moe_a4_prefill_options_are_immutable_numerical_controls(monkeypatch):
                 query, config, weight_plan, torch.device("cuda", 0)
             )
             assert (
-                caps.w4a16_a4_prefill_min_tokens,
+                caps.w4a16_a4_prefill_enabled,
                 caps.w4a16_a4_prefill_terms,
                 caps.w4a16_a4_prefill_warps,
-            ) == (128, 1, 8)
+            ) == (True, 1, 8)
 
 
-@pytest.mark.parametrize("threshold", ("0", "-1"))
+@pytest.mark.parametrize("enabled", (None, "0"))
 @pytest.mark.parametrize(
     "variable,value",
     (
@@ -280,18 +280,42 @@ def test_moe_a4_prefill_options_are_immutable_numerical_controls(monkeypatch):
     ),
 )
 def test_disabled_moe_a4_prefill_ignores_inactive_controls(
-    monkeypatch, threshold, variable, value
+    monkeypatch, enabled, variable, value
 ):
     from b12x.moe.fused_moe import _preparation
 
-    monkeypatch.setenv("B12X_W4A16_A4_PREFILL_MIN_TOKENS", threshold)
+    if enabled is None:
+        monkeypatch.delenv("B12X_W4A16_A4_PREFILL", raising=False)
+    else:
+        monkeypatch.setenv("B12X_W4A16_A4_PREFILL", enabled)
     monkeypatch.setenv("B12X_W4A16_A4_PREFILL_TERMS", "1")
     monkeypatch.setenv("B12X_W4A16_A4_PREFILL_WARPS", "8")
     baseline = _preparation._control_snapshot()
     monkeypatch.setenv(variable, value)
     assert _preparation._control_snapshot() == baseline
-    monkeypatch.setenv("B12X_W4A16_A4_PREFILL_MIN_TOKENS", "128")
+    monkeypatch.setenv("B12X_W4A16_A4_PREFILL", "1")
     with pytest.raises(ValueError, match=variable):
+        _preparation._control_snapshot()
+
+
+@pytest.mark.parametrize("enabled", ["0", "1"])
+def test_moe_a4_prefill_ignores_retired_token_threshold(enabled, monkeypatch):
+    from b12x.moe.fused_moe import _preparation
+
+    monkeypatch.setenv("B12X_W4A16_A4_PREFILL", enabled)
+    monkeypatch.delenv("B12X_W4A16_A4_PREFILL_MIN_TOKENS", raising=False)
+    baseline = _preparation._control_snapshot()
+    for value in ("1", "3072", "invalid"):
+        monkeypatch.setenv("B12X_W4A16_A4_PREFILL_MIN_TOKENS", value)
+        assert _preparation._control_snapshot() == baseline
+
+
+@pytest.mark.parametrize("value", ["-1", "2", "true"])
+def test_moe_a4_prefill_enable_rejects_non_boolean_controls(value, monkeypatch):
+    from b12x.moe.fused_moe import _preparation
+
+    monkeypatch.setenv("B12X_W4A16_A4_PREFILL", value)
+    with pytest.raises(ValueError, match="B12X_W4A16_A4_PREFILL"):
         _preparation._control_snapshot()
 
 

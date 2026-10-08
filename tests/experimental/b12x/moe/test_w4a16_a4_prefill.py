@@ -3,9 +3,8 @@
 Gates the NVFP4-activation prefill pipeline (route pack 128 -> quantize ->
 A4 FC1 -> A4 FC2 -> FP32-weighted top-k sum) against a float64 torch emulation
 of the same quantization contract, for one activation plane (NVFP4) and two
-planes (NVFP4 value + NVFP4 residual). Checks the W4A16 binding's selection
-(A4 at or above the threshold, W4A16 below it, W4A16 for weights prepared
-without calibrated activation scales) and graph replay across live token
+planes (NVFP4 value + NVFP4 residual). Checks explicit per-call precision
+selection, calibrated-scale requirements, and graph replay across live token
 counts with the same compiled callables.
 """
 
@@ -115,10 +114,10 @@ def _make_case(seed):
     )
 
 
-def _env(monkeypatch, threshold, terms):
+def _env(monkeypatch, enabled, terms):
     # Plan-time options: preparation may run lazily at the first bind, so they
     # stay set for the whole test.
-    monkeypatch.setenv("B12X_W4A16_A4_PREFILL_MIN_TOKENS", str(threshold))
+    monkeypatch.setenv("B12X_W4A16_A4_PREFILL", str(int(enabled)))
     monkeypatch.setenv("B12X_W4A16_A4_PREFILL_TERMS", str(terms))
 
 
@@ -235,7 +234,7 @@ def _scales(case):
 @pytest.mark.parametrize("swiglu_limit", [None, 2.03, 10.0])
 def test_a4_prefill_matches_float64_emulation(terms, swiglu_limit, monkeypatch):
     require_b12x()
-    _env(monkeypatch, 64, terms)
+    _env(monkeypatch, True, terms)
     case = _make_case(11)
     from b12x.moe import fused_moe as moe
 
@@ -256,7 +255,7 @@ def test_a4_prefill_matches_float64_emulation(terms, swiglu_limit, monkeypatch):
         torch.empty(s.shape, dtype=s.dtype, device=x.device) for s in xp.scratch_specs()
     )
     out = torch.empty_like(x)
-    binding = _bind(xp, x, ids, wts, out, scratch)
+    binding = _bind(xp, x, ids, wts, out, scratch, a4_prefill=True)
     launches = getattr(binding, "_impl", binding).a4_prefill_launches
     assert launches is not None and launches.terms == terms
     from b12x.moe import fused_moe as moe
@@ -277,9 +276,9 @@ def test_a4_prefill_matches_float64_emulation(terms, swiglu_limit, monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_a4_prefill_threshold_and_scale_gating(monkeypatch):
+def test_a4_prefill_requires_explicit_choice_and_calibrated_scales(monkeypatch):
     require_b12x()
-    _env(monkeypatch, 128, 1)
+    _env(monkeypatch, True, 1)
     case = _make_case(12)
     a1g, a2g = _scales(case)
     experts = _prepare(case, a1g, a2g)
@@ -288,12 +287,10 @@ def test_a4_prefill_threshold_and_scale_gating(monkeypatch):
     scratch = tuple(
         torch.empty(s.shape, dtype=s.dtype, device=dev) for s in xp.scratch_specs()
     )
-    for tokens, expect_a4 in ((64, False), (127, False), (128, True), (256, True)):
+    for tokens in (4, 64, 128, 256):
         x, ids, wts = _inputs(tokens, tokens)
         binding = _bind(xp, x, ids, wts, torch.empty_like(x), scratch)
-        assert (
-            getattr(binding, "_impl", binding).a4_prefill_launches is not None
-        ) == expect_a4, tokens
+        assert getattr(binding, "_impl", binding).a4_prefill_launches is None, tokens
     # Without calibrated scales (or with invalid ones) the weights stay W4A16 only.
     bad = a1g.clone()
     bad[3] = float("nan")
@@ -307,16 +304,18 @@ def test_a4_prefill_threshold_and_scale_gating(monkeypatch):
             torch.empty(s.shape, dtype=s.dtype, device=dev)
             for s in xp_plain.scratch_specs()
         )
-        binding = _bind(xp_plain, x, ids, wts, torch.empty_like(x), scratch_plain)
+        binding = _bind(
+            xp_plain, x, ids, wts, torch.empty_like(x), scratch_plain, a4_prefill=True
+        )
         assert getattr(binding, "_impl", binding).a4_prefill_launches is None
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("threshold", [128, 512])
-def test_a4_prefill_per_call_choice_overrides_the_threshold(threshold, monkeypatch):
+@pytest.mark.parametrize("enabled", [False, True])
+def test_a4_prefill_per_call_choice_is_independent_of_token_count(enabled, monkeypatch):
     """A caller that knows which rows are prefill picks the path per call."""
     require_b12x()
-    _env(monkeypatch, threshold, 1)
+    _env(monkeypatch, enabled, 1)
     case = _make_case(13)
     a1g, a2g = _scales(case)
     experts = _prepare(case, a1g, a2g)
@@ -325,19 +324,17 @@ def test_a4_prefill_per_call_choice_overrides_the_threshold(threshold, monkeypat
     scratch = tuple(
         torch.empty(s.shape, dtype=s.dtype, device=dev) for s in xp.scratch_specs()
     )
-    for tokens, choice, expect_a4 in (
-        (48, True, True),
-        (48, None, False),
-        (256, False, False),
-        (256, None, 256 >= threshold),
-    ):
-        x, ids, wts = _inputs(tokens, tokens)
-        binding = _bind(
-            xp, x, ids, wts, torch.empty_like(x), scratch, a4_prefill=choice
-        )
-        launches = getattr(binding, "_impl", binding).a4_prefill_launches
-        assert (launches is not None) == expect_a4, (tokens, choice)
-    # A forced call below the threshold computes the same A4 math.
+    for tokens in (4, 256):
+        for choice in (None, False, True):
+            x, ids, wts = _inputs(tokens, tokens)
+            binding = _bind(
+                xp, x, ids, wts, torch.empty_like(x), scratch, a4_prefill=choice
+            )
+            launches = getattr(binding, "_impl", binding).a4_prefill_launches
+            assert (launches is not None) == (enabled and choice is True)
+    if not enabled:
+        return
+    # An explicitly selected small prefill computes the same A4 math.
     from b12x.moe import fused_moe as moe
 
     x, ids, wts = _inputs(48, 21)
@@ -378,9 +375,9 @@ def test_a4_prefill_option_leaves_fp4_activation_plans_alone(monkeypatch):
         ),
         geometry=moe.MoEGeometry(num_experts=E, hidden_size=H, intermediate_size=I),
     )
-    _env(monkeypatch, 0, 1)
+    _env(monkeypatch, False, 1)
     without = _prepare(case, a1g, a2g)._impl
-    _env(monkeypatch, 128, 1)
+    _env(monkeypatch, True, 1)
     with_option = _prepare(case, a1g, a2g)._impl
     assert not with_option.a4_prefill_scales
     assert torch.equal(without.a1_gscale, with_option.a1_gscale)
@@ -389,11 +386,11 @@ def test_a4_prefill_option_leaves_fp4_activation_plans_alone(monkeypatch):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("csf", [False, True])
-def test_a4_prefill_force_preserves_explicit_a16_cutoff(csf, monkeypatch):
+def test_a4_prefill_explicit_choice_ignores_auto_a16_cutoff(csf, monkeypatch):
     require_b12x()
     from b12x.moe import fused_moe as moe
 
-    _env(monkeypatch, 64, 1)
+    _env(monkeypatch, True, 1)
     case = _make_case(16)
     case["plan"] = moe.plan_weights(
         source=case["plan"].source,
@@ -414,23 +411,138 @@ def test_a4_prefill_force_preserves_explicit_a16_cutoff(csf, monkeypatch):
         out = torch.empty_like(x)
         binding = _bind(xp, x, ids, wts, out, scratch, a4_prefill=True)
         launches = getattr(binding, "_impl", binding).a4_prefill_launches
-        assert (launches is not None) == (tokens > 128)
+        assert launches is not None
         moe.run(binding=binding)
-        if tokens > 128:
-            ref = _emulate(case, x, ids, wts, a1g, a2g, 1)
-            rel = ((out.double() - ref).norm() / ref.norm()).item()
-            assert rel < 4e-3, (csf, rel)
-        else:
-            expected = torch.empty_like(x)
-            moe.run(binding=_bind(xp, x, ids, wts, expected, scratch, a4_prefill=False))
-            torch.testing.assert_close(out, expected, rtol=0, atol=0)
+        ref = _emulate(case, x, ids, wts, a1g, a2g, 1)
+        rel = ((out.double() - ref).norm() / ref.norm()).item()
+        assert rel < 4e-3, (csf, rel)
+        for choice in (None, False):
+            a16 = _bind(xp, x, ids, wts, out, scratch, a4_prefill=choice)
+            assert getattr(a16, "_impl", a16).a4_prefill_launches is None
+
+
+@pytest.mark.parametrize("calibrated", [False, True])
+def test_csf_prefetch_query_matches_exact_variant_and_precision(
+    calibrated, monkeypatch
+):
+    """Prefetch follows the selected reader, including uncalibrated A16 fallback."""
+    from types import MappingProxyType
+
+    from b12x._lib.quant.nvfp4_csf import Nvfp4CsfDecoder
+    from b12x._lib.runtime_control import kernel_resolution_guard
+    from b12x.moe import fused_moe as moe
+
+    device = require_b12x()
+    _env(monkeypatch, True, 1)
+    case = _make_case(18)
+    a1g, a2g = _scales(case) if calibrated else (None, None)
+    owner = _prepare(case, a1g, a2g, csf=True)
+    plan = moe.plan_execution(
+        experts=owner,
+        capacity=moe.ExecutionCapacity(
+            max_tokens=3072, top_k=TOPK, warmup_token_counts=(4,)
+        ),
+        invocation={"fast_math": True},
+    )
+    with pytest.raises(RuntimeError, match="require a prepared MoE plan"):
+        moe.uses_expanded_nvfp4_scales(plan, num_tokens=4)
+    scratch = tuple(
+        torch.empty(s.shape, dtype=s.dtype, device=device) for s in plan.scratch_specs()
+    )
+    x, ids, wts = _inputs(128, 52)
+    output = torch.empty_like(x)
+    _bind(plan, x, ids, wts, output, scratch)
+    decoded = []
+    decode = Nvfp4CsfDecoder.decode
+
+    def record_decode(self, *args, **kwargs):
+        decoded.append(self)
+        return decode(self, *args, **kwargs)
+
+    monkeypatch.setattr(Nvfp4CsfDecoder, "decode", record_decode)
+    for tokens in (4, 6, 128):
+        for choice in (None, True):
+            expected = tokens != 4 and not (calibrated and choice is True)
+            with kernel_resolution_guard("prepared scale-consumer metadata"):
+                before = torch.cuda.memory_allocated()
+                assert (
+                    moe.uses_expanded_nvfp4_scales(
+                        plan, num_tokens=tokens, a4_prefill=choice
+                    )
+                    is expected
+                )
+                assert torch.cuda.memory_allocated() == before
+            assert not decoded
+            binding = _bind(
+                plan,
+                x[:tokens],
+                ids[:tokens],
+                wts[:tokens],
+                output[:tokens],
+                scratch,
+                a4_prefill=choice,
+            )
+            assert (binding.a4_prefill_launches is not None) == (
+                calibrated and choice is True
+            ), (tokens, choice)
+            if calibrated and choice is True and tokens == 4:
+                assert binding.a4_prefill_launches is (
+                    plan._prepared.state.variants[3072].w4a16_launches.a4_prefill
+                )
+            moe.run(binding=binding)
+            torch.cuda.synchronize()
+            assert bool(decoded) is expected
+            decoded.clear()
+    for tokens in (0, 3073):
+        with pytest.raises(ValueError, match="capacity"):
+            moe.uses_expanded_nvfp4_scales(plan, num_tokens=tokens)
+    if calibrated:
+        # Without a larger prepared variant, the exact four-row plan retains
+        # A16 when its intermediate buffers cannot hold padded A4 routes.
+        small = _plan(owner, 4)
+        small_scratch = tuple(
+            torch.empty(s.shape, dtype=s.dtype, device=device)
+            for s in small.scratch_specs()
+        )
+        binding = _bind(
+            small,
+            x[:4],
+            ids[:4],
+            wts[:4],
+            output[:4],
+            small_scratch,
+            a4_prefill=True,
+        )
+        assert binding.a4_prefill_launches is None
+        assert not moe.uses_expanded_nvfp4_scales(small, num_tokens=4, a4_prefill=True)
+        # A4 cannot use a plan whose intermediate buffers do not fit its planes.
+        root = plan._prepared.state
+        state = root.variants[3072]
+        core = state.scratch._core_workspace_plan
+        undersized = replace(
+            core,
+            tensor_specs=tuple(
+                replace(spec, shape=(1,))
+                if spec.name == "intermediate_cache13"
+                else spec
+                for spec in core.tensor_specs
+            ),
+        )
+        variants = dict(root.variants)
+        variants[3072] = replace(
+            state, scratch=replace(state.scratch, _core_workspace_plan=undersized)
+        )
+        monkeypatch.setattr(
+            plan._prepared, "state", replace(root, variants=MappingProxyType(variants))
+        )
+        assert moe.uses_expanded_nvfp4_scales(plan, num_tokens=128, a4_prefill=True)
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA devices")
 def test_a4_prefill_launchers_are_owned_by_each_device(monkeypatch):
     from b12x.moe import fused_moe as moe
 
-    _env(monkeypatch, 64, 1)
+    _env(monkeypatch, True, 1)
     owners = []
     for ordinal in (0, 1):
         with torch.cuda.device(ordinal):
@@ -445,7 +557,7 @@ def test_a4_prefill_launchers_are_owned_by_each_device(monkeypatch):
                 torch.empty(s.shape, dtype=s.dtype, device=x.device)
                 for s in xp.scratch_specs()
             )
-            binding = _bind(xp, x, ids, wts, out, scratch)
+            binding = _bind(xp, x, ids, wts, out, scratch, a4_prefill=True)
             launches = getattr(binding, "_impl", binding).a4_prefill_launches
             assert launches is not None
             owners.append((launches.quant, launches.fc1, launches.fc2))
@@ -463,7 +575,7 @@ def test_a4_prefill_graph_replay_reuses_launches(terms, monkeypatch):
     from b12x.moe import fused_moe as moe
     from b12x._lib.runtime_control import kernel_resolution_guard
 
-    _env(monkeypatch, 64, terms)
+    _env(monkeypatch, True, terms)
     case = _make_case(13)
     a1g, a2g = _scales(case)
     experts = _prepare(case, a1g, a2g)
@@ -476,7 +588,7 @@ def test_a4_prefill_graph_replay_reuses_launches(terms, monkeypatch):
     for tokens in (96, 320, 200):
         x, ids, wts = _inputs(tokens, 100 + tokens)
         eager_out = torch.empty_like(x)
-        binding = _bind(xp, x, ids, wts, eager_out, scratch)
+        binding = _bind(xp, x, ids, wts, eager_out, scratch, a4_prefill=True)
         launches = getattr(binding, "_impl", binding).a4_prefill_launches
         assert launches is not None
         seen.add((id(launches.quant), id(launches.fc1), id(launches.fc2)))
@@ -516,3 +628,109 @@ def test_a4_prefill_graph_replay_reuses_launches(terms, monkeypatch):
             graph.reset()
     # One compiled pipeline serves every live token count of the capacity.
     assert len(seen) == 1
+
+
+@pytest.mark.parametrize(
+    "inline_words,terms,capacity,warps",
+    [(0, 1, 320, 8), (0, 1, 3072, 8), (4, 2, 3072, 8), (64, 1, 3072, 16)],
+)
+def test_a4_csf_stage_reads_preserve_dense_graph_output(
+    inline_words, terms, capacity, warps, monkeypatch
+):
+    """Compressed A4 stages preserve arithmetic without touching expanded scales."""
+    import numpy as np
+
+    from b12x._lib.quant.nvfp4_csf import Nvfp4CsfDecoder
+    from b12x._lib.runtime_control import kernel_resolution_guard
+    from b12x.moe import fused_moe as moe
+    from .test_w4a16_csf_tp6 import _swizzled
+
+    device = require_b12x()
+    _env(monkeypatch, True, terms)
+    monkeypatch.setenv("B12X_W4A16_A4_PREFILL_WARPS", str(warps))
+    monkeypatch.setenv("B12X_NVFP4_CSF_INLINE_WORDS", str(inline_words))
+    case = _make_case(17)
+    case["plan"] = moe.plan_weights(
+        source=case["plan"].source,
+        activation=replace(case["plan"].activation, swiglu_limit=10.0),
+        geometry=case["plan"].geometry,
+    )
+    for name, rows, columns in (("s13", 2 * I, H // 16), ("s2", H, I // 16)):
+        expert = np.arange(E)[:, None, None]
+        row = np.arange(rows)[None, :, None]
+        group = np.arange(columns)[None, None, :]
+        logical = 0x28 + (row // 64 + expert * 3) % 16 + (group + row) % 14
+        # Two groups per atom force global replacement-word reads; other groups
+        # retain base/code words.
+        logical[:, :, 1::2] = 0x68 + (row + expert) % 8
+        logical[:, 5, ::8] = 0
+        logical = logical.astype(np.uint8)
+        case[name] = _swizzled(logical, device)
+        case[name + "_log"] = (
+            torch.from_numpy(logical).to(device).view(torch.float8_e4m3fn)
+        )
+    a1g = torch.linspace(800, 1100, E, device=device)
+    a2g = torch.linspace(24, 56, E, device=device)
+    owners = [_prepare(case, a1g, a2g, csf=csf) for csf in (False, True)]
+    x, ids, wts = _inputs(131, 51)
+    bindings, outputs, scratches = [], [], []
+    for owner in owners:
+        plan = _plan(owner, capacity)
+        scratch = tuple(
+            torch.empty(s.shape, dtype=s.dtype, device=device)
+            for s in plan.scratch_specs()
+        )
+        output = torch.empty_like(x)
+        binding = _bind(plan, x, ids, wts, output, scratch, a4_prefill=True)
+        bindings.append(binding)
+        outputs.append(output)
+        scratches.append(scratch)
+    launches = [binding.a4_prefill_launches for binding in bindings]
+    assert launches[0].csf_inline_words is None
+    assert launches[1].csf_inline_words == inline_words
+    assert launches[0].fc1 is not launches[1].fc1
+    assert launches[0].fc2 is not launches[1].fc2
+    expanded = owners[1]._impl.w4a16_expanded
+    scale_scratch = (expanded.w13_scale, expanded.w2_scale)
+
+    def reject_expansion(*args, **kwargs):
+        raise AssertionError("A4 CSF stages must not expand global scale scratch")
+
+    monkeypatch.setattr(Nvfp4CsfDecoder, "decode", reject_expansion)
+    for buffer in scale_scratch:
+        buffer.view(torch.uint8).fill_(0x7F)
+    for binding in bindings:
+        moe.run(binding=binding)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(outputs[1], outputs[0], rtol=0, atol=0)
+    assert torch.isfinite(outputs[1]).all() and torch.count_nonzero(outputs[1])
+    graph = torch.cuda.CUDAGraph()
+    stable = (*scratches[1], *scale_scratch, outputs[1])
+    pointers = tuple(t.data_ptr() for t in stable)
+    try:
+        with kernel_resolution_guard("A4 CSF prepared stages"):
+            with torch.cuda.graph(graph):
+                moe.run(binding=bindings[1])
+            for seed in (61, 62):
+                changed = _inputs(x.shape[0], seed)
+                for target, source in zip((x, ids, wts), changed, strict=True):
+                    target.copy_(source)
+                moe.run(binding=bindings[0])
+                for buffer in (*scratches[1], *scale_scratch):
+                    buffer.view(torch.uint8).fill_(0x7F)
+                outputs[1].fill_(float("nan"))
+                torch.cuda.synchronize()
+                allocated = torch.cuda.memory_allocated()
+                torch.cuda.reset_peak_memory_stats()
+                graph.replay()
+                torch.cuda.synchronize()
+                assert torch.cuda.memory_allocated() == allocated
+                assert torch.cuda.max_memory_allocated() == allocated
+                assert pointers == tuple(t.data_ptr() for t in stable)
+                torch.testing.assert_close(outputs[1], outputs[0], rtol=0, atol=0)
+                assert all(
+                    torch.all(buffer.view(torch.uint8) == 0x7F)
+                    for buffer in scale_scratch
+                )
+    finally:
+        graph.reset()
