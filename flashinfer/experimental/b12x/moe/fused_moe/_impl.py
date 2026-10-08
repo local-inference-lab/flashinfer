@@ -858,6 +858,7 @@ class TPMoEScratchCaps:
     w4a16_a4_prefill_terms: int = 1
     w4a16_a4_prefill_warps: int = 8
     w4a16_a4_csf_inline_words: int | None = None
+    w4a16_csf_stage_max_tokens: int = 1536
     w4a8_csf_inline: bool = False
     frozen: bool = True
 
@@ -1021,6 +1022,8 @@ class TPMoEScratchPlan:
         ``scales_expanded`` states that ``expand_scales(experts)`` ran on this
         call's stream (or one it waits for) after the last other use of the
         shared NVFP4-CSF scratch; the call then skips its own expansion.
+        Eligible A4 calls above the prepared CSF stage limit consume these
+        expanded scales; smaller A4 calls retain shared-memory scale decoding.
 
         ``a4_prefill=True`` selects prepared NVFP4 activation launches.
         False and None keep W4A16 regardless of token count. Unsupported
@@ -1126,6 +1129,7 @@ class TPMoEScratchPlan:
                     cache2_bytes=tensors["intermediate_cache2"].numel()
                     * tensors["intermediate_cache2"].element_size(),
                     force=a4_prefill,
+                    scales_expanded=scales_expanded,
                 )
         elif (
             self.caps.quant_mode == "w4a16" and self._core_workspace_plan.full_rotation

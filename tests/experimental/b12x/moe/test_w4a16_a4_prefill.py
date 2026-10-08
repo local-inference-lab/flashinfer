@@ -538,6 +538,61 @@ def test_csf_prefetch_query_matches_exact_variant_and_precision(
         assert moe.uses_expanded_nvfp4_scales(plan, num_tokens=128, a4_prefill=True)
 
 
+def test_a4_prefetch_reader_requires_live_size_and_ready_scales(monkeypatch):
+    """Prospective prefetch and binding agree without changing A4 precision."""
+    from b12x._lib.runtime_control import kernel_resolution_guard
+    from b12x.moe import fused_moe as moe
+
+    device = require_b12x()
+    _env(monkeypatch, True, 1)
+    case = _make_case(19)
+    owner = _prepare(case, *_scales(case), csf=True)
+    plan = moe.plan_execution(
+        experts=owner,
+        capacity=moe.ExecutionCapacity(
+            max_tokens=3072, top_k=TOPK, warmup_token_counts=(4,)
+        ),
+        invocation={"fast_math": True},
+    )
+    scratch = tuple(
+        torch.empty(s.shape, dtype=s.dtype, device=device) for s in plan.scratch_specs()
+    )
+    x, ids, wts = _inputs(1537, 53)
+    output = torch.empty_like(x)
+    _bind(plan, x, ids, wts, output, scratch, a4_prefill=True)
+    with kernel_resolution_guard("prepared A4 scale-readiness selection"):
+        before = torch.cuda.memory_allocated()
+        for tokens in (4, 128, 1536, 1537):
+            for ready in (False, True):
+                for choice in (None, False, True):
+                    binding = _bind(
+                        plan,
+                        x[:tokens],
+                        ids[:tokens],
+                        wts[:tokens],
+                        output[:tokens],
+                        scratch,
+                        a4_prefill=choice,
+                        scales_expanded=ready,
+                    )
+                    uses_expanded = moe.uses_expanded_nvfp4_scales(
+                        plan,
+                        num_tokens=tokens,
+                        a4_prefill=choice,
+                        scales_expanded=ready,
+                    )
+                    launch = binding.a4_prefill_launches
+                    if choice is True:
+                        assert launch is not None
+                        expected = ready and tokens > 1536
+                        assert (launch.csf_inline_words is None) is expected
+                    else:
+                        assert launch is None
+                        expected = tokens != 4
+                    assert uses_expanded is expected, (tokens, ready, choice)
+        assert torch.cuda.memory_allocated() == before
+
+
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA devices")
 def test_a4_prefill_launchers_are_owned_by_each_device(monkeypatch):
     from b12x.moe import fused_moe as moe
@@ -631,13 +686,21 @@ def test_a4_prefill_graph_replay_reuses_launches(terms, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "inline_words,terms,capacity,warps",
-    [(0, 1, 320, 8), (0, 1, 3072, 8), (4, 2, 3072, 8), (64, 1, 3072, 16)],
+    "inline_words,terms,capacity,warps,tokens,ready",
+    [
+        (0, 1, 320, 8, 131, False),
+        (0, 1, 3072, 8, 131, False),
+        (4, 2, 3072, 8, 131, False),
+        (64, 1, 3072, 16, 131, False),
+        (4, 1, 3072, 8, 131, True),
+        (4, 1, 3072, 8, 1537, False),
+        (4, 1, 3072, 8, 1537, True),
+    ],
 )
-def test_a4_csf_stage_reads_preserve_dense_graph_output(
-    inline_words, terms, capacity, warps, monkeypatch
+def test_a4_csf_scale_readers_preserve_dense_graph_output(
+    inline_words, terms, capacity, warps, tokens, ready, monkeypatch
 ):
-    """Compressed A4 stages preserve arithmetic without touching expanded scales."""
+    """Both CSF readers preserve dense arithmetic and caller expansion ordering."""
     import numpy as np
 
     from b12x._lib.quant.nvfp4_csf import Nvfp4CsfDecoder
@@ -672,7 +735,7 @@ def test_a4_csf_stage_reads_preserve_dense_graph_output(
     a1g = torch.linspace(800, 1100, E, device=device)
     a2g = torch.linspace(24, 56, E, device=device)
     owners = [_prepare(case, a1g, a2g, csf=csf) for csf in (False, True)]
-    x, ids, wts = _inputs(131, 51)
+    x, ids, wts = _inputs(tokens, 51)
     bindings, outputs, scratches = [], [], []
     for owner in owners:
         plan = _plan(owner, capacity)
@@ -681,24 +744,37 @@ def test_a4_csf_stage_reads_preserve_dense_graph_output(
             for s in plan.scratch_specs()
         )
         output = torch.empty_like(x)
-        binding = _bind(plan, x, ids, wts, output, scratch, a4_prefill=True)
+        binding = _bind(
+            plan,
+            x,
+            ids,
+            wts,
+            output,
+            scratch,
+            a4_prefill=True,
+            scales_expanded=ready,
+        )
         bindings.append(binding)
         outputs.append(output)
         scratches.append(scratch)
     launches = [binding.a4_prefill_launches for binding in bindings]
     assert launches[0].csf_inline_words is None
-    assert launches[1].csf_inline_words == inline_words
-    assert launches[0].fc1 is not launches[1].fc1
-    assert launches[0].fc2 is not launches[1].fc2
+    consumes_expanded = ready and tokens > 1536
+    assert launches[1].csf_inline_words == (None if consumes_expanded else inline_words)
+    if not consumes_expanded:
+        assert launches[0].fc1 is not launches[1].fc1
+        assert launches[0].fc2 is not launches[1].fc2
     expanded = owners[1]._impl.w4a16_expanded
     scale_scratch = (expanded.w13_scale, expanded.w2_scale)
 
     def reject_expansion(*args, **kwargs):
-        raise AssertionError("A4 CSF stages must not expand global scale scratch")
+        raise AssertionError("A4 must use compressed stages or caller-expanded scales")
 
     monkeypatch.setattr(Nvfp4CsfDecoder, "decode", reject_expansion)
     for buffer in scale_scratch:
         buffer.view(torch.uint8).fill_(0x7F)
+    if consumes_expanded:
+        assert moe.expand_scales(owners[1])
     for binding in bindings:
         moe.run(binding=binding)
     torch.cuda.synchronize()
@@ -708,7 +784,7 @@ def test_a4_csf_stage_reads_preserve_dense_graph_output(
     stable = (*scratches[1], *scale_scratch, outputs[1])
     pointers = tuple(t.data_ptr() for t in stable)
     try:
-        with kernel_resolution_guard("A4 CSF prepared stages"):
+        with kernel_resolution_guard("A4 CSF prepared readers"):
             with torch.cuda.graph(graph):
                 moe.run(binding=bindings[1])
             for seed in (61, 62):
@@ -718,6 +794,8 @@ def test_a4_csf_stage_reads_preserve_dense_graph_output(
                 moe.run(binding=bindings[0])
                 for buffer in (*scratches[1], *scale_scratch):
                     buffer.view(torch.uint8).fill_(0x7F)
+                if consumes_expanded:
+                    assert moe.expand_scales(owners[1])
                 outputs[1].fill_(float("nan"))
                 torch.cuda.synchronize()
                 allocated = torch.cuda.memory_allocated()
@@ -728,9 +806,10 @@ def test_a4_csf_stage_reads_preserve_dense_graph_output(
                 assert torch.cuda.max_memory_allocated() == allocated
                 assert pointers == tuple(t.data_ptr() for t in stable)
                 torch.testing.assert_close(outputs[1], outputs[0], rtol=0, atol=0)
-                assert all(
-                    torch.all(buffer.view(torch.uint8) == 0x7F)
-                    for buffer in scale_scratch
-                )
+                if not consumes_expanded:
+                    assert all(
+                        torch.all(buffer.view(torch.uint8) == 0x7F)
+                        for buffer in scale_scratch
+                    )
     finally:
         graph.reset()

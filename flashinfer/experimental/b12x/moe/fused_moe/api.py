@@ -222,6 +222,7 @@ def uses_expanded_nvfp4_scales(
     route_ids_dtype: torch.dtype = torch.int32,
     has_route_map: bool = False,
     collect_activation_amax: bool = False,
+    scales_expanded: bool = False,
 ) -> bool:
     """Whether a prepared invocation consumes the shared NVFP4-CSF expansion.
 
@@ -229,6 +230,10 @@ def uses_expanded_nvfp4_scales(
     and scale-consumer selection as binding. It does not prepare a plan or
     launch GPU work. A caller may skip scale prefetch when it returns False.
     Route mappings and activation calibration must describe the later bind.
+    ``scales_expanded=True`` queries a call whose scale expansion is already
+    ordered before execution, or a prospective call for which the caller will
+    arrange that ordering. Large eligible A4 calls can then consume the shared
+    expansion instead of decoding scale tiles in shared memory.
     """
     if getattr(plan, "_prepared", None) is None:
         raise RuntimeError("scale-consumer queries require a prepared MoE plan")
@@ -240,6 +245,7 @@ def uses_expanded_nvfp4_scales(
             route_ids_dtype=route_ids_dtype,
             has_route_map=has_route_map,
             collect_activation_amax=collect_activation_amax,
+            scales_expanded=scales_expanded,
         )
     return state.uses_expanded_nvfp4_scales(
         num_tokens=num_tokens,
@@ -247,6 +253,7 @@ def uses_expanded_nvfp4_scales(
         route_ids_dtype=route_ids_dtype,
         has_route_map=has_route_map,
         collect_activation_amax=collect_activation_amax,
+        scales_expanded=scales_expanded,
     )
 
 

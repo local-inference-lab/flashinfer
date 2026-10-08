@@ -39,17 +39,30 @@ selected stage-decoding launches bypass full expansion into global scratch.
 Other consumers can still require that scratch; selecting an in-kernel
 decoder does not remove the shared allocation from the prepared owner.
 
+Plans also prepare dense A4 scale consumers when their capacity exceeds
+`B12X_W4A16_CSF_STAGE_MAX_TOKENS` (default `1536`). A call with more live rows
+than this limit selects those consumers only with `scales_expanded=True`.
+The caller must have expanded this layer's scales and ordered that expansion
+before the call, after the previous use of shared scale scratch. Calls at or
+below the limit, and calls without ready expanded scales, retain stage
+decoding. This size policy selects the scale consumer; precision remains
+controlled by `a4_prefill`.
+
 `uses_expanded_nvfp4_scales(plan, num_tokens=..., a4_prefill=...,
-route_ids_dtype=...)` reports whether the selected call reads expanded
+route_ids_dtype=..., scales_expanded=...)` reports whether the selected call reads expanded
 NVFP4-CSF scales. It requires a prepared execution plan and performs no GPU
 work. Serving integrations can omit scale prefetch when every following-layer
-span uses a compressed-scale reader. Outstanding writes to shared scale
-scratch still require synchronization before reusing that scratch.
+span uses a compressed-scale reader. To decide whether to prefetch, query
+the following layer's spans with prospective `scales_expanded=True`; pass
+True to the execution binding only after arranging the corresponding stream
+ordering. CUDA graph calls without external scale preparation use the default
+False and retain stage decoding. Outstanding writes to shared scale scratch
+still require synchronization before reusing that scratch.
 
 `B12X_W4A16_A4_PREFILL_TERMS=1` uses one NVFP4 activation plane. A value of `2`
 adds an independently quantized residual plane. `B12X_W4A16_A4_PREFILL_WARPS`
 accepts `8` (default) or `16`. These controls and the capability flag are immutable
-execution-plan inputs and are part of tuning query schema 24. Changing the
+execution-plan inputs and are part of tuning query schema 25. Changing the
 environment requires preparing another execution plan. Kernel compilation
 retains device-owned callables; replay performs no compilation or tensor
 allocation. A4 always applies router weights in the FP32 final sum. Set
