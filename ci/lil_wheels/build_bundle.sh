@@ -75,8 +75,10 @@ docker buildx build \
 cp -a "${output_dir}/raw/wheels/." "${output_dir}/bundle/wheels/"
 python_wheel=$(find "${output_dir}/bundle/wheels" -maxdepth 1 -name 'flashinfer_python-*.whl' -print -quit)
 jit_wheel=$(find "${output_dir}/bundle/wheels" -maxdepth 1 -name 'flashinfer_jit_cache-*.whl' -print -quit)
+provider_wheel=$(find "${output_dir}/bundle/wheels" -maxdepth 1 -name 'flashinfer_jit_cache_sm120f-*.whl' -print -quit)
 test -n "${python_wheel}"
 test -n "${jit_wheel}"
+test -n "${provider_wheel}"
 
 wheel_metadata() {
   python3 - "$1" "$2" <<'PY'
@@ -102,6 +104,8 @@ test "$(wheel_metadata "${python_wheel}" Name)" = flashinfer-python
 test "$(wheel_metadata "${python_wheel}" Version)" = "${package_version}"
 test "$(wheel_metadata "${jit_wheel}" Name)" = flashinfer-jit-cache
 test "$(wheel_metadata "${jit_wheel}" Version)" = "${package_version}"
+test "$(wheel_metadata "${provider_wheel}" Name)" = flashinfer-jit-cache-sm120f
+test "$(wheel_metadata "${provider_wheel}" Version)" = "${package_version}"
 
 packages_json='[]'
 requirements="${output_dir}/bundle/requirements-github.txt"

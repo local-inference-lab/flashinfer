@@ -55,9 +55,13 @@ def verify_release(
 
     packages = manifest["packages"]
     package_files = {package["file"] for package in packages}
-    if len(packages) != 2 or len(package_files) != 2:
-        raise ValueError("manifest must declare exactly two package files")
-    for prefix in ("flashinfer_python-", "flashinfer_jit_cache-"):
+    if len(packages) != 3 or len(package_files) != 3:
+        raise ValueError("manifest must declare exactly three package files")
+    for prefix in (
+        "flashinfer_python-",
+        "flashinfer_jit_cache-",
+        "flashinfer_jit_cache_sm120f-",
+    ):
         matches = [name for name in package_files if name.startswith(prefix)]
         if (
             len(matches) != 1

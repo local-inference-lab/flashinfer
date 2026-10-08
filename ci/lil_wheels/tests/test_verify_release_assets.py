@@ -20,8 +20,11 @@ def digest(payload: bytes) -> str:
 
 def write_release(directory: Path, promotion: bool = False) -> None:
     wheels = {
-        "flashinfer_python-0.6.18-py3-none-any.whl": b"python wheel",
-        "flashinfer_jit_cache-0.6.18-py3-none-any.whl": b"jit wheel",
+        "flashinfer_python-0.7.1-py3-none-any.whl": b"python wheel",
+        "flashinfer_jit_cache-0.7.1-py3-none-any.whl": b"jit wheel",
+        "flashinfer_jit_cache_sm120f-0.7.1-py3-none-manylinux_2_28_x86_64.whl": (
+            b"provider wheel"
+        ),
     }
     for name, payload in wheels.items():
         (directory / name).write_bytes(payload)
@@ -100,10 +103,22 @@ def test_accepts_complete_stable_promotion(tmp_path):
 @pytest.mark.parametrize(
     "names",
     [
-        ["install.sh", "runtime.lock"],
-        ["flashinfer_python-a.whl", "flashinfer_python-b.whl"],
-        ["flashinfer_python-a.txt", "flashinfer_jit_cache-a.whl"],
-        ["flashinfer_python-../a.whl", "flashinfer_jit_cache-a.whl"],
+        ["install.sh", "runtime.lock", "manifest.json"],
+        [
+            "flashinfer_python-a.whl",
+            "flashinfer_python-b.whl",
+            "flashinfer_jit_cache_sm120f-a.whl",
+        ],
+        [
+            "flashinfer_python-a.txt",
+            "flashinfer_jit_cache-a.whl",
+            "flashinfer_jit_cache_sm120f-a.whl",
+        ],
+        [
+            "flashinfer_python-../a.whl",
+            "flashinfer_jit_cache-a.whl",
+            "flashinfer_jit_cache_sm120f-a.whl",
+        ],
     ],
 )
 def test_rejects_nonwheel_package_inventory(tmp_path, names):

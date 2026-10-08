@@ -83,10 +83,17 @@ RUN --mount=type=cache,id=lil-flashinfer-aot-cu134-sm120f${CACHE_PLATFORM},targe
     MAX_JOBS="${MAX_JOBS}" \
     FLASHINFER_NVCC_THREADS="${NVCC_THREADS}" \
     NVCC_THREADS="${NVCC_THREADS}" \
+    FLASHINFER_JIT_CACHE_PROVIDER_ARCH="${FLASHINFER_CUDA_ARCH_LIST}" \
+    python -m pip wheel --no-build-isolation --no-deps \
+      --wheel-dir /wheelhouse ./flashinfer-jit-cache-provider \
+ && FLASHINFER_LOCAL_VERSION="${FLASHINFER_LOCAL_VERSION}" \
+    SOURCE_DATE_EPOCH="${FLASHINFER_SOURCE_DATE_EPOCH}" \
+    FLASHINFER_JIT_CACHE_PROVIDER_ARCHS="${FLASHINFER_CUDA_ARCH_LIST}" \
     python -m pip wheel --no-build-isolation --no-deps \
       --wheel-dir /wheelhouse ./flashinfer-jit-cache \
  && test "$(find /wheelhouse -maxdepth 1 -name 'flashinfer_python-*.whl' | wc -l)" -eq 1 \
- && test "$(find /wheelhouse -maxdepth 1 -name 'flashinfer_jit_cache-*.whl' | wc -l)" -eq 1
+ && test "$(find /wheelhouse -maxdepth 1 -name 'flashinfer_jit_cache-*.whl' | wc -l)" -eq 1 \
+ && test "$(find /wheelhouse -maxdepth 1 -name 'flashinfer_jit_cache_sm120f-*.whl' | wc -l)" -eq 1
 
 FROM build AS validate
 
@@ -115,6 +122,8 @@ assert flashinfer_jit_cache.__version__ == expected_version
 assert flashinfer_jit_cache.__git_version__ == expected_commit
 assert importlib.metadata.version("flashinfer-python") == expected_version
 assert importlib.metadata.version("flashinfer-jit-cache") == expected_version
+# The jit-cache shim names one SM120 provider wheel holding the AOT modules.
+assert importlib.metadata.version("flashinfer-jit-cache-sm120f") == expected_version
 # B12X ships inside FlashInfer: the experimental implementation and the
 # top-level `b12x` import package that loads it.
 (python_wheel,) = Path("/wheelhouse").glob("flashinfer_python-*.whl")
