@@ -58,6 +58,54 @@ def test_sm12x_default_backend_by_row_capacity(capability, max_tokens, backend) 
     assert TUNING.configure(query, device=device).default.backend == backend
 
 
+
+def _synthetic(capability):
+    return DeviceIdentity(
+        vendor="nvidia",
+        compute_capability=capability,
+        sm_count=48,
+        product_name="Synthetic GPU",
+    )
+
+
+def _query(max_tokens):
+    return projection.Bf16VocabProjectionQuery(
+        dtype="bfloat16",
+        max_tokens=max_tokens,
+        in_features=2_560,
+        out_features=248_320,
+    )
+
+
+def _backend_choices(query, capability) -> set[str]:
+    space = TUNING.parameter_space(query, _synthetic(capability))
+    for knob in space.knobs:
+        if knob.name == "backend":
+            return set(knob.values)
+    raise AssertionError("backend knob missing from the parameter space")
+
+
+def test_cute_candidate_offered_only_on_sm12x() -> None:
+    query = _query(max_tokens=4)
+
+    assert "cute" not in _backend_choices(query, (9, 0))
+    assert "cute" not in _backend_choices(query, (10, 0))
+    assert "cute" in _backend_choices(query, (12, 1))
+    assert "cute" in _backend_choices(query, (12, 0))
+
+
+def test_cute_override_rejected_outside_sm12x() -> None:
+    config = projection.Bf16VocabProjectionConfig(
+        backend="cute", algorithm="simt", block_k=0, num_warps=0
+    )
+
+    with pytest.raises(ValueError, match="SM120 and SM121"):
+        TUNING.configure(_query(4), device=_synthetic((9, 0)), override=config)
+
+    # Declaration-time validation has no device identity and stays permissive.
+    TUNING.validate_config(_query(4), config, None)
+    assert TUNING.configure(_query(4), device=_synthetic((12, 1)), override=config).pinned == config
+
 @cuda_required
 @pytest.mark.parametrize("rows", [1, 3, 8])
 def test_cute_projection_serves_fewer_rows_than_prepared_in_graph(rows) -> None:

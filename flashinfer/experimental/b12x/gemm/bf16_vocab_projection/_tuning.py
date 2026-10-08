@@ -27,6 +27,9 @@ _ALGORITHMS = {"torch": ("torch",), "triton": ("row", "loop"), "cute": ("simt",)
 # RTX 5090 (12, 0): SIMT wins at 2 rows, ties at 4 and loses at 8, so wider
 # capacities keep cuBLAS unless autotuning measures otherwise.
 _DEFAULT_CUTE_TOKENS = {(12, 0): 2, (12, 1): MAX_CUTE_TOKENS}
+# The bf16 GEMV CuTe kernel targets the SM120/SM121 family only; other
+# devices must not see it in the candidate space or pass an override to it.
+_CUTE_CAPABILITIES = frozenset(_DEFAULT_CUTE_TOKENS)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -128,7 +131,7 @@ def _validate_query(
 def _validate_config(
     query: Bf16VocabProjectionQuery,
     config: Bf16VocabProjectionConfig,
-    _device: DeviceIdentity | None,
+    device: DeviceIdentity | None,
 ) -> None:
     if not isinstance(config, Bf16VocabProjectionConfig):
         raise TypeError("config must be Bf16VocabProjectionConfig")
@@ -139,6 +142,11 @@ def _validate_config(
     if config.backend == "cute":
         if (config.algorithm, config.block_k, config.num_warps) != ("simt", 0, 0):
             raise ValueError("CuTe projection configs select only the SIMT GEMV")
+        if device is not None and device.compute_capability not in _CUTE_CAPABILITIES:
+            raise ValueError(
+                "the CuTe vocabulary GEMV supports only SM120 and SM121 "
+                f"(device is sm_{device.compute_capability[0]}{device.compute_capability[1]})"
+            )
         if query.max_tokens > MAX_CUTE_TOKENS:
             raise ValueError(
                 f"the CuTe vocabulary GEMV supports max_tokens <= {MAX_CUTE_TOKENS}"
@@ -179,7 +187,11 @@ def _tuning_parameters(query, device):
     backends = ["torch"]
     if query.max_tokens == 1 and query.in_features <= MAX_IN_FEATURES:
         backends.append("triton")
-    if query.max_tokens <= MAX_CUTE_TOKENS:
+    if (
+        device is not None
+        and device.compute_capability in _CUTE_CAPABILITIES
+        and query.max_tokens <= MAX_CUTE_TOKENS
+    ):
         backends.append("cute")
     return ParameterSpace.create(
         TUNING.knobs,
