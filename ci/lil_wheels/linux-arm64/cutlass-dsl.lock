@@ -1,0 +1,27 @@
+# CUTLASS DSL 4.7.1 for the wheel builder, which ships 4.6.2 (NGC PyTorch 26.08).
+# Hashes match blackwell-llm-docker's runtime lock (qwen38-runtime.lock).
+nvidia-cutlass-dsl==4.7.1 \
+    --hash=sha256:765850c74868a0b5a02fefbfc1b380842b64e5f7a1c8b1655e322a3b14c01726
+nvidia-cutlass-dsl-libs-base==4.7.1 \
+    --hash=sha256:06658e691eb1047c83be48ba501bf73f2ea7ecdd8c1ee5f9f26db587908e43ed \
+    --hash=sha256:36192b4d0f72c4f47b39def20f4fda71058005617b7204395570768827524982 \
+    --hash=sha256:d01420777ac1ff22ee0c7842b6779fa58271b37c9a57cbd0bfff3eea932d35c7 \
+    --hash=sha256:93880e666f17513d5878f3b2ee76e9177a0acd59673dd27cb2c34dbdf5fe89f0 \
+    --hash=sha256:298e73ad0f1b0484e4b8438e9daae38732a6cadc9f4023475e5b0c2868985aba \
+    --hash=sha256:e86c55a5010a7edfc067648a75cb29d0c5bd67d75210168cf507b0d0e4d15ba7
+nvidia-cutlass-dsl-libs-core==4.7.1 \
+    --hash=sha256:c65662abc9ab18fd997c57547895736928e559f4624bbe2aa1aa91418ea014ca
+nvidia-cutlass-dsl-libs-cu12==4.7.1 \
+    --hash=sha256:d3708b78b9b70dc1b29c9a48a7030d14a1a8c17b52f3f2d088db3d73c603bec8 \
+    --hash=sha256:5c1087e1d514b4afcaea9296e5f19c8e678aba93ee485e56f681fa7169e7a861 \
+    --hash=sha256:49d556f2be188d75810fa8c547ad15dba40685138ac27d5441844182ac4955a9 \
+    --hash=sha256:77684a86191195b2d6eb5f7088bb9bf25e45db58ceb44a9c02ffb0787bb95fb9 \
+    --hash=sha256:f5ab528aeb4548261fab7f393f2d119909f792c7165c986e98479ce2345a125d \
+    --hash=sha256:f57a3955c17b7dcd5472aa47c46513e5f3914e1325fc308afca1b9063a8f897b
+nvidia-cutlass-dsl-libs-cu13==4.7.1 \
+    --hash=sha256:e675bf04dc6c91f7c4d5540699b7a031f2b8b44cd2687b32c20892f112f7e0d9 \
+    --hash=sha256:a1d23cef44675e63825c3f5d773e7b4228802ca155eab61c0bc5e551caf35ad2 \
+    --hash=sha256:990baa4dc8b6b0c7710afc89411e8eb05099a4c9bd01162bcbd365bd876edf59 \
+    --hash=sha256:425676733c1a1751e5fd4fc4ddd4ec6fbe6760d631ce12ed287dd63cf8c3646e \
+    --hash=sha256:4474ca7a9ea274f2977ee6fca7618c7611fcbad25bcdf756770458c8ad6a84a2 \
+    --hash=sha256:7aaf4380a338ae36c53512f66b89470de6ee1f04f38163a89cd25e6dee92fe87
