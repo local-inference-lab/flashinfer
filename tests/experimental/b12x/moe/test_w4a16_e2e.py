@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import ExitStack
+from inspect import signature
 import pytest
 import torch
 
@@ -12,13 +13,10 @@ from b12x._lib.intrinsics import (
 )
 from b12x._lib.runtime_control import kernel_resolution_guard
 from b12x.moe.fused_moe._impl import (
-    plan_b12x_fp4_moe_weights,
     prewarm_w4a16_fc2_e8m0,
     prepare_w4a16_fc2_e8m0,
-    prepare_b12x_fp4_moe_weights,
     run_w4a16_fc2_e8m0,
 )
-from b12x.moe._shared.execution import PreparedWeightLayout
 from b12x.moe._shared.kernels.reference import (
     moe_reference_nvfp4,
     moe_reference_w4a16_f32,
@@ -47,6 +45,7 @@ from b12x.moe._shared.kernels.w4a16.prepare import (
     prepare_w4a16_modelopt_nvfp4_weights as prepare_w4a16_weights,
     prepare_w4a16_packed_weights,
 )
+from b12x.moe._shared.kernels.w4a16.route_pack import compile_w4a16_route_pack_launches
 from b12x.testing.reference.helpers import (
     make_tp_moe_fp4_binding,
     prepare_tp_moe_fp4_experts,
@@ -242,6 +241,135 @@ def test_w4a16_prefill_reduction_prepared_capacity_and_graph(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("intermediate,capacity", [(144, 4), (352, 4), (192, 16)])
+@pytest.mark.parametrize("activation", ["relu2", "silu"])
+@pytest.mark.parametrize("ids_dtype", [torch.int32, torch.int64])
+def test_w4a16_modelopt_capacity_reuses_prepared_launches(
+    intermediate, capacity, activation, ids_dtype
+):
+    from b12x._lib.compile_plan import program_keys
+    from b12x.moe import fused_moe
+    from b12x.preparation import PreparationSession, PreparedCall
+    from b12x.preparation.types import require_prepared
+
+    torch.manual_seed(7192)
+    experts, hidden, topk = 8, 128, 2
+    x = (torch.randn(capacity, hidden, device="cuda") * 0.125).to(torch.bfloat16)
+    ids = torch.randint(experts, (capacity, topk), device="cuda", dtype=ids_dtype)
+    weights = torch.softmax(torch.randn(capacity, topk, device="cuda"), dim=-1)
+    raw = _make_weights(
+        experts=experts,
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+        activation=activation,
+    )
+    weight_plan = fused_moe.plan_weights(
+        source=fused_moe.PackedSource(
+            format=fused_moe.PackedSourceFormat("modelopt_nvfp4")
+        ),
+        activation=fused_moe.ActivationSpec(
+            mode=fused_moe.ActivationMode.A4,
+            a16_max_tokens=capacity,
+            nonlinearity=activation,
+            io_dtype=x.dtype,
+        ),
+        geometry=fused_moe.MoEGeometry(
+            num_experts=experts,
+            hidden_size=hidden,
+            intermediate_size=intermediate,
+        ),
+    )
+    prepared = fused_moe.prepare_weights(
+        plan=weight_plan,
+        weights=fused_moe.PackedWeights(
+            input_scale=torch.ones(experts, device="cuda"),
+            intermediate_scale=torch.ones(experts, device="cuda"),
+            w13=raw[0].clone(),
+            w13_block_scales=raw[1].clone(),
+            w13_global_scales=raw[2].clone(),
+            w2=raw[3].clone(),
+            w2_block_scales=raw[4].clone(),
+            w2_global_scales=raw[5].clone(),
+        ),
+    )
+    plan = fused_moe.plan_execution(
+        experts=prepared,
+        capacity=fused_moe.ExecutionCapacity(max_tokens=capacity, top_k=topk),
+        routing=fused_moe.RoutingSpec(),
+    )
+    output = torch.empty_like(x)
+
+    def allocate(state):
+        return tuple(
+            torch.empty(s.shape, dtype=s.dtype, device=s.device)
+            for s in state.scratch.scratch_specs()
+        )
+
+    def bind(state, scratch, rows):
+        return state.bind(
+            scratch=scratch,
+            a=x[:rows],
+            experts=prepared,
+            topk_weights=weights[:rows],
+            topk_ids=ids[:rows],
+            output=output[:rows],
+        )
+
+    def primer(state):
+        scratch = allocate(state)
+        binding = bind(state, scratch, capacity)
+        return PreparedCall(run=lambda: state.run(binding), owners=scratch)
+
+    def expected(rows):
+        return _reference_w4a16(
+            x[:rows], *raw, ids[:rows], weights[:rows], activation=activation
+        )
+
+    with PreparationSession(device=x.device, autotune=False) as session:
+        request = plan.request(name="modelopt-capacity", prepare_call=primer)
+        session.prepare((request,))
+        state = require_prepared(request.plan, "moe.decode")
+        direct = capacity <= _W4A16_SMALL_M_DIRECT_MAX_M
+        if direct:
+            native_programs = set(program_keys(state.w4a16_launches.native_direct))
+            assert len(native_programs) == 2 * capacity
+            assert native_programs <= set(program_keys(state.launchers))
+        else:
+            assert state.w4a16_launches.route_mode == "packed"
+            assert state.w4a16_launches.native_direct is None
+        scratch = allocate(state)
+        pointers = tuple(t.data_ptr() for t in (*scratch, output))
+        for rows in (1, 3, capacity, 2):
+            oracle = expected(rows)
+            with kernel_resolution_guard():
+                binding = bind(state, scratch, rows)
+                actual = binding.run()
+            assert binding.quant_mode == "w4a16"
+            if direct:
+                assert any(
+                    launch.m == rows and launch.topk_ids_dtype == ids_dtype
+                    for launch in binding.fused_launch.small_m_direct_launches
+                )
+            else:
+                assert binding.fused_launch is state.w4a16_launches.packed
+            assert actual.data_ptr() == output.data_ptr()
+            _assert_matches_oracle(actual, oracle, activation=activation)
+        graph = torch.cuda.CUDAGraph()
+        with session.capture(), torch.cuda.graph(graph):
+            captured = binding.run()
+        for factor in (-0.5, 2.0):
+            x.mul_(factor)
+            oracle = expected(2)
+            before = torch.cuda.memory_allocated()
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.cuda.memory_allocated() == before
+            assert pointers == tuple(t.data_ptr() for t in (*scratch, output))
+            _assert_matches_oracle(captured, oracle, activation=activation)
+        del graph
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("tokens", [70, 300])
 def test_w4a16_skipped_empty_row_blocks_are_bit_identical(tokens, monkeypatch):
     """Large-M route blocks skip the MMAs of 16-row blocks without live routes.
@@ -414,7 +542,8 @@ def test_w4a16_small_m_direct_barrier_modes_eager_and_graph(
         w2_blockscale=w2_blockscale,
         w2_alphas=w2_global_scale,
         activation=activation,
-        quant_mode="w4a16",
+        quant_mode="nvfp4",
+        a16_max_tokens=m,
     )
     prepared = expert_weights._impl.representation_for("w4a16")
     assert prepared.weight_layout == "modelopt"
@@ -455,10 +584,12 @@ def test_w4a16_small_m_direct_barrier_modes_eager_and_graph(
             experts=expert_weights,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
-            quant_mode="w4a16",
+            quant_mode="nvfp4",
             output=torch.empty_like(x),
         )
     )
+    assert binding.quant_mode == "w4a16"
+    direct_launches = 0
     expected = _reference_w4a16(
         x,
         *weights,
@@ -1191,6 +1322,17 @@ def test_w4a16_packed_runtime_expert_count_reuses_compiled_kernel(
             force_tile_config=(64, 128, 64, 128),
         )
         assert fused_launch.num_experts == experts
+        route_pack_launches = (
+            None
+            if tc_decode
+            else compile_w4a16_route_pack_launches(
+                tokens=m,
+                topk=topk,
+                block_size=fused_launch.moe_block_size,
+                num_experts=experts,
+                ordinal=device.index,
+            )
+        )
         topk_sum_launch = (
             None
             if tc_decode
@@ -1218,6 +1360,7 @@ def test_w4a16_packed_runtime_expert_count_reuses_compiled_kernel(
             expert_offsets=buffers.expert_offsets,
             fused_launch=fused_launch,
             topk_sum_launch=topk_sum_launch,
+            route_pack_launches=route_pack_launches,
         ).clone()
         expected = moe_reference_w4a16_fp4_e8m0_k32(
             x,
@@ -2028,7 +2171,8 @@ def test_w4a16_modelopt_direct_replay_ignores_stale_swizzle_tail(
     direct_launches: list[tuple[int, int]] = []
 
     def spy_direct_launch(*args, **kwargs) -> None:
-        direct_launches.append((int(kwargs["m"]), int(kwargs["intermediate_size"])))
+        arguments = signature(real_direct_launch).bind(*args, **kwargs).arguments
+        direct_launches.append((arguments["m"], arguments["intermediate_size"]))
         real_direct_launch(*args, **kwargs)
 
     monkeypatch.setattr(
@@ -2072,14 +2216,18 @@ def test_w4a16_modelopt_direct_replay_ignores_stale_swizzle_tail(
         w2_blockscale=w2_blockscale,
         w2_alphas=w2_global_scale,
         activation=activation,
-        quant_mode="w4a16",
+        quant_mode="nvfp4",
+        a16_max_tokens=m,
     )
     prepared_w4a16 = w4a16_experts._impl.representation_for("w4a16")
     assert prepared_w4a16.weight_layout == "modelopt"
     micro_w13_scale = prepared_w4a16.micro_w13_scale
     assert micro_w13_scale is not None
-    assert micro_w13_scale.data_ptr() == w13_blockscale.data_ptr()
-    assert prepared_w4a16.micro_w2_scale.data_ptr() == w2_blockscale.data_ptr()
+    assert micro_w13_scale.data_ptr() == w4a16_experts._impl.w1_blockscale.data_ptr()
+    assert (
+        prepared_w4a16.micro_w2_scale.data_ptr()
+        == w4a16_experts._impl.w2_blockscale.data_ptr()
+    )
     assert _small_m_direct_supported(
         m=m,
         hidden_size=hidden_size,
@@ -2108,9 +2256,11 @@ def test_w4a16_modelopt_direct_replay_ignores_stale_swizzle_tail(
                 dtype=x.dtype,
                 device=x.device,
             ),
-            quant_mode="w4a16",
+            quant_mode="nvfp4",
         )
     )
+    assert binding.quant_mode == "w4a16"
+    direct_launches.clear()
     expected = moe_reference_w4a16_f32(
         x,
         w13,
@@ -2197,7 +2347,8 @@ def test_w4a16_modelopt_direct_non64_intermediate_is_bounds_safe(
     direct_launches: list[tuple[int, int]] = []
 
     def spy_direct_launch(*args, **kwargs) -> None:
-        direct_launches.append((int(kwargs["m"]), int(kwargs["intermediate_size"])))
+        arguments = signature(real_direct_launch).bind(*args, **kwargs).arguments
+        direct_launches.append((arguments["m"], arguments["intermediate_size"]))
         real_direct_launch(*args, **kwargs)
 
     monkeypatch.setattr(
@@ -2254,7 +2405,8 @@ def test_w4a16_modelopt_direct_non64_intermediate_is_bounds_safe(
         w2_blockscale=w2_blockscale,
         w2_alphas=w2_global_scale,
         activation=activation,
-        quant_mode="w4a16",
+        quant_mode="nvfp4",
+        a16_max_tokens=m,
     )
     prepared = experts_w4a16._impl.representation_for("w4a16")
     assert prepared.weight_layout == "modelopt"
@@ -2282,9 +2434,11 @@ def test_w4a16_modelopt_direct_non64_intermediate_is_bounds_safe(
             experts=experts_w4a16,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
-            quant_mode="w4a16",
+            quant_mode="nvfp4",
         )
     )
+    assert binding.quant_mode == "w4a16"
+    direct_launches.clear()
     expected = moe_reference_w4a16_f32(
         x,
         w13,
@@ -3159,29 +3313,7 @@ def test_tp_moe_w4a16_prepared_reuse_path_is_deterministic_under_odd_shape_stres
     reference_weights = tuple(t.clone() for t in weights)
     w13, w13_blockscale, w13_global_scale, w2, w2_blockscale, w2_global_scale = weights
     a_gscale = torch.ones(experts, dtype=torch.float32, device="cuda")
-    weight_plan = plan_b12x_fp4_moe_weights(
-        quant_modes="w4a16",
-        source_format="modelopt_nvfp4",
-        activation=activation,
-        params_dtype=torch.bfloat16,
-        num_experts=experts,
-        hidden_size=hidden_size,
-        intermediate_size=intermediate_size,
-        w4a16_layout=PreparedWeightLayout.MMA_PACKED,
-    )
-    prepared = prepare_b12x_fp4_moe_weights(
-        plan=weight_plan,
-        w1_fp4=w13,
-        w1_blockscale=w13_blockscale,
-        w1_global_scale=w13_global_scale,
-        a1_gscale=a_gscale,
-        w2_fp4=w2,
-        w2_blockscale=w2_blockscale,
-        w2_global_scale=w2_global_scale,
-        a2_gscale=a_gscale,
-        params_dtype=torch.bfloat16,
-    )
-    assert prepared.representation_for("w4a16") is not None
+    prepared = None
 
     cases = [
         (1, 1, 1, torch.int32, 0.25),
@@ -3197,6 +3329,21 @@ def test_tp_moe_w4a16_prepared_reuse_path_is_deterministic_under_odd_shape_stres
         x = (torch.randn(m, hidden_size, device="cuda") * input_scale).to(
             torch.bfloat16
         )
+        if prepared is None:
+            prepared = prepare_tp_moe_fp4_experts(
+                a=x,
+                a1_gscale=a_gscale,
+                w1_fp4=w13,
+                w1_blockscale=w13_blockscale,
+                w1_alphas=w13_global_scale,
+                a2_gscale=a_gscale,
+                w2_fp4=w2,
+                w2_blockscale=w2_blockscale,
+                w2_alphas=w2_global_scale,
+                activation=activation,
+                quant_mode="w4a16",
+            )
+            assert prepared._impl.representation_for("w4a16").weight_layout == "packed"
         topk_ids = torch.randint(
             0,
             experts,
@@ -3537,6 +3684,13 @@ def test_w4a16_preplanned_capacity_launch_accepts_smaller_live_m() -> None:
         hidden_size=hidden_size,
         element_dtype="bf16",
     )
+    route_pack_launches = compile_w4a16_route_pack_launches(
+        tokens=capacity_m,
+        topk=topk,
+        block_size=block_size_m,
+        num_experts=experts,
+        ordinal=x.device.index,
+    )
     output = torch.empty_like(x)
 
     def _run(output_buffer: torch.Tensor) -> torch.Tensor:
@@ -3559,6 +3713,7 @@ def test_w4a16_preplanned_capacity_launch_accepts_smaller_live_m() -> None:
             expert_counts=buffers.expert_counts,
             fused_launch=fused_launch,
             topk_sum_launch=topk_sum_launch,
+            route_pack_launches=route_pack_launches,
         )
 
     actual = _run(output)

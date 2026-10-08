@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+from contextlib import ExitStack
 import os
 import socket
 
@@ -15,6 +16,13 @@ from b12x.comm.pcie.pcie_oneshot import (
     PCIeOneshotAllReducePool,
     _tp2_plain_remote_push_enabled,
 )
+from b12x.comm.pcie._oneshot_preparation import (
+    _prepare_fused_call,
+    _prepare_plain_call,
+    plan,
+    query_from_runtime,
+)
+from b12x.preparation import CollectiveRequirement, PreparationSession
 from b12x.comm.pcie._oneshot_cute import (
     _PLAIN_GRAPH_ARRIVED_OFFSET,
     _PLAIN_GRAPH_EPOCH_OFFSET,
@@ -93,8 +101,42 @@ def _read_local_u32(channel, source: int, stream: torch.cuda.Stream) -> int:
     return value.value
 
 
+def _prepare_plan(prepared: ExitStack, channel, inp, out, **fused):
+    surface = (
+        "OneshotAllReduce.all_reduce_fused_add_rms_norm"
+        if fused
+        else "OneshotAllReduce.all_reduce"
+    )
+    query = query_from_runtime(channel, surface=surface, call={"inp": inp})
+    declaration = plan(query, runtime=channel)
+    collective = CollectiveRequirement(
+        key=surface, ranks=tuple(range(channel.world_size))
+    )
+    session = prepared.enter_context(
+        PreparationSession(device=inp.device, autotune=False)
+    )
+    prepare_call = _prepare_fused_call if fused else _prepare_plain_call
+    request = declaration.request(
+        name=surface,
+        collective=collective,
+        prepare_call=lambda state: prepare_call(state, inp=inp, out=out, **fused),
+    )
+    result = session.prepare(
+        (request,),
+        coordinator=lambda progress: (
+            collective.key if progress.ready_collectives else None
+        ),
+    )
+    prepared.enter_context(result)
+    return declaration
+
+
 def _run_eager(
-    pool: PCIeOneshotAllReducePool, device: torch.device, rank: int, world_size: int
+    pool: PCIeOneshotAllReducePool,
+    device: torch.device,
+    rank: int,
+    world_size: int,
+    prepared: ExitStack,
 ) -> None:
     remote_push = _tp2_plain_remote_push_active(world_size)
     dtypes = (
@@ -113,14 +155,18 @@ def _run_eager(
     )
     rank_sum = _rank_sum(world_size)
 
+    channel = pool.for_stream(channel_id="eager:default")
     for dtype in dtypes:
         for shape in shapes:
             inp = torch.empty(shape, device=device, dtype=dtype)
             out = torch.empty_like(inp)
+            declaration = _prepare_plan(prepared, channel, inp, out)
             for iteration in range(TORTURE_EAGER_ITERS):
                 base = float((iteration % 64) * 3)
                 inp.fill_(base + rank)
-                pool.all_reduce(inp, out=out, channel_id="eager:default")
+                pool.all_reduce(
+                    inp, plan=declaration, out=out, channel_id="eager:default"
+                )
                 torch.cuda.synchronize(device)
                 _assert_constant(out, world_size * base + rank_sum)
 
@@ -130,6 +176,7 @@ def _run_graph_scratch_reuse(
     device: torch.device,
     rank: int,
     world_size: int,
+    prepared: ExitStack,
 ) -> None:
     stream = torch.cuda.Stream(device=device)
     rank_sum = _rank_sum(world_size)
@@ -150,11 +197,11 @@ def _run_graph_scratch_reuse(
     graph = torch.cuda.CUDAGraph()
     with pool.capture(stream, channel_id="graph:torture") as graph_channel:
         with torch.cuda.stream(stream):
-            graph_channel.prepare_graph_all_reduce(scratch)
+            declaration = _prepare_plan(prepared, graph_channel, scratch, outs[0])
         with torch.cuda.graph(graph, stream=stream):
             for layer in range(layers):
                 scratch.copy_(sources[layer])
-                graph_channel.all_reduce(scratch, out=outs[layer])
+                graph_channel.all_reduce(scratch, plan=declaration, out=outs[layer])
     stream.synchronize()
 
     for iteration in range(TORTURE_GRAPH_REPLAYS):
@@ -210,11 +257,12 @@ def _run_multistream(
     device: torch.device,
     rank: int,
     world_size: int,
+    prepared: ExitStack,
 ) -> None:
     stream_a = torch.cuda.Stream(device=device)
     stream_b = torch.cuda.Stream(device=device)
-    pool.for_stream(stream_a, channel_id="eager:a")
-    pool.for_stream(stream_b, channel_id="eager:b")
+    channel_a = pool.for_stream(stream_a, channel_id="eager:a")
+    channel_b = pool.for_stream(stream_b, channel_id="eager:b")
     rank_sum = _rank_sum(world_size)
 
     remote_push = _tp2_plain_remote_push_active(world_size)
@@ -225,15 +273,20 @@ def _run_multistream(
     inp_b = torch.empty(shape_b, device=device, dtype=torch.bfloat16)
     out_b = torch.empty_like(inp_b)
 
+    with torch.cuda.stream(stream_a):
+        plan_a = _prepare_plan(prepared, channel_a, inp_a, out_a)
+    with torch.cuda.stream(stream_b):
+        plan_b = _prepare_plan(prepared, channel_b, inp_b, out_b)
+
     for iteration in range(TORTURE_MULTISTREAM_ITERS):
         base_a = float(iteration % 64)
         base_b = float(100 + (iteration % 64) * 2)
         with torch.cuda.stream(stream_a):
             inp_a.fill_(base_a + rank)
-            pool.all_reduce(inp_a, out=out_a, channel_id="eager:a")
+            pool.all_reduce(inp_a, plan=plan_a, out=out_a, channel_id="eager:a")
         with torch.cuda.stream(stream_b):
             inp_b.fill_(base_b + rank)
-            pool.all_reduce(inp_b, out=out_b, channel_id="eager:b")
+            pool.all_reduce(inp_b, plan=plan_b, out=out_b, channel_id="eager:b")
         stream_a.synchronize()
         stream_b.synchronize()
         _assert_constant(out_a, world_size * base_a + rank_sum)
@@ -245,6 +298,7 @@ def _run_tp2_mixed_protocol_reuse(
     device: torch.device,
     rank: int,
     world_size: int,
+    prepared: ExitStack,
 ) -> None:
     """Alternate pull, fused, and peer-push protocols on one eager channel."""
 
@@ -255,33 +309,54 @@ def _run_tp2_mixed_protocol_reuse(
     rank_sum = _rank_sum(world_size)
 
     pull_input = torch.full((1, 6144), 11.0 + rank, device=device, dtype=torch.bfloat16)
-    pull_output = pool.all_reduce(pull_input, channel_id=channel_id)
+    pull_output = torch.empty_like(pull_input)
+    pull_plan = _prepare_plan(prepared, channel, pull_input, pull_output)
+    pool.all_reduce(pull_input, plan=pull_plan, out=pull_output, channel_id=channel_id)
     torch.cuda.synchronize(device)
     _assert_constant(pull_output, world_size * 11.0 + rank_sum)
 
     fp32_input = torch.full((2048,), 13.0 + rank, device=device, dtype=torch.float32)
-    fp32_output = pool.all_reduce(fp32_input, channel_id=channel_id)
+    fp32_output = torch.empty_like(fp32_input)
+    fp32_plan = _prepare_plan(prepared, channel, fp32_input, fp32_output)
+    pool.all_reduce(fp32_input, plan=fp32_plan, out=fp32_output, channel_id=channel_id)
     torch.cuda.synchronize(device)
     _assert_constant(fp32_output, world_size * 13.0 + rank_sum)
 
     push_input = torch.full((1, 4096), 17.0 + rank, device=device, dtype=torch.bfloat16)
-    push_output = pool.all_reduce(push_input, channel_id=channel_id)
+    push_output = torch.empty_like(push_input)
+    push_plan = _prepare_plan(prepared, channel, push_input, push_output)
+    pool.all_reduce(push_input, plan=push_plan, out=push_output, channel_id=channel_id)
     torch.cuda.synchronize(device)
     _assert_constant(push_output, world_size * 17.0 + rank_sum)
 
     residual = torch.full_like(push_input, 0.25)
     weight = torch.ones(4096, device=device, dtype=torch.bfloat16)
+    fused_out = torch.empty_like(push_input)
+    residual_out = torch.empty_like(residual)
+    fused_plan = _prepare_plan(
+        prepared,
+        channel,
+        push_input,
+        fused_out,
+        residual=residual,
+        weight=weight,
+        residual_out=residual_out,
+        epsilon=1e-6,
+    )
     pool.all_reduce_fused_add_rms_norm(
         push_input,
         residual,
         weight,
         1e-6,
+        plan=fused_plan,
+        out=fused_out,
+        residual_out=residual_out,
         channel_id=channel_id,
     )
     torch.cuda.synchronize(device)
 
     push_input.fill_(23.0 + rank)
-    push_output = pool.all_reduce(push_input, channel_id=channel_id)
+    pool.all_reduce(push_input, plan=push_plan, out=push_output, channel_id=channel_id)
     torch.cuda.synchronize(device)
     _assert_constant(push_output, world_size * 23.0 + rank_sum)
 
@@ -298,6 +373,7 @@ def _run_tp2_payload_patterns(
     device: torch.device,
     rank: int,
     world_size: int,
+    prepared: ExitStack,
 ) -> None:
     """Exercise peer-push publication with zeros and lane-varying payloads."""
 
@@ -315,7 +391,10 @@ def _run_tp2_payload_patterns(
             patterns.append(pattern.to(torch.bfloat16).view(4, 4096))
         inp = patterns[rank]
         expected = patterns[0] + patterns[1]
-        pool.all_reduce(inp, out=output, channel_id="eager:default")
+        if iteration == 0:
+            channel = pool.for_stream(channel_id="eager:default")
+            declaration = _prepare_plan(prepared, channel, inp, output)
+        pool.all_reduce(inp, plan=declaration, out=output, channel_id="eager:default")
         torch.cuda.synchronize(device)
         assert torch.equal(output.view(torch.int16), expected.view(torch.int16))
 
@@ -325,6 +404,7 @@ def _run_tp2_graph_payload_patterns(
     device: torch.device,
     rank: int,
     world_size: int,
+    prepared: ExitStack,
 ) -> None:
     """Validate every qualified graph geometry with arbitrary payload bits."""
 
@@ -352,14 +432,16 @@ def _run_tp2_graph_payload_patterns(
         source.zero_()
     with pool.capture(stream, channel_id="graph:payload") as graph_channel:
         with torch.cuda.stream(stream):
-            for scratch in scratches:
-                graph_channel.prepare_graph_all_reduce(scratch)
+            declarations = [
+                _prepare_plan(prepared, graph_channel, scratch, output)
+                for scratch, output in zip(scratches, outputs, strict=True)
+            ]
         with torch.cuda.graph(graph, stream=stream):
-            for source, scratch, output in zip(
-                sources, scratches, outputs, strict=True
+            for source, scratch, output, declaration in zip(
+                sources, scratches, outputs, declarations, strict=True
             ):
                 scratch.copy_(source)
-                graph_channel.all_reduce(scratch, out=output)
+                graph_channel.all_reduce(scratch, plan=declaration, out=output)
     stream.synchronize()
 
     for iteration in range(TORTURE_PAYLOAD_ITERS):
@@ -395,6 +477,7 @@ def _run_tp2_graph_weak_contiguous_storage(
     device: torch.device,
     rank: int,
     world_size: int,
+    prepared: ExitStack,
 ) -> None:
     """Validate graph peer-push over a dense, non-contiguous logical view."""
 
@@ -408,10 +491,10 @@ def _run_tp2_graph_weak_contiguous_storage(
     graph = torch.cuda.CUDAGraph()
     with pool.capture(stream, channel_id="graph:weak-contiguous") as graph_channel:
         with torch.cuda.stream(stream):
-            graph_channel.prepare_graph_all_reduce(scratch)
+            declaration = _prepare_plan(prepared, graph_channel, scratch, output)
         with torch.cuda.graph(graph, stream=stream):
             scratch.copy_(source)
-            graph_channel.all_reduce(scratch, out=output)
+            graph_channel.all_reduce(scratch, plan=declaration, out=output)
     stream.synchronize()
 
     lane = torch.arange(source.numel(), device=device, dtype=torch.float32).view_as(
@@ -437,6 +520,7 @@ def _run_tp2_graph_generation_wrap(
     device: torch.device,
     rank: int,
     world_size: int,
+    prepared: ExitStack,
 ) -> None:
     """Replay the peer-push kernel across uint32 generation wraparound."""
 
@@ -450,10 +534,10 @@ def _run_tp2_graph_generation_wrap(
 
     with pool.capture(stream, channel_id="graph:wrap") as graph_channel:
         with torch.cuda.stream(stream):
-            graph_channel.prepare_graph_all_reduce(scratch)
+            declaration = _prepare_plan(prepared, graph_channel, scratch, output)
         with torch.cuda.graph(graph, stream=stream):
             scratch.copy_(source)
-            graph_channel.all_reduce(scratch, out=output)
+            graph_channel.all_reduce(scratch, plan=declaration, out=output)
     stream.synchronize()
 
     backend_state = graph_channel._ext._state(graph_channel._ptr)
@@ -533,15 +617,17 @@ def _graph_payload_worker(rank: int, world_size: int, port: int) -> None:
         max_input_bytes=TP2_PLAIN_REMOTE_PUSH_MAX_BYTES,
         max_concurrent_channels=2,
     )
+    prepared = ExitStack()
     try:
         pool.prepare_channels(("graph:payload", "graph:weak-contiguous", "graph:wrap"))
-        _run_tp2_graph_payload_patterns(pool, device, rank, world_size)
+        _run_tp2_graph_payload_patterns(pool, device, rank, world_size, prepared)
         dist.barrier()
-        _run_tp2_graph_weak_contiguous_storage(pool, device, rank, world_size)
+        _run_tp2_graph_weak_contiguous_storage(pool, device, rank, world_size, prepared)
         dist.barrier()
-        _run_tp2_graph_generation_wrap(pool, device, rank, world_size)
+        _run_tp2_graph_generation_wrap(pool, device, rank, world_size, prepared)
         torch.cuda.synchronize(device)
     finally:
+        prepared.close()
         pool.close()
         dist.destroy_process_group()
 
@@ -565,6 +651,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         ),
         max_concurrent_channels=2,
     )
+    prepared = ExitStack()
     try:
         pool.prepare_channels(
             (
@@ -574,17 +661,18 @@ def _worker(rank: int, world_size: int, port: int) -> None:
                 "graph:torture",
             )
         )
-        _run_eager(pool, device, rank, world_size)
+        _run_eager(pool, device, rank, world_size, prepared)
         dist.barrier()
-        _run_tp2_mixed_protocol_reuse(pool, device, rank, world_size)
+        _run_tp2_mixed_protocol_reuse(pool, device, rank, world_size, prepared)
         dist.barrier()
-        _run_tp2_payload_patterns(pool, device, rank, world_size)
+        _run_tp2_payload_patterns(pool, device, rank, world_size, prepared)
         dist.barrier()
-        _run_graph_scratch_reuse(pool, device, rank, world_size)
+        _run_graph_scratch_reuse(pool, device, rank, world_size, prepared)
         dist.barrier()
-        _run_multistream(pool, device, rank, world_size)
+        _run_multistream(pool, device, rank, world_size, prepared)
         torch.cuda.synchronize(device)
     finally:
+        prepared.close()
         pool.close()
         dist.destroy_process_group()
 
@@ -642,6 +730,7 @@ def _shape_growth_wrap_worker(
     )
     stream = torch.cuda.Stream(device=device)
     graphs, inputs, outputs = [], [], []
+    prepared = ExitStack()
     try:
         for rows in (1, 4):
             source = torch.full(
@@ -654,10 +743,10 @@ def _shape_growth_wrap_worker(
             stream.wait_stream(torch.cuda.current_stream(device))
             with pool.capture(stream) as channel:
                 with torch.cuda.stream(stream):
-                    channel.prepare_graph_all_reduce(source)
+                    declaration = _prepare_plan(prepared, channel, source, output)
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph, stream=stream):
-                    channel.all_reduce(source, out=output)
+                    channel.all_reduce(source, plan=declaration, out=output)
             stream.synchronize()
             graphs.append(graph)
             inputs.append(source)
@@ -718,6 +807,7 @@ def _shape_growth_wrap_worker(
     finally:
         for graph in graphs:
             graph.reset()
+        prepared.close()
         pool.close()
         dist.destroy_process_group()
 

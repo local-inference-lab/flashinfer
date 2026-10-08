@@ -370,6 +370,7 @@ class _W4A16PrimaryLaunches:
     topk_sum: object
     mapped_topk_sum: object
     route_pack: object | None
+    native_direct: object | None = None
 
     def select(
         self,
@@ -384,6 +385,17 @@ class _W4A16PrimaryLaunches:
                 "W4A16 execution exceeds its prepared capacity: "
                 f"requested={int(tokens)}, prepared={self.tokens}"
             )
+        if (
+            self.native_direct is not None
+            and self.route_mode != "packed"
+            and not has_route_map
+            and activation_amax is None
+            and any(
+                launch.m == int(tokens) and launch.topk_ids_dtype == route_ids_dtype
+                for launch in self.native_direct.small_m_direct_launches
+            )
+        ):
+            return self.native_direct, None, None
         native_direct = (
             int(tokens) == self.tokens
             and self.route_mode != "packed"
@@ -429,6 +441,7 @@ class _W4A16PrimaryLaunches:
                 self.direct_mapped,
                 self.topk_sum,
                 self.mapped_topk_sum,
+                self.native_direct,
                 *(() if self.route_pack is None else self.route_pack.carriers()),
             )
             if launcher is not None
@@ -448,6 +461,9 @@ def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
         _DEFAULT_MAX_SHARED_MEM,
         _MAX_DIRECT_TOPK_ROUTE_M,
         _W4A16_SMALL_M_DIRECT_MAX_M,
+        W4A16SmallMDirectCompileResult,
+        _compile_w4a16_small_m_direct,
+        _small_m_direct_supported,
         compile_w4a16_fused_moe,
         compile_w4a16_topk_sum,
     )
@@ -478,6 +494,60 @@ def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
     )
     with torch.cuda.device(core.device):
         props = torch.cuda.get_device_properties(core.device)
+        native_direct = None
+        native_tokens = int(caps.max_tokens)
+        native_args = dict(
+            hidden_size=core.k,
+            intermediate_size=core.n,
+            num_experts=core.weight_E,
+            topk=core.num_topk,
+            activation=core.activation,
+            swiglu_limit=core.swiglu_limit,
+            swiglu_alpha=core.swiglu_alpha,
+            swiglu_beta=core.swiglu_beta,
+            scale_format=scale_format,
+            w13_layout=w13_layout,
+        )
+        if (
+            caps.decode_config.w4a16_route_mode != "packed"
+            and not caps.collect_activation_amax
+            and _small_m_direct_supported(
+                **native_args,
+                m=native_tokens,
+                apply_router_weight_on_input=caps.apply_router_weight_on_input,
+                element_dtype=element_dtype,
+                weight_layout=weight_layout,
+            )
+        ):
+            launches = tuple(
+                _compile_w4a16_small_m_direct(
+                    **native_args,
+                    m=m,
+                    fast_math=caps.w4a16_fast_math,
+                    topk_ids_dtype=ids_dtype,
+                    device=core.device,
+                )
+                for m in range(1, native_tokens + 1)
+                for ids_dtype in (torch.int32, torch.int64)
+            )
+            native_direct = attach_programs(
+                W4A16SmallMDirectCompileResult(int(route_block), launches),
+                *(launch.compiled for launch in launches),
+            )
+            # Native micro kernels support K16 tails outside the generic tile grid.
+            if scale_format == "e4m3_k16" and core.n % 64:
+                return _W4A16PrimaryLaunches(
+                    tokens=int(caps.max_tokens),
+                    route_mode=caps.decode_config.w4a16_route_mode or "auto",
+                    packed=None,
+                    packed_mapped=None,
+                    direct=None,
+                    direct_mapped=None,
+                    topk_sum=None,
+                    mapped_topk_sum=None,
+                    route_pack=None,
+                    native_direct=native_direct,
+                )
         compiler_args = dict(
             size_m=tokens,
             hidden_size=core.k,
@@ -593,6 +663,7 @@ def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
         topk_sum=topk_sum,
         mapped_topk_sum=mapped_topk_sum,
         route_pack=route_pack,
+        native_direct=native_direct,
     )
 
 

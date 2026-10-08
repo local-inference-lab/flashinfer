@@ -1260,6 +1260,12 @@ class _W4A16SmallMDirectLaunch(NamedTuple):
     topk_ids_dtype: torch.dtype
 
 
+@dataclass(frozen=True)
+class W4A16SmallMDirectCompileResult:
+    moe_block_size: int
+    small_m_direct_launches: tuple[_W4A16SmallMDirectLaunch, ...]
+
+
 class _W4A16FC2DirectLaunch(NamedTuple):
     compiled: object
     grid_x: int
@@ -13738,7 +13744,7 @@ def _resolve_route_block_size_m(
     topk: int,
     route_num_experts: int,
     planned_block_size_m: int | None,
-    fused_launch: W4A16FusedMoeCompileResult | None,
+    fused_launch: W4A16FusedMoeCompileResult | W4A16SmallMDirectCompileResult | None,
 ) -> int:
     """Resolve one route geometry shared by scratch, packing, and GEMM."""
     planned = None if planned_block_size_m is None else int(planned_block_size_m)
@@ -13800,7 +13806,9 @@ def run_w4a16_moe(
     swiglu_limit: float | None = None,
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
-    fused_launch: W4A16FusedMoeCompileResult | None = None,
+    fused_launch: W4A16FusedMoeCompileResult
+    | W4A16SmallMDirectCompileResult
+    | None = None,
     topk_sum_launch: W4A16TopKSumCompileResult | None = None,
     route_block_size_m: int | None = None,
     intermediate_rotation_scales: torch.Tensor | None = None,
@@ -14215,7 +14223,7 @@ def run_w4a16_moe(
                 (
                     launch
                     for launch in fused_launch.small_m_direct_launches
-                    if launch.topk_ids_dtype == topk_ids.dtype
+                    if launch.topk_ids_dtype == topk_ids.dtype and launch.m == m
                 ),
                 None,
             )
@@ -14257,6 +14265,9 @@ def run_w4a16_moe(
         else:
             _w4a16_small_m_direct_launch_flat(*launch_args, launcher=direct_launch)
         return output
+
+    if isinstance(fused_launch, W4A16SmallMDirectCompileResult):
+        raise RuntimeError("execution does not match its prepared native W4A16 route")
 
     # TC decode keeps the top-k reduction inside the fused tensor-core kernel.
     # Direct-route emit hooks resolve global expert IDs against compact tiers
