@@ -371,6 +371,37 @@ class _W4A16PrimaryLaunches:
     mapped_topk_sum: object
     route_pack: object | None
     native_direct: object | None = None
+    a4_prefill: object | None = None
+
+    def select_a4(
+        self,
+        *,
+        tokens: int,
+        route_ids_dtype: torch.dtype,
+        has_route_map: bool,
+        activation_amax: object | None,
+        apply_router_weight_on_input: bool,
+        force: bool | None = None,
+    ) -> object | None:
+        """The A4 prefill launch set for calls at or above its threshold.
+
+        ``force`` overrides the threshold: True takes the A4 launches for any
+        call within their capacity (the caller knows the rows are prefill),
+        False never does.
+        """
+        launches = self.a4_prefill
+        if (
+            launches is None
+            or force is False
+            or (force is None and int(tokens) < launches.min_tokens)
+            or int(tokens) > launches.tokens
+            or route_ids_dtype not in (torch.int32, torch.int64)
+            or has_route_map
+            or activation_amax is not None
+            or apply_router_weight_on_input
+        ):
+            return None
+        return launches
 
     def select(
         self,
@@ -443,6 +474,7 @@ class _W4A16PrimaryLaunches:
                 self.mapped_topk_sum,
                 self.native_direct,
                 *(() if self.route_pack is None else self.route_pack.carriers()),
+                *(() if self.a4_prefill is None else self.a4_prefill.carriers()),
             )
             if launcher is not None
         )
@@ -652,6 +684,42 @@ def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
             num_experts=core.route_E,
             ordinal=core.device.index,
         )
+        a4_prefill = None
+        from b12x.moe._shared.kernels.w4a16.prefill_a4 import (
+            a4_prefill_min_tokens,
+            a4_prefill_supported,
+            a4_prefill_terms,
+            compile_w4a16_a4_prefill,
+        )
+
+        a4_min = a4_prefill_min_tokens()
+        if (
+            a4_min > 0
+            and tokens >= a4_min
+            and core.route_E == core.weight_E
+            and not caps.apply_router_weight_on_input
+            and a4_prefill_supported(
+                prepared_layout=weight_layout,
+                scale_format=scale_format,
+                activation=core.activation,
+                is_gated=core.activation in {"silu"},
+                dtype=core.dtype,
+                hidden_size=core.k,
+                intermediate_size=core.n,
+            )
+        ):
+            a4_prefill = compile_w4a16_a4_prefill(
+                tokens=tokens,
+                min_tokens=a4_min,
+                topk=core.num_topk,
+                hidden_size=core.k,
+                intermediate_size=core.n,
+                num_experts=core.weight_E,
+                sms=int(props.multi_processor_count),
+                ordinal=core.device.index,
+                fast_math=bool(caps.w4a16_fast_math),
+                terms=a4_prefill_terms(),
+            )
     # Direct routing requires exact M; packed routing accepts live M up to capacity.
     return _W4A16PrimaryLaunches(
         tokens=int(caps.max_tokens),
@@ -664,6 +732,7 @@ def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
         mapped_topk_sum=mapped_topk_sum,
         route_pack=route_pack,
         native_direct=native_direct,
+        a4_prefill=a4_prefill,
     )
 
 
