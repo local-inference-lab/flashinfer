@@ -420,7 +420,10 @@ def prepare_weights(
                 plan.activation.mode is ActivationMode.A16
                 and plan.prepared_format.packing is not WeightPacking.MMA_PACKED
             )
-            or plan.activation.a16_max_tokens
+            or (
+                plan.activation.a16_max_tokens
+                and plan.activation.mode is not ActivationMode.A16
+            )
         ):
             raise ValueError(
                 "NVFP4-CSF requires native ModelOpt NVFP4 A4/A16 in up/gate order"
@@ -811,7 +814,41 @@ def prepare_weights(
             )
         input_scale = weights.input_scale
         intermediate_scale = weights.intermediate_scale
-        if plan.activation.mode is ActivationMode.A16:
+        from b12x.moe._shared.kernels.w4a16.prefill_a4 import (
+            a4_prefill_min_tokens,
+            a4_prefill_supported,
+        )
+
+        keep_activation_scales = (
+            plan.activation.mode is ActivationMode.A16
+            and a4_prefill_min_tokens() > 0
+            and a4_prefill_supported(
+                prepared_layout=plan._impl.w4a16_weight_layout or "packed",
+                scale_format=plan._impl.w4a16_scale_format or "e4m3_k16",
+                activation=plan.activation.nonlinearity,
+                is_gated=plan.activation.nonlinearity == "silu",
+                swiglu_limit=plan.activation.swiglu_limit,
+                dtype=plan.activation.io_dtype,
+                hidden_size=plan.geometry.hidden_size,
+                intermediate_size=plan.geometry.intermediate_size,
+            )
+            and input_scale is not None
+            and intermediate_scale is not None
+            and all(
+                bool((torch.isfinite(scale) & (scale > 0)).all())
+                for scale in (input_scale, intermediate_scale)
+            )
+            # Unit scales are the uncalibrated W4A16 placeholder.
+            and not all(
+                bool((scale == 1).all()) for scale in (input_scale, intermediate_scale)
+            )
+        )
+        if keep_activation_scales:
+            # Shared input quantization uses the widest calibrated expert range.
+            input_scale = (
+                input_scale.detach().reshape(-1).amin().reshape(1).contiguous()
+            )
+        if plan.activation.mode is ActivationMode.A16 and not keep_activation_scales:
             input_scale = torch.ones(
                 plan.geometry.num_experts,
                 dtype=torch.float32,
@@ -846,6 +883,8 @@ def prepare_weights(
             a1_gscale=input_scale,
             a2_gscale=intermediate_scale,
         )
+        if keep_activation_scales:
+            prepared = replace(prepared, a4_prefill_scales=True)
     return PreparedExperts(plan=plan, _impl=prepared)
 
 

@@ -224,6 +224,53 @@ def _nvfp4_auto_query(rows=1):
     )
 
 
+def test_moe_a4_prefill_options_are_immutable_numerical_controls(monkeypatch):
+    import torch
+    from b12x.moe import fused_moe as moe
+    from b12x.moe.fused_moe import _preparation
+    from b12x.moe.fused_moe._tuning import TUNING
+
+    monkeypatch.setenv("B12X_W4A16_A4_PREFILL_MIN_TOKENS", "128")
+    monkeypatch.setenv("B12X_W4A16_A4_PREFILL_TERMS", "1")
+    monkeypatch.setenv("B12X_W4A16_A4_PREFILL_WARPS", "8")
+    weight_plan = moe.plan_weights(
+        source=moe.PackedSource(format="modelopt_nvfp4", w13_layout="w13"),
+        activation=moe.ActivationSpec(
+            mode="a16", nonlinearity="silu", io_dtype=torch.bfloat16
+        ),
+        geometry=moe.MoEGeometry(
+            num_experts=32, hidden_size=512, intermediate_size=512
+        ),
+    )._impl
+    query = replace(
+        _nvfp4_query(),
+        quant_mode="w4a16",
+        quant_modes=("w4a16",),
+        weight_layouts=tuple(layout.value for layout in weight_plan.weight_layouts),
+        w4a16_weight_layout=weight_plan.w4a16_weight_layout,
+        w4a16_scale_format=weight_plan.w4a16_scale_format,
+        controls=_preparation._control_snapshot(),
+    )
+    config = TUNING.configure(query, device=DEVICE, search=False).default
+    for variable, value in (
+        ("B12X_W4A16_A4_PREFILL_MIN_TOKENS", "256"),
+        ("B12X_W4A16_A4_PREFILL_TERMS", "2"),
+        ("B12X_W4A16_A4_PREFILL_WARPS", "16"),
+    ):
+        with monkeypatch.context() as changed:
+            changed.setenv(variable, value)
+            different = replace(query, controls=_preparation._control_snapshot())
+            assert TUNING.encode_query(query) != TUNING.encode_query(different)
+            caps = _preparation._lower_caps(
+                query, config, weight_plan, torch.device("cuda", 0)
+            )
+            assert (
+                caps.w4a16_a4_prefill_min_tokens,
+                caps.w4a16_a4_prefill_terms,
+                caps.w4a16_a4_prefill_warps,
+            ) == (128, 1, 8)
+
+
 @pytest.mark.parametrize("capability,sms", (((12, 0), 188), ((12, 1), 48)))
 @pytest.mark.parametrize("rows", (1, 2, 4, 8, 9, 16))
 def test_moe_auto_promotes_native_decode_and_races_both_precisions(

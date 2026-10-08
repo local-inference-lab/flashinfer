@@ -115,7 +115,15 @@ def _control_snapshot() -> FrozenMapping:
         trellis_decode_table,
     )
 
-    from b12x.moe._shared.kernels.w4a16.kernel import _w4a16_small_m_occupancy
+    from b12x.moe._shared.kernels.w4a16.kernel import (
+        _FP32_TOPK_WEIGHTS,
+        _w4a16_small_m_occupancy,
+    )
+    from b12x.moe._shared.kernels.w4a16.prefill_a4 import (
+        a4_prefill_min_tokens,
+        a4_prefill_terms,
+        a4_prefill_warps,
+    )
 
     tile = _impl._dynamic_tile_mn_override()
     raw_materialized = _impl.os.environ.get(_impl._DYNAMIC_NVFP4_MATERIALIZED_ENV)
@@ -123,6 +131,10 @@ def _control_snapshot() -> FrozenMapping:
         {
             "trellis_decode_table": trellis_decode_table(),
             "w4a16_small_m_occupancy": _w4a16_small_m_occupancy(),
+            "w4a16_fp32_topk_weights": _FP32_TOPK_WEIGHTS,
+            "w4a16_a4_prefill_min_tokens": a4_prefill_min_tokens(),
+            "w4a16_a4_prefill_terms": a4_prefill_terms(),
+            "w4a16_a4_prefill_warps": a4_prefill_warps(),
             "w4a8_csf_inline_max_tokens": _impl.W4A8_CSF_INLINE_MAX_TOKENS,
             "w4a16_prefill_fused_sum": prefill_fused_sum_enabled(),
             "w4a16_csf_stage_max_tokens": _impl.W4A16_CSF_STAGE_MAX_TOKENS,
@@ -220,7 +232,12 @@ def _query(
         w4a16_block_size_m=invocation.get("w4a16_block_size_m"),
         fast_math=bool(invocation.get("fast_math", True)),
         numerical_recipe=invocation.get("numerical_recipe"),
-        controls=controls,
+        controls=FrozenMapping(
+            {
+                **controls.to_dict(),
+                "w4a16_a16_max_tokens": experts.plan.activation.a16_max_tokens,
+            }
+        ),
         shared_input_scales=experts._impl.can_share_input(input_scales_static=True),
         nvfp4_inline_scales=plan.nvfp4_inline_scales,
     )
@@ -350,6 +367,12 @@ def _lower_caps(
         ),
         trellis_decode_table=str(query.controls.get("trellis_decode_table", "auto")),
         w4a16_small_m_occupancy=int(query.controls.get("w4a16_small_m_occupancy", 1)),
+        w4a16_a4_prefill_min_tokens=int(
+            query.controls.get("w4a16_a4_prefill_min_tokens", 0)
+        ),
+        w4a16_a4_prefill_terms=int(query.controls.get("w4a16_a4_prefill_terms", 1)),
+        w4a16_a4_prefill_warps=int(query.controls.get("w4a16_a4_prefill_warps", 8)),
+        w4a16_a16_max_tokens=int(query.controls.get("w4a16_a16_max_tokens", 0)),
         w4a16_skip_empty_m_blocks=bool(
             query.controls.get("w4a16_skip_empty_m_blocks", True)
         ),
@@ -371,6 +394,34 @@ class _W4A16PrimaryLaunches:
     mapped_topk_sum: object
     route_pack: object | None
     native_direct: object | None = None
+    a4_prefill: object | None = None
+    a16_max_tokens: int = 0
+
+    def select_a4(
+        self,
+        *,
+        tokens: int,
+        route_ids_dtype: torch.dtype,
+        has_route_map: bool,
+        activation_amax: object | None,
+        apply_router_weight_on_input: bool,
+        force: bool | None = None,
+    ) -> object | None:
+        """Select compatible A4 calls, preserving explicit caller precision."""
+        launches = self.a4_prefill
+        if (
+            launches is None
+            or force is False
+            or (force is None and int(tokens) < launches.min_tokens)
+            or not 0 < int(tokens) <= launches.tokens
+            or int(tokens) <= self.a16_max_tokens
+            or route_ids_dtype not in (torch.int32, torch.int64)
+            or has_route_map
+            or activation_amax is not None
+            or apply_router_weight_on_input
+        ):
+            return None
+        return launches
 
     def select(
         self,
@@ -443,6 +494,7 @@ class _W4A16PrimaryLaunches:
                 self.mapped_topk_sum,
                 self.native_direct,
                 *(() if self.route_pack is None else self.route_pack.carriers()),
+                *(() if self.a4_prefill is None else self.a4_prefill.carriers()),
             )
             if launcher is not None
         )
@@ -652,6 +704,43 @@ def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
             num_experts=core.route_E,
             ordinal=core.device.index,
         )
+        a4_prefill = None
+        from b12x.moe._shared.kernels.w4a16.prefill_a4 import (
+            a4_prefill_supported,
+            compile_w4a16_a4_prefill,
+        )
+
+        a4_min = caps.w4a16_a4_prefill_min_tokens
+        if (
+            a4_min > 0
+            and tokens > caps.w4a16_a16_max_tokens
+            and core.route_E == core.weight_E
+            and not caps.apply_router_weight_on_input
+            and a4_prefill_supported(
+                prepared_layout=weight_layout,
+                scale_format=scale_format,
+                activation=core.activation,
+                is_gated=core.activation == "silu",
+                swiglu_limit=core.swiglu_limit,
+                dtype=core.dtype,
+                hidden_size=core.k,
+                intermediate_size=core.n,
+            )
+        ):
+            a4_prefill = compile_w4a16_a4_prefill(
+                tokens=tokens,
+                min_tokens=a4_min,
+                topk=core.num_topk,
+                hidden_size=core.k,
+                intermediate_size=core.n,
+                num_experts=core.weight_E,
+                sms=int(props.multi_processor_count),
+                ordinal=core.device.index,
+                fast_math=bool(caps.w4a16_fast_math),
+                terms=caps.w4a16_a4_prefill_terms,
+                warps=caps.w4a16_a4_prefill_warps,
+                swiglu_limit=core.swiglu_limit,
+            )
     # Direct routing requires exact M; packed routing accepts live M up to capacity.
     return _W4A16PrimaryLaunches(
         tokens=int(caps.max_tokens),
@@ -664,6 +753,8 @@ def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
         mapped_topk_sum=mapped_topk_sum,
         route_pack=route_pack,
         native_direct=native_direct,
+        a4_prefill=a4_prefill,
+        a16_max_tokens=caps.w4a16_a16_max_tokens,
     )
 
 

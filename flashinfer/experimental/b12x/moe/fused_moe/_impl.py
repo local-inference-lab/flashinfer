@@ -459,6 +459,7 @@ class B12XFP4ExpertWeights:
     # compressed scales inline: (w13, w2) Mxfp4CsfInlinePlane. The canonical scale
     # fields keep the caller's expansion scratch, which these launches never read.
     mxfp4_csf_inline: tuple | None = None
+    a4_prefill_scales: bool = False
     _uniform_a1_scale: bool = field(default=False, init=False, repr=False)
     _a1_scale_version: int | None = field(default=None, init=False, repr=False)
 
@@ -853,6 +854,10 @@ class TPMoEScratchCaps:
     trellis_decode_table: str = "auto"
     w4a16_skip_empty_m_blocks: bool = True
     w4a16_small_m_occupancy: int = 1
+    w4a16_a4_prefill_min_tokens: int = 0
+    w4a16_a4_prefill_terms: int = 1
+    w4a16_a4_prefill_warps: int = 8
+    w4a16_a16_max_tokens: int = 0
     w4a8_csf_inline: bool = False
     frozen: bool = True
 
@@ -1008,6 +1013,7 @@ class TPMoEScratchPlan:
         route_expert_map: torch.Tensor | None = None,
         output_expert_map: torch.Tensor | None = None,
         scales_expanded: bool = False,
+        a4_prefill: bool | None = None,
         _w4a16_launches: object | None = None,
     ) -> "TPMoEFP4Binding":
         """Bind live tensors to this scratch plan.
@@ -1015,6 +1021,10 @@ class TPMoEScratchPlan:
         ``scales_expanded`` states that ``expand_scales(experts)`` ran on this
         call's stream (or one it waits for) after the last other use of the
         shared NVFP4-CSF scratch; the call then skips its own expansion.
+
+        ``a4_prefill`` selects prepared NVFP4 activation launches: None uses
+        their token threshold, True bypasses the threshold, and False keeps
+        W4A16. Unsupported calls and uncalibrated weights remain W4A16.
         """
         if not isinstance(experts, B12XFP4ExpertWeights):
             raise TypeError("experts must come from prepare_b12x_fp4_moe_weights")
@@ -1087,6 +1097,7 @@ class TPMoEScratchPlan:
         fused_launch = None
         topk_sum_launch = None
         route_pack_launches = None
+        a4_prefill_launches = None
         if (
             self.caps.quant_mode == "w4a16"
             and not self._core_workspace_plan.full_rotation
@@ -1101,6 +1112,29 @@ class TPMoEScratchPlan:
                 has_route_map=route_expert_map is not None,
                 activation_amax=activation_amax,
             )
+            if experts.a4_prefill_scales:
+                a4_prefill_launches = _w4a16_launches.select_a4(
+                    tokens=int(a.shape[0]),
+                    route_ids_dtype=topk_ids.dtype,
+                    has_route_map=(
+                        route_expert_map is not None or output_expert_map is not None
+                    ),
+                    activation_amax=activation_amax,
+                    apply_router_weight_on_input=self.caps.apply_router_weight_on_input,
+                    force=a4_prefill,
+                )
+                if a4_prefill_launches is not None:
+                    from b12x.moe._shared.kernels.w4a16.prefill_a4 import (
+                        a4_prefill_fits,
+                    )
+
+                    if not a4_prefill_fits(
+                        a4_prefill_launches,
+                        tokens=int(a.shape[0]),
+                        intermediate_cache13=tensors["intermediate_cache13"],
+                        intermediate_cache2=tensors["intermediate_cache2"],
+                    ):
+                        a4_prefill_launches = None
         elif (
             self.caps.quant_mode == "w4a16" and self._core_workspace_plan.full_rotation
         ):
@@ -1169,6 +1203,7 @@ class TPMoEScratchPlan:
             fused_launch=fused_launch,
             topk_sum_launch=topk_sum_launch,
             route_pack_launches=route_pack_launches,
+            a4_prefill_launches=a4_prefill_launches,
         )
         return replace(
             binding,
@@ -1269,6 +1304,7 @@ class TPMoEFP4Binding:
     fused_launch: object | None = None
     topk_sum_launch: object | None = None
     route_pack_launches: object | None = None
+    a4_prefill_launches: object | None = None
     # The caller expanded every expert's NVFP4-CSF scales with expand_scales().
     scales_expanded: bool = False
     w4a8_csf_inline: bool = False
@@ -2996,6 +3032,7 @@ def _build_tp_moe_fp4_binding_from_views(
     fused_launch: object | None = None,
     topk_sum_launch: object | None = None,
     route_pack_launches: object | None = None,
+    a4_prefill_launches: object | None = None,
 ) -> TPMoEFP4Binding:
     if not isinstance(experts, B12XFP4ExpertWeights):
         raise TypeError("experts must come from prepare_b12x_fp4_moe_weights")
@@ -3198,6 +3235,7 @@ def _build_tp_moe_fp4_binding_from_views(
             fused_launch=fused_launch,
             topk_sum_launch=topk_sum_launch,
             route_pack_launches=route_pack_launches,
+            a4_prefill_launches=a4_prefill_launches,
         )
 
     if plan.implementation == "micro":
@@ -13608,6 +13646,24 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
                     "CUDA graph capture requires contiguous W4A16 topk_ids"
                 )
             topk_ids = topk_ids.contiguous()
+        a4_launches = binding.a4_prefill_launches
+        if a4_launches is not None:
+            from b12x.moe._shared.kernels.w4a16.prefill_a4 import (
+                run_w4a16_a4_prefill,
+            )
+
+            return run_w4a16_a4_prefill(
+                a,
+                prepared,
+                topk_weights,
+                topk_ids,
+                a1_gscale=a1_gscale,
+                a2_gscale=a2_gscale,
+                intermediate_cache13=intermediate_cache13,
+                intermediate_cache2=intermediate_cache2,
+                output=scatter_output,
+                launches=a4_launches,
+            )
         result = run_w4a16_moe(
             a,
             prepared,
