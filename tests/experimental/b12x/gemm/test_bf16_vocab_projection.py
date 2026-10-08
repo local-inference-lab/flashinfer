@@ -31,6 +31,124 @@ def test_unknown_device_default_uses_selected_torch_backend() -> None:
     assert config.backend == "torch"
 
 
+@pytest.mark.parametrize(
+    ("capability", "max_tokens", "backend"),
+    [
+        ((12, 1), 1, "triton"),
+        ((12, 1), 8, "cute"),
+        ((12, 1), 9, "torch"),
+        ((12, 0), 2, "cute"),
+        ((12, 0), 4, "torch"),
+    ],
+)
+def test_sm12x_default_backend_by_row_capacity(capability, max_tokens, backend) -> None:
+    query = projection.Bf16VocabProjectionQuery(
+        dtype="bfloat16",
+        max_tokens=max_tokens,
+        in_features=2_560,
+        out_features=248_320,
+    )
+    device = DeviceIdentity(
+        vendor="nvidia",
+        compute_capability=capability,
+        sm_count=48,
+        product_name="Synthetic GPU",
+    )
+
+    assert TUNING.configure(query, device=device).default.backend == backend
+
+
+
+def _synthetic(capability):
+    return DeviceIdentity(
+        vendor="nvidia",
+        compute_capability=capability,
+        sm_count=48,
+        product_name="Synthetic GPU",
+    )
+
+
+def _query(max_tokens):
+    return projection.Bf16VocabProjectionQuery(
+        dtype="bfloat16",
+        max_tokens=max_tokens,
+        in_features=2_560,
+        out_features=248_320,
+    )
+
+
+def _backend_choices(query, capability) -> set[str]:
+    space = TUNING.parameter_space(query, _synthetic(capability))
+    for knob in space.knobs:
+        if knob.name == "backend":
+            return set(knob.values)
+    raise AssertionError("backend knob missing from the parameter space")
+
+
+def test_cute_candidate_offered_only_on_sm12x() -> None:
+    query = _query(max_tokens=4)
+
+    assert "cute" not in _backend_choices(query, (9, 0))
+    assert "cute" not in _backend_choices(query, (10, 0))
+    assert "cute" in _backend_choices(query, (12, 1))
+    assert "cute" in _backend_choices(query, (12, 0))
+
+
+def test_cute_override_rejected_outside_sm12x() -> None:
+    config = projection.Bf16VocabProjectionConfig(
+        backend="cute", algorithm="simt", block_k=0, num_warps=0
+    )
+
+    with pytest.raises(ValueError, match="SM120 and SM121"):
+        TUNING.configure(_query(4), device=_synthetic((9, 0)), override=config)
+
+    # Declaration-time validation has no device identity and stays permissive.
+    TUNING.validate_config(_query(4), config, None)
+    assert TUNING.configure(_query(4), device=_synthetic((12, 1)), override=config).pinned == config
+
+@cuda_required
+@pytest.mark.parametrize("rows", [1, 3, 8])
+def test_cute_projection_serves_fewer_rows_than_prepared_in_graph(rows) -> None:
+    torch.manual_seed(5)
+    device = torch.device("cuda")
+    weight = torch.randn(16_384, 512, device=device, dtype=torch.bfloat16)
+    prepared_source = torch.randn(8, 512, device=device, dtype=torch.bfloat16)
+    source = prepared_source[:rows]
+    declaration = projection.plan(
+        projection.Caps(
+            device=device, max_tokens=8, in_features=512, out_features=16_384
+        ),
+        override=projection.Bf16VocabProjectionConfig(
+            backend="cute", algorithm="simt", block_k=0, num_warps=0
+        ),
+    )
+
+    with PreparationSession(
+        device=device, autotune=False, compile_workers=2
+    ) as session:
+        session.prepare(
+            (
+                declaration.request(
+                    name="vocab",
+                    prepare_call=lambda state: PreparedCall(
+                        run=lambda: state.run(prepared_source, weight)
+                    ),
+                ),
+            )
+        )
+        binding = projection.bind(declaration, source=source, weight=weight)
+        graph = torch.cuda.CUDAGraph()
+        with session.capture(), torch.cuda.graph(graph):
+            actual = projection.run(binding)
+        actual.fill_(float("nan"))
+        source.normal_()
+        graph.replay()
+        torch.cuda.synchronize(device)
+
+    expected = (source.float() @ weight.float().T).to(torch.bfloat16)
+    torch.testing.assert_close(actual.float(), expected.float(), rtol=1e-2, atol=5e-2)
+
+
 @cuda_required
 def test_prepared_projection_matches_reference_and_replays_graph() -> None:
     torch.manual_seed(4)
