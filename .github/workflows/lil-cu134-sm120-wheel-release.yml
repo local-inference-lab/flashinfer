@@ -3,7 +3,8 @@ name: LIL FlashInfer CUDA 13.4 SM120 wheels
 on:
   push:
     branches:
-      - community/jovian-judgement-cu134-sm120
+      - community/karmic-kraken-cu134-sm120
+      - integration/karmic-kraken-beta
     tags:
       - flashinfer-cu134-sm120-stable-*
 
