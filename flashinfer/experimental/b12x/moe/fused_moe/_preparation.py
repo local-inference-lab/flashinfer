@@ -127,14 +127,15 @@ def _control_snapshot() -> FrozenMapping:
 
     tile = _impl._dynamic_tile_mn_override()
     raw_materialized = _impl.os.environ.get(_impl._DYNAMIC_NVFP4_MATERIALIZED_ENV)
+    a4_min_tokens = a4_prefill_min_tokens()
     return FrozenMapping(
         {
             "trellis_decode_table": trellis_decode_table(),
             "w4a16_small_m_occupancy": _w4a16_small_m_occupancy(),
             "w4a16_fp32_topk_weights": _FP32_TOPK_WEIGHTS,
-            "w4a16_a4_prefill_min_tokens": a4_prefill_min_tokens(),
-            "w4a16_a4_prefill_terms": a4_prefill_terms(),
-            "w4a16_a4_prefill_warps": a4_prefill_warps(),
+            "w4a16_a4_prefill_min_tokens": a4_min_tokens,
+            "w4a16_a4_prefill_terms": a4_prefill_terms() if a4_min_tokens > 0 else 1,
+            "w4a16_a4_prefill_warps": a4_prefill_warps() if a4_min_tokens > 0 else 8,
             "w4a8_csf_inline_max_tokens": _impl.W4A8_CSF_INLINE_MAX_TOKENS,
             "w4a16_prefill_fused_sum": prefill_fused_sum_enabled(),
             "w4a16_csf_stage_max_tokens": _impl.W4A16_CSF_STAGE_MAX_TOKENS,

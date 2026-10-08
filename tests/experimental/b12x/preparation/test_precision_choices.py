@@ -271,6 +271,30 @@ def test_moe_a4_prefill_options_are_immutable_numerical_controls(monkeypatch):
             ) == (128, 1, 8)
 
 
+@pytest.mark.parametrize("threshold", ("0", "-1"))
+@pytest.mark.parametrize(
+    "variable,value",
+    (
+        ("B12X_W4A16_A4_PREFILL_TERMS", "3"),
+        ("B12X_W4A16_A4_PREFILL_WARPS", "4"),
+    ),
+)
+def test_disabled_moe_a4_prefill_ignores_inactive_controls(
+    monkeypatch, threshold, variable, value
+):
+    from b12x.moe.fused_moe import _preparation
+
+    monkeypatch.setenv("B12X_W4A16_A4_PREFILL_MIN_TOKENS", threshold)
+    monkeypatch.setenv("B12X_W4A16_A4_PREFILL_TERMS", "1")
+    monkeypatch.setenv("B12X_W4A16_A4_PREFILL_WARPS", "8")
+    baseline = _preparation._control_snapshot()
+    monkeypatch.setenv(variable, value)
+    assert _preparation._control_snapshot() == baseline
+    monkeypatch.setenv("B12X_W4A16_A4_PREFILL_MIN_TOKENS", "128")
+    with pytest.raises(ValueError, match=variable):
+        _preparation._control_snapshot()
+
+
 @pytest.mark.parametrize("capability,sms", (((12, 0), 188), ((12, 1), 48)))
 @pytest.mark.parametrize("rows", (1, 2, 4, 8, 9, 16))
 def test_moe_auto_promotes_native_decode_and_races_both_precisions(
