@@ -14,7 +14,9 @@ A4 weight preparation retains its per-expert scales.
 
 Supported weights use packed ModelOpt NVFP4 with ordinary or compressed
 NVFP4-CSF block scales, BF16 input/output, SiLU gating, hidden size divisible
-by 256, and intermediate size divisible by 128. A positive `swiglu_limit` uses
+by 256, and intermediate size divisible by 64. FC1 masks the unused half of
+a final 128-channel intermediate tile and reads gate/up scale halves from
+their original compressed slabs. A positive `swiglu_limit` uses
 the W4A16 activation contract: clamp the BF16 GEMM gate above the limit and the
 up input to the symmetric interval, round SiLU and up to BF16, multiply, then
 round the intermediate to BF16 before quantization. Expert maps, input router
@@ -62,7 +64,7 @@ still require synchronization before reusing that scratch.
 `B12X_W4A16_A4_PREFILL_TERMS=1` uses one NVFP4 activation plane. A value of `2`
 adds an independently quantized residual plane. `B12X_W4A16_A4_PREFILL_WARPS`
 accepts `8` (default) or `16`. These controls and the capability flag are immutable
-execution-plan inputs and are part of tuning query schema 25. Changing the
+execution-plan inputs and are part of tuning query schema 26. Changing the
 environment requires preparing another execution plan. Kernel compilation
 retains device-owned callables; replay performs no compilation or tensor
 allocation. A4 always applies router weights in the FP32 final sum. Set

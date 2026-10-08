@@ -71,12 +71,13 @@ def _qdq(x, gs, terms):
     return q1 + _nvfp4_qdq(x.float() - q1, gs)
 
 
-def _make_case(seed):
+def _make_case(seed, intermediate_size=I, hidden_size=H, num_experts=E, top_k=TOPK):
     import numpy as np
 
     from b12x.moe import fused_moe as moe
     from b12x.moe._shared.kernels.w4a16.host import unswizzle_expert_scales
 
+    E, H, I = num_experts, hidden_size, intermediate_size
     dev = torch.device("cuda")
     rng = np.random.default_rng(seed)
     gen = torch.Generator(device=dev).manual_seed(seed)
@@ -96,6 +97,7 @@ def _make_case(seed):
     g13 = (torch.rand(E, device=dev, generator=gen) * 0.5 + 0.75) * 0.02
     g2 = (torch.rand(E, device=dev, generator=gen) * 0.5 + 0.75) * 0.02
     return dict(
+        top_k=top_k,
         w13=w13,
         w2=w2,
         s13=s13,
@@ -124,6 +126,9 @@ def _env(monkeypatch, enabled, terms):
 def _prepare(case, a1g, a2g, *, csf=False):
     from b12x.moe import fused_moe as moe
 
+    H = case["plan"].geometry.hidden_size
+    I = case["plan"].geometry.intermediate_size
+
     weights = moe.PackedWeights(
         w13=case["w13"].clone(),
         w2=case["w2"].clone(),
@@ -150,12 +155,12 @@ def _prepare(case, a1g, a2g, *, csf=False):
     return moe.prepare_weights(plan=case["plan"], weights=weights)
 
 
-def _plan(experts, tokens):
+def _plan(experts, tokens, top_k=TOPK):
     from b12x.moe import fused_moe as moe
 
     return moe.plan_execution(
         experts=experts,
-        capacity=moe.ExecutionCapacity(max_tokens=tokens, top_k=TOPK),
+        capacity=moe.ExecutionCapacity(max_tokens=tokens, top_k=top_k),
         invocation={"fast_math": True},
     )
 
@@ -176,6 +181,9 @@ def _bind(xp, x, ids, wts, out, scratch, **kwargs):
 
 
 def _emulate(case, x, ids, wts, a1g, a2g, terms):
+    H = x.shape[-1]
+    TOPK = ids.shape[-1]
+    I = case["plan"].geometry.intermediate_size
     tokens = x.shape[0]
     flat = ids.flatten().long()
     xq = _qdq(x.float(), a1g.amin().reshape(1), terms).double()
@@ -197,7 +205,8 @@ def _emulate(case, x, ids, wts, a1g, a2g, terms):
     return (y.view(tokens, TOPK, H) * wts.double().view(tokens, TOPK, 1)).sum(dim=1)
 
 
-def _inputs(tokens, seed):
+def _inputs(tokens, seed, hidden_size=H, num_experts=E, top_k=TOPK):
+    E, H, TOPK = num_experts, hidden_size, top_k
     dev = torch.device("cuda")
     gen = torch.Generator(device=dev).manual_seed(seed)
     x = (torch.randn(tokens, H, device=dev, generator=gen) * 0.5).to(torch.bfloat16)
@@ -214,8 +223,12 @@ def _inputs(tokens, seed):
 def _scales(case):
     """Calibration-like global scales: 448 * 6 / amax with headroom. Odd factors
     keep the synthetic data off exact E2M1 midpoints."""
+    H = case["plan"].geometry.hidden_size
+    E = case["plan"].geometry.num_experts
+    TOPK = case["top_k"]
+    I = case["plan"].geometry.intermediate_size
     dev = torch.device("cuda")
-    x, ids, _ = _inputs(64, 999)
+    x, ids, _ = _inputs(64, 999, H, E, TOPK)
     flat = ids.flatten().long()
     amax = 0.0
     for e in torch.unique(flat).tolist():
@@ -231,11 +244,22 @@ def _scales(case):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("terms", [1, 2])
-@pytest.mark.parametrize("swiglu_limit", [None, 2.03, 10.0])
-def test_a4_prefill_matches_float64_emulation(terms, swiglu_limit, monkeypatch):
+@pytest.mark.parametrize(
+    "hidden_size,intermediate_size,num_experts,top_k,swiglu_limit",
+    [
+        (512, 256, 8, 2, None),
+        (512, 256, 8, 2, 2.03),
+        (512, 256, 8, 2, 10.0),
+        (512, 320, 8, 2, None),
+        (2560, 320, 16, 10, None),
+    ],
+)
+def test_a4_prefill_matches_float64_emulation(
+    terms, hidden_size, intermediate_size, num_experts, top_k, swiglu_limit, monkeypatch
+):
     require_b12x()
     _env(monkeypatch, True, terms)
-    case = _make_case(11)
+    case = _make_case(11, intermediate_size, hidden_size, num_experts, top_k)
     from b12x.moe import fused_moe as moe
 
     case["plan"] = moe.plan_weights(
@@ -244,13 +268,13 @@ def test_a4_prefill_matches_float64_emulation(terms, swiglu_limit, monkeypatch):
         geometry=case["plan"].geometry,
     )
     a1g, a2g = _scales(case)
-    a1g = a1g * torch.linspace(0.9, 1.1, E, device=a1g.device)
-    a2g = a2g * torch.linspace(1.1, 0.9, E, device=a2g.device)
+    a1g = a1g * torch.linspace(0.9, 1.1, num_experts, device=a1g.device)
+    a2g = a2g * torch.linspace(1.1, 0.9, num_experts, device=a2g.device)
     experts = _prepare(case, a1g, a2g)
     assert experts._impl.a4_prefill_scales
-    tokens = 192
-    xp = _plan(experts, tokens)
-    x, ids, wts = _inputs(tokens, 5)
+    tokens = 16 if top_k == 10 else 192
+    xp = _plan(experts, 192, top_k)
+    x, ids, wts = _inputs(tokens, 5, hidden_size, num_experts, top_k)
     scratch = tuple(
         torch.empty(s.shape, dtype=s.dtype, device=x.device) for s in xp.scratch_specs()
     )
@@ -686,19 +710,23 @@ def test_a4_prefill_graph_replay_reuses_launches(terms, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "inline_words,terms,capacity,warps,tokens,ready",
+    "intermediate_size,inline_words,terms,capacity,warps,tokens,ready",
     [
-        (0, 1, 320, 8, 131, False),
-        (0, 1, 3072, 8, 131, False),
-        (4, 2, 3072, 8, 131, False),
-        (64, 1, 3072, 16, 131, False),
-        (4, 1, 3072, 8, 131, True),
-        (4, 1, 3072, 8, 1537, False),
-        (4, 1, 3072, 8, 1537, True),
+        (256, 0, 1, 320, 8, 131, False),
+        (256, 0, 1, 3072, 8, 131, False),
+        (256, 4, 2, 3072, 8, 131, False),
+        (256, 64, 1, 3072, 16, 131, False),
+        (256, 4, 1, 3072, 8, 131, True),
+        (256, 4, 1, 3072, 8, 1537, False),
+        (256, 4, 1, 3072, 8, 1537, True),
+        (320, 0, 1, 320, 8, 131, False),
+        (320, 4, 2, 3072, 16, 131, False),
+        (320, 4, 1, 3072, 8, 1537, False),
+        (320, 4, 2, 3072, 8, 1537, True),
     ],
 )
 def test_a4_csf_scale_readers_preserve_dense_graph_output(
-    inline_words, terms, capacity, warps, tokens, ready, monkeypatch
+    intermediate_size, inline_words, terms, capacity, warps, tokens, ready, monkeypatch
 ):
     """Both CSF readers preserve dense arithmetic and caller expansion ordering."""
     import numpy as np
@@ -712,7 +740,8 @@ def test_a4_csf_scale_readers_preserve_dense_graph_output(
     _env(monkeypatch, True, terms)
     monkeypatch.setenv("B12X_W4A16_A4_PREFILL_WARPS", str(warps))
     monkeypatch.setenv("B12X_NVFP4_CSF_INLINE_WORDS", str(inline_words))
-    case = _make_case(17)
+    I = intermediate_size
+    case = _make_case(17, I)
     case["plan"] = moe.plan_weights(
         source=case["plan"].source,
         activation=replace(case["plan"].activation, swiglu_limit=10.0),
@@ -765,6 +794,15 @@ def test_a4_csf_scale_readers_preserve_dense_graph_output(
         assert launches[0].fc1 is not launches[1].fc1
         assert launches[0].fc2 is not launches[1].fc2
     expanded = owners[1]._impl.w4a16_expanded
+    packed = owners[1]._impl.representation.value
+    assert (
+        expanded.w13.untyped_storage().data_ptr()
+        == packed.w13.untyped_storage().data_ptr()
+    )
+    assert (
+        expanded.w2.untyped_storage().data_ptr()
+        == packed.w2.untyped_storage().data_ptr()
+    )
     scale_scratch = (expanded.w13_scale, expanded.w2_scale)
 
     def reject_expansion(*args, **kwargs):

@@ -75,6 +75,7 @@ from b12x._lib.intrinsics import (
     st_global_u32,
     st_global_v4_u32,
     st_shared_u32,
+    st_shared_v4_u32,
 )
 from b12x._lib.quant.nvfp4_csf_packed import HEADER_BYTES, record_bytes
 
@@ -369,8 +370,8 @@ class A4PackedPrefillGemm:
     ):
         if phase not in ("fc1", "fc2"):
             raise ValueError(f"unknown A4 prefill phase {phase!r}")
-        if hidden_size % 256 or intermediate_size % 128:
-            raise ValueError("A4 prefill needs H % 256 == 0 and I % 128 == 0")
+        if hidden_size % 256 or intermediate_size % 64:
+            raise ValueError("A4 prefill needs H % 256 == 0 and I % 64 == 0")
         if terms not in (1, 2):
             raise ValueError("terms must be 1 or 2")
         if warps not in (8, 16):
@@ -379,6 +380,7 @@ class A4PackedPrefillGemm:
         self.fc1 = phase == "fc1"
         self.hidden_size = int(hidden_size)
         self.intermediate_size = int(intermediate_size)
+        self.fc1_half_slab = self.fc1 and self.intermediate_size % 128 != 0
         self.top_k = int(top_k)
         self.stages = int(stages)
         self.fast_math = bool(fast_math)
@@ -405,7 +407,9 @@ class A4PackedPrefillGemm:
         self.size_k = self.hidden_size if self.fc1 else self.intermediate_size
         self.size_n = 2 * self.intermediate_size if self.fc1 else self.hidden_size
         self.n_tiles = (
-            self.intermediate_size // 128 if self.fc1 else self.hidden_size // 256
+            (self.intermediate_size + 127) // 128
+            if self.fc1
+            else self.hidden_size // 256
         )
         self.k_tiles = self.size_k // TILE_K
         # Stage: activation planes, then the B chunks and their scales.
@@ -420,7 +424,8 @@ class A4PackedPrefillGemm:
             self.csf_expert_bytes = self.csf_slabs * (
                 self.csf_slab_bytes + self.k_tiles * self.csf_record_bytes
             )
-            self.stage_bytes += 512 + 2 * self.csf_record_bytes
+            self.csf_stage_records = 4 if self.fc1_half_slab else 2
+            self.stage_bytes += 512 + self.csf_stage_records * self.csf_record_bytes
         self.pipeline_bytes = self.stages * self.stage_bytes
         self.csf_bases_off = max(self.pipeline_bytes, BLOCK_M * EPI_ROW_BYTES)
         self.shared_bytes = self.csf_bases_off + ROUTE_BYTES
@@ -512,6 +517,18 @@ class A4PackedPrefillGemm:
     # -- staging -------------------------------------------------------------------
 
     @cute.jit
+    def _copy_chunk(self, dst, src, n_tile, chunk):
+        if cutlass.const_expr(self.fc1_half_slab):
+            if n_tile * Int32(2) + (chunk & Int32(1)) < Int32(
+                self.intermediate_size // 64
+            ):
+                cp_async4_shared_global(dst, src)
+            else:
+                st_shared_v4_u32(dst, Uint32(0), Uint32(0), Uint32(0), Uint32(0))
+        else:
+            cp_async4_shared_global(dst, src)
+
+    @cute.jit
     def _csf_slab(self, n_tile: Int32, slab: Int32) -> Int32:
         result = n_tile * Int32(2) + slab
         if cutlass.const_expr(self.fc1):
@@ -527,36 +544,70 @@ class A4PackedPrefillGemm:
     @cute.jit
     def _stage_csf_tile(self, scales_u8, smem_base, tid, expert, n_tile):
         if tid < Int32(16):
-            slab = self._csf_slab(n_tile, tid // Int32(8))
-            cp_async4_shared_global(
-                smem_base + Int32(self.csf_bases_off) + tid * Int32(16),
-                self._csf_block(scales_u8, expert)
-                + Int64(slab) * Int64(self.csf_slab_bytes)
-                + Int64(tid % Int32(8)) * Int64(16),
-            )
+            if cutlass.const_expr(self.fc1_half_slab):
+                chunk = tid // Int32(4)
+                packed_chunk = self._chunk_n64(n_tile, chunk)
+                self._copy_chunk(
+                    smem_base + Int32(self.csf_bases_off) + tid * Int32(16),
+                    self._csf_block(scales_u8, expert)
+                    + Int64(packed_chunk // Int32(2)) * Int64(self.csf_slab_bytes)
+                    + Int64(packed_chunk & Int32(1)) * Int64(64)
+                    + Int64(tid % Int32(4)) * Int64(16),
+                    n_tile,
+                    chunk,
+                )
+            else:
+                slab = self._csf_slab(n_tile, tid // Int32(8))
+                cp_async4_shared_global(
+                    smem_base + Int32(self.csf_bases_off) + tid * Int32(16),
+                    self._csf_block(scales_u8, expert)
+                    + Int64(slab) * Int64(self.csf_slab_bytes)
+                    + Int64(tid % Int32(8)) * Int64(16),
+                )
 
     @cute.jit
     def _issue_csf(self, scales_u8, stage_base, k_tile, tid, expert, n_tile):
         block = self._csf_block(scales_u8, expert)
         if tid < Int32(32):
-            slab = self._csf_slab(n_tile, tid // Int32(16))
-            cp_async4_shared_global(
-                stage_base + Int32(self.csf_off) + tid * Int32(16),
-                block
-                + Int64(slab) * Int64(self.csf_slab_bytes)
-                + Int64(128)
-                + Int64(k_tile) * Int64(256)
-                + Int64(tid % Int32(16)) * Int64(16),
-            )
-        if tid < Int32(2 * self.csf_record_bytes // 16):
-            slab = self._csf_slab(n_tile, tid // Int32(self.csf_record_bytes // 16))
-            cp_async4_shared_global(
+            if cutlass.const_expr(self.fc1_half_slab):
+                chunk = tid // Int32(8)
+                packed_chunk = self._chunk_n64(n_tile, chunk)
+                self._copy_chunk(
+                    stage_base + Int32(self.csf_off) + tid * Int32(16),
+                    block
+                    + Int64(packed_chunk // Int32(2)) * Int64(self.csf_slab_bytes)
+                    + Int64(128)
+                    + Int64(k_tile) * Int64(256)
+                    + Int64((tid % Int32(8)) // Int32(2)) * Int64(64)
+                    + Int64(packed_chunk & Int32(1)) * Int64(32)
+                    + Int64(tid & Int32(1)) * Int64(16),
+                    n_tile,
+                    chunk,
+                )
+            else:
+                slab = self._csf_slab(n_tile, tid // Int32(16))
+                cp_async4_shared_global(
+                    stage_base + Int32(self.csf_off) + tid * Int32(16),
+                    block
+                    + Int64(slab) * Int64(self.csf_slab_bytes)
+                    + Int64(128)
+                    + Int64(k_tile) * Int64(256)
+                    + Int64(tid % Int32(16)) * Int64(16),
+                )
+        if tid < Int32(self.csf_stage_records * self.csf_record_bytes // 16):
+            slot = tid // Int32(self.csf_record_bytes // 16)
+            slab = self._csf_slab(n_tile, slot)
+            if cutlass.const_expr(self.fc1_half_slab):
+                slab = self._chunk_n64(n_tile, slot) // Int32(2)
+            self._copy_chunk(
                 stage_base + Int32(self.csf_off + 512) + tid * Int32(16),
                 block
                 + Int64(self.csf_slabs * self.csf_slab_bytes)
                 + (Int64(slab) * Int64(self.k_tiles) + Int64(k_tile))
                 * Int64(self.csf_record_bytes)
                 + Int64(tid % Int32(self.csf_record_bytes // 16)) * Int64(16),
+                n_tile,
+                slot,
             )
 
     @cute.jit
@@ -566,19 +617,24 @@ class A4PackedPrefillGemm:
             chunk = (tid // Int32(16)) % Int32(4)
             slab = chunk // Int32(2)
             word = tid % Int32(16) + (chunk % Int32(2)) * Int32(16)
+            codes_offset = slab * Int32(256) + group * Int32(64) + word * Int32(2)
+            bases_offset = slab * Int32(128) + word * Int32(4)
+            if cutlass.const_expr(self.fc1_half_slab):
+                slab = chunk
+                local_word = tid % Int32(16)
+                word = local_word + (
+                    self._chunk_n64(Int32(0), chunk) & Int32(1)
+                ) * Int32(16)
+                codes_offset = (
+                    chunk * Int32(128) + group * Int32(32) + local_word * Int32(2)
+                )
+                bases_offset = chunk * Int32(64) + local_word * Int32(4)
             codes = ld_shared_u16_zx_ordered(
-                stage_base
-                + Int32(self.csf_off)
-                + slab * Int32(256)
-                + group * Int32(64)
-                + word * Int32(2)
+                stage_base + Int32(self.csf_off) + codes_offset
             )
             codes = (codes | (codes << Uint32(12))) & Uint32(0x0F0F0F0F)
             value = codes + ld_shared_u32(
-                smem_base
-                + Int32(self.csf_bases_off)
-                + slab * Int32(128)
-                + word * Int32(4)
+                smem_base + Int32(self.csf_bases_off) + bases_offset
             )
             record = (
                 stage_base
@@ -629,18 +685,22 @@ class A4PackedPrefillGemm:
                 cp_async_u32_shared_global(
                     stage_base + dst, src + Int64(k_tile) * Int64(4)
                 )
-        for src, dst in b_desc:
-            cp_async4_shared_global(
+        for src, dst, chunk in b_desc:
+            self._copy_chunk(
                 stage_base + dst,
                 src + Int64(k_tile) * Int64((TILE_K // 16) * (self.size_n // 64) * 512),
+                n_tile,
+                chunk,
             )
         if cutlass.const_expr(self.csf_scales):
             self._issue_csf(scales_u8, stage_base, k_tile, tid, expert, n_tile)
         else:
             if tid < Int32((TILE_K // 16) * 4 * 4):
-                cp_async4_shared_global(
+                self._copy_chunk(
                     stage_base + s_dst,
                     s_src + Int64(k_tile) * Int64((TILE_K // 16) * self.size_n),
+                    n_tile,
+                    (tid >> Int32(2)) & Int32(3),
                 )
 
     # -- mainloop ------------------------------------------------------------------
@@ -741,7 +801,7 @@ class A4PackedPrefillGemm:
                 + ((b_k16 * Int32(4) + b_chunk) << Int32(9))
                 + ((b_vec ^ (b_k16 & Int32(1))) << Int32(4))
             )
-            b_desc.append((src, dst))
+            b_desc.append((src, dst, b_chunk))
         s_k16 = (tid >> Int32(4)) & Int32(3)
         s_chunk = (tid >> Int32(2)) & Int32(3)
         s_part = tid & Int32(3)
@@ -1007,7 +1067,12 @@ class A4PackedPrefillGemm:
             row = tid & Int32(BLOCK_M - 1)
             half = tid >> Int32(7)
             route = Int32(ld_shared_u32(route_base + (row << Int32(2))))
-            if route < live_routes:
+            live = route < live_routes
+            if cutlass.const_expr(self.fc1_half_slab):
+                live = live and n_tile * Int32(2) + half < Int32(
+                    self.intermediate_size // 64
+                )
+            if live:
                 row_base = smem_base + row * Int32(EPI_ROW_BYTES) + (half << Int32(7))
                 words = cute.make_rmem_tensor((8,), Uint32)
                 words2 = cute.make_rmem_tensor((8,), Uint32)
@@ -1273,7 +1338,7 @@ def a4_prefill_supported(
         and dtype == torch.bfloat16
         and (swiglu_limit is None or (math.isfinite(swiglu_limit) and swiglu_limit > 0))
         and hidden_size % 256 == 0
-        and intermediate_size % 128 == 0
+        and intermediate_size % 64 == 0
     )
 
 
@@ -1341,7 +1406,7 @@ def _compile_a4_kernels(
         int(intermediate_size),
         int(topk),
         bool(fast_math),
-        4,
+        5,
         int(terms),
         warps,
         swiglu_limit,
@@ -1397,7 +1462,7 @@ def _compile_a4_kernels(
                 Int32(1),
                 stream,
                 compile_spec=KernelCompileSpec.from_key(
-                    f"moe.w4a16.a4_prefill.{phase}", 4, key
+                    f"moe.w4a16.a4_prefill.{phase}", 5, key
                 ),
             )
         )

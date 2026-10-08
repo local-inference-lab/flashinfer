@@ -298,11 +298,11 @@ def test_storage_without_inline_words_matches_uninlined_storage_size(
 
 
 class _A4ScaleStages:
-    def __init__(self, phase, inline):
+    def __init__(self, phase, inline, intermediate_size):
         self.gemm = A4PackedPrefillGemm(
             phase=phase,
             hidden_size=512,
-            intermediate_size=256,
+            intermediate_size=intermediate_size,
             top_k=2,
             csf_inline_words=inline,
         )
@@ -353,10 +353,11 @@ class _A4ScaleStages:
 
 @pytest.mark.parametrize("phase", ["fc1", "fc2"])
 @pytest.mark.parametrize("inline", [0, 4])
-def test_a4_stage_words_match_dense_scale_tiles(phase, inline):
+@pytest.mark.parametrize("intermediate_size", [64, 256, 320])
+def test_a4_stage_words_match_dense_scale_tiles(phase, inline, intermediate_size):
     """A4 reads separated gate/up slabs and global replacement-word spills exactly."""
     device = require_b12x()
-    probe = _A4ScaleStages(phase, inline)
+    probe = _A4ScaleStages(phase, inline, intermediate_size)
     gemm = probe.gemm
     experts = 3
     logical = _logical_scales(
@@ -376,16 +377,13 @@ def test_a4_stage_words_match_dense_scale_tiles(phase, inline):
     for tile in range(gemm.n_tiles):
         if gemm.fc1:
             first = tile * 128
-            second = first + gemm.intermediate_size
-            expected.append(
-                torch.cat(
-                    (
-                        dense[:, :, first : first + 128],
-                        dense[:, :, second : second + 128],
-                    ),
-                    dim=-1,
-                )
-            )
+            live = min(128, gemm.intermediate_size - first)
+            halves = []
+            for offset in (0, gemm.intermediate_size):
+                half = torch.zeros(experts, gemm.size_k // 16, 128, dtype=torch.uint8)
+                half[:, :, :live] = dense[:, :, offset + first : offset + first + live]
+                halves.append(half)
+            expected.append(torch.cat(halves, dim=-1))
         else:
             expected.append(dense[:, :, tile * 256 : (tile + 1) * 256])
     expected = torch.stack(expected, dim=1).reshape(
@@ -400,7 +398,7 @@ def test_a4_stage_words_match_dense_scale_tiles(phase, inline):
         Int32(1),
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
-            "quant.w4a16_a4_csf_stage_oracle", 1, (phase, inline)
+            "quant.w4a16_a4_csf_stage_oracle", 2, (phase, inline, intermediate_size)
         ),
     )
     program(
