@@ -392,6 +392,8 @@ def _process_nvfp4_packed_scales(
     if scale_factor > 1.0:
         packed_scales = (packed_scales.float() * scale_factor).to(torch.float16)
     packed_scales = packed_scales * (2**7)
+    # Nonzero lifted bytes require bit 7 for the packed BF16 decoder.
+    # The discard is an encoding constraint, not an FP16 range limit.
     packed_scales[packed_scales < 2] = 0
     packed_scales = packed_scales.view(torch.int16) << 1
     packed_scales = packed_scales.view(torch.float8_e4m3fn)
