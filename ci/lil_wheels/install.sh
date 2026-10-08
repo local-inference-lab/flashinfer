@@ -25,6 +25,7 @@ assert flashinfer_jit_cache.__version__ == expected_version
 assert flashinfer_jit_cache.__git_version__ == expected_commit
 assert importlib.metadata.version("flashinfer-python") == expected_version
 assert importlib.metadata.version("flashinfer-jit-cache") == expected_version
+assert importlib.metadata.version("flashinfer-jit-cache-sm120f") == expected_version
 print(f"FlashInfer {flashinfer.__version__}")
 print(f"source commit {flashinfer.__git_commit__}")
 PY
