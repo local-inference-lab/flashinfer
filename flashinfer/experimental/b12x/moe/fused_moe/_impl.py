@@ -3367,6 +3367,8 @@ def _plan_core_workspace(
     route_num_experts: int | None = None,
     w4a16_block_size_m: int | None = None,
     w4a16_prefill_fused_sum: bool | None = None,
+    w4a16_a4_prefill_enabled: bool = False,
+    w4a16_a4_prefill_terms: int = 1,
     trellis_bits: int = 3,
     trellis_tile_config: tuple[int, int, int, int] | None = None,
     trellis_pair_kinds: frozenset[str] | None = None,
@@ -3735,6 +3737,75 @@ def _plan_core_workspace(
                 // _dtype_nbytes(dtype),
             )
         cache_dtype = torch.float16 if full_rotation else dtype
+        # NVFP4 A4 prefill workspace (B12X_W4A16_A4_PREFILL): the A4 pipeline
+        # carves quantized input/intermediate planes, their scales, and padded
+        # route metadata out of cache2 and keeps one BF16 FC2 row per route in
+        # cache13. The carve exceeds the ordinary A16 allocation at GLM's
+        # prefill chunk sizes (38,146,560 B vs 33,554,432 B at 8192 tokens,
+        # terms=1), so select_a4()/fits_buffers() silently fell back to W4A16
+        # for near-full chunks. Reserve max(A16, A4) for cache2/cache13 at plan
+        # time, gated on the plan's frozen A4 controls (never the MXFP4 env
+        # knob) and mirroring the A4 compile admission in
+        # _w4a16_primary_launches exactly (route namespace match, no
+        # router-weight-on-input, supported packed/NVFP4 geometry). Sizing goes
+        # through the kernel's own carve (a4_prefill_workspace_requirements ->
+        # W4A16A4PrefillLaunches.scratch_bytes/_carve_layout), never a second
+        # hand formula. Flag-off plans keep the stock sizes; an enabled hybrid
+        # plan reserves the enlarged buffers even when a given call binds A16
+        # (the reservation is plan-level, not per-bind).
+        _a4_cache13_elements = 0
+        if (
+            w4a16_a4_prefill_enabled
+            and route_E == int(weight_E)
+            and not apply_router_weight_on_input
+        ):
+            from b12x.moe._shared.kernels.w4a16.host import (
+                max_packed_route_slots as _a4_mprs,
+                route_pack_token_capacity as _a4_rptc,
+            )
+            from b12x.moe._shared.kernels.w4a16.prefill_a4 import (
+                A4_PREFILL_ROUTE_BLOCK as _A4_RB,
+                a4_prefill_supported as _a4_supported,
+                a4_prefill_workspace_requirements as _a4_requirements,
+            )
+
+            if _a4_supported(
+                prepared_layout=weight_layout,
+                scale_format=scale_format,
+                activation=activation,
+                is_gated=activation == "silu",
+                swiglu_limit=swiglu_limit,
+                dtype=dtype,
+                hidden_size=int(k),
+                intermediate_size=int(n),
+            ):
+                _a4_tokens = int(token_capacity)
+                _a4_numel_cap = _a4_rptc(_a4_tokens, int(num_topk)) * int(num_topk)
+                _a4_pr = max(_a4_mprs(_a4_numel_cap, _A4_RB, route_E), 1)
+                _a4_rbl = (_a4_pr + _A4_RB - 1) // _A4_RB
+                _a4_terms = (
+                    int(w4a16_a4_prefill_terms)
+                    if int(w4a16_a4_prefill_terms) in (1, 2)
+                    else 1
+                )
+                _a4_cache2_bytes, _a4_cache13_bytes = _a4_requirements(
+                    tokens=_a4_tokens,
+                    hidden_size=int(k),
+                    intermediate_size=int(n),
+                    num_experts=route_E,
+                    topk=int(num_topk),
+                    terms=_a4_terms,
+                    max_packed_routes=_a4_pr,
+                    max_route_blocks=_a4_rbl,
+                )
+                _a4_ebytes = _dtype_nbytes(cache_dtype)
+                intermediate_cache2_elements = max(
+                    intermediate_cache2_elements,
+                    (_a4_cache2_bytes + _a4_ebytes - 1) // _a4_ebytes,
+                )
+                _a4_cache13_elements = (
+                    _a4_cache13_bytes + _a4_ebytes - 1
+                ) // _a4_ebytes
         use_prefill_fused_sum = prefill_fused_sum_eligible(
             dtype=dtype,
             m=token_capacity,
@@ -3751,6 +3822,15 @@ def _plan_core_workspace(
             if use_prefill_fused_sum
             else routed_capacity * max(fc1_cols, int(k))
         )
+        # NVFP4 A4 prefill workspace: cache13 must also fit one BF16 FC2 row
+        # per route — tokens * topk * hidden_size ELEMENTS, i.e. that product
+        # times 2 bytes — for the admitted A4 pipeline (fits_buffers checks
+        # both planes together).
+        if _a4_cache13_elements > 0:
+            intermediate_cache13_elements = max(
+                intermediate_cache13_elements,
+                _a4_cache13_elements,
+            )
         tensor_specs = [
             _TensorAllocSpec(
                 "intermediate_cache13",
@@ -8300,6 +8380,8 @@ def plan_tp_moe_arena_layout(
     deterministic_output: bool | None = None,
     w4a16_block_size_m: int | None = None,
     w4a16_prefill_fused_sum: bool | None = None,
+    w4a16_a4_prefill_enabled: bool = False,
+    w4a16_a4_prefill_terms: int = 1,
     decode_config: MoeDecodeConfig,
 ) -> TPMoEArenaLayout:
     """Compute the byte layout needed by one lane-owned MoE pool."""
@@ -8399,6 +8481,8 @@ def plan_tp_moe_arena_layout(
             route_num_experts=route_num_experts,
             w4a16_block_size_m=w4a16_block_size_m,
             w4a16_prefill_fused_sum=w4a16_prefill_fused_sum,
+            w4a16_a4_prefill_enabled=w4a16_a4_prefill_enabled,
+            w4a16_a4_prefill_terms=w4a16_a4_prefill_terms,
             trellis_bits=weight_plan.trellis_bits or 3,
             trellis_tile_config=weight_plan.trellis_tile_config,
             trellis_pair_kinds=weight_plan.trellis_pair_kinds,
@@ -9025,6 +9109,8 @@ def _plan_tp_moe_arena_layout_from_caps(
         deterministic_output=deterministic_output,
         w4a16_block_size_m=_resolve_trellis_route_block_size(caps),
         w4a16_prefill_fused_sum=caps.w4a16_prefill_fused_sum,
+        w4a16_a4_prefill_enabled=bool(caps.w4a16_a4_prefill_enabled),
+        w4a16_a4_prefill_terms=int(caps.w4a16_a4_prefill_terms),
         decode_config=caps.decode_config,
     )
 
@@ -9085,6 +9171,8 @@ def plan_tp_moe_scratch(
         route_num_experts=caps.route_num_experts,
         w4a16_block_size_m=resolved_block_size_m,
         w4a16_prefill_fused_sum=caps.w4a16_prefill_fused_sum,
+        w4a16_a4_prefill_enabled=bool(caps.w4a16_a4_prefill_enabled),
+        w4a16_a4_prefill_terms=int(caps.w4a16_a4_prefill_terms),
         trellis_bits=caps.weight_plan.trellis_bits or 3,
         trellis_tile_config=caps.weight_plan.trellis_tile_config,
         trellis_pair_kinds=caps.weight_plan.trellis_pair_kinds,
@@ -9683,6 +9771,8 @@ def materialize_tp_moe_arena_workspaces(
             route_num_experts=caps.route_num_experts,
             w4a16_block_size_m=resolved_block_size_m,
             w4a16_prefill_fused_sum=caps.w4a16_prefill_fused_sum,
+            w4a16_a4_prefill_enabled=bool(caps.w4a16_a4_prefill_enabled),
+            w4a16_a4_prefill_terms=int(caps.w4a16_a4_prefill_terms),
             trellis_bits=weight_plan.trellis_bits or 3,
             trellis_tile_config=weight_plan.trellis_tile_config,
             trellis_pair_kinds=weight_plan.trellis_pair_kinds,
