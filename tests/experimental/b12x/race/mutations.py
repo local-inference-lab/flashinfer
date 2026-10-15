@@ -1,9 +1,10 @@
-"""Check that the race tests catch b12x races that were really shipped.
+"""Check that the race tests detect known classes of b12x races.
 
-Each mutation puts a fixed race back into a b12x module (by deleting the fix's
-lines from the installed source), then runs the scenarios that should expose
-it in a fresh interpreter. A mutation the harness fails to catch means the
-perturbation or scenario coverage is too weak for that class of bug.
+Each mutation removes, from a b12x module's installed source, the lines that
+prevent one known race (a fence, a barrier release, a CTA-wide sync), then runs
+the scenarios that cover that kernel in a fresh interpreter. A mutation the
+harness does not catch marks a class of bug that the perturbation or the
+scenario coverage cannot detect.
 
     python -m tests.experimental.b12x.race.mutations              # all
     python -m tests.experimental.b12x.race.mutations dense_gemm_stage_fence
@@ -12,8 +13,8 @@ The mutated module is loaded before anything imports b12x, here and in b12x's
 spawned compile workers (which re-import this module as their main module).
 ``B12X_RACE_MUTATION`` names the active mutation; like every non-operational
 ``B12X_`` variable it is part of the compile cache key, so mutated kernels
-never share cache entries with real ones. Set ``B12X_RACE_FUZZ_DELAY`` too for
-mutations listed with ``delay``.
+never share cache entries with real ones. Mutations listed with ``delay`` also
+run with ``B12X_RACE_FUZZ_DELAY``.
 """
 
 from __future__ import annotations
@@ -154,7 +155,7 @@ def main(argv: list[str]) -> int:
         caught = any(r["bad"] for r in result["results"])
         for r in result["results"]:
             print(
-                f"{name} on {result['device']}: {r['description']}: {r['bad']} of {r['replays']} replays differ"
+                f"{name} on {result['device']}: {r['description']}: {r['bad']} of {r['replays']} replays out of tolerance"
             )
         print(f"{name}: {'caught' if caught else 'MISSED'}")
         if not caught:

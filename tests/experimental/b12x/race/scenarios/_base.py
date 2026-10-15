@@ -19,9 +19,11 @@ class Scenario:
 
 
 def _rows_for_waves(device, n, waves, tile_m=64, tile_n=128) -> int:
-    """Rows that give a 64x128-tiled output about ``waves`` CTAs per SM: races
-    between CTAs need more CTAs than SMs, and the race rate grows with the
-    number of waves (a one-wave grid on 188 SMs rarely shows #16)."""
+    """Rows that give a 64x128-tiled output about ``waves`` CTAs per SM. Races
+    between CTAs need more CTAs than SMs, and their rate grows with the number
+    of waves: on a 188-SM RTX PRO 6000, a dense GEMM without its stage-reuse
+    proxy fence fails 0.04% of contended replays as a one-wave 96-row grid and
+    1-2% as a several-wave 512-row grid."""
     sms = torch.cuda.get_device_properties(device).multi_processor_count
     tiles_n = -(-n // tile_n)
     return tile_m * max(1, -(-waves * sms // tiles_n))
