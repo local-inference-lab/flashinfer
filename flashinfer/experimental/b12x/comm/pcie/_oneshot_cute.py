@@ -140,6 +140,30 @@ class _PackedMath:
         )
 
     @cute.jit
+    def _pull_accumulate(
+        self,
+        accumulator: cute.Tensor,
+        peer_ptrs: cute.Pointer,
+        offset: Int64,
+    ) -> None:
+        # Loads rotate to spread peer reads; a fixed sum order keeps ranks bit-identical.
+        words = cute.make_rmem_tensor((self._world_size * 4,), cutlass.Uint32)
+        for peer_index in cutlass.range_constexpr(self._world_size):
+            peer_rank = (self._rank + peer_index) % self._world_size
+            loaded = ld_global_v4_u32(Int64(peer_ptrs[peer_rank]) + offset)
+            for word in cutlass.range_constexpr(4):
+                words[peer_rank * 4 + word] = loaded[word]
+        for source_rank in cutlass.range_constexpr(self._world_size):
+            self._accumulate_words(
+                accumulator,
+                words[source_rank * 4],
+                words[source_rank * 4 + 1],
+                words[source_rank * 4 + 2],
+                words[source_rank * 4 + 3],
+                source_rank == 0,
+            )
+
+    @cute.jit
     def _store_accumulator(self, address: Int64, accumulator: cute.Tensor) -> None:
         if cutlass.const_expr(self._dtype_name == "float32"):
             st_global_v4_f32(
@@ -354,14 +378,7 @@ class _OneshotLaunch(_PackedMath):
                 accumulator = cute.make_rmem_tensor(
                     (self._pack_elems,), cutlass.Float32
                 )
-                for peer_index in cutlass.range_constexpr(self._world_size):
-                    peer_rank = (self._rank + peer_index) % self._world_size
-                    peer_base = Int64(peer_ptrs[peer_rank])
-                    self._load_accumulate(
-                        accumulator,
-                        peer_base + Int64(index) * Int64(16),
-                        peer_index == 0,
-                    )
+                self._pull_accumulate(accumulator, peer_ptrs, Int64(index) * Int64(16))
                 self._store_accumulator(
                     output_base + Int64(index) * Int64(16), accumulator
                 )
@@ -1013,46 +1030,26 @@ class _FusedOneshotLaunch(_PackedMath):
             for lane in cutlass.range_constexpr(4):
                 accumulator[lane] = u32_as_f32(low[lane])
                 accumulator[lane + 4] = u32_as_f32(high[lane])
-        elif cutlass.const_expr(self._mode == "stage_remote_push"):
-            self._load_accumulate(
-                accumulator,
-                input_base + index * Int64(16),
-                True,
-            )
+        elif cutlass.const_expr(
+            self._mode == "stage_remote_push" or self._mode == "stage_push"
+        ):
             local_stage = Int64(peer_ptrs[self._rank])
-            for peer_index in cutlass.range_constexpr(1, self._world_size):
-                source_rank = (self._rank + peer_index) % self._world_size
-                self._load_accumulate(
-                    accumulator,
-                    local_stage
-                    + (Int64(source_rank) * shard_packs + index) * Int64(16),
-                    False,
-                )
-        elif cutlass.const_expr(self._mode == "stage_push"):
-            self._load_accumulate(
-                accumulator,
-                input_base + index * Int64(16),
-                True,
-            )
-            local_stage = Int64(peer_ptrs[self._rank])
-            initialized = True
             for source_rank in cutlass.range_constexpr(self._world_size):
-                if cutlass.const_expr(source_rank != self._rank):
+                if cutlass.const_expr(source_rank == self._rank):
+                    self._load_accumulate(
+                        accumulator,
+                        input_base + index * Int64(16),
+                        source_rank == 0,
+                    )
+                else:
                     self._load_accumulate(
                         accumulator,
                         local_stage
                         + (Int64(source_rank) * shard_packs + index) * Int64(16),
-                        not initialized,
+                        source_rank == 0,
                     )
-                    initialized = True
         else:
-            for peer_index in cutlass.range_constexpr(self._world_size):
-                peer_rank = (self._rank + peer_index) % self._world_size
-                self._load_accumulate(
-                    accumulator,
-                    Int64(peer_ptrs[peer_rank]) + index * Int64(16),
-                    peer_index == 0,
-                )
+            self._pull_accumulate(accumulator, peer_ptrs, index * Int64(16))
         for lane in cutlass.range_constexpr(self._pack_elems):
             if cutlass.const_expr(self._reduction_dtype == "bfloat16"):
                 accumulator[lane] = accumulator[lane].to(cutlass.BFloat16).to(Float32)
