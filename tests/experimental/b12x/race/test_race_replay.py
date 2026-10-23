@@ -1,12 +1,14 @@
-"""b12x kernels must replay bit-exactly while other work perturbs their timing.
+"""b12x kernels must give sound results while other work perturbs their timing.
 
-Each scenario (see ``scenarios.py``) is captured in a CUDA graph, its first
-replay becomes the reference, quiet replays must reproduce it, and then every
-replay under ``SMContention`` must reproduce it too. A difference in any bit
-means the kernel's result depends on CTA or warp timing: a missing fence,
-barrier release or CTA-wide sync. The b12x dense GEMM stage-reuse race
-(local-inference-lab/flashinfer#16) fails about 1-4% of such replays on
-GB10, RTX PRO 4000 and RTX PRO 6000 when its fence is removed.
+Each scenario (see ``scenarios/``) is captured in a CUDA graph and its first
+replay becomes the reference. Quiet replays calibrate how far arithmetic order
+alone moves each output (b12x is not deterministic, and need not be); every
+replay under ``SMContention`` must then stay within a margin of that spread
+(see ``replay.py``). Values outside it mean the kernel's result depends on CTA
+or warp timing: a missing fence, barrier release or CTA-wide sync. A b12x
+dense GEMM without its stage-reuse proxy fence (mutation
+``dense_gemm_stage_fence``) puts about 1-4% of contended replays outside it on
+GB10, RTX PRO 4000 and RTX PRO 6000.
 
 Budgets and modes:
 
@@ -17,9 +19,11 @@ Budgets and modes:
   with random warp delays after CTA syncs, named barriers and mbarrier waits
   (``b12x._lib.race_fuzz``), which exposes kernels that publish results before
   the rest of their CTA has written them. Instrumented kernels get their own
-  compile cache entries. Run the suite both ways: the delays also close some
-  windows (with them, the unfenced #16 GEMM passes 2000 of 2000 replays on an
-  RTX PRO 6000; without them it fails 28-40 of 2000).
+  compile cache entries. The two modes detect different defects, so run the
+  suite in both: contention exposes missing proxy fences, which the delays
+  hide (``dense_gemm_stage_fence`` fails 28-40 of 2000 contended replays on an
+  RTX PRO 6000 without delays and none with them), and the delays expose
+  missing CTA syncs before barrier arrivals.
 
 A curated case may carry ``"xfail": reason`` for a known, unfixed race; it
 runs as a strict xfail, so the suite reports when a fix makes it pass.
@@ -69,7 +73,9 @@ def _check(family, case, contention):
             family,
             case,
             id=f"{family}-{index}",
-            marks=pytest.mark.xfail(strict=True, reason=case["xfail"]) if "xfail" in case else (),
+            marks=pytest.mark.xfail(strict=True, reason=case["xfail"])
+            if "xfail" in case
+            else (),
         )
         for family, cases in scenarios.CASES.items()
         for index, case in enumerate(cases)

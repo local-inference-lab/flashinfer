@@ -30,7 +30,6 @@ import torch
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import Float32, Int32, Int64
 
-from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
 
 _GOLDEN = -7046029254386353131  # 0x9E3779B97F4A7C15 as int64
 _LCG_MUL = 6364136223846793005
@@ -128,9 +127,10 @@ class _Launch:
 class SMContention:
     """Context manager that keeps highest-priority noise running on ``device``.
 
-    ``launched`` counts noise kernels issued so far; tests report it to show the
-    noise ran. The default schedule mirrors the perturbation that exposed the
-    b12x dense GEMM stage-reuse race (local-inference-lab/flashinfer#16).
+    ``launched`` counts the noise kernels issued; tests report it to show the
+    noise ran. With the default schedule, a b12x dense GEMM missing its
+    stage-reuse proxy fence (mutation ``dense_gemm_stage_fence``) corrupts about
+    1-4% of replays.
     """
 
     def __init__(
@@ -185,8 +185,10 @@ class SMContention:
         self._thread = None
         self._error = None
 
+    # Plain cute.compile (no b12x compiler, cache or arch gate), so the noise
+    # runs beside any kernel on any CuTe DSL target, SM100-family included.
     def _compile_hog(self, threads, words):
-        return b12x_compile(
+        return cute.compile(
             _Hog(threads, words),
             self._buf,
             Int32(1),
@@ -194,19 +196,11 @@ class SMContention:
             Int64(1),
             Int32(0),
             self._cu_stream(),
-            compile_spec=KernelCompileSpec.from_key(
-                "test.race.hog", 1, (threads, words)
-            ),
         )
 
     def _compile_skew(self, threads):
-        return b12x_compile(
-            _Skew(threads),
-            self._sink,
-            Int32(1),
-            Int64(1),
-            self._cu_stream(),
-            compile_spec=KernelCompileSpec.from_key("test.race.skew", 1, (threads,)),
+        return cute.compile(
+            _Skew(threads), self._sink, Int32(1), Int64(1), self._cu_stream()
         )
 
     def _cu_stream(self):
