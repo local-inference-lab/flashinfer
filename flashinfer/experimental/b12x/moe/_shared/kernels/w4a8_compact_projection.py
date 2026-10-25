@@ -325,6 +325,9 @@ class W4A8CompactMicroProjectionKernel:
         output_tile: Int32,
         k128_slice: Int32,
         tid: Int32,
+        bounds=None,
+        value_offset=None,
+        base_word=None,
     ):
         physical_tile = output_tile // Int32(128 // self.tile_n)
         packed_half = output_tile % Int32(128 // self.tile_n)
@@ -341,12 +344,28 @@ class W4A8CompactMicroProjectionKernel:
                     + physical_tile * Int32(self.csf_reader.plane.storage.column_groups)
                     + k128_slice
                 )
+                cached = None
+                if cutlass.const_expr(bounds is not None):
+                    first, end = Uint32(0), Uint32(0)
+                    for chunk in cutlass.range_constexpr(cute.size(bounds, mode=[0])):
+                        selected_first = cute.arch.shuffle_sync(
+                            bounds[chunk, 0], k128_slice % Int32(32)
+                        )
+                        selected_end = cute.arch.shuffle_sync(
+                            bounds[chunk, 1], k128_slice % Int32(32)
+                        )
+                        if k128_slice // Int32(32) == Int32(chunk):
+                            first, end = selected_first, selected_end
+                    cached = (first, end)
                 self.csf_reader.stage_compressed(
                     scales.iterator,
                     expert_idx,
                     group,
                     target,
                     tid,
+                    cached,
+                    value_offset,
+                    base_word,
                     coordinates=(projection, physical_tile, k128_slice),
                 )
             return
@@ -386,6 +405,9 @@ class W4A8CompactMicroProjectionKernel:
         expert: Int32,
         projection_tile: Int32,
         k128_slice: Int32,
+        csf_bounds=None,
+        csf_value_offset=None,
+        csf_base_word=None,
     ):
         stage_base = smem_base
         if cutlass.const_expr(self.stages == 2):
@@ -436,6 +458,9 @@ class W4A8CompactMicroProjectionKernel:
                 output_tile,
                 k128_slice,
                 tid,
+                csf_bounds,
+                csf_value_offset,
+                csf_base_word,
             )
         else:
             packed_tile = projection_tile // Int32(2)
@@ -499,6 +524,23 @@ class W4A8CompactMicroProjectionKernel:
             input_smem_base -= (projection_tile // Int32(self.n_tiles)) * Int32(
                 self.shared_words * 4
             )
+        csf_bounds, csf_base_word, csf_value_offset = None, None, None
+        if cutlass.const_expr(self.csf_inline):
+            # Each task keeps one validated expert and projection row group
+            # throughout its K sweep; another persistent-grid task reloads them.
+            projection = projection_tile // Int32(self.n_tiles)
+            output_tile = projection_tile % Int32(self.n_tiles)
+            physical_tile = output_tile // Int32(128 // self.tile_n)
+            section_expert = expert * Int32(self.csf_reader.plane.sections) + projection
+            csf_value_offset = self.csf_reader.plane.group_value_offset(
+                w13_sfb.iterator
+            )
+            csf_bounds = self.csf_reader.prefetch_column_bounds(
+                w13_sfb.iterator, section_expert, physical_tile
+            )
+            csf_base_word = self.csf_reader.prefetch_row_bases(
+                w13_sfb.iterator, section_expert, physical_tile, tid
+            )
         for preload in cutlass.range_constexpr(1):
             if cutlass.const_expr(preload < self.k // 128):
                 self._stage_slice(
@@ -512,6 +554,9 @@ class W4A8CompactMicroProjectionKernel:
                     expert,
                     projection_tile,
                     Int32(preload),
+                    csf_bounds,
+                    csf_value_offset,
+                    csf_base_word,
                 )
             cute.arch.cp_async_commit_group()
 
@@ -551,6 +596,9 @@ class W4A8CompactMicroProjectionKernel:
                         expert,
                         projection_tile,
                         next_slice,
+                        csf_bounds,
+                        csf_value_offset,
+                        csf_base_word,
                     )
                 cute.arch.cp_async_commit_group()
             if cutlass.const_expr(self.max_copy_groups == 2):
@@ -633,6 +681,9 @@ class W4A8CompactMicroProjectionKernel:
                         expert,
                         projection_tile,
                         next_slice,
+                        csf_bounds,
+                        csf_value_offset,
+                        csf_base_word,
                     )
                 cute.arch.cp_async_commit_group()
             k128_slice += Int32(1)

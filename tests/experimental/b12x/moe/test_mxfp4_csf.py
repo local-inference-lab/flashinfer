@@ -328,6 +328,7 @@ def test_expanded_scales_match_native_under_poisoned_replay(
     deterministic=True,
     packing=None,
     inactive=False,
+    zero_tiny=False,
 ):
     """Poisoned scale scratch is restored before native kernels execute."""
     device = require_b12x()
@@ -358,6 +359,9 @@ def test_expanded_scales_match_native_under_poisoned_replay(
     if after_plan is not None:
         after_plan()
     source = torch.randn(tokens, h, dtype=torch.bfloat16, device=device) * 0.1
+    if zero_tiny:
+        source[0].zero_()
+        source[1].mul_(1e-10)
     ids = torch.stack(
         [torch.randperm(e, device=device)[:topk] for _ in range(tokens)]
     ).to(ids_dtype)
@@ -420,7 +424,7 @@ def test_expanded_scales_match_native_under_poisoned_replay(
             if inactive:
                 ids[0, 0] = -1
                 if tokens > 1:
-                    ids[-1, -1] = e
+                    ids[-1, -1] = 2**32 if ids_dtype == torch.int64 else e
             for buffer in scratch[0]:
                 buffer.view(torch.uint8).fill_(0xFF)
             for output in outputs:
@@ -719,6 +723,31 @@ def test_compact_micro_inline_poisoned_graph(
         inline=inline_scales,
         execution_override=config,
         inactive=True,
+    )
+
+
+@pytest.mark.parametrize("tokens", (4, 6, 8, 16))
+@pytest.mark.parametrize("fc1_tile_n", (64, 128))
+def test_compact_inline_task_metadata_follows_full_width_routes(
+    tokens, fc1_tile_n, monkeypatch
+):
+    """A bounded grid reloads metadata for changing experts and N64 halves."""
+    test_expanded_scales_match_native_under_poisoned_replay(
+        5120,
+        576,
+        tokens,
+        "w31",
+        torch.int64,
+        monkeypatch,
+        inline=True,
+        execution_override=moe.MoeDecodeConfig(
+            backend="micro",
+            route_planner="internal",
+            max_active_clusters=1,
+            micro_fc1_tile_n=fc1_tile_n,
+        ),
+        inactive=True,
+        zero_tiny=True,
     )
 
 
