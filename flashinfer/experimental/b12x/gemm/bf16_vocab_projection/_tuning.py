@@ -14,7 +14,6 @@ from b12x.preparation import (
 )
 from b12x.preparation._efficiency import (
     AutotuneEffort,
-    EfficiencyPredicate,
     capture_autotune_effort,
 )
 
@@ -168,23 +167,13 @@ def _tuning_parameters(query, device):
             else ("torch",),
             "block_k": tuple(sorted(set(row_blocks) | _LOOP_BLOCKS)),
         },
+        predicates=(
+            lambda choice: choice["backend"] != "triton" or query.max_tokens <= 8,
+        ),
         efficiency_predicates=(
-            EfficiencyPredicate(
-                lambda choice: (
-                    choice["backend"] != "triton" or choice["num_warps"] in (4, 8)
-                ),
-                minimum_effort="medium",
-            ),
-            EfficiencyPredicate(
-                lambda choice: (
-                    choice["backend"] != "triton"
-                    or (query.max_tokens == 1 and query.in_features <= MAX_IN_FEATURES)
-                ),
-                minimum_effort="high",
-            ),
-            EfficiencyPredicate(
-                lambda choice: choice["backend"] != "triton" or query.max_tokens <= 8,
-                minimum_effort="max",
+            lambda choice: (
+                choice["backend"] != "triton"
+                or (query.max_tokens == 1 and query.in_features <= MAX_IN_FEATURES)
             ),
         ),
         autotune_effort=query.autotune_effort,

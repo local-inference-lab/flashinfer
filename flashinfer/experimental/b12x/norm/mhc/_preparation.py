@@ -19,7 +19,6 @@ from ._tuning import MhcConfig, MhcQuery, TUNING
 
 _CONTROL_NAMES = (
     "B12X_AUTOTUNE_EFFORT",
-    "B12X_AUTOTUNE_EXHAUSTIVE",
     "B12X_MHC_PREFILL_TF32_MMA",
     "B12X_MHC_PREFILL_BF16_MMA",
     "B12X_MHC_PREFILL_BF16_MIN_TOKENS",
@@ -214,7 +213,7 @@ def _compile_query(query_payload):
         {
             name: value
             for name, value in query_payload["controls"].items()
-            if name not in ("B12X_AUTOTUNE_EFFORT", "B12X_AUTOTUNE_EXHAUSTIVE")
+            if name != "B12X_AUTOTUNE_EFFORT"
         }
     )
     return FrozenMapping(compile_payload)

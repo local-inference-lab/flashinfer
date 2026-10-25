@@ -225,7 +225,7 @@ def test_qwen_deterministic_defaults_keep_existing_kernel_routes(tokens):
 
 
 @pytest.mark.parametrize("tokens", [1, 8, 128])
-@pytest.mark.parametrize("effort", ["medium", "max"])
+@pytest.mark.parametrize("effort", ["default", "audit"])
 @pytest.mark.parametrize("precision", ["nvfp4", "w4a8_mx"])
 def test_mixed_precision_search_preserves_each_precision_candidates(
     tokens, effort, precision

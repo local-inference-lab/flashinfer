@@ -5,9 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 
 from b12x.preparation._efficiency import (
-    EfficiencyPredicate,
     capture_autotune_effort,
-    capture_exhaustive_search,
     powers_of_two,
 )
 
@@ -86,7 +84,6 @@ class GqaQuery:
     force_split_kv: bool | None
     abi: FrozenMapping
     controls: FrozenMapping
-    exhaustive: bool = field(default_factory=capture_exhaustive_search)
     autotune_effort: str = field(default_factory=capture_autotune_effort)
 
     @property
@@ -114,7 +111,6 @@ class GqaQuery:
             "force_split_kv": self.force_split_kv,
             "abi": self.abi,
             "controls": self.controls,
-            "exhaustive": self.exhaustive,
             "autotune_effort": self.autotune_effort,
         }
 
@@ -428,15 +424,10 @@ def _tuning_parameters(
                 else (False, True)
             ),
         },
-        exhaustive=query.exhaustive,
         autotune_effort=query.autotune_effort,
         efficiency_predicates=(
-            EfficiencyPredicate(
-                lambda p: p["graph_ctas_per_sm"] in residencies, minimum_effort="high"
-            ),
-            EfficiencyPredicate(
-                lambda p: p["apply_chunk_efficiency_policy"], minimum_effort="high"
-            ),
+            lambda p: p["graph_ctas_per_sm"] in residencies,
+            lambda p: p["apply_chunk_efficiency_policy"],
         ),
     )
 

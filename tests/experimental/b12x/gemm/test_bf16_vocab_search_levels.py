@@ -28,7 +28,7 @@ def query(**changes):
             max_tokens=1,
             in_features=5120,
             out_features=129280,
-            autotune_effort="medium",
+            autotune_effort="default",
         ),
         **changes,
     )
@@ -44,7 +44,7 @@ def test_nested_search_and_natural_default_membership(tokens, k):
     q = query(max_tokens=tokens, in_features=k)
     default = TUNING.default_config(q, DEVICE)
     previous = {default}
-    for effort in ("off", "low", "medium", "high", "max"):
+    for effort in ("off", "default", "audit"):
         active = replace(q, autotune_effort=effort)
         space = TUNING.parameter_space(active, DEVICE)
         assignment = TUNING.config_payload(default)
@@ -57,41 +57,39 @@ def test_nested_search_and_natural_default_membership(tokens, k):
         previous = selected
 
 
-def test_deepseek_single_token_medium_keeps_full_declared_space():
+def test_deepseek_single_token_default_keeps_full_declared_space():
     q = query()
     assert len(choices(q)) == 17
-    assert len(choices(replace(q, autotune_effort="low"))) == 9
-    assert choices(q) == choices(replace(q, autotune_effort="max"))
+    assert choices(q) == choices(replace(q, autotune_effort="audit"))
 
 
 @pytest.mark.parametrize(
-    "changes,config,minimum",
+    "changes,config,raced_at",
     [
         (
             {"max_tokens": 2},
             Config(backend="triton", algorithm="row", block_k=8192, num_warps=8),
-            "high",
+            ("audit",),
         ),
         (
             {"in_features": 9216},
             Config(backend="triton", algorithm="loop", block_k=1024, num_warps=4),
-            "high",
+            ("audit",),
         ),
+        # Triton beyond eight tokens is dominated at every effort.
         (
             {"max_tokens": 9},
             Config(backend="triton", algorithm="row", block_k=8192, num_warps=8),
-            "max",
+            (),
         ),
     ],
 )
-def test_policy_filters_do_not_reject_explicit_configs(changes, config, minimum):
+def test_policy_filters_do_not_reject_explicit_configs(changes, config, raced_at):
     q = query(**changes)
     TUNING.validate_config(q, config, DEVICE)
-    for effort in ("low", "medium", "high", "max"):
+    for effort in ("default", "audit"):
         active = replace(q, autotune_effort=effort)
-        assert (config in choices(active)) == (
-            effort in ("high", "max") if minimum == "high" else effort == "max"
-        )
+        assert (config in choices(active)) == (effort in raced_at)
         pinned = TUNING.configure(active, device=DEVICE, override=config)
         assert pinned.default == pinned.pinned == config
 
@@ -117,22 +115,20 @@ def test_policy_filters_do_not_reject_explicit_configs(changes, config, minimum)
         ),
     ],
 )
-def test_max_preserves_kernel_resource_and_axis_constraints(changes, config):
-    q = query(autotune_effort="max", **changes)
+def test_audit_preserves_kernel_resource_and_axis_constraints(changes, config):
+    q = query(autotune_effort="audit", **changes)
     with pytest.raises(ValueError):
         TUNING.validate_config(q, config, DEVICE)
     assert config not in choices(q)
 
 
 def test_effort_is_captured_in_selection_but_not_compilation(monkeypatch):
-    monkeypatch.setenv("B12X_AUTOTUNE_EFFORT", "low")
+    monkeypatch.setenv("B12X_AUTOTUNE_EFFORT", "default")
     low = Query(dtype="bfloat16", max_tokens=1, in_features=5120, out_features=129280)
-    monkeypatch.setenv("B12X_AUTOTUNE_EFFORT", "max")
-    maximum = Query(
-        dtype="bfloat16", max_tokens=1, in_features=5120, out_features=129280
-    )
-    assert low.autotune_effort == "low"
-    assert maximum.autotune_effort == "max"
-    assert TUNING.encode_query(low) != TUNING.encode_query(maximum)
-    assert _compile_query_payload(low) == _compile_query_payload(maximum)
+    monkeypatch.setenv("B12X_AUTOTUNE_EFFORT", "audit")
+    audit = Query(dtype="bfloat16", max_tokens=1, in_features=5120, out_features=129280)
+    assert low.autotune_effort == "default"
+    assert audit.autotune_effort == "audit"
+    assert TUNING.encode_query(low) != TUNING.encode_query(audit)
+    assert _compile_query_payload(low) == _compile_query_payload(audit)
     assert "autotune_effort" not in _compile_query_payload(low)

@@ -63,7 +63,7 @@ def _configs(query):
 def _parameters(query, device):
     configs = tuple(dict.fromkeys(_configs(query)))
     effort = capture_autotune_effort()
-    if effort in (AutotuneEffort.OFF, AutotuneEffort.LOW):
+    if effort is AutotuneEffort.OFF:
         configs = tuple(
             dict.fromkeys(
                 CollectiveConfig(

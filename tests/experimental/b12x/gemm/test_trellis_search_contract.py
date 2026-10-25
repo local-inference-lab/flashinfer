@@ -65,7 +65,7 @@ def kernel(q, config):
 
 
 def test_three_bit_large_tile_matches_kernel_allocation():
-    q = query(autotune_effort="max")
+    q = query(autotune_effort="audit")
     config = TrellisConfig(backend="cutedsl", block_rows=64, tile_k=128, tile_n=128)
     assert _shared_memory_bytes(q, config) == 93_184
     assert kernel(q, config).shared_words * 4 == 93_184
@@ -85,7 +85,7 @@ def test_search_memory_accounting_matches_kernel(layout):
 def test_defaults_belong_to_every_effort(layout, rows):
     q = query(layout, max_rows=rows)
     default = TUNING.default_config(q, DEVICE)
-    for effort in ("off", "low", "medium", "high", "max"):
+    for effort in ("off", "default", "audit"):
         active = replace(q, autotune_effort=effort)
         configured = TUNING.configure(active, device=DEVICE)
         configured.space.validate(TUNING.config_payload(default))
@@ -111,8 +111,8 @@ def test_effort_does_not_change_plan_compile_jobs():
     from b12x.gemm.trellis_linear._preparation import plan
     from b12x.moe._shared.kernels.w4a16.prepare import PreparedTrellis256DenseWeight
 
-    low = query(autotune_effort="low")
-    maximum = replace(low, autotune_effort="max")
+    low = query(autotune_effort="off")
+    maximum = replace(low, autotune_effort="audit")
     empty = torch.empty(0)
     weight = PreparedTrellis256DenseWeight(
         trellis=empty,
@@ -134,4 +134,4 @@ def test_effort_does_not_change_plan_compile_jobs():
     assert TUNING.encode_query(low) != TUNING.encode_query(maximum)
     jobs = low_plan._compile_jobs(config, device)
     assert jobs == maximum_plan._compile_jobs(config, device)
-    assert jobs[0].args[0]["autotune_effort"] == "medium"
+    assert jobs[0].args[0]["autotune_effort"] == "default"

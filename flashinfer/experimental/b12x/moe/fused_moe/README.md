@@ -84,11 +84,11 @@ defaults; autotuning retains both supported scale choices, including compact
 N64 inline candidates. SM121 retains its device-specific defaults.
 
 M16/M32 inline candidates at routing densities above one tile per expert are
-searched at `B12X_AUTOTUNE_EFFORT=high` and `max`. Lower efforts omit them.
-Resident-grid caps use sparse power-of-two and fractional ladders below `max`;
-`max` searches every integer cap within the cooperative residency bound.
-`off` selects the heuristic configuration. Effort is captured in the tuning
-query and does not affect compiled program identities. Compact MXFP4 W4A8
+searched only at `B12X_AUTOTUNE_EFFORT=audit`; the default effort omits them.
+Resident-grid caps race a power-of-two and fractional ladder up to the
+cooperative residency bound at every effort. `off` selects the heuristic
+configuration. Effort is captured in the tuning query and does not affect
+compiled program identities. Compact MXFP4 W4A8
 retains reconstructed K128 scale words across both K64 pipeline steps.
 
 Packed FP4 W4A16 execution searches FC1/FC2 tile pairs, route-block sizes,

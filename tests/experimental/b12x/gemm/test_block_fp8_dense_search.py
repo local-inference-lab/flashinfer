@@ -51,9 +51,11 @@ def query(m=8, block=32):
 
 @pytest.mark.parametrize("m", (1, 8, 64, 4096))
 @pytest.mark.parametrize("block", (32, 128))
-@pytest.mark.parametrize("exhaustive", (False, True))
-def test_block_scaled_linear_searches_the_complete_dense_domain(m, block, exhaustive):
-    declaration = replace(query(m, block), exhaustive=exhaustive)
+@pytest.mark.parametrize("audit", (False, True))
+def test_block_scaled_linear_searches_the_complete_dense_domain(m, block, audit):
+    declaration = replace(
+        query(m, block), autotune_effort="audit" if audit else "default"
+    )
     wrapper = TUNING.eligible_plan(declaration, DEVICE)
     ordinary = DENSE.eligible_plan(dense_query(declaration), DEVICE)
     assert {config for _, config in wrapper.candidates} == {
@@ -63,7 +65,7 @@ def test_block_scaled_linear_searches_the_complete_dense_domain(m, block, exhaus
     assert {config.tile_k for config in configs} == {64, 128}
     assert {config.swap_ab for config in configs} == {False, True}
     assert {config.large_m_unroll for config in configs} == {False, True}
-    if exhaustive:
+    if audit:
         assert {config.tile_n for config in configs} == {16, 32, 64, 128}
 
 

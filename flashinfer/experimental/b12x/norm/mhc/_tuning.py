@@ -6,7 +6,7 @@ import math
 from dataclasses import dataclass, replace
 
 from b12x.preparation import DeviceIdentity, FrozenMapping
-from b12x.preparation._efficiency import AutotuneEffort, EfficiencyPredicate
+from b12x.preparation._efficiency import AutotuneEffort
 from b12x.preparation.tuning import (
     Knob,
     ParameterBinding,
@@ -347,10 +347,6 @@ def _validate_query(query, device):
     if not isinstance(query, MhcQuery):
         raise TypeError("query must be MhcQuery")
     _autotune_effort(query)
-    if "B12X_AUTOTUNE_EFFORT" not in query.controls and query.controls.get(
-        "B12X_AUTOTUNE_EXHAUSTIVE", "0"
-    ) not in ("0", "1"):
-        raise ValueError("B12X_AUTOTUNE_EXHAUSTIVE must be 0 or 1")
     if query.operation not in ("pre", "post", "post_pre", "collapse"):
         raise ValueError("unknown mHC operation")
     if query.dtype != "bfloat16":
@@ -413,13 +409,7 @@ def _validate_query(query, device):
 
 def _autotune_effort(query: MhcQuery) -> AutotuneEffort:
     value = query.controls.get("B12X_AUTOTUNE_EFFORT")
-    if value is not None:
-        return AutotuneEffort(value)
-    return (
-        AutotuneEffort.MAX
-        if query.controls.get("B12X_AUTOTUNE_EXHAUSTIVE", "0") == "1"
-        else AutotuneEffort.MEDIUM
-    )
+    return AutotuneEffort.DEFAULT if value is None else AutotuneEffort(value)
 
 
 def _tuning_parameters(query: MhcQuery, device: DeviceIdentity | None):
@@ -553,8 +543,6 @@ def _tuning_parameters(query: MhcQuery, device: DeviceIdentity | None):
                 or (total_k // p["projection_tile_k"]) % p["projection_k_splits"] == 0
             ),
             lambda p: p["backend"] != "tf32_tma" or shared_bytes(p) <= smem_limit,
-        ),
-        efficiency_predicates=(
             # Larger M tiles with the same grid only add padding and storage.
             compact_m_grid,
             # Keep exact and power-of-two N coverage and avoid wholly masked warps.
@@ -570,24 +558,13 @@ def _tuning_parameters(query: MhcQuery, device: DeviceIdentity | None):
                 or p["projection_num_stages"]
                 <= total_k // (p["projection_tile_k"] * p["projection_k_splits"])
             ),
-            # Low effort keeps coarse projection tiles and modest split counts.
-            EfficiencyPredicate(
-                lambda p: (
-                    p["backend"] != "tf32_tma"
-                    or (
-                        p["projection_tile_k"] >= 64
-                        and p["projection_tile_n"] in (8, 24)
-                        and p["projection_num_n_warps"] == 1
-                        and p["projection_k_splits"] <= 8
-                    )
-                ),
-                minimum_effort="medium",
-            ),
-            # High effort explores scheduling, warp layout and pipeline tradeoffs.
-            EfficiencyPredicate(bounded_split_grid, minimum_effort="high"),
-            EfficiencyPredicate(prefill_warp_layout, minimum_effort="high"),
-            EfficiencyPredicate(prefill_pipeline, minimum_effort="high"),
-            EfficiencyPredicate(prefill_split_work, minimum_effort="high"),
+        ),
+        # Scheduling, warp layout and pipeline guesses; the audit lifts them.
+        efficiency_predicates=(
+            bounded_split_grid,
+            prefill_warp_layout,
+            prefill_pipeline,
+            prefill_split_work,
         ),
     )
 

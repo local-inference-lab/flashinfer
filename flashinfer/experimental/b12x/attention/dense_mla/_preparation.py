@@ -542,9 +542,7 @@ def plan(
         _compile_jobs=lambda config, device: (
             CompileJob.create(
                 "b12x.attention.dense_mla._preparation:compile_dense_mla",
-                TUNING.encode_query(
-                    replace(query, exhaustive=False, autotune_effort="medium")
-                ),
+                TUNING.encode_query(replace(query, autotune_effort="default")),
                 TUNING.encode_config(config),
                 CompileJob.DEVICE_ORDINAL,
             ),

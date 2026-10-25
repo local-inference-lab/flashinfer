@@ -1,4 +1,4 @@
-"""Exhaustive search lifts efficiency rules while retaining kernel legality."""
+"""The audit effort lifts efficiency rules while retaining kernel legality."""
 
 from dataclasses import replace
 
@@ -7,19 +7,19 @@ import pytest
 from b12x.preparation import DeviceIdentity, FrozenMapping, Knob, ParameterSpace
 
 
-def test_exhaustive_lifts_only_efficiency_predicates():
+def test_audit_lifts_only_efficiency_predicates():
     space = ParameterSpace.create(
         (Knob(name="tile", values=(8, 16, 32)),),
         predicates=(lambda p: p["tile"] >= 16,),
         efficiency_predicates=(lambda p: p["tile"] <= 16,),
     )
-    exhaustive = replace(space, exhaustive=True)
+    audit = replace(space, autotune_effort="audit")
     assert [p["tile"] for p in space.configurations()] == [16]
-    assert [p["tile"] for p in exhaustive.configurations()] == [16, 32]
+    assert [p["tile"] for p in audit.configurations()] == [16, 32]
     with pytest.raises(ValueError, match="efficiency predicates"):
         space.validate({"tile": 32})
-    exhaustive.validate({"tile": 32})
-    for active in (space, exhaustive):
+    audit.validate({"tile": 32})
+    for active in (space, audit):
         with pytest.raises(ValueError, match="correctness predicates"):
             active.validate({"tile": 8})
         with pytest.raises(ValueError, match="eligible values"):
@@ -35,9 +35,9 @@ def test_efficiency_errors_are_not_silent_rejections():
     )
     with pytest.raises(RuntimeError, match="invalid planner state"):
         list(space.configurations())
-    assert len(list(replace(space, exhaustive=True).configurations())) == 1
-    with pytest.raises(TypeError, match="boolean"):
-        replace(space, exhaustive="0")
+    assert len(list(replace(space, autotune_effort="audit").configurations())) == 1
+    with pytest.raises(ValueError):
+        replace(space, autotune_effort="exhaustive")
 
 
 def _query():
@@ -55,6 +55,10 @@ def _query():
         rms_eps=1e-20,
         smem_limit=100 << 10,
     )
+
+
+def _audit(query):
+    return replace(query, controls=FrozenMapping({"B12X_AUTOTUNE_EFFORT": "audit"}))
 
 
 def _choice(**changes):
@@ -77,9 +81,13 @@ def _choice(**changes):
 @pytest.mark.parametrize(
     "changes",
     [
+        # A wider M tile with the same grid only adds padding.
         {"projection_num_m_warps": 3},
+        # N tiles beyond the covering power of two add masked columns.
         {"projection_tile_n": 64},
+        # A fourth N warp over 24 mixes is wholly masked.
         {"projection_tile_n": 32, "projection_num_n_warps": 4},
+        # Four stages cannot buffer a two-iteration K loop.
         {
             "projection_tile_k": 256,
             "projection_k_splits": 40,
@@ -89,23 +97,19 @@ def _choice(**changes):
         },
     ],
 )
-def test_mhc_efficiency_rules_and_explicit_pin(changes):
+def test_mhc_dominance_rules_hold_at_every_effort_and_allow_pins(changes):
     from b12x.norm.mhc._tuning import MhcConfig, TUNING
 
     device = DeviceIdentity("nvidia", (12, 0), 188, "RTX PRO 6000")
     query = _query()
-    exhaustive = replace(
-        query, controls=FrozenMapping({"B12X_AUTOTUNE_EXHAUSTIVE": "1"})
-    )
     choice = _choice(**changes)
-    with pytest.raises(ValueError, match="efficiency predicates"):
-        TUNING.parameter_space(query, device).validate(choice)
-    TUNING.parameter_space(exhaustive, device).validate(choice)
+    for active in (query, _audit(query)):
+        with pytest.raises(ValueError, match="correctness predicates"):
+            TUNING.parameter_space(active, device).validate(choice)
     config = MhcConfig(
         projection_tile_m=16 * choice["projection_num_m_warps"], **choice
     )
     assert TUNING.configure(query, device=device, override=config).pinned == config
-    assert TUNING.lower(exhaustive, device, choice) == config
 
 
 @pytest.mark.parametrize(
@@ -122,12 +126,11 @@ def test_mhc_efficiency_rules_and_explicit_pin(changes):
         },
     ],
 )
-def test_mhc_exhaustive_preserves_correctness_rules(changes):
+def test_mhc_audit_preserves_correctness_rules(changes):
     from b12x.norm.mhc._tuning import TUNING
 
-    query = replace(_query(), controls=FrozenMapping({"B12X_AUTOTUNE_EXHAUSTIVE": "1"}))
     with pytest.raises(ValueError, match="correctness predicates"):
-        TUNING.parameter_space(query, None).validate(_choice(**changes))
+        TUNING.parameter_space(_audit(_query()), None).validate(_choice(**changes))
 
 
 def test_mhc_underoccupied_projection_remains_eligible():
@@ -141,38 +144,36 @@ def test_mhc_underoccupied_projection_remains_eligible():
         ).validate(choice)
 
 
-def test_mhc_declaration_captures_exhaustive_policy(monkeypatch):
+def test_mhc_declaration_captures_effort(monkeypatch):
     from b12x.norm import mhc
     from b12x.norm.mhc._tuning import TUNING
 
     caps = mhc.Caps(device="cpu", max_tokens=1, hidden_size=5120)
     invocation = FrozenMapping({"operation": "collapse"})
-    monkeypatch.setenv("B12X_AUTOTUNE_EXHAUSTIVE", "0")
+    monkeypatch.setenv("B12X_AUTOTUNE_EFFORT", "default")
     pruned = mhc.plan(caps, invocation=invocation)
-    monkeypatch.setenv("B12X_AUTOTUNE_EXHAUSTIVE", "1")
-    exhaustive = mhc.plan(caps, invocation=invocation)
-    monkeypatch.setenv("B12X_AUTOTUNE_EXHAUSTIVE", "0")
-    assert pruned.query.controls["B12X_AUTOTUNE_EXHAUSTIVE"] == "0"
-    assert exhaustive.query.controls["B12X_AUTOTUNE_EXHAUSTIVE"] == "1"
-    assert TUNING.encode_query(pruned.query) != TUNING.encode_query(exhaustive.query)
-    with pytest.raises(ValueError, match="must be 0 or 1"):
+    monkeypatch.setenv("B12X_AUTOTUNE_EFFORT", "audit")
+    audit = mhc.plan(caps, invocation=invocation)
+    assert pruned.query.controls["B12X_AUTOTUNE_EFFORT"] == "default"
+    assert audit.query.controls["B12X_AUTOTUNE_EFFORT"] == "audit"
+    assert TUNING.encode_query(pruned.query) != TUNING.encode_query(audit.query)
+    assert TUNING.parameter_space(_query(), None).autotune_effort == "default"
+    with pytest.raises(ValueError, match="not a valid AutotuneEffort"):
         TUNING.configure(
-            replace(
-                _query(), controls=FrozenMapping({"B12X_AUTOTUNE_EXHAUSTIVE": "yes"})
-            ),
+            replace(_query(), controls=FrozenMapping({"B12X_AUTOTUNE_EFFORT": "yes"})),
             device=None,
         )
 
 
-def test_exhaustive_policy_does_not_change_compiled_program_identity(monkeypatch):
+def test_effort_does_not_change_compiled_program_identity(monkeypatch):
     from b12x._lib.compiler import _static_compile_cache_context
     import cutlass.cute as cute
 
     try:
-        monkeypatch.setenv("B12X_AUTOTUNE_EXHAUSTIVE", "0")
+        monkeypatch.setenv("B12X_AUTOTUNE_EFFORT", "default")
         _static_compile_cache_context.cache_clear()
         pruned = _static_compile_cache_context(cute.compile)
-        monkeypatch.setenv("B12X_AUTOTUNE_EXHAUSTIVE", "1")
+        monkeypatch.setenv("B12X_AUTOTUNE_EFFORT", "audit")
         _static_compile_cache_context.cache_clear()
         assert _static_compile_cache_context(cute.compile) == pruned
     finally:
@@ -209,7 +210,7 @@ def test_mhc_prefill_correlations_preserve_products_and_pins(
         before.validate(choice)
     with pytest.raises(ValueError, match="efficiency predicates"):
         after.validate(choice)
-    replace(after, exhaustive=True).validate(choice)
+    replace(after, autotune_effort="audit").validate(choice)
     config = MhcConfig(
         projection_tile_m=16 * choice["projection_num_m_warps"], **choice
     )
@@ -268,6 +269,8 @@ def test_mhc_excess_split_grid_scales_with_sm_count_and_preserves_pins():
     TUNING.parameter_space(query, large).validate(choice)
     with pytest.raises(ValueError, match="efficiency predicates"):
         TUNING.parameter_space(query, small).validate(choice)
-    replace(TUNING.parameter_space(query, small), exhaustive=True).validate(choice)
+    replace(TUNING.parameter_space(query, small), autotune_effort="audit").validate(
+        choice
+    )
     config = MhcConfig(projection_tile_m=64, **choice)
     assert TUNING.configure(query, device=small, override=config).pinned == config

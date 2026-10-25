@@ -6,7 +6,7 @@ import math
 from dataclasses import dataclass
 
 from b12x.preparation import DeviceIdentity, FrozenMapping
-from b12x.preparation._efficiency import AutotuneEffort, EfficiencyPredicate
+from b12x.preparation._efficiency import AutotuneEffort
 from b12x.preparation.tuning import (
     Knob,
     ParameterBinding,
@@ -39,7 +39,7 @@ class HyperConnectionQuery:
     add_residual: bool = False
     gate_stride: int = 0
     paired: bool = False
-    autotune_effort: str = "medium"
+    autotune_effort: str = "default"
     indexed_rows: int = 0
     index_dtype: str = "int64"
 
@@ -286,19 +286,14 @@ def _tuning_parameters(query, device):
         TUNING.knobs,
         values=values,
         autotune_effort=AutotuneEffort(query.autotune_effort),
-        efficiency_predicates=(
-            EfficiencyPredicate(
-                lambda c: (
-                    operation != "gate_mean"
-                    or c["pointwise_block"] >= min(32, covering)
-                ),
-                minimum_effort="high",
+        predicates=(
+            lambda c: (
+                operation != "gate_mean" or c["pointwise_block"] >= min(8, covering)
             ),
-            EfficiencyPredicate(
-                lambda c: (
-                    operation != "gate_mean" or c["pointwise_block"] >= min(8, covering)
-                ),
-                minimum_effort="max",
+        ),
+        efficiency_predicates=(
+            lambda c: (
+                operation != "gate_mean" or c["pointwise_block"] >= min(32, covering)
             ),
         ),
     )

@@ -9,7 +9,7 @@ from b12x.norm.hyperconnection import _preparation, _tuning
 from b12x.preparation import FrozenMapping
 
 
-def query(operation="grouped_rmsnorm", hidden=5120, effort="medium", **kwargs):
+def query(operation="grouped_rmsnorm", hidden=5120, effort="default", **kwargs):
     return _tuning.HyperConnectionQuery(
         dtype="bfloat16",
         max_tokens=128,
@@ -26,9 +26,7 @@ def assignment(config):
     return {key: value for key, value in config.to_dict().items() if key != "backend"}
 
 
-@pytest.mark.parametrize(
-    "effort,floor", [("low", 32), ("medium", 32), ("high", 8), ("max", 1)]
-)
+@pytest.mark.parametrize("effort,floor", [("default", 32), ("audit", 8)])
 def test_gate_mean_efficiency_floor(effort, floor):
     q = query("gate_mean", hidden=2560, effort=effort)
     space = _tuning.TUNING.parameter_space(q, None)
@@ -39,7 +37,7 @@ def test_gate_mean_efficiency_floor(effort, floor):
             assert knob.values == tuple(1 << bit for bit in range(13))
 
 
-@pytest.mark.parametrize("effort", ["off", "low", "medium", "high", "max"])
+@pytest.mark.parametrize("effort", ["off", "default", "audit"])
 @pytest.mark.parametrize("hidden", [1, 8, 128, 512, 1280, 2560, 5120])
 @pytest.mark.parametrize(
     "operation,options",
@@ -99,7 +97,7 @@ def test_native_geometry_is_canonical(operation):
     assert configurations == [assignment(_tuning.TUNING.default_config(q, None))]
 
 
-@pytest.mark.parametrize("effort", ["low", "medium", "high", "max"])
+@pytest.mark.parametrize("effort", ["default", "audit"])
 def test_effort_keeps_launch_legality(effort):
     q = query(hidden=512, effort=effort)
     default = _tuning.TUNING.default_config(q, None)
@@ -117,14 +115,14 @@ def test_effort_captured_but_excluded_from_program_key(monkeypatch):
 
     caps = hyperconnection.Caps(device="cpu", max_tokens=128, hidden_size=5120)
     plans = []
-    for effort in ("low", "high"):
+    for effort in ("default", "audit"):
         monkeypatch.setenv("B12X_AUTOTUNE_EFFORT", effort)
         plans.append(
             hyperconnection.plan(
                 caps, invocation=FrozenMapping({"operation": "gate_mean"})
             )
         )
-    assert [plan.query.autotune_effort for plan in plans] == ["low", "high"]
+    assert [plan.query.autotune_effort for plan in plans] == ["default", "audit"]
     payloads = [_tuning.TUNING.encode_query(plan.query) for plan in plans]
     assert payloads[0] != payloads[1]
     jobs = [
@@ -155,15 +153,14 @@ def test_off_iterates_only_default():
     ]
 
 
-def test_explicit_effort_overrides_legacy_exhaustive(monkeypatch):
+def test_explicit_effort_overrides_environment(monkeypatch):
     from b12x.norm import hyperconnection
     from b12x.preparation import autotune_effort
 
-    monkeypatch.setenv("B12X_AUTOTUNE_EXHAUSTIVE", "1")
-    monkeypatch.delenv("B12X_AUTOTUNE_EFFORT", raising=False)
+    monkeypatch.setenv("B12X_AUTOTUNE_EFFORT", "audit")
     caps = hyperconnection.Caps(device="cpu", max_tokens=128, hidden_size=5120)
-    with autotune_effort("low"):
+    with autotune_effort("default"):
         plan = hyperconnection.plan(caps, invocation={"operation": "gate_mean"})
-    assert plan.query.autotune_effort == "low"
+    assert plan.query.autotune_effort == "default"
     plan = hyperconnection.plan(caps, invocation={"operation": "gate_mean"})
-    assert plan.query.autotune_effort == "max"
+    assert plan.query.autotune_effort == "audit"

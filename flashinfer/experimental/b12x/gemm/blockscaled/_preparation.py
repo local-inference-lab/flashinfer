@@ -47,7 +47,7 @@ def _compile_query_payload(query):
 
 def _decode_query(payload):
     values = dict(payload)
-    values["autotune_effort"] = "medium"
+    values["autotune_effort"] = "default"
     values["codegen"] = FrozenMapping(values["codegen"])
     return BlockscaledQuery(**values)
 

@@ -175,7 +175,7 @@ _LAUNCH_ONLY_FIELDS = frozenset(("max_batch", "sm_count", "max_splits"))
 
 def _compile_key(query: PagedDecodeQuery, config: PagedDecodeConfig) -> tuple:
     fields = {**TUNING.encode_query(query), **config.to_dict()}
-    excluded = _LAUNCH_ONLY_FIELDS | {"exhaustive", "autotune_effort"}
+    excluded = _LAUNCH_ONLY_FIELDS | {"autotune_effort"}
     return tuple(sorted((k, v) for k, v in fields.items() if k not in excluded))
 
 
@@ -634,9 +634,7 @@ def make_plan(caps, *, invocation=None, override=None) -> Plan:
         sm_count=int(sm_count),
     )
     TUNING.validate_query(query, None)
-    compile_query = TUNING.encode_query(
-        replace(query, exhaustive=False, autotune_effort="medium")
-    )
+    compile_query = TUNING.encode_query(replace(query, autotune_effort="default"))
 
     def compile_jobs(config, detected):
         return (

@@ -9,7 +9,7 @@ from b12x.preparation import DeviceIdentity
 
 
 DEVICE = DeviceIdentity("nvidia", (12, 0), 188, "SM120")
-LEVELS = ("low", "medium", "high", "max")
+LEVELS = ("default", "audit")
 
 
 def query(recipe="nvfp4", m=8, n=128, k=256, **kwargs):
@@ -52,15 +52,16 @@ def test_levels_are_nested_and_naturally_include_heuristic(recipe, m, n, k):
 
 
 @pytest.mark.parametrize(
-    "q,tile_m,tile_n,tile_k,mma_warps,minimum",
+    "q,tile_m,tile_n,tile_k,mma_warps,rule",
     (
-        (query(m=8), 64, 64, 64, None, "high"),
-        (query("mxfp8", m=16, n=64), 16, 128, 64, 4, "high"),
-        (query("iq2_xs", m=16), 4, 4, 256, None, "max"),
+        (query(m=8), 64, 64, 64, None, "efficiency"),
+        (query("mxfp8", m=16, n=64), 16, 128, 64, 4, "efficiency"),
+        # N4 tiles beyond eight tokens are dominated at every effort.
+        (query("iq2_xs", m=16), 4, 4, 256, None, "correctness"),
     ),
 )
-def test_performance_filters_lift_at_declared_effort(
-    q, tile_m, tile_n, tile_k, mma_warps, minimum
+def test_performance_filters_lift_at_audit_and_dominance_rules_hold(
+    q, tile_m, tile_n, tile_k, mma_warps, rule
 ):
     choice = dict(
         mode="a16",
@@ -70,13 +71,14 @@ def test_performance_filters_lift_at_declared_effort(
         split_k=1,
         mma_warps=mma_warps,
     )
-    for level in LEVELS:
-        active = replace(q, autotune_effort=level)
-        if LEVELS.index(level) < LEVELS.index(minimum):
-            with pytest.raises(ValueError, match="efficiency"):
-                TUNING.lower(active, DEVICE, choice)
-        else:
-            TUNING.lower(active, DEVICE, choice)
+    with pytest.raises(ValueError, match=rule):
+        TUNING.lower(replace(q, autotune_effort="default"), DEVICE, choice)
+    audit = replace(q, autotune_effort="audit")
+    if rule == "efficiency":
+        TUNING.lower(audit, DEVICE, choice)
+    else:
+        with pytest.raises(ValueError, match=rule):
+            TUNING.lower(audit, DEVICE, choice)
 
 
 @pytest.mark.parametrize("level", LEVELS)
@@ -98,15 +100,15 @@ def test_mxfp8_row_support_precision_and_workspace_stay_mandatory(level):
 def test_effort_is_captured_in_declaration_but_excluded_from_program_key(monkeypatch):
     from b12x.gemm.blockscaled._preparation import _compile_query_payload, _decode_query
 
-    monkeypatch.setenv("B12X_AUTOTUNE_EFFORT", "high")
+    monkeypatch.setenv("B12X_AUTOTUNE_EFFORT", "audit")
     q = query()
-    assert q.autotune_effort == "high"
-    monkeypatch.setenv("B12X_AUTOTUNE_EFFORT", "low")
-    assert q.autotune_effort == "high"
+    assert q.autotune_effort == "audit"
+    monkeypatch.setenv("B12X_AUTOTUNE_EFFORT", "off")
+    assert q.autotune_effort == "audit"
     assert TUNING.encode_query(q) != TUNING.encode_query(
-        replace(q, autotune_effort="low")
+        replace(q, autotune_effort="off")
     )
     payload = _compile_query_payload(q)
-    assert payload == _compile_query_payload(replace(q, autotune_effort="max"))
+    assert payload == _compile_query_payload(replace(q, autotune_effort="off"))
     assert "autotune_effort" not in payload
-    assert _decode_query(payload).autotune_effort == "medium"
+    assert _decode_query(payload).autotune_effort == "default"

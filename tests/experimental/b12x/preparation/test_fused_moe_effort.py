@@ -37,7 +37,7 @@ def query(tokens=4, experts=384, top_k=6, recipe="w4a8_mx", **kwargs):
 @pytest.mark.parametrize("experts,top_k", ((384, 6), (128, 3)))
 def test_nested_candidates_and_default_membership(device, experts, top_k):
     sets = []
-    for effort in ("low", "medium", "high", "max"):
+    for effort in ("default", "audit"):
         q = query(experts=experts, top_k=top_k, autotune_effort=effort)
         configuration = TUNING.configure(q, device=device)
         default_payload = TUNING.config_payload(configuration.default)
@@ -46,8 +46,8 @@ def test_nested_candidates_and_default_membership(device, experts, top_k):
         candidates = {config for _, config in TUNING.iterate(configuration)}
         assert configuration.default in candidates
         sets.append(candidates)
-    assert sets[0] <= sets[1] <= sets[2] < sets[3]
-    assert any(c.max_active_clusters == 3 for c in sets[3])
+    assert sets[0] <= sets[1]
+    assert {c.max_active_clusters for c in sets[1]} >= {None, 1, 2, 4, device.sm_count}
     q = query(experts=experts, top_k=top_k, autotune_effort="off")
     configuration = TUNING.configure(q, device=device)
     assert list(TUNING.iterate(configuration)) == [
@@ -70,23 +70,18 @@ def test_inline_density_is_efficiency_only(device, experts, top_k, tokens):
         w4a16_route_mode=None,
     )
     payload = TUNING.config_payload(config)
-    for effort in ("low", "medium"):
-        with pytest.raises(ValueError, match="efficiency"):
-            TUNING.lower(replace(q, autotune_effort=effort), device, payload)
-    for effort in ("high", "max"):
-        assert (
-            TUNING.lower(replace(q, autotune_effort=effort), device, payload) == config
-        )
+    with pytest.raises(ValueError, match="efficiency"):
+        TUNING.lower(q, device, payload)
+    audit = replace(q, autotune_effort="audit")
+    assert TUNING.lower(audit, device, payload) == config
     invalid = replace(config, dynamic_tile_m=64)
     with pytest.raises(ValueError, match="Inline scales"):
-        TUNING.lower(
-            replace(q, autotune_effort="max"), device, TUNING.config_payload(invalid)
-        )
+        TUNING.lower(audit, device, TUNING.config_payload(invalid))
 
 
 @pytest.mark.parametrize("device", DEVICES)
-def test_max_retains_residency_and_determinism_constraints(device):
-    q = query(autotune_effort="max")
+def test_audit_retains_residency_and_determinism_constraints(device):
+    q = query(autotune_effort="audit")
     config = replace(
         TUNING.default_config(q, device),
         backend="dynamic",
@@ -106,13 +101,13 @@ def test_effort_is_captured_and_not_a_program_identity(monkeypatch):
     from b12x.moe.fused_moe._preparation import _decode_query, _program_query_payload
     from b12x.preparation._efficiency import capture_autotune_effort
 
-    monkeypatch.setenv("B12X_AUTOTUNE_EFFORT", "high")
+    monkeypatch.setenv("B12X_AUTOTUNE_EFFORT", "audit")
     q = query(autotune_effort=capture_autotune_effort().value)
-    assert _decode_query(TUNING.encode_query(q)).autotune_effort == "high"
+    assert _decode_query(TUNING.encode_query(q)).autotune_effort == "audit"
     assert _program_query_payload(q) == _program_query_payload(
-        replace(q, autotune_effort="max")
+        replace(q, autotune_effort="default")
     )
-    assert _decode_query(_program_query_payload(q)).autotune_effort == "medium"
+    assert _decode_query(_program_query_payload(q)).autotune_effort == "default"
 
 
 @pytest.mark.parametrize("device", DEVICES)
@@ -121,7 +116,7 @@ def test_filters_naturally_preserve_defaults_across_shapes(device, recipe):
     for tokens in (1, 4, 8, 16, 64, 683, 1025, 2049):
         for experts, top_k in ((384, 6), (128, 3)):
             for intermediate in (2304, 1152, 576):
-                for effort in ("low", "medium", "high", "max"):
+                for effort in ("default", "audit"):
                     q = replace(
                         query(tokens, experts, top_k, recipe),
                         intermediate_size=intermediate,

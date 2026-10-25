@@ -6,7 +6,7 @@ from b12x._lib.quant.block_codec import BLOCK_CODECS, block_codec
 
 from dataclasses import dataclass, replace
 
-from b12x.preparation._efficiency import AutotuneEffort, EfficiencyPredicate
+from b12x.preparation._efficiency import AutotuneEffort
 
 from b12x.preparation import (
     DeviceIdentity,
@@ -54,7 +54,7 @@ class MoeDecodeQuery:
     csf_inline_scales: bool = False
     swiglu_clamp_after_silu: bool = False
     a4_prefill: bool | None = None
-    autotune_effort: str = "medium"
+    autotune_effort: str = "default"
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -962,27 +962,6 @@ def _launch_parameter_space(query, device):
     return {"max_active_clusters": (None, *ladder)}
 
 
-@dataclass(frozen=True, kw_only=True)
-class _MoeParameterSpace(ParameterSpace):
-    sparse_grids: tuple[object, ...]
-
-    def _product(self, index, assignment):
-        if index < len(self.knobs):
-            knob = self.knobs[index]
-            if (
-                knob.name == "max_active_clusters"
-                and knob.active(assignment)
-                and not self.exhaustive
-                and self.autotune_effort is not AutotuneEffort.MAX
-            ):
-                for value in self.sparse_grids:
-                    assignment[knob.name] = value
-                    yield from self._product(index + 1, assignment)
-                del assignment[knob.name]
-                return
-        yield from super()._product(index, assignment)
-
-
 def _tuning_parameters(query, device):
     launch_query = query
     if query.quant_mode == "multi":
@@ -1014,38 +993,20 @@ def _tuning_parameters(query, device):
             "w4a16_block_size_m": (None, *blocks),
             "w4a16_pipeline_stages": (None, 2, 3, 4, 5),
         }
-    grid_knob = next(k for k in space.knobs if k.name == "max_active_clusters")
-    sparse_grids = frozenset(grid_knob.values)
-    limit = max((v for v in sparse_grids if v is not None), default=0)
-    grids = (None, *range(1, limit + 1))
-    dense_space = ParameterSpace.create(
+    return ParameterSpace.create(
         space.knobs,
-        values={"max_active_clusters": grids, **w4a16_values},
+        values=w4a16_values,
         predicates=space.predicates,
         efficiency_predicates=(
-            EfficiencyPredicate(
-                lambda p: p["max_active_clusters"] in sparse_grids,
-                minimum_effort="max",
-            ),
-            EfficiencyPredicate(
-                lambda p: (
-                    not (
-                        p["csf_inline_scales"]
-                        and p["backend"] == "dynamic"
-                        and query.routed_rows > query.num_experts * p["dynamic_tile_m"]
-                    )
-                ),
-                minimum_effort="high",
+            lambda p: (
+                not (
+                    p["csf_inline_scales"]
+                    and p["backend"] == "dynamic"
+                    and query.routed_rows > query.num_experts * p["dynamic_tile_m"]
+                )
             ),
         ),
         autotune_effort=query.autotune_effort,
-    )
-    return _MoeParameterSpace(
-        knobs=dense_space.knobs,
-        predicates=dense_space.predicates,
-        efficiency_predicates=dense_space.efficiency_predicates,
-        autotune_effort=dense_space.autotune_effort,
-        sparse_grids=tuple(value for value in grids if value in sparse_grids),
     )
 
 

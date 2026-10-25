@@ -8,7 +8,6 @@ from dataclasses import dataclass, field, replace
 from b12x.preparation import DeviceIdentity, FrozenMapping
 from b12x.preparation._efficiency import (
     capture_autotune_effort,
-    capture_exhaustive_search,
 )
 from b12x.preparation.tuning import (
     Knob,
@@ -56,7 +55,6 @@ class DsaIndexerQuery:
     cache_format: str = "fp8"
     max_candidates: int = 0
     candidate_topk_blocks: int = 0
-    exhaustive: bool = field(default_factory=capture_exhaustive_search)
     autotune_effort: str = field(default_factory=capture_autotune_effort)
 
 
@@ -426,7 +424,6 @@ def _parameters(query, device):
             "fused_merge": (FUSED_MERGE_AUTO,),
             "mxfp4": choices,
         },
-        exhaustive=query.exhaustive,
         autotune_effort=query.autotune_effort,
     )
 

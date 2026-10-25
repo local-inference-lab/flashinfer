@@ -514,7 +514,7 @@ def test_lagged_post_pre_tf32_small_projection_tile(
     monkeypatch,
 ):
     if geometry:
-        monkeypatch.setenv("B12X_AUTOTUNE_EXHAUSTIVE", "1")
+        monkeypatch.setenv("B12X_AUTOTUNE_EFFORT", "audit")
     device = require_sm120()
     hidden = 5120
     residual, x, fn, scale, bias = _make_inputs(

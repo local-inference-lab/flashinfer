@@ -27,8 +27,7 @@ def query(**changes):
             has_sinks=False,
             descale_layout="tensor",
             sm_count=188,
-            exhaustive=False,
-            autotune_effort="medium",
+            autotune_effort="default",
         ),
         **changes,
     )
@@ -42,7 +41,7 @@ def test_nested_search_and_natural_default_membership(heads, max_q, window, caus
     q = query(num_q_heads=heads, max_q_per_req=max_q, window_left=window, causal=causal)
     default = _tuning.default_config(q)
     previous = set()
-    for effort in ("off", "low", "medium", "high", "max"):
+    for effort in ("off", "default", "audit"):
         active = replace(q, autotune_effort=effort)
         space = _tuning.TUNING.parameter_space(active, DEVICE)
         assignment = FrozenMapping({"head_splits": default.head_splits})
@@ -51,7 +50,7 @@ def test_nested_search_and_natural_default_membership(heads, max_q, window, caus
         selected = {cfg for _, cfg in _tuning.TUNING.choices(active, DEVICE)}
         assert default in selected
         assert previous <= selected
-        if effort in ("off", "low", "medium"):
+        if effort in ("off", "default"):
             assert selected == {default}
         else:
             assert {cfg.head_splits for cfg in selected} == {
@@ -62,34 +61,27 @@ def test_nested_search_and_natural_default_membership(heads, max_q, window, caus
         previous = selected
 
 
-def test_high_restores_legal_slices_but_keeps_row_capacity():
-    q = query(max_q_per_req=8, autotune_effort="high")
+def test_audit_restores_legal_slices_but_keeps_row_capacity():
+    q = query(max_q_per_req=8, autotune_effort="audit")
     space = _tuning.TUNING.parameter_space(q, DEVICE)
     assert {choice["head_splits"] for choice in space.configurations()} == {4, 8, 16}
     with pytest.raises(ValueError, match="correctness"):
         space.validate(FrozenMapping({"head_splits": 1}))
-    exhaustive = replace(q, autotune_effort="low", exhaustive=True)
-    assert tuple(
-        _tuning.TUNING.parameter_space(exhaustive, DEVICE).configurations()
-    ) == tuple(space.configurations())
 
 
 def test_effort_is_captured_in_query_and_excluded_from_compile_key():
     base = query()
     config = _tuning.default_config(base)
-    with autotune_effort("high"):
+    with autotune_effort("audit"):
         captured = _tuning.PagedDecodeQuery(
             **{
                 k: v
                 for k, v in _tuning.TUNING.encode_query(base).items()
-                if k not in ("exhaustive", "autotune_effort")
+                if k != "autotune_effort"
             }
         )
-    assert captured.autotune_effort == "high"
+    assert captured.autotune_effort == "audit"
     assert _tuning.TUNING.encode_query(base) != _tuning.TUNING.encode_query(captured)
     assert _preparation._compile_key(base, config) == _preparation._compile_key(
         captured, config
-    )
-    assert _preparation._compile_key(base, config) == _preparation._compile_key(
-        replace(captured, exhaustive=True), config
     )

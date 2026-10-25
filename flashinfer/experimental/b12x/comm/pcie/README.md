@@ -18,8 +18,8 @@ tuning keys. Every caller still binds its own serving operands.
 TP4 payload-ready transports require their reserved incoming slots and qualified
 SM120 hardware. Two-shot retains its native capacity and alignment constraints.
 Unsupported alternatives are absent, rather than failing over during execution.
-Low effort compares base launch configurations; medium/high/max also explore
-launch geometry. Tuning off retains the static dispatch policy. Explicit
+Tuning races the native alternatives over their launch geometry; off retains
+the static dispatch policy. Explicit
 `CollectiveConfig(implementation=..., threads=..., blocks=...)` pins a legal
 configuration. Native low-level plans still use `PcieConfig`.
 

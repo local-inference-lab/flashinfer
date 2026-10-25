@@ -183,7 +183,7 @@ def test_quantized_configuration_graph_output_and_scratch(provided, variant):
         blockscaled.query_from_call(
             source, weight, out=output, activation_mode="quantized"
         ),
-        autotune_effort="high",
+        autotune_effort="audit",
     )
 
     def matches(config):

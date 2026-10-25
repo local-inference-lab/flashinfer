@@ -5,7 +5,6 @@ from dataclasses import asdict, dataclass, field, fields
 from b12x.preparation import Knob, ParameterBinding, ParameterSpace, TuningContract
 from b12x.preparation._efficiency import (
     AutotuneEffort,
-    EfficiencyPredicate,
     capture_autotune_effort,
 )
 
@@ -225,19 +224,9 @@ def _parameters(query, device):
         values={"backend": tuple(backends)},
         predicates=(_eligible,),
         efficiency_predicates=(
-            EfficiencyPredicate(
-                lambda choice: (
-                    (choice["backend"] != "mma" or _mma_preferred(query))
-                    and (choice["backend"] != "prefill" or _prefill_preferred(query))
-                ),
-                minimum_effort="high",
-            ),
-            EfficiencyPredicate(
-                lambda choice: (
-                    choice["backend"] != "simt"
-                    or (choice["rows_per_tile"] != 1 and choice["block_threads"] == 128)
-                ),
-                minimum_effort="medium",
+            lambda choice: (
+                (choice["backend"] != "mma" or _mma_preferred(query))
+                and (choice["backend"] != "prefill" or _prefill_preferred(query))
             ),
         ),
         autotune_effort=query.autotune_effort,

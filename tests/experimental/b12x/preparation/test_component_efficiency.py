@@ -180,36 +180,33 @@ def _declarations():
 @pytest.mark.parametrize("device", DEVICES)
 def test_efficiency_mode_is_captured_and_keys_selection(index, device, monkeypatch):
     module, query_type, values = _declarations()[index]
-    monkeypatch.setenv("B12X_AUTOTUNE_EXHAUSTIVE", "0")
+    monkeypatch.setenv("B12X_AUTOTUNE_EFFORT", "default")
     ordinary = query_type(**values)
-    monkeypatch.setenv("B12X_AUTOTUNE_EXHAUSTIVE", "1")
-    exhaustive = query_type(**values)
-    monkeypatch.setenv("B12X_AUTOTUNE_EXHAUSTIVE", "0")
-    assert ordinary.exhaustive is False and exhaustive.exhaustive is True
-    assert module.TUNING.encode_query(ordinary) != module.TUNING.encode_query(
-        exhaustive
-    )
-    assert module.TUNING.parameter_space(ordinary, device).exhaustive is False
-    assert module.TUNING.parameter_space(exhaustive, device).exhaustive is True
-    monkeypatch.setenv("B12X_AUTOTUNE_EXHAUSTIVE", "yes")
-    with pytest.raises(ValueError, match="must be 0 or 1"):
+    monkeypatch.setenv("B12X_AUTOTUNE_EFFORT", "audit")
+    audit = query_type(**values)
+    assert (ordinary.autotune_effort, audit.autotune_effort) == ("default", "audit")
+    assert module.TUNING.encode_query(ordinary) != module.TUNING.encode_query(audit)
+    assert module.TUNING.parameter_space(ordinary, device).autotune_effort == "default"
+    assert module.TUNING.parameter_space(audit, device).autotune_effort == "audit"
+    monkeypatch.setenv("B12X_AUTOTUNE_EFFORT", "yes")
+    with pytest.raises(ValueError, match="B12X_AUTOTUNE_EFFORT"):
         query_type(**values)
 
 
 @pytest.mark.parametrize("device", DEVICES)
 @pytest.mark.parametrize(
-    "recipe,m,n,k,tm,tn,tk,swap,load",
+    "recipe,m,n,k,tm,tn,tk,swap,load,rule",
     (
-        ("nvfp4", 64, 4096, 4096, 64, 64, 128, False, "cpasync"),
-        ("nvfp4", 64, 64, 256, 64, 64, 128, True, "cpasync"),
-        ("nvfp4", 16, 4096, 4096, 128, 64, 128, False, "tma"),
-        ("mxfp8", 8, 4096, 4096, 64, 16, 128, True, "tma"),
-        ("nvfp4", 512, 8192, 4096, 64, 64, 512, False, "tma"),
-        ("mxfp8", 256, 4096, 4096, 16, 64, 128, False, "tma"),
+        ("nvfp4", 64, 4096, 4096, 64, 64, 128, False, "cpasync", "correctness"),
+        ("nvfp4", 64, 64, 256, 64, 64, 128, True, "cpasync", "correctness"),
+        ("nvfp4", 16, 4096, 4096, 128, 64, 128, False, "tma", "efficiency"),
+        ("mxfp8", 8, 4096, 4096, 64, 16, 128, True, "tma", "efficiency"),
+        ("nvfp4", 512, 8192, 4096, 64, 64, 512, False, "tma", "correctness"),
+        ("mxfp8", 256, 4096, 4096, 16, 64, 128, False, "tma", "efficiency"),
     ),
 )
 def test_dense_efficiency_can_be_lifted_or_pinned(
-    device, recipe, m, n, k, tm, tn, tk, swap, load
+    device, recipe, m, n, k, tm, tn, tk, swap, load, rule
 ):
     from b12x.gemm._tuning import DenseGemmConfig, DenseGemmQuery, TUNING
 
@@ -223,7 +220,6 @@ def test_dense_efficiency_can_be_lifted_or_pinned(
         in_features=k,
         out_features=n,
         expected_m=m,
-        exhaustive=False,
     )
     config = DenseGemmConfig(
         backend="cutedsl",
@@ -236,18 +232,19 @@ def test_dense_efficiency_can_be_lifted_or_pinned(
         large_m_unroll=False if recipe == "mxfp8" else None,
         target_occupancy=None,
     )
-    with pytest.raises(ValueError, match="efficiency predicates"):
+    audit = replace(query, autotune_effort="audit")
+    with pytest.raises(ValueError, match=f"{rule} predicates"):
         TUNING.parameter_space(query, device).validate(asdict(config))
-    assert (
-        TUNING.lower(replace(query, exhaustive=True), device, asdict(config)) == config
-    )
+    if rule == "efficiency":
+        assert TUNING.lower(audit, device, asdict(config)) == config
+    else:
+        with pytest.raises(ValueError, match="correctness predicates"):
+            TUNING.lower(audit, device, asdict(config))
     assert TUNING.configure(query, device=device, override=config).pinned == config
     constrained = replace(query, overrides=FrozenMapping({"mma_tiler_mn": (tm, tn)}))
     TUNING.parameter_space(constrained, device).validate(asdict(config))
     with pytest.raises(ValueError):
-        TUNING.lower(
-            replace(query, exhaustive=True), device, asdict(replace(config, tile_m=7))
-        )
+        TUNING.lower(audit, device, asdict(replace(config, tile_m=7)))
 
 
 @pytest.mark.parametrize("device", DEVICES)
@@ -271,7 +268,6 @@ def test_dense_retains_bk64_and_gb10_counterexamples(device):
             in_features=k,
             out_features=n,
             expected_m=m,
-            exhaustive=False,
         )
         fp8 = recipe in ("mxfp8", "block_fp8")
         config = DenseGemmConfig(
@@ -291,17 +287,15 @@ def test_dense_retains_bk64_and_gb10_counterexamples(device):
 @pytest.mark.parametrize("device", DEVICES)
 def test_kda_keeps_non_power_default_and_allows_explicit_window(device):
     module, kind, values = _declarations()[2]
-    query = kind(**values, exhaustive=False)
+    query = kind(**values)
     space = module.TUNING.parameter_space(query, device)
     windows = {p["window_tiles"] for p in space.configurations()}
     assert {1, 16, 41, 64, 128, 129} <= windows
     config = replace(module._default_config(query, device), window_tiles=17)
     with pytest.raises(ValueError, match="efficiency predicates"):
         space.validate(config.to_dict())
-    assert (
-        module.TUNING.lower(replace(query, exhaustive=True), device, config.to_dict())
-        == config
-    )
+    audit = replace(query, autotune_effort="audit")
+    assert module.TUNING.lower(audit, device, config.to_dict()) == config
     assert (
         module.TUNING.configure(query, device=device, override=config).pinned == config
     )
@@ -311,7 +305,8 @@ def test_kda_keeps_non_power_default_and_allows_explicit_window(device):
 def test_mla_keeps_quotients_and_explicit_split_caps(device):
     module, kind, values = _declarations()[4]
     for capacity, selected in ((1024, 171), (2048, 187)):
-        query = kind(**(values | {"cache_tokens": capacity * 64}), exhaustive=False)
+        query = kind(**(values | {"cache_tokens": capacity * 64}))
+        audit = replace(query, autotune_effort="audit")
         space = module.TUNING.parameter_space(query, device)
         splits = {p["max_splits"] for p in space.configurations()}
         assert selected in splits
@@ -326,13 +321,10 @@ def test_mla_keeps_quotients_and_explicit_split_caps(device):
             module.TUNING.configure(query, device=device, override=config).pinned
             == config
         )
-        assert (
-            module.TUNING.lower(replace(query, exhaustive=True), device, asdict(config))
-            == config
-        )
+        assert module.TUNING.lower(audit, device, asdict(config)) == config
         with pytest.raises(ValueError, match="cannot exceed"):
             module.TUNING.configure(
-                replace(query, exhaustive=True),
+                audit,
                 device=device,
                 override=module.DenseMlaConfig(max_splits=capacity + 1),
             )
@@ -341,7 +333,7 @@ def test_mla_keeps_quotients_and_explicit_split_caps(device):
 @pytest.mark.parametrize("device", DEVICES)
 def test_varlen_retains_dense_n_axis_and_kernel_legality(device):
     module, kind, values = _declarations()[5]
-    query = kind(**values, exhaustive=False)
+    query = kind(**values)
     for n in (80, 96, 112, 176):
         assert (
             module.TUNING.lower(query, device, {"tile_m": 128, "tile_n": n}).tile_n == n
@@ -349,19 +341,23 @@ def test_varlen_retains_dense_n_axis_and_kernel_legality(device):
     choice = {"tile_m": 256, "tile_n": 16}
     with pytest.raises(ValueError, match="efficiency predicates"):
         module.TUNING.lower(query, device, choice)
-    exhaustive = replace(query, exhaustive=True)
-    config = module.TUNING.lower(exhaustive, device, choice)
+    audit = replace(query, autotune_effort="audit")
+    config = module.TUNING.lower(audit, device, choice)
     assert (
         module.TUNING.configure(query, device=device, override=config).pinned == config
     )
+    # M tiles above 256 are dominated at every effort; within the dominance
+    # bound the kernel's own legality check still applies.
+    with pytest.raises(ValueError, match="correctness predicates"):
+        module.TUNING.lower(audit, device, {"tile_m": 768, "tile_n": 384})
     with pytest.raises(ValueError, match="unsupported by the production kernel"):
-        module.TUNING.lower(exhaustive, device, {"tile_m": 768, "tile_n": 384})
+        module.TUNING.lower(audit, device, {"tile_m": 256, "tile_n": 384})
 
 
 @pytest.mark.parametrize("device", DEVICES)
 def test_gqa_retains_residency_endpoints_and_explicit_controls(device):
     module, kind, values = _declarations()[6]
-    query = kind(**values, exhaustive=False)
+    query = kind(**values)
     space = module.TUNING.parameter_space(query, device)
     maximum = max(space.knobs[0].values)
     assignments = list(space.configurations())
@@ -375,7 +371,9 @@ def test_gqa_retains_residency_endpoints_and_explicit_controls(device):
                 "apply_chunk_efficiency_policy": True,
             }
         )
-    module.TUNING.parameter_space(replace(query, exhaustive=True), device).validate(
+    module.TUNING.parameter_space(
+        replace(query, autotune_effort="audit"), device
+    ).validate(
         {
             "graph_ctas_per_sm": 5,
             "force_split_kv": False,
@@ -412,16 +410,17 @@ def test_dense_mla_compile_jobs_ignore_search_mode(monkeypatch):
         max_page_table_width=16,
         num_cache_pages=16,
     )
-    monkeypatch.setenv("B12X_AUTOTUNE_EXHAUSTIVE", "0")
+    monkeypatch.setenv("B12X_AUTOTUNE_EFFORT", "default")
     ordinary = dense_mla.plan(caps)
-    monkeypatch.setenv("B12X_AUTOTUNE_EXHAUSTIVE", "1")
-    exhaustive = dense_mla.plan(caps)
+    monkeypatch.setenv("B12X_AUTOTUNE_EFFORT", "audit")
+    audit = dense_mla.plan(caps)
     config = TUNING.default_config(ordinary.query, DEVICES[0])
     device = SimpleNamespace(ordinal=0)
-    assert ordinary._compile_jobs(config, device) == exhaustive._compile_jobs(
-        config, device
+    assert ordinary._compile_jobs(config, device) == audit._compile_jobs(config, device)
+    assert (ordinary.query.autotune_effort, audit.query.autotune_effort) == (
+        "default",
+        "audit",
     )
-    assert ordinary.query.exhaustive is False and exhaustive.query.exhaustive is True
 
 
 @pytest.mark.parametrize("device", DEVICES)
@@ -432,10 +431,7 @@ def test_indexer_fused_geometry_domain_and_pins(device, mode, heads, rows):
     from b12x.attention.dsa_indexer._mxfp4_tuning import default_fused_config
 
     module, query_type, values = _declarations()[7]
-    query = query_type(
-        **(values | dict(mode=mode, num_q_heads=heads, max_q_rows=rows)),
-        exhaustive=False,
-    )
+    query = query_type(**(values | dict(mode=mode, num_q_heads=heads, max_q_rows=rows)))
     candidates = module.TUNING.eligible_plan(query, device).candidates
     assert len(candidates) >= 2
     pinned = module.DsaIndexerConfig(
@@ -468,13 +464,14 @@ def test_indexer_compile_jobs_ignore_search_mode(
         max_candidates=max_candidates,
         candidate_topk_blocks=candidate_topk_blocks,
     )
-    monkeypatch.setenv("B12X_AUTOTUNE_EXHAUSTIVE", "0")
+    monkeypatch.setenv("B12X_AUTOTUNE_EFFORT", "default")
     ordinary = dsa_indexer.plan(caps)
-    monkeypatch.setenv("B12X_AUTOTUNE_EXHAUSTIVE", "1")
-    exhaustive = dsa_indexer.plan(caps)
+    monkeypatch.setenv("B12X_AUTOTUNE_EFFORT", "audit")
+    audit = dsa_indexer.plan(caps)
     config = TUNING.default_config(ordinary.query, DEVICES[0])
     device = SimpleNamespace(ordinal=0)
-    assert ordinary._compile_jobs(config, device) == exhaustive._compile_jobs(
-        config, device
+    assert ordinary._compile_jobs(config, device) == audit._compile_jobs(config, device)
+    assert (ordinary.query.autotune_effort, audit.query.autotune_effort) == (
+        "default",
+        "audit",
     )
-    assert ordinary.query.exhaustive is False and exhaustive.query.exhaustive is True

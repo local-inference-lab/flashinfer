@@ -189,7 +189,7 @@ def test_real_mhc_discovery_matches_serial_without_cuda_or_compilation():
         device = detect_device("cuda:0")
         jobs = []
         for operation in ("pre", "post_pre"):
-            with autotune_effort("max"):
+            with autotune_effort("audit"):
                 plan = mhc.plan(mhc.Caps(device="cuda:0", max_tokens=3584, hidden_size=5120),
                     invocation=dict(operation=operation, has_norm_weight=True, lagged_mix=True,
                         expanded_residual=operation == "pre", rms_eps=1e-20, hc_eps=1e-6,

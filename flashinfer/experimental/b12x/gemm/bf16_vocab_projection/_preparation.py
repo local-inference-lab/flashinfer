@@ -29,7 +29,7 @@ def compile_vocab_projection(query_payload, config_payload, ordinal):
     """Compile exactly the selected native vocabulary launcher."""
     from . import _kernel
 
-    query = Bf16VocabProjectionQuery(**dict(query_payload), autotune_effort="medium")
+    query = Bf16VocabProjectionQuery(**dict(query_payload), autotune_effort="default")
     config = Bf16VocabProjectionConfig.from_config(FrozenMapping(config_payload))
     TUNING.validate_query(query, None)
     TUNING.validate_config(query, config, None)

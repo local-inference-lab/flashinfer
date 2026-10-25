@@ -7,7 +7,6 @@ from dataclasses import dataclass, field
 from b12x.preparation._efficiency import (
     AutotuneEffort,
     capture_autotune_effort,
-    capture_exhaustive_search,
 )
 
 from b12x.preparation import FrozenMapping, TuningContract
@@ -23,7 +22,6 @@ class BlockFp8LinearQuery:
     output_dtype: str
     output_mode: str
     weight_block_size: int = 128
-    exhaustive: bool = field(default_factory=capture_exhaustive_search)
     autotune_effort: str = field(default_factory=capture_autotune_effort)
     codegen: FrozenMapping | None = None
 
@@ -57,7 +55,6 @@ def dense_query(query):
         expected_m=query.max_tokens,
         sfb_k_replicated=query.weight_block_size == 128,
         codegen=query.codegen,
-        exhaustive=query.exhaustive,
         autotune_effort=query.autotune_effort,
     )
 

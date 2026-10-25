@@ -148,7 +148,7 @@ def plan(query: GemvQuery, *, invocation=FrozenMapping(), override=None) -> Plan
     invocation = FrozenMapping(invocation)
     if invocation:
         raise ValueError("projection invocation semantics belong in GemvQuery")
-    compile_query = TUNING.encode_query(replace(query, autotune_effort="medium"))
+    compile_query = TUNING.encode_query(replace(query, autotune_effort="default"))
 
     def compile_jobs(config, device):
         if config.backend == "torch":

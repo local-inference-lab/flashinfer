@@ -1,4 +1,4 @@
-"""Per-query defaults and exhaustive legal kernel parameter spaces."""
+"""Per-query defaults and finite legal kernel parameter spaces."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from enum import Enum
 from typing import Generic, TypeVar
 
 from .types import DeviceIdentity, FrozenMapping
-from ._efficiency import AutotuneEffort, EfficiencyPredicate
+from ._efficiency import AutotuneEffort
 
 QueryT = TypeVar("QueryT")
 ConfigT = TypeVar("ConfigT")
@@ -69,17 +69,18 @@ class Knob:
 
 @dataclass(frozen=True, kw_only=True)
 class ParameterSpace:
-    """Finite axes with correctness and optional efficiency predicates.
+    """Finite axes with correctness and efficiency predicates.
 
-    ``predicates`` always apply. Performance filters are lifted at their declared
-    autotune effort; ``exhaustive=True`` selects the max effort.
+    ``predicates`` always apply: correctness, resource limits, and dominance
+    rules whose excluded assignments cannot win. ``efficiency_predicates`` are
+    performance guesses that prune the default search; the audit effort lifts
+    them.
     """
 
     knobs: tuple[Knob, ...]
     predicates: tuple[Callable[[Mapping[str, object]], bool], ...] = ()
     efficiency_predicates: tuple[Callable[[Mapping[str, object]], bool], ...] = ()
-    exhaustive: bool = False
-    autotune_effort: AutotuneEffort | str = AutotuneEffort.MEDIUM
+    autotune_effort: AutotuneEffort | str = AutotuneEffort.DEFAULT
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "knobs", tuple(self.knobs))
@@ -87,8 +88,6 @@ class ParameterSpace:
         object.__setattr__(
             self, "efficiency_predicates", tuple(self.efficiency_predicates)
         )
-        if type(self.exhaustive) is not bool:
-            raise TypeError("exhaustive must be a boolean")
         object.__setattr__(
             self, "autotune_effort", AutotuneEffort(self.autotune_effort)
         )
@@ -107,19 +106,12 @@ class ParameterSpace:
             raise ValueError(
                 "parameter spaces must identify at least their implementation"
             )
-        level = AutotuneEffort.MAX if self.exhaustive else self.autotune_effort
         object.__setattr__(
             self,
             "_active_efficiency",
-            tuple(
-                predicate
-                for predicate in self.efficiency_predicates
-                if (
-                    predicate.applies(level)
-                    if isinstance(predicate, EfficiencyPredicate)
-                    else level is not AutotuneEffort.MAX
-                )
-            ),
+            ()
+            if self.autotune_effort is AutotuneEffort.AUDIT
+            else self.efficiency_predicates,
         )
 
     @classmethod
@@ -130,8 +122,7 @@ class ParameterSpace:
         values: Mapping[str, Iterable[object]] = FrozenMapping(),
         predicates: Iterable[Callable[[Mapping[str, object]], bool]] = (),
         efficiency_predicates: Iterable[Callable[[Mapping[str, object]], bool]] = (),
-        exhaustive: bool = False,
-        autotune_effort: AutotuneEffort | str = AutotuneEffort.MEDIUM,
+        autotune_effort: AutotuneEffort | str = AutotuneEffort.DEFAULT,
     ) -> ParameterSpace:
         """Resolve planner ranges while preserving the declared binding times."""
         knobs = tuple(knobs)
@@ -146,7 +137,6 @@ class ParameterSpace:
             ),
             predicates=tuple(predicates),
             efficiency_predicates=tuple(efficiency_predicates),
-            exhaustive=exhaustive,
             autotune_effort=autotune_effort,
         )
 
@@ -380,9 +370,7 @@ class CandidateIterator:
         if self.done:
             raise StopIteration
         cfg = self.configuration
-        heuristic_only = (
-            cfg.space.autotune_effort is AutotuneEffort.OFF and not cfg.space.exhaustive
-        )
+        heuristic_only = cfg.space.autotune_effort is AutotuneEffort.OFF
         try:
             raw = next(self._product)
         except StopIteration:

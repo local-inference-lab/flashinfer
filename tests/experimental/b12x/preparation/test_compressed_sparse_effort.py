@@ -59,11 +59,9 @@ def test_effort_domains_are_nested_and_contain_heuristic(rows, width):
         previous = configs
 
 
-def test_medium_restores_legal_one_split_without_broadening_arithmetic():
+def test_default_races_power_of_two_geometries_without_broadening_arithmetic():
     query = declaration().query
-    low = configurations(replace(query, autotune_effort=AutotuneEffort.LOW))
-    medium = configurations(replace(query, autotune_effort=AutotuneEffort.MEDIUM))
-    assert {(c.max_chunks_per_row, c.split_chunk_size) for c in low} == {(54, 12)}
+    medium = configurations(replace(query, autotune_effort=AutotuneEffort.DEFAULT))
     assert {(c.max_chunks_per_row, c.split_chunk_size) for c in medium} == {
         (1, 1024),
         (10, 64),
@@ -79,34 +77,51 @@ def test_medium_restores_legal_one_split_without_broadening_arithmetic():
     assert not TUNING.parameter_space(query, DEVICE)._passes_predicates(invalid)
 
 
-def test_max_covers_every_distinct_supported_split_contract():
+def test_audit_covers_every_distinct_split_contract_on_the_ladder():
     from b12x.attention.compressed_sparse_mla._tuning import _split_config
 
-    query = replace(declaration(width=270000).query, autotune_effort=AutotuneEffort.MAX)
+    query = replace(
+        declaration(width=270000).query, autotune_effort=AutotuneEffort.AUDIT
+    )
     supported = {
         (_split_config(query, n).num_chunks, _split_config(query, n).chunk_size)
-        for n in range(1, 257)
+        for n in (*range(1, 33), *range(40, 257, 8))
     }
     configs = configurations(query)
     assert {(c.max_chunks_per_row, c.split_chunk_size) for c in configs} == supported
+    assert len(supported) > len(
+        configurations(replace(query, autotune_effort=AutotuneEffort.DEFAULT))
+    )
 
 
 def test_pins_keep_legal_geometry_below_effort_filter():
-    query = replace(declaration().query, autotune_effort=AutotuneEffort.LOW)
+    from b12x.attention.compressed_sparse_mla._tuning import _split_config
+
+    query = replace(
+        declaration(width=270000).query, autotune_effort=AutotuneEffort.DEFAULT
+    )
+    raced = {(c.max_chunks_per_row, c.split_chunk_size) for c in configurations(query)}
+    split = next(
+        split
+        for split in (_split_config(query, n) for n in range(1, 33))
+        if (split.num_chunks, split.chunk_size) not in raced
+    )
     config = replace(
         TUNING.default_config(query, DEVICE),
-        max_chunks_per_row=1,
-        split_chunk_size=1024,
+        max_chunks_per_row=split.num_chunks,
+        split_chunk_size=split.chunk_size,
     )
     assert config not in configurations(query)
     assert TUNING.configure(query, device=DEVICE, override=config).pinned == config
     with pytest.raises(ValueError, match="split contract"):
-        TUNING.validate_config(query, replace(config, split_chunk_size=12), DEVICE)
+        TUNING.validate_config(
+            query, replace(config, split_chunk_size=split.chunk_size + 1), DEVICE
+        )
 
 
 @pytest.mark.parametrize("mode", ["extend", "verify", "draft_extend"])
 def test_single_pass_geometry_remains_fixed(mode):
-    query = replace(declaration(mode=mode).query, autotune_effort=AutotuneEffort.MAX)
+    query = replace(declaration(mode=mode).query, autotune_effort=AutotuneEffort.AUDIT)
     assert {
         (c.max_chunks_per_row, c.split_chunk_size, c.single_pass)
         for c in configurations(query)
@@ -114,14 +129,14 @@ def test_single_pass_geometry_remains_fixed(mode):
 
 
 def test_effort_is_captured_keyed_and_absent_from_compile_payload(monkeypatch):
-    monkeypatch.setenv("B12X_AUTOTUNE_EFFORT", "low")
+    monkeypatch.setenv("B12X_AUTOTUNE_EFFORT", "default")
     low = declaration()
-    monkeypatch.setenv("B12X_AUTOTUNE_EFFORT", "max")
+    monkeypatch.setenv("B12X_AUTOTUNE_EFFORT", "audit")
     maximum = declaration()
-    assert low.query.autotune_effort is AutotuneEffort.LOW
-    assert maximum.query.autotune_effort is AutotuneEffort.MAX
+    assert low.query.autotune_effort is AutotuneEffort.DEFAULT
+    assert maximum.query.autotune_effort is AutotuneEffort.AUDIT
     assert _declaration_key(low) != _declaration_key(maximum)
-    assert low.contract.encode_query(low.query)["autotune_effort"] == "low"
+    assert low.contract.encode_query(low.query)["autotune_effort"] == "default"
     assert low._compile_jobs(
         TUNING.default_config(low.query, DEVICE), SimpleNamespace(ordinal=0)
     ) == maximum._compile_jobs(
@@ -129,7 +144,7 @@ def test_effort_is_captured_keyed_and_absent_from_compile_payload(monkeypatch):
     )
 
 
-def test_bf16_constraint_still_excludes_fp8_at_max():
+def test_bf16_constraint_still_excludes_fp8_at_audit():
     plan = declaration(arithmetic="bf16")
-    query = replace(plan.query, autotune_effort=AutotuneEffort.MAX)
+    query = replace(plan.query, autotune_effort=AutotuneEffort.AUDIT)
     assert all(c.v41_compute_mode == "bf16" for c in configurations(query))

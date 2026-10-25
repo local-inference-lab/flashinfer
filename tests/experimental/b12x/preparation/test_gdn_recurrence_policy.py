@@ -41,15 +41,15 @@ def _caps(tokens=512, **kwargs):
     )
 
 
-def _query(tokens=512, *, policy="auto", exhaustive=False):
+def _query(tokens=512, *, policy="auto", audit=False):
     plan = gdn_prefill.plan(_caps(tokens, recurrence_policy=policy))
-    return replace(plan.query, exhaustive=exhaustive)
+    return replace(plan.query, autotune_effort="audit" if audit else "default")
 
 
 @pytest.mark.parametrize("tokens", CAPACITIES)
-@pytest.mark.parametrize("exhaustive", (False, True))
-def test_sequential_policy_keeps_every_legal_performance_choice(tokens, exhaustive):
-    auto = _query(tokens, exhaustive=exhaustive)
+@pytest.mark.parametrize("audit", (False, True))
+def test_sequential_policy_keeps_every_legal_performance_choice(tokens, audit):
+    auto = _query(tokens, audit=audit)
     restricted = replace(auto, recurrence_policy="sequential_k1")
     full = {config for _, config in _tuning.TUNING.choices(auto, DEVICE)}
     selected = {config for _, config in _tuning.TUNING.choices(restricted, DEVICE)}
@@ -63,7 +63,7 @@ def test_sequential_policy_keeps_every_legal_performance_choice(tokens, exhausti
     assert len({config.window_tiles for config in selected}) > 1
     assert any(config.k_split > 1 for config in full)
     assert any(config.algorithm == "chunk_parallel" for config in full) == (
-        exhaustive or tokens > 128
+        tokens > 128
     )
     for config in selected:
         layout = _impl._materialize_layout(
@@ -98,9 +98,9 @@ def test_default_policy_keeps_default_configuration(tokens):
     )
 
 
-@pytest.mark.parametrize("exhaustive", (False, True))
-def test_incompatible_overrides_and_assignments_rejected(exhaustive):
-    query = _query(policy="sequential_k1", exhaustive=exhaustive)
+@pytest.mark.parametrize("audit", (False, True))
+def test_incompatible_overrides_and_assignments_rejected(audit):
+    query = _query(policy="sequential_k1", audit=audit)
     auto = replace(query, recurrence_policy="auto")
     candidates = tuple(_tuning.TUNING.choices(auto, DEVICE))
     incompatible = [

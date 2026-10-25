@@ -122,7 +122,7 @@ def _worker(rank, world, directory):
             **kwargs,
         )
 
-    with autotune_effort("medium"):
+    with autotune_effort("default"):
         for iteration in range(2):
             owner = session("reuse", cache_only=iteration == 1)
             plans, requests, operands = declarations()

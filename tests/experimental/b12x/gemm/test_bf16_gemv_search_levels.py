@@ -28,14 +28,14 @@ def choices(q):
 
 
 def test_effort_capture_and_selection_identity(monkeypatch):
-    monkeypatch.setenv("B12X_AUTOTUNE_EFFORT", "low")
+    monkeypatch.setenv("B12X_AUTOTUNE_EFFORT", "default")
     low = query()
-    monkeypatch.setenv("B12X_AUTOTUNE_EFFORT", "high")
+    monkeypatch.setenv("B12X_AUTOTUNE_EFFORT", "audit")
     high = query()
-    assert low.autotune_effort == "low"
-    assert high.autotune_effort == "high"
+    assert low.autotune_effort == "default"
+    assert high.autotune_effort == "audit"
     assert TUNING.encode_query(low) != TUNING.encode_query(high)
-    assert TUNING.parameter_space(low, None).autotune_effort == "low"
+    assert TUNING.parameter_space(low, None).autotune_effort == "default"
     monkeypatch.setenv("B12X_AUTOTUNE_EFFORT", "invalid")
     with pytest.raises(ValueError):
         query()
@@ -45,15 +45,15 @@ def test_effort_capture_and_selection_identity(monkeypatch):
 def test_effort_does_not_change_compile_jobs(backend):
     from b12x.gemm.bf16_gemv._preparation import plan
 
-    low = query(autotune_effort="low")
-    maximum = replace(low, autotune_effort="max")
+    low = query(autotune_effort="off")
+    maximum = replace(low, autotune_effort="audit")
     low_plan, maximum_plan = plan(low), plan(maximum)
     config = GemvConfig(backend=backend)
     device = SimpleNamespace(ordinal=0)
     assert TUNING.encode_query(low) != TUNING.encode_query(maximum)
     jobs = low_plan._compile_jobs(config, device)
     assert jobs == maximum_plan._compile_jobs(config, device)
-    assert jobs[0].args[0]["autotune_effort"] == "medium"
+    assert jobs[0].args[0]["autotune_effort"] == "default"
 
 
 @pytest.mark.parametrize(
@@ -64,7 +64,7 @@ def test_nested_tiers_and_natural_heuristic_membership(n, k, rows):
     q = replace(query(), out_features=n, in_features=k, max_rows=rows)
     default = TUNING.default_config(q, None)
     previous = {default}
-    for effort in ("off", "low", "medium", "high", "max"):
+    for effort in ("off", "default", "audit"):
         active = replace(q, autotune_effort=effort)
         space = TUNING.parameter_space(active, None)
         assignment = TUNING.config_payload(default)
@@ -77,18 +77,15 @@ def test_nested_tiers_and_natural_heuristic_membership(n, k, rows):
         previous = selected
 
 
-def test_high_restores_small_projection_backends_and_preserves_pins():
+def test_audit_restores_small_projection_backends_and_preserves_pins():
     q = query()
     for backend in ("mma", "prefill"):
         config = GemvConfig(backend=backend)
         TUNING.validate_config(q, config, None)
-        for effort in ("low", "medium"):
-            active = replace(q, autotune_effort=effort)
-            assert config not in choices(active)
-            pinned = TUNING.configure(active, device=None, override=config)
-            assert pinned.default == pinned.pinned == config
-        for effort in ("high", "max"):
-            assert config in choices(replace(q, autotune_effort=effort))
+        assert config not in choices(q)
+        pinned = TUNING.configure(q, device=None, override=config)
+        assert pinned.default == pinned.pinned == config
+        assert config in choices(replace(q, autotune_effort="audit"))
 
 
 @pytest.mark.parametrize(
@@ -116,15 +113,15 @@ def test_high_restores_small_projection_backends_and_preserves_pins():
         ("tc", {"max_rows": 8, "bias_dtype": "bfloat16"}),
     ],
 )
-def test_max_keeps_backend_support_mandatory(backend, changes):
-    q = replace(query(), autotune_effort="max", **changes)
+def test_audit_keeps_backend_support_mandatory(backend, changes):
+    q = replace(query(), autotune_effort="audit", **changes)
     config = GemvConfig(backend=backend)
     with pytest.raises(ValueError, match="ineligible"):
         TUNING.validate_config(q, config, None)
     assert config not in choices(q)
 
 
-def test_medium_preserves_projection_defaults():
+def test_default_preserves_projection_defaults():
     q = query()
     assert TUNING.default_config(q, None).backend == "torch"
     assert (

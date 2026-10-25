@@ -14,7 +14,6 @@ from b12x.preparation import (
 )
 from b12x.preparation._efficiency import (
     AutotuneEffort,
-    EfficiencyPredicate,
     capture_autotune_effort,
     powers_of_two,
 )
@@ -283,10 +282,8 @@ def _parameters(query: SparseMlaQuery, device: DeviceIdentity | None) -> Paramet
             for split in (_split_config(query, limit),)
         )
 
-    legal = geometries(range(1, 257))
-    low = geometries((256,))
-    medium = geometries(powers_of_two(256))
-    high = geometries((*range(1, 33), *range(40, 257, 8)))
+    legal = geometries((*range(1, 33), *range(40, 257, 8)))
+    raced = geometries(powers_of_two(256))
 
     def pair(choice):
         return choice["max_chunks_per_row"], choice["split_chunk_size"]
@@ -301,11 +298,7 @@ def _parameters(query: SparseMlaQuery, device: DeviceIdentity | None) -> Paramet
             "v41_heads_per_block": head_blocks,
         },
         predicates=(lambda choice: pair(choice) in legal,),
-        efficiency_predicates=(
-            EfficiencyPredicate(lambda choice: pair(choice) in low, "medium"),
-            EfficiencyPredicate(lambda choice: pair(choice) in medium, "high"),
-            EfficiencyPredicate(lambda choice: pair(choice) in high, "max"),
-        ),
+        efficiency_predicates=(lambda choice: pair(choice) in raced,),
         autotune_effort=query.autotune_effort,
     )
 

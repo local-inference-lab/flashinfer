@@ -792,10 +792,9 @@ def test_tuning_keeps_the_live_length_merge_policy() -> None:
         reserve_paged_logits=False,
         paged_logits_k_rows=0,
         operands=FrozenMapping({}),
-        exhaustive=False,
     )
-    for exhaustive in (False, True):
-        plan = TUNING.eligible_plan(replace(query, exhaustive=exhaustive), device)
+    for effort in ("default", "audit"):
+        plan = TUNING.eligible_plan(replace(query, autotune_effort=effort), device)
         assert {config.fused_merge for _, config in plan.candidates} == {
             FUSED_MERGE_AUTO
         }

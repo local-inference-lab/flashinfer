@@ -27,7 +27,6 @@ from b12x.preparation import (
 )
 from b12x.preparation._efficiency import (
     AutotuneEffort,
-    EfficiencyPredicate,
     capture_autotune_effort,
 )
 from b12x._lib.quant.csf_blocks import Nvfp4CompactBlockPlane
@@ -119,11 +118,8 @@ def _parameters(query, device):
             "direct_routes": (False, True) if _uses_presence(query) else (False,),
             "bitmap_routes": (False, True) if _uses_presence(query) else (False,),
         },
-        efficiency_predicates=(
-            EfficiencyPredicate(
-                lambda p: not p["direct_routes"] or query.routes <= query.first[6],
-                minimum_effort=AutotuneEffort.MAX,
-            ),
+        predicates=(
+            lambda p: not p["direct_routes"] or query.routes <= query.first[6],
         ),
         autotune_effort=query.autotune_effort,
     )
@@ -172,7 +168,7 @@ def _program_query_payload(query):
 @program_cache(scope="preparation")
 def compile_expansion(query_payload, config_payload, ordinal):
     values = dict(query_payload)
-    values.setdefault("autotune_effort", AutotuneEffort.MEDIUM)
+    values.setdefault("autotune_effort", AutotuneEffort.DEFAULT)
     query = CsfExpansionQuery(**values)
     config = CsfExpansionConfig.from_config(config_payload)
     geometries = tuple(

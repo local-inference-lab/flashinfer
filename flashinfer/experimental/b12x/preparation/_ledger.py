@@ -32,12 +32,7 @@ LEDGER_VERSION = 1
 # Legal counts per effort enumerate the whole product once per effort; larger
 # products record admission levels only.
 LEGAL_COUNT_CARTESIAN_LIMIT = 20_000
-EFFORT_LEVELS = (
-    AutotuneEffort.LOW,
-    AutotuneEffort.MEDIUM,
-    AutotuneEffort.HIGH,
-    AutotuneEffort.MAX,
-)
+EFFORT_LEVELS = (AutotuneEffort.DEFAULT, AutotuneEffort.AUDIT)
 
 
 def admission_levels(space, candidates, *, cartesian_count=None):
@@ -50,10 +45,7 @@ def admission_levels(space, candidates, *, cartesian_count=None):
     ``LEGAL_COUNT_CARTESIAN_LIMIT``.
     """
     variants = {
-        effort: replace(
-            space, autotune_effort=effort, exhaustive=effort is AutotuneEffort.MAX
-        )
-        for effort in EFFORT_LEVELS
+        effort: replace(space, autotune_effort=effort) for effort in EFFORT_LEVELS
     }
     levels = []
     for assignment, _ in candidates:
@@ -250,7 +242,7 @@ class RaceLedger:
             if configuration.pinned is None
             else contract.config_payload(configuration.pinned).to_dict(),
             "dependencies": list(request.dependencies),
-            "effort": "max" if space.exhaustive else space.autotune_effort.value,
+            "effort": space.autotune_effort.value,
             "protocol": {
                 "rounds": session.rounds,
                 "samples": session.samples,

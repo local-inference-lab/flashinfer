@@ -71,13 +71,7 @@ def query():
 
 @pytest.mark.parametrize(
     "effort,warps",
-    [
-        ("off", {2}),
-        ("low", {2}),
-        ("medium", {1, 2, 4}),
-        ("high", {1, 2, 4}),
-        ("max", {1, 2, 4}),
-    ],
+    [("off", {2}), ("default", {1, 2, 4}), ("audit", {1, 2, 4})],
 )
 def test_legal_warps_and_natural_heuristic_membership(effort, warps):
     candidate_query = replace(query(), autotune_effort=effort)
@@ -88,8 +82,8 @@ def test_legal_warps_and_natural_heuristic_membership(effort, warps):
         TUNING.validate_config(candidate_query, config, DEVICE)
 
 
-def test_pins_preserve_legal_warps_below_efficiency_threshold():
-    candidate_query = replace(query(), autotune_effort="low")
+def test_pins_preserve_legal_warps():
+    candidate_query = replace(query(), autotune_effort="off")
     for warps in (1, 4):
         config = QsaConfig(backend="cutedsl", sparse_gqa_direct_kv_warps=warps)
         assert (
@@ -106,12 +100,12 @@ def test_effort_capture_serialization_and_program_key_neutrality(monkeypatch):
     from b12x.attention.qsa import _contract
     from b12x.preparation.session import _declaration_key
 
-    monkeypatch.setenv("B12X_AUTOTUNE_EFFORT", "low")
+    monkeypatch.setenv("B12X_AUTOTUNE_EFFORT", "default")
     low = query()
-    monkeypatch.setenv("B12X_AUTOTUNE_EFFORT", "max")
+    monkeypatch.setenv("B12X_AUTOTUNE_EFFORT", "audit")
     maximum = query()
-    assert low.autotune_effort is AutotuneEffort.LOW
-    assert maximum.autotune_effort is AutotuneEffort.MAX
+    assert low.autotune_effort is AutotuneEffort.DEFAULT
+    assert maximum.autotune_effort is AutotuneEffort.AUDIT
     assert QsaQuery(**low.to_dict()) == low
     assert TUNING.encode_query(low) != TUNING.encode_query(maximum)
     assert "autotune_effort" not in low.program_payload()
@@ -135,7 +129,6 @@ def test_effort_capture_serialization_and_program_key_neutrality(monkeypatch):
     )
 
 
-def test_legacy_exhaustive_environment_captures_max(monkeypatch):
+def test_unset_environment_captures_the_default_tier(monkeypatch):
     monkeypatch.delenv("B12X_AUTOTUNE_EFFORT", raising=False)
-    monkeypatch.setenv("B12X_AUTOTUNE_EXHAUSTIVE", "1")
-    assert query().autotune_effort is AutotuneEffort.MAX
+    assert query().autotune_effort is AutotuneEffort.DEFAULT

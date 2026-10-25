@@ -4,8 +4,8 @@ Preparation sessions append one record per completed race to the ``ledger_v1``
 table of each race-progress database beside the selection cache (see
 ``b12x.preparation._ledger``). This tool reads those records and reports, per
 component: candidates raced, default regret (how much slower the heuristic
-default is than the winner), pruning regret per autotune effort (how much
-slower the best candidate admitted at a lower effort is than the winner),
+default is than the winner), pruning regret (how much slower the best
+candidate admitted at the default effort is than an audit race's winner),
 runner-up margin, round-to-round noise, and wall time. Shard records that
 tensor-parallel ranks wrote for one race are merged into one logical run
 first. ``--replications`` compares repeated runs of the same key: winner
@@ -31,7 +31,7 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-EFFORT_RANK = {"low": 0, "medium": 1, "high": 2, "max": 3}
+EFFORT_RANK = {"default": 0, "audit": 1}
 MARGINS_PERCENT = (1, 2, 5, 10)
 
 
@@ -328,23 +328,22 @@ def summarize(analyses):
         groups[item["component_id"]].append(item)
     header = (
         f"{'component':<38} {'races':>5} {'cand':>6} {'meas':>6} "
-        f"{'default regret p50/p90':>22} {'prune low/med/high p50':>23} "
+        f"{'default regret p50/p90':>22} {'prune default p50':>17} "
         f"{'2nd/1st p50':>11} {'noise p50':>9} {'secs':>8}"
     )
     lines = [header, "-" * len(header)]
     for component in sorted(groups):
         items = groups[component]
         regrets = [i["default_regret"] for i in items]
-        prune = "/".join(
-            _pct(_quantile([i["pruning_regret"].get(level) for i in items], 0.5))
-            for level in ("low", "medium", "high")
+        prune = _pct(
+            _quantile([i["pruning_regret"].get("default") for i in items], 0.5)
         )
         lines.append(
             f"{component[:38]:<38} {len(items):>5} "
             f"{_count(_quantile([i['candidates'] for i in items], 0.5)):>6} "
             f"{_count(_quantile([i['measured'] for i in items], 0.5)):>6} "
             f"{_pct(_quantile(regrets, 0.5)) + '/' + _pct(_quantile(regrets, 0.9)):>22} "
-            f"{prune:>23} "
+            f"{prune:>17} "
             f"{_ratio(_quantile([i['runner_up_ratio'] for i in items], 0.5)):>11} "
             f"{_pct(_quantile([i['noise_cv'] for i in items], 0.5)):>9} "
             f"{sum(i['seconds'] or 0 for i in items):>8.0f}"
@@ -355,20 +354,17 @@ def summarize(analyses):
 def describe_records(analyses):
     header = (
         f"{'component':<34} {'effort':<6} {'cand':>5} {'meas':>5} {'win':>5} "
-        f"{'winner us':>10} {'2nd/1st':>8} {'default':>8} {'prune l/m/h':>20} "
+        f"{'winner us':>10} {'2nd/1st':>8} {'default':>8} {'prune':>8} "
         f"{'noise':>6} {'secs':>6}"
     )
     lines = [header, "-" * len(header)]
     for item in analyses:
-        prune = "/".join(
-            _pct(item["pruning_regret"].get(level))
-            for level in ("low", "medium", "high")
-        )
+        prune = _pct(item["pruning_regret"].get("default"))
         lines.append(
             f"{item['component_id'][:34]:<34} {item['effort']:<6} "
             f"{item['candidates']:>5} {item['measured']:>5} {item['winner_index']:>5} "
             f"{item['winner_us']:>10.1f} {_ratio(item['runner_up_ratio']):>8} "
-            f"{_pct(item['default_regret']):>8} {prune:>20} "
+            f"{_pct(item['default_regret']):>8} {prune:>8} "
             f"{_pct(item['noise_cv']):>6} {(item['seconds'] or 0):>6.0f}"
         )
     return "\n".join(lines)

@@ -41,7 +41,7 @@ def query(m=8, n=1792, k=5120, **kwargs):
 
 @pytest.mark.parametrize("m", [1, 8])
 @pytest.mark.parametrize("n,k", [(1792, 5120), (8192, 1280)])
-@pytest.mark.parametrize("effort", ["low", "medium", "high", "max"])
+@pytest.mark.parametrize("effort", ["default", "audit"])
 def test_auto_includes_every_eligible_dense_configuration(m, n, k, effort):
     q = query(m, n, k, autotune_effort=effort)
     inner = quantized_query(q, expected_m=quantized_expected_m(q))
@@ -159,7 +159,7 @@ def test_caller_workspace_limit_and_a16_knobs_are_validated():
 
 @pytest.mark.parametrize("recipe", ["nvfp4", "mxfp4"])
 @pytest.mark.parametrize("rows", [1, 8, 128])
-@pytest.mark.parametrize("effort", ["low", "medium", "high", "max"])
+@pytest.mark.parametrize("effort", ["default", "audit"])
 def test_fp4_quantized_search_includes_dense_candidates(recipe, rows, effort):
     q = replace(
         query(m=rows, n=512, k=2560),

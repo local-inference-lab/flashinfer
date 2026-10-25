@@ -46,8 +46,7 @@ def query(**changes):
             force_split_kv=None,
             abi=FrozenMapping(),
             controls=FrozenMapping(),
-            exhaustive=False,
-            autotune_effort="medium",
+            autotune_effort="default",
         ),
         **changes,
     )
@@ -65,10 +64,10 @@ def lower(q, *, residency=1, policy=False, split=True):
     )
 
 
-def test_high_retains_configs_and_natural_default_membership():
+def test_audit_retains_configs_and_natural_default_membership():
     q = query()
     previous = set()
-    for effort in ("low", "medium", "high", "max"):
+    for effort in ("default", "audit"):
         active = replace(q, autotune_effort=effort)
         space = _tuning.TUNING.parameter_space(active, DEVICE)
         configs = {
@@ -77,16 +76,15 @@ def test_high_retains_configs_and_natural_default_membership():
         assert previous <= configs
         assert _tuning._heuristic(active, DEVICE) in configs
         previous = configs
-    assert lower(replace(q, autotune_effort="high")).max_chunks_per_request == 48
+    assert lower(replace(q, autotune_effort="audit")).max_chunks_per_request == 48
     assert lower(q, policy=True).max_chunks_per_request == 19
     with pytest.raises(ValueError, match="efficiency"):
         lower(q)
-    assert lower(replace(q, exhaustive=True)).max_chunks_per_request == 48
 
 
 @pytest.mark.parametrize("dtype", ["bfloat16", "float8_e4m3fn"])
-def test_high_lifts_measured_split_knees_and_preserves_residency(dtype):
-    q = query(kv_dtype=dtype, autotune_effort="high")
+def test_audit_lifts_measured_split_knees_and_preserves_residency(dtype):
+    q = query(kv_dtype=dtype, autotune_effort="audit")
     assert lower(q, residency=1).max_chunks_per_request == 48
     assert lower(q, residency=2).max_chunks_per_request == 96
     assert lower(q, policy=True).max_chunks_per_request == (
@@ -94,19 +92,19 @@ def test_high_lifts_measured_split_knees_and_preserves_residency(dtype):
     )
 
 
-def test_high_lifts_nominal_and_bf16_minimax_split_limits():
+def test_audit_lifts_nominal_and_bf16_minimax_split_limits():
     q = query(
         q_heads=6,
         head_dim_qk=128,
         head_dim_vo=128,
         cache_tokens=32768,
-        autotune_effort="high",
+        autotune_effort="audit",
     )
     assert lower(q, residency=2, policy=True).max_chunks_per_request == 20
     assert lower(q, residency=2).max_chunks_per_request == 96
 
 
-def test_high_lifts_one_wave_limit(monkeypatch):
+def test_audit_lifts_one_wave_limit(monkeypatch):
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (12, 0))
     q = query(
         q_heads=36,
@@ -116,16 +114,15 @@ def test_high_lifts_one_wave_limit(monkeypatch):
         page_size=128,
         cache_tokens=32768,
         kv_dtype="float8_e4m3fn",
-        autotune_effort="high",
+        autotune_effort="audit",
     )
     assert lower(q, residency=2, policy=True).max_chunks_per_request == 12
     assert lower(q, residency=2).max_chunks_per_request == 24
 
 
-@pytest.mark.parametrize("effort", ["high", "max"])
-def test_broader_policy_preserves_storage_and_direct_constraints(effort):
+def test_broader_policy_preserves_storage_and_direct_constraints():
     q = query(
-        autotune_effort=effort,
+        autotune_effort="audit",
         requested_max_work_items=7,
         requested_max_partial_rows=5,
     )
@@ -149,7 +146,7 @@ def test_broader_policy_preserves_storage_and_direct_constraints(effort):
     ],
 )
 def test_broader_policy_keeps_explicit_chunk_controls(name):
-    q = query(autotune_effort="high", controls=FrozenMapping({name: "16"}))
+    q = query(autotune_effort="audit", controls=FrozenMapping({name: "16"}))
     cfg = lower(q)
     assert cfg.chunk_pages_lut()[-1] == 16
     assert cfg.max_chunks_per_request == 16

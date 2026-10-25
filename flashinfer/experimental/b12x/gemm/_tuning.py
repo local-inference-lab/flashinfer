@@ -13,9 +13,7 @@ from dataclasses import asdict, dataclass, field, fields
 
 from b12x.preparation._efficiency import (
     AutotuneEffort,
-    EfficiencyPredicate,
     capture_autotune_effort,
-    capture_exhaustive_search,
 )
 
 from b12x.preparation import FrozenMapping
@@ -59,7 +57,6 @@ class DenseGemmQuery:
     sm_count: int | None = None
     workspace_form: str = "owned"
     sfb_k_replicated: bool = False
-    exhaustive: bool = field(default_factory=capture_exhaustive_search)
     autotune_effort: str = field(default_factory=capture_autotune_effort)
 
     def __post_init__(self):
@@ -641,38 +638,17 @@ def _parameters(query, device):
         row_tile = p["tile_n"] if p["swap_ab"] else p["tile_m"]
         return query.recipe != "mxfp8" or query.max_rows <= 128 or row_tile >= 32
 
-    def low_geometry(p):
-        return (
-            (
-                not p["swap_ab"]
-                or query.recipe in ("nvfp4", "mxfp4")
-                or query.out_features <= 512
-            )
-            and p["load_path"] == "tma"
-            and p["tile_k"] != 512
-            and p["target_occupancy"] in (None, 1)
-            and (
-                p["large_m_unroll"] in (None, False)
-                or query.expected_m is None
-                or query.expected_m > 128
-            )
-        )
-
+    constrained = not query.overrides and query.batch == 1
     return ParameterSpace.create(
         TUNING.knobs,
         values=values,
-        exhaustive=query.exhaustive,
         autotune_effort=query.autotune_effort,
-        efficiency_predicates=()
-        if query.overrides or query.batch != 1
-        else (
-            EfficiencyPredicate(low_geometry, minimum_effort="medium"),
-            short_unswapped_async,
-            EfficiencyPredicate(bounded_row_padding, minimum_effort="high"),
-            EfficiencyPredicate(narrow_output_swap, minimum_effort="high"),
-            bounded_prefill_k_tile,
-            EfficiencyPredicate(reuse_rows, minimum_effort="high"),
-        ),
+        predicates=(short_unswapped_async, bounded_prefill_k_tile)
+        if constrained
+        else (),
+        efficiency_predicates=(bounded_row_padding, narrow_output_swap, reuse_rows)
+        if constrained
+        else (),
     )
 
 

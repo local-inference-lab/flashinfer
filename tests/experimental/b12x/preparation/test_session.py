@@ -1314,7 +1314,7 @@ def test_job_autotune_override_upgrades_live_default_and_reuses_winner(
     assert calls == [21, 6]
 
 
-@pytest.mark.parametrize("effort", ["off", "medium"])
+@pytest.mark.parametrize("effort", ["off", "default"])
 @pytest.mark.parametrize("autotune", [True, False])
 def test_candidate_memory_envelope_covers_eligible_configs(
     tmp_path, monkeypatch, effort, autotune

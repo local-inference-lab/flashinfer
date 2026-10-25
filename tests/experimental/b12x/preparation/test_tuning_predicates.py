@@ -391,33 +391,27 @@ def test_gdn_prefill_races_one_segment_plan_and_a_window_ladder():
     space.validate(sequential)
     with pytest.raises(ValueError, match="efficiency predicates"):
         space.validate({**sequential, "window_tiles": 8})
-    exhaustive = component.TUNING.parameter_space(
-        replace(query, exhaustive=True), IDENTITY
+    audit = component.TUNING.parameter_space(
+        replace(query, autotune_effort="audit"), IDENTITY
     )
-    exhaustive.validate({**sequential, "window_tiles": 8})
-    exhaustive.validate(
-        {
-            **sequential,
-            "algorithm": "chunk_parallel",
-            "segment_tokens": 1024,
-            "window_tiles": None,
-        }
-    )
+    audit.validate({**sequential, "window_tiles": 8})
     # A 128-token sequence is one 128-token segment: chunk-parallel has no
-    # chunk-level parallelism to exploit and is not raced at all.
-    assert not any(
-        assignment["algorithm"] == "chunk_parallel"
-        for assignment in space.configurations()
-    )
-    with pytest.raises(ValueError, match="predicates"):
-        space.validate(
-            {
-                **sequential,
-                "algorithm": "chunk_parallel",
-                "segment_tokens": 128,
-                "window_tiles": None,
-            }
+    # chunk-level parallelism to exploit and is dominated at every effort.
+    for active in (space, audit):
+        assert not any(
+            assignment["algorithm"] == "chunk_parallel"
+            for assignment in active.configurations()
         )
+        for segment_tokens in (128, 1024):
+            with pytest.raises(ValueError, match="correctness predicates"):
+                active.validate(
+                    {
+                        **sequential,
+                        "algorithm": "chunk_parallel",
+                        "segment_tokens": segment_tokens,
+                        "window_tiles": None,
+                    }
+                )
 
     longer = component.TUNING.parameter_space(replace(query, max_tokens=512), IDENTITY)
     chunked = {

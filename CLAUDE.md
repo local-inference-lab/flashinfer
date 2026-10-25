@@ -549,8 +549,9 @@ autotune effort that admits it, and per-round timings, plus the batches raced,
 rejected candidates, and wall seconds per phase. Records are append-only, so
 retuning accumulates replications. `python -m b12x.tools.tuning_ledger
 [--root DIR] [--records] [--replications]` merges tensor-parallel shard records
-into runs and reports default regret, pruning regret per effort, runner-up
-margins, round-to-round noise, and replication agreement.
+into runs and reports default regret, pruning regret (the default tier's best
+candidate against an audit winner), runner-up margins, round-to-round noise,
+and replication agreement.
 
 ### Dispatch Macros
 

@@ -272,7 +272,7 @@ def plan(
         return (
             CompileJob.create(
                 "b12x.gemm.trellis_linear._preparation:_compile_trellis",
-                TUNING.encode_query(replace(query, autotune_effort="medium")),
+                TUNING.encode_query(replace(query, autotune_effort="default")),
                 TUNING.encode_config(config),
                 CompileJob.DEVICE_ORDINAL,
                 device.identity.sm_count,
@@ -341,7 +341,7 @@ def plan(
 
         config = selection.config
         programs = _compile_trellis(
-            TUNING.encode_query(replace(query, autotune_effort="medium")),
+            TUNING.encode_query(replace(query, autotune_effort="default")),
             TUNING.encode_config(config),
             device.ordinal,
             device.identity.sm_count,

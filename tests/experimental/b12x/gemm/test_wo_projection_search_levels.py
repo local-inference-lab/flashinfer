@@ -27,7 +27,7 @@ def query(**changes):
             group_width=4096,
             rank=1024,
             hidden=5120,
-            autotune_effort="medium",
+            autotune_effort="default",
         ),
         **changes,
     )
@@ -44,7 +44,7 @@ def test_nested_efforts_and_natural_heuristic_membership(groups, tokens, dynamic
     q = query(groups=groups, max_tokens=tokens, dynamic_tokens=dynamic)
     default = TUNING.default_config(q, DEVICE)
     previous = {default}
-    for effort in ("off", "low", "medium", "high", "max"):
+    for effort in ("off", "default", "audit"):
         active = replace(q, autotune_effort=effort)
         space = TUNING.parameter_space(active, DEVICE)
         assignment = TUNING.config_payload(default)
@@ -59,13 +59,10 @@ def test_nested_efforts_and_natural_heuristic_membership(groups, tokens, dynamic
 
 @pytest.mark.parametrize("groups", [1, 2, 4, 8])
 @pytest.mark.parametrize("tokens", [1, 8])
-def test_medium_search_restores_tp_decode_tiles_and_lowering(groups, tokens):
+def test_default_search_races_tp_decode_tiles_and_lowering(groups, tokens):
     q = query(groups=groups, max_tokens=tokens)
     assert {config.decode_tile_n for config in choices(q)} == {0, 64, 128}
-    low = choices(replace(q, autotune_effort="low"))
-    assert {config.decode_tile_n for config in low} == (
-        {0, 64 if tokens == 1 else 128} if groups == 2 else {0}
-    )
+    assert choices(q) == choices(replace(q, autotune_effort="audit"))
     caps = wo.Caps(
         device="cuda:0",
         max_tokens=tokens,
@@ -80,7 +77,7 @@ def test_medium_search_restores_tp_decode_tiles_and_lowering(groups, tokens):
         config = WoProjectionConfig(decode_tile_n=tile)
         TUNING.validate_config(q, config, DEVICE)
         pinned = TUNING.configure(
-            replace(q, autotune_effort="low"), device=DEVICE, override=config
+            replace(q, autotune_effort="off"), device=DEVICE, override=config
         )
         assert pinned.pinned == pinned.default == config
         jobs = declaration._compile_jobs(config, device)
@@ -135,8 +132,8 @@ def test_packed_weights_preserve_layout_and_selected_tile(tile):
         {"groups": 8, "rank": 48},
     ],
 )
-def test_max_preserves_fused_quantization_legality(changes):
-    q = query(autotune_effort="max", **changes)
+def test_audit_preserves_fused_quantization_legality(changes):
+    q = query(autotune_effort="audit", **changes)
     assert choices(q) == {WoProjectionConfig()}
     with pytest.raises(ValueError, match="static BF16"):
         TUNING.validate_config(q, WoProjectionConfig(decode_tile_n=64), DEVICE)
@@ -149,15 +146,15 @@ def test_max_preserves_fused_quantization_legality(changes):
         {"wo_b_tiled": True},
     ],
 )
-def test_max_preserves_packed_weight_geometry(changes):
+def test_audit_preserves_packed_weight_geometry(changes):
     with pytest.raises(ValueError, match="tiled WO"):
-        TUNING.validate_query(query(autotune_effort="max", **changes), DEVICE)
+        TUNING.validate_query(query(autotune_effort="audit", **changes), DEVICE)
 
 
 @pytest.mark.parametrize("tile", [64, 128])
 def test_captured_tile_override_preserves_heuristic_and_conflict_checks(tile):
     q = query(codegen=FrozenMapping({"wo_b_fused_tile": f"16x{tile}"}))
-    for effort in ("off", "low", "medium", "high", "max"):
+    for effort in ("off", "default", "audit"):
         active = replace(q, autotune_effort=effort)
         default = TUNING.default_config(active, DEVICE)
         assert default in choices(active)
@@ -176,14 +173,14 @@ def test_effort_selection_identity_excludes_compilation_payload(monkeypatch):
         rank=1024,
         hidden=5120,
     )
-    monkeypatch.setenv("B12X_AUTOTUNE_EFFORT", "low")
+    monkeypatch.setenv("B12X_AUTOTUNE_EFFORT", "default")
     low_plan = wo.plan(caps)
     low = low_plan.query
-    monkeypatch.setenv("B12X_AUTOTUNE_EFFORT", "max")
+    monkeypatch.setenv("B12X_AUTOTUNE_EFFORT", "audit")
     maximum_plan = wo.plan(caps)
     maximum = maximum_plan.query
-    assert low.autotune_effort == "low"
-    assert maximum.autotune_effort == "max"
+    assert low.autotune_effort == "default"
+    assert maximum.autotune_effort == "audit"
     assert TUNING.encode_query(low) != TUNING.encode_query(maximum)
     assert _compile_query_payload(low) == _compile_query_payload(maximum)
     assert "autotune_effort" not in _compile_query_payload(low)
@@ -194,9 +191,8 @@ def test_effort_selection_identity_excludes_compilation_payload(monkeypatch):
     )
 
 
-def test_legacy_exhaustive_alias_and_invalid_effort(monkeypatch):
+def test_unset_effort_defaults_and_invalid_effort_is_rejected(monkeypatch):
     monkeypatch.delenv("B12X_AUTOTUNE_EFFORT", raising=False)
-    monkeypatch.setenv("B12X_AUTOTUNE_EXHAUSTIVE", "1")
     q = WoProjectionQuery(
         dtype="bfloat16",
         max_tokens=1,
@@ -205,7 +201,7 @@ def test_legacy_exhaustive_alias_and_invalid_effort(monkeypatch):
         rank=1024,
         hidden=5120,
     )
-    assert q.autotune_effort == "max"
+    assert q.autotune_effort == "default"
     assert {config.decode_tile_n for config in choices(q)} == {0, 64, 128}
     monkeypatch.setenv("B12X_AUTOTUNE_EFFORT", "invalid")
     with pytest.raises(ValueError, match="B12X_AUTOTUNE_EFFORT"):

@@ -12,9 +12,7 @@ from b12x.preparation import (
     TuningContract,
 )
 from b12x.preparation._efficiency import (
-    EfficiencyPredicate,
     capture_autotune_effort,
-    capture_exhaustive_search,
 )
 
 from ._kernel import SMEM_LIMIT, default_max_splits
@@ -45,7 +43,6 @@ class PagedDecodeQuery:
     has_sinks: bool
     descale_layout: str
     sm_count: int
-    exhaustive: bool = field(default_factory=capture_exhaustive_search)
     autotune_effort: str = field(default_factory=capture_autotune_effort)
 
     @property
@@ -214,12 +211,7 @@ def _parameters(query, device):
         TUNING.knobs,
         values={"head_splits": _head_split_choices(query)},
         predicates=(lambda p: _rows_fit(query, p["head_splits"]),),
-        efficiency_predicates=(
-            EfficiencyPredicate(
-                lambda p: p["head_splits"] == hs, minimum_effort="high"
-            ),
-        ),
-        exhaustive=query.exhaustive,
+        efficiency_predicates=(lambda p: p["head_splits"] == hs,),
         autotune_effort=query.autotune_effort,
     )
 

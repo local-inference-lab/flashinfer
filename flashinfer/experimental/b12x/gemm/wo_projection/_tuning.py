@@ -13,7 +13,6 @@ from b12x.preparation import (
 )
 from b12x.preparation._efficiency import (
     AutotuneEffort,
-    EfficiencyPredicate,
     capture_autotune_effort,
 )
 
@@ -150,28 +149,9 @@ def _default(query, device):
 def _parameters(query, device):
     override = query.codegen.get("wo_b_fused_tile", "")
     tiles = (0, int(override.split("x")[1])) if override else (0, 64, 128)
-    preferred_n = (
-        int(override.split("x")[1])
-        if override
-        else (64 if query.max_tokens == 1 else 128)
-    )
     return ParameterSpace.create(
         TUNING.knobs,
-        values={
-            "decode_tile_n": tiles if _decode_domain(query) else (0,),
-        },
-        efficiency_predicates=(
-            EfficiencyPredicate(
-                lambda choice: (
-                    choice["decode_tile_n"] == 0 or _decode_tuning_geometry(query)
-                ),
-                minimum_effort="medium",
-            ),
-            EfficiencyPredicate(
-                lambda choice: choice["decode_tile_n"] in (0, preferred_n),
-                minimum_effort="medium",
-            ),
-        ),
+        values={"decode_tile_n": tiles if _decode_domain(query) else (0,)},
         autotune_effort=query.autotune_effort,
     )
 

@@ -9,7 +9,6 @@ from dataclasses import asdict, dataclass, field, replace
 from b12x.preparation import BackendConfig, FrozenMapping, make_fixed_contract
 from b12x.preparation._efficiency import (
     AutotuneEffort,
-    EfficiencyPredicate,
     capture_autotune_effort,
 )
 from b12x.preparation.tuning import (
@@ -130,7 +129,6 @@ def quantized_query(query, *, expected_m):
         expected_m=expected_m,
         codegen=query.codegen,
         autotune_effort=query.autotune_effort,
-        exhaustive=False,
     )
 
 
@@ -572,20 +570,16 @@ def _tuning_parameters(query, device):
             "dense_config": dense_configs,
             "a16_backend": ("auto", "packed") if expanded else ("auto",),
         },
-        predicates=(eligible,),
-        autotune_effort=query.autotune_effort,
-        efficiency_predicates=(
-            EfficiencyPredicate(row_padding, minimum_effort="high"),
-            EfficiencyPredicate(narrow_output, minimum_effort="high"),
-            EfficiencyPredicate(
-                lambda parameters: (
-                    parameters["mode"] != "a16"
-                    or parameters["tile_n"] != 4
-                    or query.num_tokens <= 8
-                ),
-                minimum_effort="max",
+        predicates=(
+            eligible,
+            lambda parameters: (
+                parameters["mode"] != "a16"
+                or parameters["tile_n"] != 4
+                or query.num_tokens <= 8
             ),
         ),
+        autotune_effort=query.autotune_effort,
+        efficiency_predicates=(row_padding, narrow_output),
     )
 
 

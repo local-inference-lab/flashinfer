@@ -6,7 +6,6 @@ from dataclasses import dataclass, field
 
 from b12x.preparation._efficiency import (
     AutotuneEffort,
-    EfficiencyPredicate,
     capture_autotune_effort,
 )
 
@@ -322,16 +321,7 @@ def _encode_query(query: QsaQuery) -> dict[str, object]:
 
 
 def _parameters(query: QsaQuery, _device: DeviceIdentity | None) -> ParameterSpace:
-    return ParameterSpace.create(
-        TUNING.knobs,
-        autotune_effort=query.autotune_effort,
-        efficiency_predicates=(
-            EfficiencyPredicate(
-                lambda p: p["sparse_gqa_direct_kv_warps"] == 2,
-                minimum_effort="medium",
-            ),
-        ),
-    )
+    return ParameterSpace.create(TUNING.knobs, autotune_effort=query.autotune_effort)
 
 
 TUNING = TuningContract(

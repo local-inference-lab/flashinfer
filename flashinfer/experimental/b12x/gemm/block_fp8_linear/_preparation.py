@@ -248,9 +248,7 @@ def plan(
         weight_block_size=caps.block_size[0],
     )
 
-    compile_query = TUNING.encode_query(
-        replace(query, exhaustive=False, autotune_effort="medium")
-    )
+    compile_query = TUNING.encode_query(replace(query, autotune_effort="default"))
 
     def compile_jobs(config, device):
         return (

@@ -65,13 +65,13 @@ def test_dcp_candidates_coalesce_effective_grids_and_preserve_overrides():
         alternatives=FrozenMapping({"dcp": native}),
         default=CollectiveConfig(implementation="dcp", threads=256, blocks=16),
     )
-    with autotune_effort("medium"):
+    with autotune_effort("default"):
         values = list(TUNING.iterate(TUNING.configure(query, device=None)))
     assert len(values) == 3
     assert {config.threads for _, config in values} == {128, 256, 512}
     native["setup"].update(threads_override=256, blocks_override=16)
     query = replace(query, alternatives=FrozenMapping({"dcp": native}))
-    with autotune_effort("medium"):
+    with autotune_effort("default"):
         values = list(TUNING.iterate(TUNING.configure(query, device=None)))
     assert len(values) == 1
     assert values[0][1] == query.default
