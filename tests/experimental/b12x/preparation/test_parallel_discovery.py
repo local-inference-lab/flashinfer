@@ -24,6 +24,80 @@ def finish(iterator):
             return done.value
 
 
+@pytest.mark.parametrize("workers", [1, 4])
+@pytest.mark.parametrize("complete", [False, True])
+def test_discovery_pipeline_bounds_open_locks(tmp_path, monkeypatch, workers, complete):
+    resource = pytest.importorskip("resource")
+    from b12x._lib.compile_pool import CompilationPlan
+    from b12x.preparation import DetectedDevice
+    from b12x.preparation import session as session_module
+    from .test_defaults import Query
+
+    pending = True
+
+    class Discovery:
+        def describe(self, jobs):
+            return tuple(jobs)
+
+        def descriptions(self, jobs):
+            return None if pending else tuple(CompilationPlan(job, ()) for job in jobs)
+
+    monkeypatch.setattr(
+        session_module, "discovery_key", lambda rows, target: str(rows[0][2][0].args[0])
+    )
+    items = []
+    for index in range(256):
+        item = request(name=str(index), tuning=contract())
+        items.append(
+            replace(
+                item,
+                plan=replace(
+                    item.plan,
+                    query=Query(index + 1),
+                    _compile_jobs=lambda config, device, index=index: (
+                        CompileJob.create("test.factory:compile", index, config.width),
+                    ),
+                ),
+            )
+        )
+
+    limits = resource.getrlimit(resource.RLIMIT_NOFILE)
+    with session(tmp_path, compile_workers=workers) as engine:
+        job = engine.begin(items)
+        job._pipeline = finish(job._configure(session_module._coalesce_requests(items)))
+        job._selections = {}
+        cache = engine._race_progress_cache()
+        engine.device = DetectedDevice(0, None)
+        monkeypatch.setattr(engine, "_compiler", lambda: Discovery())
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (min(limits[0], 128), limits[1]))
+            finish(job._pump_pipeline(None))
+            assert len(job._discovery_locks) == workers
+            # Required discovery progresses even when speculative discovery is full.
+            current = job._pipeline[-1]
+            steps = job._describe_candidates(current)
+            assert next(steps) == "compile"
+            assert len(job._discovery_locks) == workers + 1
+            pending = False
+            finish(steps)
+            if complete:
+                while job._pipeline:
+                    finish(job._pump_pipeline(None))
+                assert all(
+                    cache.load_discovery(str(index)) is not None for index in range(256)
+                )
+                assert not job._discovery_locks
+            else:
+                assert cache.load_discovery("0") is None
+            job.close()
+            for index in range(256):
+                with cache.discovery_lock(str(index)).acquire(timeout=0):
+                    pass
+        finally:
+            resource.setrlimit(resource.RLIMIT_NOFILE, limits)
+            engine.device = DetectedDevice(None, None)
+
+
 @pytest.mark.parametrize("cancel", [False, True])
 def test_session_counts_before_discovery_and_can_cancel_pending_metadata(
     tmp_path, monkeypatch, cancel

@@ -1572,6 +1572,12 @@ class PreparationJob:
         if state.cache is not None and state.lock is None:
             record = state.cache.load_discovery(state.key)
             if record is None:
+                # Bound open discovery descriptors while compiler work is pending.
+                # Required discovery bypasses admission so the active race can progress.
+                if not wait and len(self._discovery_locks) >= max(
+                    1, self.session.compile_workers
+                ):
+                    return
                 lock = state.cache.discovery_lock(state.key)
                 while True:
                     if self._warmup_only:
