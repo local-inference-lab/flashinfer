@@ -31,7 +31,7 @@ class CandidateResourceIneligibleError(RuntimeError):
 
 
 ConfigT = TypeVar("ConfigT")
-_SCALAR_TYPES = (str, int, float, bool, type(None))
+_SCALAR_TYPES = frozenset((str, int, float, bool, type(None)))
 
 _CURRENT_PLAN: ContextVar[object] = ContextVar("b12x_preparation_plan")
 
@@ -80,29 +80,40 @@ def _normalized_name(value: str) -> str:
     return " ".join(value.strip().casefold().split())
 
 
-def _freeze_value(value: object, *, field: str) -> object:
+def _freeze_value(value: object) -> object:
+    kind = type(value)
+    if kind in _SCALAR_TYPES or kind is FrozenMapping:
+        return value
+    if kind is dict:
+        return FrozenMapping(value)
+    if kind is tuple or kind is list:
+        return tuple([_freeze_value(item) for item in value])
     if isinstance(value, FrozenMapping):
         return value
     if isinstance(value, Mapping):
         return FrozenMapping(value)
     if isinstance(value, (tuple, list)):
-        return tuple(_freeze_value(item, field=f"{field}[]") for item in value)
-    if isinstance(value, float) and not math.isfinite(value):
-        raise ValueError(f"metadata field {field!r} requires an explicit finite codec")
-    if isinstance(value, _SCALAR_TYPES):
-        return value
-    raise TypeError(
-        f"metadata field {field!r} must contain JSON-compatible values, "
-        f"got {type(value).__name__}"
-    )
+        return tuple([_freeze_value(item) for item in value])
+    return value
 
 
 def _thaw_value(value: object) -> object:
-    if isinstance(value, FrozenMapping):
+    kind = type(value)
+    if kind is FrozenMapping:
         return value.to_dict()
-    if isinstance(value, tuple):
+    if kind is tuple:
         return [_thaw_value(item) for item in value]
     return value
+
+
+def _restore_frozen_mapping(items):
+    mapping = object.__new__(FrozenMapping)
+    object.__setattr__(mapping, "_items", items)
+    return mapping
+
+
+def _item_key(item):
+    return item[0]
 
 
 @dataclass(frozen=True, init=False)
@@ -112,18 +123,44 @@ class FrozenMapping(Mapping[str, object]):
     _items: tuple[tuple[str, object], ...]
 
     def __init__(self, values: Mapping[str, object] | None = None) -> None:
-        items: list[tuple[str, object]] = []
-        for key, value in (values or {}).items():
-            if not isinstance(key, str) or not key:
-                raise ValueError("metadata mapping keys must be non-empty strings")
-            items.append((key, _freeze_value(value, field=key)))
-        object.__setattr__(self, "_items", tuple(sorted(items)))
+        if type(values) is FrozenMapping:
+            items = values._items
+        elif values:
+            items = tuple(
+                sorted(
+                    [(key, _freeze_value(value)) for key, value in values.items()],
+                    key=_item_key,
+                )
+            )
+        else:
+            items = ()
+        object.__setattr__(self, "_items", items)
+
+    def __hash__(self) -> int:
+        # Payloads key per-candidate dictionaries; hashing nested tuples on
+        # every lookup dominated preparation.
+        cached = self.__dict__.get("_hash")
+        if cached is None:
+            cached = hash(self._items)
+            object.__setattr__(self, "_hash", cached)
+        return cached
+
+    def __reduce__(self):
+        return _restore_frozen_mapping, (self._items,)
 
     def __getitem__(self, key: str) -> object:
-        for candidate, value in self._items:
-            if candidate == key:
-                return value
-        raise KeyError(key)
+        index = self.__dict__.get("_index")
+        if index is None:
+            index = dict(self._items)
+            object.__setattr__(self, "_index", index)
+        return index[key]
+
+    def __contains__(self, key: object) -> bool:
+        try:
+            self[key]
+        except (KeyError, TypeError):
+            return False
+        return True
 
     def __iter__(self) -> Iterator[str]:
         return (key for key, _ in self._items)

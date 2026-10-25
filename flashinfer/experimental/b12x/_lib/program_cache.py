@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import pickle
 import gc
 import time
 import weakref
@@ -10,8 +11,6 @@ from collections import namedtuple
 from threading import RLock
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
-from collections.abc import Mapping
-from dataclasses import fields, is_dataclass
 from enum import Enum
 
 from .compile_plan import (
@@ -25,30 +24,6 @@ from .compile_plan import (
 _CACHES = weakref.WeakSet()
 _MAPPING_CACHES = []
 _PREPARATION_CACHE = ContextVar("b12x_preparation_program_cache", default=None)
-
-
-def _metadata_key(value):
-    if isinstance(value, Mapping):
-        return frozenset((_metadata_key(k), _metadata_key(v)) for k, v in value.items())
-    if isinstance(value, (tuple, list)):
-        return (type(value), tuple(_metadata_key(item) for item in value))
-    if is_dataclass(value) and not isinstance(value, type):
-        return (
-            type(value),
-            tuple(
-                (item.name, _metadata_key(getattr(value, item.name)))
-                for item in fields(value)
-            ),
-        )
-    if value is None or isinstance(value, (str, int, float, bool, Enum)):
-        return (type(value), value)
-    import torch
-
-    if isinstance(value, (torch.dtype, torch.device)):
-        return (type(value), value)
-    raise TypeError(
-        f"program factory cache requires metadata, not {type(value).__name__}"
-    )
 
 
 class PreparationProgramCache:
@@ -127,8 +102,10 @@ class program_cache:
             if scope is None:
                 return self._function(*args, **kwargs)
             return scope.call(self, args, kwargs)
+        # Metadata arguments pickle to bytes that preserve value types; equal
+        # bytes are equal arguments, and differently shared equal trees only miss.
         key = (
-            _metadata_key((args, kwargs))
+            pickle.dumps((args, kwargs), protocol=5)
             if self._metadata
             else functools._make_key(args, kwargs, typed=False)
         )

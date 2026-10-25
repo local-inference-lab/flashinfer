@@ -29,32 +29,6 @@ from .compile_plan import (
 )
 
 
-def _validate_metadata(value):
-    if value is None or type(value) in (bool, int, float, str):
-        return
-    if isinstance(value, Enum):
-        _validate_metadata(value.value)
-        return
-    if is_dataclass(value) and not isinstance(value, type):
-        for item in fields(value):
-            _validate_metadata(getattr(value, item.name))
-        return
-    if isinstance(value, Mapping):
-        for key, item in value.items():
-            _validate_metadata(key)
-            _validate_metadata(item)
-        return
-    if isinstance(value, (tuple, list)):
-        for item in value:
-            _validate_metadata(item)
-        return
-    import torch
-
-    if isinstance(value, (torch.dtype, torch.device)):
-        return
-    raise TypeError(f"compile jobs accept metadata only, not {type(value).__name__}")
-
-
 class _DeviceArgument(Enum):
     ORDINAL = "device_ordinal"
 
@@ -69,27 +43,8 @@ class CompileJob:
     args: tuple[object, ...] = ()
     kwargs: tuple[tuple[str, object], ...] = ()
 
-    def __post_init__(self):
-        module, separator, name = self.factory.partition(":")
-        if (
-            not separator
-            or not module
-            or not name
-            or "<locals>" in name
-            or any(
-                not part.isidentifier()
-                for part in (*module.split("."), *name.split("."))
-            )
-        ):
-            raise ValueError("compile factories require an importable module:attribute")
-        _validate_metadata(self.args)
-        _validate_metadata(self.kwargs)
-        if any(not isinstance(key, str) for key, value in self.kwargs):
-            raise TypeError("compile keyword names must be strings")
-
     @classmethod
     def create(cls, factory: str, *args: object, **kwargs: object):
-        # __post_init__ also validates direct construction and rejects tensors.
         return cls(
             factory=factory, args=tuple(args), kwargs=tuple(sorted(kwargs.items()))
         )
@@ -575,8 +530,13 @@ class CompilePool:
         self._submitted: set[ProgramKey] = set()
         self._cute_programs = self._triton_programs = 0
         self._completed: set[ProgramKey] = set()
-        self._required: list[CompilationPlan] = []
-        self._optional: list[CompilationPlan] = []
+        self._required: deque[CompilationPlan] = deque()
+        self._optional: deque[CompilationPlan] = deque()
+        # Each queued program maps to the plan that produces it, so coverage
+        # checks and promotion stay constant time however deep the queues grow.
+        # A promoted plan also remains in the optional queue; dispatch skips it.
+        self._queued: dict[ProgramKey, CompilationPlan] = {}
+        self._required_ids: set[int] = set()
         self._inflight = 0
         self._limit = workers
         self._optional_cancelled = False
@@ -625,7 +585,7 @@ class CompilePool:
         with self._condition:
             if self._pool is None:
                 raise RuntimeError("compiler pool is closed")
-            self._raise_errors()
+            self._raise_errors(workers=False)
             for job in jobs:
                 payload = pickle.dumps(job, protocol=5)
                 keys.append(payload)
@@ -682,11 +642,15 @@ class CompilePool:
             queue = self._required if self._required else self._optional
             if not queue:
                 break
-            plan = queue.pop(0)
+            plan = queue.popleft()
+            if queue is self._required:
+                self._required_ids.discard(id(plan))
             added = set(plan.programs) - self._submitted
             if not added:
                 continue
             self._submitted.update(added)
+            for program in added:
+                self._queued.pop(program, None)
             self._cute_programs += sum(p.dialect == "cute" for p in added)
             self._triton_programs += sum(p.dialect == "triton" for p in added)
             self._jobs += 1
@@ -705,32 +669,29 @@ class CompilePool:
         with self._condition:
             if self._pool is None:
                 raise RuntimeError("compiler pool is closed")
-            self._raise_errors()
+            self._raise_errors(workers=False)
             for plan in plans:
                 self._requested_jobs += 1
                 programs.update(plan.programs)
                 if not required and self._optional_cancelled:
                     continue
-                missing = set(plan.programs) - self._submitted
+                missing = [p for p in plan.programs if p not in self._submitted]
                 if not missing:
                     continue
                 if required:
-                    promoted = [
-                        queued
-                        for queued in self._optional
-                        if missing.intersection(queued.programs)
-                    ]
-                    self._optional = [
-                        queued for queued in self._optional if queued not in promoted
-                    ]
-                    self._required.extend(promoted)
-                queued_programs = {
-                    program
-                    for queued in (*self._required, *self._optional)
-                    for program in queued.programs
-                }
-                if missing - queued_programs:
-                    (self._required if required else self._optional).append(plan)
+                    for program in missing:
+                        queued = self._queued.get(program)
+                        if queued is not None and id(queued) not in self._required_ids:
+                            self._required_ids.add(id(queued))
+                            self._required.append(queued)
+                if any(program not in self._queued for program in missing):
+                    for program in missing:
+                        self._queued.setdefault(program, plan)
+                    if required:
+                        self._required_ids.add(id(plan))
+                        self._required.append(plan)
+                    else:
+                        self._optional.append(plan)
             self._dispatch()
         return tuple(sorted(programs, key=lambda p: (p.dialect, p.key)))
 
@@ -743,15 +704,24 @@ class CompilePool:
         with self._condition:
             self._optional_cancelled = True
             self._optional.clear()
+            self._queued = {
+                program: plan
+                for program, plan in self._queued.items()
+                if id(plan) in self._required_ids
+            }
             self._condition.notify_all()
 
     def wake(self):
         with self._condition:
             self._condition.notify_all()
 
-    def _raise_errors(self):
+    def _raise_errors(self, *, workers=True):
         if self._errors:
             raise self._errors[0]
+        # Exit checks cost a waitpid per worker. Submissions arrive once per
+        # candidate and skip them; every wait path still polls.
+        if not workers:
+            return
         exited = [
             (worker.pid, worker.exitcode)
             for worker in self._workers

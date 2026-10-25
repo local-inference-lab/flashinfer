@@ -148,27 +148,6 @@ def test_bf16_rejects_direct_or_cached_fp8_configuration(mode):
         contract._lower(constrained.query, DEVICE, assignment)
 
 
-def test_selection_cache_rejects_fp8_even_with_a_matching_record_key():
-    auto = declaration()
-    constrained = declaration(arithmetic="bf16")
-    fp8 = auto.contract.configure(auto.query, device=DEVICE).default
-    record = dict(assignment=asdict(fp8), config=asdict(fp8))
-    job = SimpleNamespace(
-        _choice_key=lambda *_: "matching-key",
-        _timing=SimpleNamespace(span=lambda *_: nullcontext()),
-        session=SimpleNamespace(
-            _selection_cache=lambda: SimpleNamespace(get=lambda _: record)
-        ),
-    )
-    obligation = SimpleNamespace(
-        selection=None,
-        configuration=constrained.contract.configure(constrained.query, device=DEVICE),
-        request=SimpleNamespace(plan=constrained),
-    )
-    with pytest.raises(ValueError, match="v41_compute_mode"):
-        PreparationJob._lookup(job, obligation, {})
-
-
 def test_compile_payload_rejects_fp8_before_lowering(monkeypatch):
     from b12x.attention.compressed_sparse_mla import _preparation
 

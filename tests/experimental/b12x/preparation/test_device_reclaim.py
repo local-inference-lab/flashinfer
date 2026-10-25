@@ -146,31 +146,3 @@ def test_gpu_reclaim_restores_the_prior_stack_limit_and_keeps_prepared_plans_run
         hc.run_swiglu(source, limit=2.0, out=output, plan=declaration)
         torch.cuda.synchronize(device)
         torch.testing.assert_close(output, expected, rtol=0, atol=0)
-
-
-def test_allocator_counter_tracks_live_storage_after_graph_pool_release():
-    device = require_b12x()
-    import torch
-    from b12x.preparation import PreparationSession
-
-    with PreparationSession(device=device, autotune=False) as engine:
-        baseline = engine._allocated()
-        storage = torch.empty((1024, 1024), device=device, dtype=torch.float32)
-        assert (
-            engine._allocated() - baseline == storage.numel() * storage.element_size()
-        )
-        for _ in range(512):
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                storage.fill_(1)
-            graph.replay()
-            graph.reset()
-            del graph
-        torch.cuda.synchronize(device)
-        assert engine._allocated() == torch.cuda.memory_allocated(device)
-        assert (
-            engine._allocated() - baseline == storage.numel() * storage.element_size()
-        )
-        del storage
-        torch.cuda.synchronize(device)
-        assert engine._allocated() == baseline

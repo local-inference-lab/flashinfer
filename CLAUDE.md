@@ -541,6 +541,17 @@ toolchain require a fresh race. Unrelated kernels retain their saved selections.
 The tuning contract's schema versions and `B12X_TUNING_CACHE_VERSION` remain
 explicit controls for changes to tuning semantics and manual retuning.
 
+Every completed b12x tuning race appends a self-describing record to the
+`ledger_v1` table of the race-progress database beside the selection cache:
+component, encoded query, effort, coverage, measurement protocol, and for every
+candidate its assignment, lowered config, program keys, the lowest
+autotune effort that admits it, and per-round timings, plus the batches raced,
+rejected candidates, and wall seconds per phase. Records are append-only, so
+retuning accumulates replications. `python -m b12x.tools.tuning_ledger
+[--root DIR] [--records] [--replications]` merges tensor-parallel shard records
+into runs and reports default regret, pruning regret per effort, runner-up
+margins, round-to-round noise, and replication agreement.
+
 ### Dispatch Macros
 
 Handle combinatorial parameter spaces:

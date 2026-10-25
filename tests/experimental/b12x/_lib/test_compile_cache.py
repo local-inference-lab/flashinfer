@@ -338,30 +338,6 @@ def test_frozen_memory_miss_rejects_before_disk_cache_load(monkeypatch):
 
 
 @pytest.mark.parametrize("explicit", [False, True])
-def test_portable_manifest_records_architecture_without_uuid(monkeypatch, explicit):
-    monkeypatch.setattr(compiler, "_current_device_ordinal", lambda: 0)
-    monkeypatch.setattr(
-        compiler, "_device_arch_key", lambda ordinal: ("cuda", (12, 1), 48)
-    )
-    spec = (
-        compiler.KernelCompileSpec.from_facts("test.portable", 1, ("rows", 8))
-        if explicit
-        else None
-    )
-    payload = compiler._compile_disk_cache_payload(
-        object(),
-        test_portable_manifest_records_architecture_without_uuid,
-        (),
-        {},
-        spec,
-    )
-    semantic = compiler._semantic_compile_manifest_payload(payload)
-    assert semantic["device_arch"] == ["cuda", [12, 1], 48]
-    assert "device_uuid" not in semantic
-    assert ("compile_spec_hash" in semantic) == explicit
-
-
-@pytest.mark.parametrize("explicit", [False, True])
 def test_matching_silicon_shares_disk_artifacts_but_not_loaded_handles(
     monkeypatch,
     explicit,

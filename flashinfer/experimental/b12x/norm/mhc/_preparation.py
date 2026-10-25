@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from functools import partial
 from types import MappingProxyType
 
@@ -199,8 +199,11 @@ def _decode_query(payload):
     return MhcQuery(**values)
 
 
-def compile_mhc(query_payload, config_payload, native_payload, ordinal):
-    """Reuse the planned programs without reconstructing their fake operands."""
+def _native_payload(native):
+    return {item.name: getattr(native, item.name) for item in fields(native)}
+
+
+def _compile_query(query_payload):
     query_payload = FrozenMapping(query_payload)
     if query_payload["codegen"] != _codegen_snapshot():
         raise ValueError(
@@ -214,8 +217,13 @@ def compile_mhc(query_payload, config_payload, native_payload, ordinal):
             if name not in ("B12X_AUTOTUNE_EFFORT", "B12X_AUTOTUNE_EXHAUSTIVE")
         }
     )
+    return FrozenMapping(compile_payload)
+
+
+def compile_mhc(query_payload, config_payload, native_payload, ordinal):
+    """Reuse the planned programs without reconstructing their fake operands."""
     return _compile_mhc(
-        FrozenMapping(compile_payload),
+        _compile_query(query_payload),
         FrozenMapping(config_payload),
         FrozenMapping(native_payload),
         ordinal,
@@ -674,12 +682,15 @@ def plan_mhc(caps, *, invocation=FrozenMapping(), override=None):
         **options,
     )
     lowered = {}
+    compile_query = []
 
     def native(config, device):
-        key = (config, device.identity)
-        if key not in lowered:
-            lowered[key] = _lower_native(query, config, device)
-        return lowered[key]
+        # Candidates reuse their config objects; identity avoids hashing configs.
+        entry = lowered.get(id(config))
+        if entry is None or entry[0] is not config or entry[1] is not device.identity:
+            entry = (config, device.identity, _lower_native(query, config, device))
+            lowered[id(config)] = entry
+        return entry[2]
 
     def memory(config, device):
         if query.operation in ("post", "collapse") or query.output_mode == "functional":
@@ -695,10 +706,12 @@ def plan_mhc(caps, *, invocation=FrozenMapping(), override=None):
 
     def materialize(selection, device):
         selected_native = native(selection.config, device)
-        compiled = compile_mhc(
-            TUNING.encode_query(query),
-            selection.config.to_dict(),
-            asdict(selected_native),
+        if not compile_query:
+            compile_query.append(_compile_query(encoded_query))
+        compiled = _compile_mhc(
+            compile_query[0],
+            FrozenMapping(selection.config.to_dict()),
+            FrozenMapping(_native_payload(selected_native)),
             device.ordinal,
         )
         return _MhcState(
@@ -712,6 +725,7 @@ def plan_mhc(caps, *, invocation=FrozenMapping(), override=None):
             ),
         )
 
+    encoded_query = TUNING.encode_query(query)
     return Plan(
         contract=TUNING,
         query=query,
@@ -722,9 +736,9 @@ def plan_mhc(caps, *, invocation=FrozenMapping(), override=None):
         _compile_jobs=lambda config, device: (
             CompileJob.create(
                 "b12x.norm.mhc._preparation:compile_mhc",
-                TUNING.encode_query(query),
+                encoded_query,
                 config.to_dict(),
-                asdict(native(config, device)),
+                _native_payload(native(config, device)),
                 CompileJob.DEVICE_ORDINAL,
             ),
         ),

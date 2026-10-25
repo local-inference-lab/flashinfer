@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import replace
 
 from ._cache import digest
+from ._ledger import RaceLedger
 from ._measurement import capture_benchmark_call, no_compilation
 from .types import CollectiveTuningRequirement, FrozenMapping, call_scope
 
@@ -103,6 +105,15 @@ def race(job, obligation):
     measurements = {}
     job._candidate_sharded = False
     job._candidate_count = len(obligation.candidates)
+    ledger = RaceLedger(
+        job=job,
+        obligation=obligation,
+        kind="collective",
+        shard_index=0,
+        shard_count=1,
+        local_indices=range(len(obligation.candidates)),
+        restored={},
+    )
 
     def sample_exchange(indices, turn, repetition, groups):
         peers = yield from exchange(
@@ -154,8 +165,13 @@ def race(job, obligation):
     try:
         for index, (assignment, config) in enumerate(obligation.candidates):
             job._phase = "preparing candidates"
+            trial_started = time.perf_counter()
+            ledger.note_precompiled(
+                index,
+                obligation.programs.get(contract.config_payload(config), frozenset()),
+            )
             programs = yield from job._compile(obligation, config, required=True)
-            yield from job._wait_programs(programs)
+            yield from job._wait_programs(programs, obligation)
             compile_assignment = obligation.configuration.space.compile_assignment(
                 assignment
             )
@@ -167,7 +183,6 @@ def race(job, obligation):
                     "collective runtime parameter changed actual compile keys"
                 )
             selected = job._selection(obligation, config, "tuned", assignment)
-            before = job.session._allocated()
             state, call, guard, retained = job._call(
                 obligation,
                 selected,
@@ -175,16 +190,7 @@ def race(job, obligation):
                 synchronize=False,
                 prime=False,
             )
-            trial = _Trial(
-                index,
-                assignment,
-                config,
-                call,
-                guard,
-                retained,
-                state,
-                max(0, job.session._allocated() - before),
-            )
+            trial = _Trial(index, assignment, config, call, guard, retained, state)
             live.append(trial)
             job._temporaries.remove(guard.finish)
             peers = yield from exchange(
@@ -224,13 +230,20 @@ def race(job, obligation):
             yield from exchange(requirement, f"validated/{index}")
             job._candidates_prepared += 1
             job._batch_index += 1
+            ledger.prepared(
+                trial,
+                seconds=time.perf_counter() - trial_started,
+                batch=job._batch_index,
+            )
             trials = ([] if champion is None else [champion]) + [trial]
             job._batch_candidates = len(trials)
+            measure_started = time.perf_counter()
             measurement = yield from job._measure(
                 trials,
                 champion=champion is not None,
                 sample_exchange=sample_exchange,
                 launch_exchange=launch_exchange,
+                sample_observer=ledger.observer(trials),
             )
             best = min(
                 range(len(trials)),
@@ -239,6 +252,14 @@ def race(job, obligation):
             measurements.update(
                 (item.index, latency)
                 for item, latency in zip(trials, measurement.latencies_us, strict=True)
+            )
+            ledger.batch(
+                job._batch_index,
+                trials,
+                measurement,
+                champion=champion,
+                winner=trials[best].index,
+                seconds=time.perf_counter() - measure_started,
             )
             for position, item in enumerate(trials):
                 if position != best:
@@ -262,9 +283,15 @@ def race(job, obligation):
         _same(peers, "assignment")
         obligation.coverage["measured_count"] = len(measurements)
         obligation.cache_pending = True
+        if obligation.key is not None:
+            ledger.commit(
+                job.session._race_progress_cache,
+                measurements=measurements,
+                champion_index=champion.index,
+                rejected_count=0,
+            )
         return job._selection(obligation, champion.config, "tuned", champion.assignment)
     finally:
         job.session._synchronize()
         for trial in reversed(live):
             trial.close()
-        job._release_race_resources()

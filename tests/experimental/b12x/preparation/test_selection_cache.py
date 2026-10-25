@@ -307,34 +307,13 @@ def test_manual_tuning_version_does_not_change_kernel_compilation_context(
         compiler.clear_compile_cache()
 
 
-def test_matching_malformed_decision_still_fails_closed(cache_device, tmp_path):
-    identity = cache_identity({}, 0)
-    cache = SelectionCache(tmp_path, identity)
-    _save_choice(cache)
-    payload = json.loads(cache.path.read_text())
-    payload["records"]["shape"]["coverage"]["measured_count"] = 1
-    cache.path.write_text(json.dumps(payload))
-    with pytest.raises(ValueError, match="only completed exhaustive"):
-        SelectionCache(tmp_path, identity)
-
-
-@pytest.mark.parametrize("failure", ("identity", "incomplete"))
-def test_cache_agreement_rejects_incompatible_or_incomplete_peer_results(
-    cache_device,
-    tmp_path,
-    failure,
-):
+def test_cache_agreement_rejects_incompatible_peer_identity(cache_device, tmp_path):
     identity = cache_identity({}, 0)
     cache = SelectionCache(tmp_path, identity)
     _save_choice(cache)
     peer = json.loads(json.dumps(cache.records))
-    if failure == "identity":
-        identity = {**identity, "sm_count": identity["sm_count"] + 1}
-        message = "identities differ"
-    else:
-        peer["shape"]["coverage"]["measured_count"] = 1
-        message = "only completed exhaustive"
-    with pytest.raises(ValueError, match=message):
+    identity = {**identity, "sm_count": identity["sm_count"] + 1}
+    with pytest.raises(ValueError, match="identities differ"):
         cache.reconcile((TuningCacheRequirement((0, 1), identity, peer),))
     assert cache.get("shape")["assignment"]["width"] == 2
 

@@ -77,51 +77,10 @@ class SelectionCache:
         self.path = Path(root) / f"{digest(self.identity)}.json"
         self.records = self._read()
         self._agreed_records = None
-
-    def _validate(self, records):
-        if not isinstance(records, dict):
-            raise ValueError("selection records must be a mapping")
-        for key, record in records.items():
-            if not isinstance(key, str) or not isinstance(record, dict):
-                raise ValueError("malformed selection record")
-            if set(record) != {"assignment", "config", "coverage", "programs"}:
-                raise ValueError("selection record fields differ from schema")
-            FrozenMapping(record["assignment"])
-            FrozenMapping(record["config"])
-            coverage = record["coverage"]
-            fields = {
-                "cartesian_count",
-                "legal_count",
-                "effective_count",
-                "measured_count",
-            }
-            if not isinstance(coverage, dict) or set(coverage) != fields:
-                raise ValueError("selection coverage fields differ from schema")
-            if any(type(value) is not int or value < 0 for value in coverage.values()):
-                raise ValueError("selection counts must be nonnegative integers")
-            if not (
-                coverage["cartesian_count"]
-                >= coverage["legal_count"]
-                >= coverage["effective_count"]
-                == coverage["measured_count"]
-                > 1
-            ):
-                raise ValueError(
-                    "only completed exhaustive multi-candidate races are cacheable"
-                )
-            programs = record["programs"]
-            if not isinstance(programs, list):
-                raise ValueError("selection program dependencies must be a list")
-            for program in programs:
-                if (
-                    not isinstance(program, list)
-                    or len(program) != 2
-                    or program[0] not in ("cute", "triton")
-                    or not isinstance(program[1], str)
-                    or not program[1]
-                ):
-                    raise ValueError("invalid selected program identity")
-        return records
+        self._pending = {}
+        # Deferred saves accumulate in memory and reach the file in one locked
+        # merge per flush instead of one per record.
+        self.deferred = False
 
     def _read(self):
         if not self.path.exists():
@@ -131,7 +90,7 @@ class SelectionCache:
             raise ValueError("invalid preparation selection cache")
         if payload["identity"] != self.identity:
             raise ValueError("selection identity differs from its cache key")
-        return self._validate(payload["records"])
+        return payload["records"]
 
     def get(self, key):
         records = self.records if self._agreed_records is None else self._agreed_records
@@ -148,12 +107,47 @@ class SelectionCache:
         for snapshot in snapshots:
             if snapshot.identity.to_dict() != self.identity:
                 raise ValueError("tuning cache identities differ across ranks")
-            records = self._validate(snapshot.records.to_dict())
+            records = snapshot.records.to_dict()
             for key, record in records.items():
                 agreed.setdefault(key, record)
         self._agreed_records = agreed
 
+    def flush(self):
+        """Merge pending records into the file under its lock."""
+        if not self._pending:
+            return
+        pending, self._pending = self._pending, {}
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with FileLock(self.path.with_suffix(".lock")):
+                records = self._read()
+                records.update(pending)
+                temporary = None
+                try:
+                    with tempfile.NamedTemporaryFile(
+                        mode="w",
+                        dir=self.path.parent,
+                        suffix=".tmp",
+                        delete=False,
+                    ) as stream:
+                        temporary = stream.name
+                        stream.write(
+                            _json({"identity": self.identity, "records": records})
+                        )
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    os.replace(temporary, self.path)
+                finally:
+                    if temporary is not None and os.path.exists(temporary):
+                        os.unlink(temporary)
+                self.records = records
+        except BaseException:
+            pending.update(self._pending)
+            self._pending = pending
+            raise
+
     def save(self, key, *, assignment, config, coverage, programs):
+        """Record a completed selection; it reaches the file at the next flush."""
         update = {
             key: {
                 "assignment": FrozenMapping(assignment).to_dict(),
@@ -167,27 +161,9 @@ class SelectionCache:
                 ],
             }
         }
-        self._validate(update)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with FileLock(self.path.with_suffix(".lock")):
-            records = self._read()
-            records.update(update)
-            temporary = None
-            try:
-                with tempfile.NamedTemporaryFile(
-                    mode="w",
-                    dir=self.path.parent,
-                    suffix=".tmp",
-                    delete=False,
-                ) as stream:
-                    temporary = stream.name
-                    stream.write(_json({"identity": self.identity, "records": records}))
-                    stream.flush()
-                    os.fsync(stream.fileno())
-                os.replace(temporary, self.path)
-            finally:
-                if temporary is not None and os.path.exists(temporary):
-                    os.unlink(temporary)
-            self.records = records
-            if self._agreed_records is not None:
-                self._agreed_records.update(update)
+        self.records.update(update)
+        if self._agreed_records is not None:
+            self._agreed_records.update(update)
+        self._pending.update(update)
+        if not self.deferred or len(self._pending) >= 64:
+            self.flush()

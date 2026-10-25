@@ -24,9 +24,10 @@ class AutotuneEffort(str, Enum):
 
     @property
     def rank(self) -> int:
-        return tuple(AutotuneEffort).index(self)
+        return _EFFORT_RANKS[self]
 
 
+_EFFORT_RANKS = {effort: rank for rank, effort in enumerate(AutotuneEffort)}
 _AUTOTUNE_EFFORT: ContextVar[AutotuneEffort | None] = ContextVar(
     "b12x_autotune_effort", default=None
 )

@@ -1,7 +1,7 @@
-"""CPU-only regression tests for interrupted/corrupt CuTe cache entries.
+"""CPU-only tests for publication and reuse of CuTe cache objects.
 
 Load the stdlib helper directly and execute the real compiler entry points with
-mock CUDA boundaries. This exercises preparation and recompile decisions without
+mock CUDA boundaries. This exercises reuse and recompile decisions without
 initializing B12X, CUTLASS, Torch, or a GPU.
 """
 
@@ -16,7 +16,6 @@ import importlib.util
 import json
 import os
 from pathlib import Path
-import shutil
 import stat
 import sys
 import tempfile
@@ -49,7 +48,7 @@ def load_functions(path, names, namespace):
     )
 
 
-class CompileCacheIntegrityTests(unittest.TestCase):
+class CompileCacheTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -57,18 +56,21 @@ class CompileCacheIntegrityTests(unittest.TestCase):
         payload = ("test-compile-payload",)
         self.key = hashlib.sha256(repr(payload).encode()).hexdigest()
         self.obj = self.root / self.key[:2] / (self.key + ".o")
-        self.manifest = self.obj.with_suffix(".json")
         self.obj.parent.mkdir()
         self.data = b"compiled object fixture"
         self.compiled = SimpleNamespace(dump_to_object=lambda _: self.data)
         self.compile_kernel = Mock(return_value=self.compiled)
-        self.loader = Mock(
-            return_value=SimpleNamespace(
-                **{
-                    "b12x_cute_" + self.key: self.compiled,
-                }
-            )
-        )
+        self.loaded_paths = []
+
+        def load(path):
+            # The real loader parses the object bytes; reject anything but the
+            # fixture so a corrupt file surfaces at load time.
+            self.loaded_paths.append(path)
+            if Path(path).read_bytes() != self.data:
+                raise RuntimeError("unloadable object")
+            return SimpleNamespace(**{"b12x_cute_" + self.key: self.compiled})
+
+        self.loader = Mock(side_effect=load)
         self.modules = {
             name: ModuleType(name)
             for name in (
@@ -108,21 +110,13 @@ class CompileCacheIntegrityTests(unittest.TestCase):
             os=os,
             json=json,
             hashlib=hashlib,
-            tempfile=tempfile,
-            shutil=shutil,
             contextmanager=contextmanager,
             FileLock=FileLock,
             nullcontext=nullcontext,
             suppress=suppress,
             atomic_write_bytes=integrity.atomic_write_bytes,
             _mkdir_durable=integrity._mkdir_durable,
-            valid_object=integrity.valid_object,
             _cute_compile_cache_dir=lambda: self.root,
-            _build_compile_manifest=lambda key, payload, func, data, **kw: {
-                "cache_key": key,
-                "object_bytes": len(data),
-                "object_sha256": hashlib.sha256(data).hexdigest(),
-            },
             _compile_memory_cache_key=lambda *args: "memory-key",
             _compile_disk_cache_payload=lambda *args: payload,
             _cute_compile_disk_cache_enabled_for_payload=lambda *args: True,
@@ -144,11 +138,8 @@ class CompileCacheIntegrityTests(unittest.TestCase):
             (
                 "_cache_prefix",
                 "_cache_object_path",
-                "_cache_manifest_path",
                 "_cache_lock_path",
-                "_write_compile_manifest",
                 "_valid_cute_compile_cache",
-                "_ensure_cute_compile_manifest",
                 "_disk_cache_key_lock",
                 "_load_cute_compile_from_disk",
                 "_store_cute_compile_to_disk",
@@ -168,153 +159,80 @@ class CompileCacheIntegrityTests(unittest.TestCase):
         modules_patch.start()
         self.addCleanup(modules_patch.stop)
 
-    def write_pair(self):
+    def write_object(self):
         self.obj.write_bytes(self.data)
-        self.manifest.write_text(
-            json.dumps(
-                {
-                    "cache_key": self.key,
-                    "object_bytes": len(self.data),
-                    "object_sha256": hashlib.sha256(self.data).hexdigest(),
-                }
-            )
-        )
 
-    def test_valid_cache_reused_without_compilation(self):
-        self.write_pair()
+    def test_published_object_is_reused_without_compilation(self):
+        self.write_object()
         self.assertTrue(self.available(self.program))
         self.assertIs(self.module.compile(object()), self.compiled)
         self.compile_kernel.assert_not_called()
 
-    def test_corruption_is_unavailable_and_recompiled(self):
-        corruptions = {
-            "empty_manifest": lambda: self.manifest.write_bytes(b""),
-            "nul_manifest": lambda: self.manifest.write_bytes(b"\0" * 64),
-            "malformed_manifest": lambda: self.manifest.write_text("{"),
-            "missing_manifest": self.manifest.unlink,
-            "missing_object": self.obj.unlink,
-            "empty_object": lambda: self.obj.write_bytes(b""),
-            "truncated_object": lambda: self.obj.write_bytes(self.data[:3]),
-            "same_size_corruption": lambda: self.obj.write_bytes(b"x" * len(self.data)),
-        }
-        for name, corrupt in corruptions.items():
+    def test_object_is_loaded_in_place_without_copies_or_hashing(self):
+        self.write_object()
+        with patch.object(integrity, "atomic_write_bytes") as publish:
+            self.assertIs(
+                self.module._load_cute_compile_from_disk(self.key), self.compiled
+            )
+        self.assertEqual(self.loaded_paths, [str(self.obj)])
+        self.assertEqual(self.obj.read_bytes(), self.data)
+        self.assertEqual(list(self.obj.parent.iterdir()), [self.obj])
+        publish.assert_not_called()
+
+    def test_missing_object_is_unavailable_and_compiled_once(self):
+        self.assertFalse(self.available(self.program))
+        self.assertIsNone(self.module._load_cute_compile_from_disk(self.key))
+        self.assertIs(self.module.compile(object()), self.compiled)
+        self.compile_kernel.assert_called_once()
+        self.assertTrue(self.available(self.program))
+        self.assertEqual(self.obj.read_bytes(), self.data)
+        self.assertEqual(list(self.obj.parent.glob("*.o")), [self.obj])
+
+    def test_unloadable_object_is_recompiled_and_replaced(self):
+        for name, corrupt in (
+            ("empty", lambda: self.obj.write_bytes(b"")),
+            ("truncated", lambda: self.obj.write_bytes(self.data[:3])),
+            ("same_size", lambda: self.obj.write_bytes(b"x" * len(self.data))),
+        ):
             with self.subTest(name=name):
-                self.write_pair()
-                self.assertTrue(self.available(self.program))
                 corrupt()
-                self.assertFalse(self.available(self.program))
                 self.memory.clear()
                 self.compile_kernel.reset_mock()
+                self.assertIsNone(self.module._load_cute_compile_from_disk(self.key))
                 self.assertIs(self.module.compile(object()), self.compiled)
                 self.compile_kernel.assert_called_once()
-                self.assertTrue(self.available(self.program))
+                self.assertEqual(self.obj.read_bytes(), self.data)
 
-    def test_invalid_manifest_fields_are_misses(self):
-        for field, value in (
-            ("cache_key", "wrong"),
-            ("object_bytes", True),
-            ("object_bytes", -1),
-            ("object_sha256", None),
-            ("object_sha256", "x" * 64),
-        ):
-            with self.subTest(field=field, value=value):
-                self.write_pair()
-                data = json.loads(self.manifest.read_text())
-                data[field] = value
-                self.manifest.write_text(json.dumps(data))
-                self.assertFalse(self.available(self.program))
-        self.manifest.write_text("[]")
-        self.assertFalse(self.available(self.program))
-
-    def test_checksums_rechecked_after_same_size_rewrite(self):
-        self.write_pair()
-        with patch.object(integrity.hashlib, "sha256", wraps=hashlib.sha256) as sha:
-            self.assertTrue(self.available(self.program))
-            self.assertTrue(self.available(self.program))
-            self.assertEqual(sha.call_count, 2)
-            info = self.obj.stat()
-            self.obj.write_bytes(b"x" * len(self.data))
-            os.utime(self.obj, ns=(info.st_atime_ns, info.st_mtime_ns))
-            self.assertFalse(self.available(self.program))
-            self.assertEqual(sha.call_count, 3)
-
-    def test_rewrites_detected_when_stat_identity_is_unchanged(self):
-        for target in (self.obj, self.manifest):
-            with self.subTest(target=target.suffix):
-                self.write_pair()
-                identities = {
-                    path: integrity._file_identity(path)
-                    for path in (self.obj, self.manifest)
-                }
-                with patch.object(
-                    integrity, "_file_identity", side_effect=identities.__getitem__
-                ):
-                    self.assertTrue(self.available(self.program))
-                    if target == self.obj:
-                        target.write_bytes(b"x" * len(self.data))
-                    else:
-                        target.write_text(
-                            target.read_text().replace(self.key, "0" * len(self.key))
-                        )
-                    self.assertEqual(target.stat().st_size, identities[target][2])
-                    self.assertFalse(self.available(self.program))
-
-    def test_staged_copy_is_validated_and_canonical_object_is_not_modified(self):
-        self.write_pair()
-
-        def mutate_copy(path):
-            Path(path).write_bytes(b"loader changed this private copy")
-            return SimpleNamespace(**{"b12x_cute_" + self.key: self.compiled})
-
-        self.loader.side_effect = mutate_copy
-        self.assertIs(self.module._load_cute_compile_from_disk(self.key), self.compiled)
-        self.assertEqual(self.obj.read_bytes(), self.data)
-        self.assertTrue(self.available(self.program))
-
-        def corrupt_copy(source, target):
-            Path(target).write_bytes(b"bad staged object")
-
-        self.loader.reset_mock()
-        with patch.object(shutil, "copy2", side_effect=corrupt_copy):
-            self.assertIsNone(self.module._load_cute_compile_from_disk(self.key))
-        self.loader.assert_not_called()
-
-    def test_interrupted_publication_is_rebuilt_and_healthy_neighbor_is_untouched(self):
-        self.write_pair()
+    def test_interrupted_publication_leaves_no_object_and_spares_neighbors(self):
         neighbor = self.obj.parent / "other.o"
         neighbor.write_bytes(b"keep this")
-        self.data = b"new object with a different checksum"
         with (
-            patch.object(
-                self.module, "_write_compile_manifest", side_effect=OSError("crash")
-            ),
+            patch.object(os, "fsync", side_effect=OSError("disk failure")),
             self.assertRaises(OSError),
         ):
             self.module._store_cute_compile_to_disk(
-                self.key,
-                self.compiled,
-                cache_payload=(1,),
-                func=object(),
+                self.key, self.compiled, cache_payload=(1,), func=object()
             )
         self.assertFalse(self.available(self.program))
+        self.assertEqual(list(self.obj.parent.glob("*.tmp")), [])
         self.module.compile(object())
         self.assertTrue(self.available(self.program))
         self.assertEqual(neighbor.read_bytes(), b"keep this")
 
-    def test_compiler_rechecks_after_another_writer_repairs_the_entry(self):
+    def test_compiler_reloads_after_another_writer_repairs_the_entry(self):
         self.obj.write_bytes(b"corrupt")
 
         @contextmanager
         def repaired_by_other_writer(key):
-            self.write_pair()
+            self.write_object()
             yield
 
         with patch.object(
             self.module, "_disk_cache_key_lock", repaired_by_other_writer
         ):
-            self.module.compile(object())
+            self.assertIs(self.module.compile(object()), self.compiled)
         self.compile_kernel.assert_not_called()
-        self.assertTrue(self.available(self.program))
+        self.assertEqual(len(self.loaded_paths), 2)
 
     def test_publication_fsyncs_file_before_rename_then_directory(self):
         events = []
@@ -345,11 +263,12 @@ class CompileCacheIntegrityTests(unittest.TestCase):
                 cache_payload=(1,),
                 func=object(),
             )
-        self.assertEqual(events, ["fsync", "replace", "directory"] * 2)
+        self.assertEqual(events, ["fsync", "replace", "directory"])
         self.assertTrue(self.available(self.program))
+        self.assertEqual(list(self.obj.parent.iterdir()), [self.obj])
 
     def test_failure_before_rename_preserves_previous_file_and_cleans_temporary(self):
-        self.write_pair()
+        self.write_object()
         with (
             patch.object(os, "fsync", side_effect=OSError("disk failure")),
             self.assertRaises(OSError),
@@ -373,7 +292,7 @@ class CompileCacheIntegrityTests(unittest.TestCase):
         selection = self.root / "preparation" / "selection.json"
         selection.parent.mkdir()
         selection.write_text('{"identity":{},"records":{}}')
-        self.write_pair()
+        self.write_object()
         self.assertTrue(self.available(self.program))
         self.module.compile(object())
         self.assertEqual(selection.read_text(), '{"identity":{},"records":{}}')

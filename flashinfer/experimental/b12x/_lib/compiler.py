@@ -7,11 +7,11 @@ import json
 import math
 import os
 import re
-import shutil
 import sys
-import tempfile
+import threading
 import time
 import traceback
+from concurrent.futures import Future, ThreadPoolExecutor
 from collections import OrderedDict
 from contextlib import contextmanager, nullcontext, suppress
 from dataclasses import dataclass, fields, is_dataclass
@@ -22,7 +22,7 @@ from threading import RLock
 from types import SimpleNamespace
 from typing import Any
 from filelock import FileLock
-from .cache_integrity import _mkdir_durable, atomic_write_bytes, valid_object
+from .cache_integrity import _mkdir_durable, atomic_write_bytes
 from .source_dependencies import callable_sources, source_dependencies
 from .compile_options import clear_options_cache, resolve_compile_options
 
@@ -1878,10 +1878,6 @@ def _cache_object_path(cache_key: str) -> Path:
     return _cute_compile_cache_dir() / cache_key[:2] / f"{cache_key}.o"
 
 
-def _cache_manifest_path(cache_key: str) -> Path:
-    return _cache_object_path(cache_key).with_suffix(".json")
-
-
 def _cache_lock_path(cache_key: str) -> Path:
     return _cache_object_path(cache_key).with_suffix(".lock")
 
@@ -1977,44 +1973,6 @@ def _semantic_structural_key(value: Any) -> Any:
     if isinstance(value, list):
         return [_semantic_structural_key(item) for item in value]
     return _manifest_json_value(value)
-
-
-def _semantic_compile_manifest_payload(
-    cache_payload: tuple[object, ...],
-) -> dict[str, Any]:
-    cache_format = str(cache_payload[0]) if cache_payload else "unknown"
-    semantic: dict[str, Any] = {
-        "cache_format": cache_format,
-        "target": _semantic_target_key(cache_payload[1]),
-    }
-    target_field = (
-        "device_arch"
-        if cache_format
-        in {
-            "b12x_cute_compile_cache_v5",
-            "b12x_cute_compile_cache_v8_explicit_spec",
-        }
-        else "device_uuid"
-    )
-    semantic[target_field] = _manifest_json_value(cache_payload[4])
-    if _is_explicit_spec_payload(cache_payload):
-        semantic["compile_spec_hash"] = cache_payload[5]
-        try:
-            semantic["compile_spec"] = json.loads(str(cache_payload[6]))
-        except (TypeError, ValueError, json.JSONDecodeError):
-            semantic["compile_spec"] = str(cache_payload[6])
-        if cache_payload[7]:
-            semantic["compile_kwargs_hash"] = cache_payload[7]
-            try:
-                semantic["compile_kwargs"] = json.loads(str(cache_payload[8]))
-            except (TypeError, ValueError, json.JSONDecodeError):
-                semantic["compile_kwargs"] = str(cache_payload[8])
-        semantic["compile_options"] = _manifest_json_value(cache_payload[9])
-    else:
-        semantic["args"] = _semantic_structural_key(cache_payload[5])
-        semantic["kwargs"] = _semantic_structural_key(cache_payload[6])
-        semantic["compile_options"] = _manifest_json_value(cache_payload[7])
-    return semantic
 
 
 _LLVM_SSA_NAME = r"%[-a-zA-Z$._0-9]+"
@@ -2204,150 +2162,14 @@ def _parse_launch_dynamic_smem_from_final_llvm(
     }
 
 
-def _extract_launch_dynamic_smem_bytes(compiled: Any) -> dict[str, Any]:
-    module = getattr(compiled, "ir_module", None)
-    kernel_info = getattr(compiled, "kernel_info", None)
-    source = "cutlass-final-llvm-launch-config-field-2"
-    if module is None:
-        return {
-            "status": "unknown",
-            "source": source,
-            "reason": "compiled-ir-unavailable",
-            "launch_dynamic_smem_bytes": {},
-        }
-    expected_kernels = (
-        {str(kernel) for kernel in kernel_info}
-        if isinstance(kernel_info, dict)
-        else set()
-    )
-    try:
-        return _parse_launch_dynamic_smem_from_final_llvm(str(module), expected_kernels)
-    except Exception as exc:
-        return {
-            "status": "unknown",
-            "source": source,
-            "reason": f"extractor-error:{type(exc).__name__}",
-            "launch_dynamic_smem_bytes": {},
-        }
-
-
-def _build_compile_manifest(
-    cache_key: str,
-    cache_payload: tuple[object, ...],
-    func: Any,
-    object_bytes: bytes,
-    compiled: Any = None,
-) -> dict[str, Any]:
-    semantic_payload = _semantic_compile_manifest_payload(cache_payload)
-    semantic_json = json.dumps(
-        semantic_payload,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=True,
-        allow_nan=False,
-    )
-    cache_format = str(cache_payload[0]) if cache_payload else "unknown"
-    explicit = _is_explicit_spec_payload(cache_payload)
-    options_index = 9 if explicit else 7
-    launch_metadata = (
-        _extract_launch_dynamic_smem_bytes(compiled)
-        if compiled is not None
-        else {
-            "status": "unknown",
-            "source": "cutlass-final-llvm-launch-config-field-2",
-            "reason": "compiled-ir-unavailable-on-object-reload",
-            "launch_dynamic_smem_bytes": {},
-        }
-    )
-    object_sha256 = hashlib.sha256(object_bytes).hexdigest()
-    artifact_evidence = {
-        "cache_key": cache_key,
-        "object_sha256": object_sha256,
-        "launch_metadata": launch_metadata,
-    }
-    artifact_evidence_json = json.dumps(
-        artifact_evidence,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=True,
-        allow_nan=False,
-    )
-    manifest: dict[str, Any] = {
-        "schema": "b12x._lib.compile_manifest.v4",
-        "cache_key": cache_key,
-        "cache_format": cache_format,
-        "cache_payload_repr": repr(cache_payload),
-        "cache_payload": _manifest_json_value(cache_payload),
-        "object_sha256": object_sha256,
-        "object_bytes": len(object_bytes),
-        "semantic_key": hashlib.sha256(semantic_json.encode("utf-8")).hexdigest(),
-        "semantic_payload": semantic_payload,
-        "target": _compile_target_name(func),
-        "target_identity": _semantic_target_key(cache_payload[1]),
-        "source_fingerprint": str(cache_payload[2]),
-        "toolchain": _manifest_json_value(cache_payload[3]),
-        "compile_options": _manifest_json_value(cache_payload[options_index]),
-        "launch_metadata": launch_metadata,
-        "artifact_evidence_sha256": hashlib.sha256(
-            artifact_evidence_json.encode("utf-8")
-        ).hexdigest(),
-    }
-    if explicit:
-        manifest["compile_spec_hash"] = str(cache_payload[5])
-        manifest["compile_spec_json"] = str(cache_payload[6])
-        manifest["compile_kwargs_hash"] = str(cache_payload[7])
-        manifest["compile_kwargs_json"] = str(cache_payload[8])
-        try:
-            spec = json.loads(str(cache_payload[6]))
-        except (TypeError, ValueError, json.JSONDecodeError):
-            spec = None
-        if isinstance(spec, dict):
-            manifest["kernel_id"] = str(spec.get("kernel", ""))
-            manifest["compile_spec_version"] = spec.get("version", "")
-    return manifest
-
-
-def _write_compile_manifest(
-    cache_key: str,
-    cache_payload: tuple[object, ...],
-    func: Any,
-    object_bytes: bytes,
-    compiled: Any = None,
-) -> None:
-    manifest = _build_compile_manifest(
-        cache_key, cache_payload, func, object_bytes, compiled=compiled
-    )
-    data = (
-        json.dumps(
-            manifest,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=True,
-            allow_nan=False,
-        )
-        + "\n"
-    )
-    atomic_write_bytes(_cache_manifest_path(cache_key), data.encode("utf-8"))
-
-
 def _valid_cute_compile_cache(cache_key: str) -> bool:
-    return valid_object(
-        _cache_object_path(cache_key),
-        _cache_manifest_path(cache_key),
-        cache_key,
-    )
+    """A published object file is the complete cache entry.
 
-
-def _ensure_cute_compile_manifest(
-    cache_key: str,
-    cache_payload: tuple[object, ...],
-    func: Any,
-) -> None:
-    manifest_path = _cache_manifest_path(cache_key)
-    if manifest_path.exists():
-        return
-    object_bytes = _cache_object_path(cache_key).read_bytes()
-    _write_compile_manifest(cache_key, cache_payload, func, object_bytes)
+    Objects are written to a temporary name and renamed into place, so a
+    visible file holds the full object; a corrupt file surfaces when the loader
+    rejects it and the entry is recompiled.
+    """
+    return _cache_object_path(cache_key).is_file()
 
 
 @contextmanager
@@ -2358,29 +2180,63 @@ def _disk_cache_key_lock(cache_key: str):
         yield
 
 
-def _load_cute_compile_from_disk(cache_key: str):
+def _read_cute_object(cache_key: str):
     from cutlass.base_dsl.export.external_binary_module import ExternalBinaryModule
 
     object_path = _cache_object_path(cache_key)
-    if not object_path.exists():
+    if not object_path.is_file():
         return None
+    # The loader reads the object bytes into an in-memory JITLink engine and
+    # never writes to the path, so the canonical object is handed over directly.
     try:
-        # CUTLASS may finalize or patch the ELF while loading it.  The cache
-        # object is content-addressed and its digest is recorded in the compile
-        # manifest, so never expose that canonical object to the loader.
-        with tempfile.TemporaryDirectory(prefix="b12x-cute-cache-load-") as raw_stage:
-            staged_object = Path(raw_stage) / object_path.name
-            shutil.copy2(object_path, staged_object)
-            # Validate the bytes actually handed to CUTLASS. Its loader can
-            # modify this private copy; it must never modify the cached object.
-            if not valid_object(
-                staged_object, _cache_manifest_path(cache_key), cache_key
-            ):
-                return None
-            module = ExternalBinaryModule(str(staged_object))
-            return getattr(module, _cache_prefix(cache_key))
+        module = ExternalBinaryModule(str(object_path))
+        return getattr(module, _cache_prefix(cache_key))
     except Exception:
         return None
+
+
+# Object loads release the GIL but serialize inside the JIT engine, so one
+# background thread overlaps them with the caller's Python work.
+_PREFETCH_LOCK = threading.Lock()
+_PREFETCHED: dict[str, Future] = {}
+_PREFETCH_EXECUTOR: ThreadPoolExecutor | None = None
+
+
+def prefetch_cute_objects(cache_keys) -> None:
+    """Start loading published CuTe objects that a later compile() will request."""
+    global _PREFETCH_EXECUTOR
+    with _PREFETCH_LOCK:
+        if _PREFETCH_EXECUTOR is None:
+            _PREFETCH_EXECUTOR = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="b12x-cute-load"
+            )
+        for cache_key in cache_keys:
+            if cache_key not in _PREFETCHED:
+                _PREFETCHED[cache_key] = _PREFETCH_EXECUTOR.submit(
+                    _read_cute_object, cache_key
+                )
+
+
+def discard_prefetched_cute_objects() -> None:
+    """Drop prefetched objects that no compile() consumed."""
+    with _PREFETCH_LOCK:
+        futures = tuple(_PREFETCHED.values())
+        _PREFETCHED.clear()
+    for future in futures:
+        future.cancel()
+
+
+def _load_cute_compile_from_disk(cache_key: str):
+    with _PREFETCH_LOCK:
+        future = _PREFETCHED.pop(cache_key, None)
+    if future is not None:
+        try:
+            compiled = future.result()
+        except Exception:
+            compiled = None
+        if compiled is not None:
+            return compiled
+    return _read_cute_object(cache_key)
 
 
 def _store_cute_compile_to_disk(
@@ -2396,10 +2252,6 @@ def _store_cute_compile_to_disk(
     object_path = _cache_object_path(cache_key)
     object_bytes = compiled.dump_to_object(_cache_prefix(cache_key))
     atomic_write_bytes(object_path, object_bytes)
-    if cache_payload is not None and func is not None:
-        _write_compile_manifest(
-            cache_key, cache_payload, func, object_bytes, compiled=compiled
-        )
 
 
 def _memory_cache_get(cache_key: object) -> Any | None:
@@ -2573,8 +2425,6 @@ def compile(
         compiled = _load_cute_compile_from_disk(cache_key)
         if compiled is not None:
             compiled = tag_compiled(compiled, program)
-            with suppress(Exception):
-                _ensure_cute_compile_manifest(cache_key, payload, func)
             with _MEMORY_CACHE_LOCK:
                 _DISK_CACHE_HITS += 1
             if post_engine_start_log:
@@ -2602,8 +2452,6 @@ def compile(
             compiled = _load_cute_compile_from_disk(cache_key)
             if compiled is not None:
                 compiled = tag_compiled(compiled, program)
-                with suppress(Exception):
-                    _ensure_cute_compile_manifest(cache_key, payload, func)
                 with _MEMORY_CACHE_LOCK:
                     _DISK_CACHE_HITS += 1
                 if post_engine_start_log:

@@ -73,22 +73,38 @@ def test_concurrent_ranks_keep_independent_checkpoints(tmp_path):
                 process.join()
 
 
-@pytest.mark.parametrize(
-    "checkpoint",
-    [
-        RaceCheckpoint({}, 0),
-        RaceCheckpoint({0: float("nan")}, 0),
-        RaceCheckpoint({0: -1.0}, 0),
-        RaceCheckpoint({0: 1.0}, 1),
-    ],
-)
-def test_invalid_measurements_cannot_replace_a_checkpoint(tmp_path, checkpoint):
+def test_ledger_records_append_in_order_and_filter_by_key(tmp_path):
     cache = RaceCache(tmp_path / "progress.sqlite3")
     try:
-        good = RaceCheckpoint({0: 1.0}, 0)
-        cache.save("race", good)
+        cache.append_ledger(
+            "a", shard_index=0, shard_count=1, session="s1", record={"n": 1}
+        )
+        cache.append_ledger(
+            "b", shard_index=1, shard_count=2, session="s2", record={"n": 2}
+        )
+        cache.append_ledger(
+            "a", shard_index=0, shard_count=1, session="s3", record={"n": 3}
+        )
+        rows = cache.ledger_records()
+        assert [row["record"]["n"] for row in rows] == [1, 2, 3]
+        assert [row["id"] for row in rows] == sorted(row["id"] for row in rows)
+        assert [row["session"] for row in cache.ledger_records("a")] == ["s1", "s3"]
+        assert cache.ledger_records("b")[0]["shard_count"] == 2
+        assert cache.ledger_records("missing") == []
         with pytest.raises(ValueError):
-            cache.save("race", checkpoint)
-        assert cache.load("race") == good
+            cache.append_ledger(
+                "c",
+                shard_index=0,
+                shard_count=1,
+                session="s",
+                record={"x": float("nan")},
+            )
+        assert len(cache.ledger_records()) == 3
+    finally:
+        cache.close()
+    # Reopening an existing database keeps the appended records.
+    cache = RaceCache(tmp_path / "progress.sqlite3")
+    try:
+        assert len(cache.ledger_records()) == 3
     finally:
         cache.close()

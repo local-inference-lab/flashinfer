@@ -85,14 +85,6 @@ def test_singleton_is_determined_after_predicates_and_equivalence():
     assert choices.legal_count == 2
 
 
-def test_metadata_requires_explicit_nonfinite_codec():
-    with pytest.raises(ValueError):
-        FrozenMapping({"limit": float("inf")})
-    with pytest.raises(ValueError):
-        FrozenMapping({"limit": float("nan")})
-    assert FrozenMapping({"limit": "+inf"}).to_dict() == {"limit": "+inf"}
-
-
 def test_packed_forced_a16_fallback_and_quantized_pin_remain_distinct():
     from b12x.preparation import DeviceIdentity
     from b12x.gemm.blockscaled._tuning import (

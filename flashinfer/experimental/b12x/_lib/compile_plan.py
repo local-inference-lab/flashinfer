@@ -39,6 +39,10 @@ class ProgramBundle:
 class _RetainedPrograms:
     cache: dict[object, Any] = field(default_factory=dict)
     owners: dict[int, Any] = field(default_factory=dict)
+    # Owners are only ever added, so a scope's program keys change only when
+    # its owner count does.
+    keys: frozenset = frozenset()
+    keyed_owners: int = 0
 
 
 _PLANNING = ContextVar("b12x_compile_planning", default=None)
@@ -54,12 +58,17 @@ _NATIVE_JITS = weakref.WeakSet()
 
 
 def retained_program_keys():
-    return frozenset(
-        program
-        for retained in tuple(_LIVE_RETAINED_PROGRAMS)
-        for owner in retained.owners.values()
-        for program in program_keys(owner)
-    )
+    keys = set()
+    for retained in tuple(_LIVE_RETAINED_PROGRAMS):
+        if retained.keyed_owners != len(retained.owners):
+            retained.keys = frozenset(
+                program
+                for owner in tuple(retained.owners.values())
+                for program in program_keys(owner)
+            )
+            retained.keyed_owners = len(retained.owners)
+        keys.update(retained.keys)
+    return frozenset(keys)
 
 
 def _planning_artifacts(

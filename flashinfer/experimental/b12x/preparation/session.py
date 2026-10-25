@@ -12,24 +12,28 @@ from __future__ import annotations
 
 import logging
 import gc
+import hashlib
 import math
 import os
 import pickle
 import threading
 import time
+import uuid
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path
 
 from filelock import Timeout
 
 from b12x._lib.compile_plan import (
+    _RESIDENT_PROGRAMS,
     compiled_program_available,
     observe_programs,
     retain_compiled_programs,
 )
 from b12x._lib.compile_pool import CompilePool, describe_compilation, compile_in_process
+from b12x._lib.compiler import discard_prefetched_cute_objects, prefetch_cute_objects
 from b12x._lib.program_cache import PreparationProgramCache, evict_unretained
 from b12x._lib.runtime_control import (
     KernelResolutionFrozenError,
@@ -39,6 +43,7 @@ from ._cache import SelectionCache, cache_identity, digest
 from ._efficiency import AutotuneEffort, capture_autotune_effort
 from ._discovery import discovery_key, discovery_record, restore_discovery
 from ._measurement import DEFAULT_SAMPLES, SURVIVOR_ROUNDS
+from ._ledger import RaceLedger
 from ._race_cache import RaceCache, RaceCheckpoint
 from ._timing import PreparationTiming
 from .device import DetectedDevice, detect_device
@@ -95,6 +100,22 @@ class _Obligation:
     cache_pending: bool = False
     ready: bool = False
     planned_candidates: int = 0
+    discovery: _Discovery | None = None
+    compiles_submitted: bool = False
+    payloads: dict = field(default_factory=dict)
+
+
+@dataclass
+class _Discovery:
+    """Program discovery for one obligation, advanced in non-blocking steps."""
+
+    candidates: tuple
+    key: str | None
+    cache: object | None
+    lock: object | None = None
+    batches: list = field(default_factory=list)
+    submitted: bool = False
+    done: bool = False
 
 
 @dataclass(frozen=True)
@@ -140,7 +161,6 @@ class _Trial:
     guard: _CallGuard
     retained: object
     state: object
-    resident: int
     latency_us: float | None = None
 
     def close(self):
@@ -371,6 +391,9 @@ class PreparationSession:
         safe to call there. A timeout does not cancel that callback; another
         preparation job cannot begin until the callback exits.
 
+        ``race_batch`` bounds the candidates timed together; ``race_budget`` is
+        accepted for compatibility and no longer limits a batch.
+
         ``prime=False`` materializes and binds selected plans without running
         their prepare calls. The caller must warm every execution path before
         capture or freeze. Candidate and retained benchmark calls still prime.
@@ -435,6 +458,7 @@ class PreparationSession:
         self._tuning_rank = 0
         self._tuning_ranks = (0,)
         self._tuning_cache_synchronized = False
+        self.session_id = uuid.uuid4().hex
         self.state = "OPEN"
 
     def configure_compile_workers(self, workers: int | None = None) -> None:
@@ -521,25 +545,6 @@ class PreparationSession:
             import torch
 
             torch.cuda.synchronize(self.device.ordinal)
-
-    def _allocated(self):
-        """Return bytes currently allocated on the preparation device."""
-        if self.device.ordinal is None:
-            return 0
-        import torch
-
-        return torch.cuda.memory_allocated(self.device.ordinal)
-
-    def _race_budget(self):
-        """Return the configured or device-derived autotuning memory budget."""
-        if self.race_budget is not None:
-            return self.race_budget
-        if self.device.ordinal is None:
-            return None
-        import torch
-
-        free, _ = torch.cuda.mem_get_info(self.device.ordinal)
-        return max(int(free) // 2, 1)
 
     def begin(self, requests, *, autotune=None):
         """Start one preparation job after the prior collective barrier drains."""
@@ -810,6 +815,8 @@ class PreparationSession:
         if self._guard is not None:
             guard, self._guard = self._guard, None
             closers.append(lambda: guard.__exit__(None, None, None))
+        if self._cache is not None:
+            closers.append(self._cache.flush)
         if self._race_cache is not None:
             cache, self._race_cache = self._race_cache, None
             closers.append(cache.close)
@@ -856,6 +863,10 @@ class PreparationJob:
         self._coverage = {}
         self._described_candidates = {}
         self._described_jobs = {}
+        self._discovery_locks = set()
+        self._available_programs = set()
+        self._pipeline = ()
+        self._selections = {}
         self._benchmark_calls = {}
         self._plans_by_name = {}
         self._started = time.monotonic()
@@ -1192,8 +1203,13 @@ class PreparationJob:
         if self._closed:
             return
         self._closed = True
+        self._release_race_resources()
         closers = [self._steps.close, *reversed(self._temporaries)]
         self._temporaries.clear()
+        closers.extend(lock.release for lock in self._discovery_locks)
+        self._discovery_locks.clear()
+        if self.session._cache is not None:
+            closers.append(self.session._cache.flush)
         if self._result is None:
             closers.extend(reversed(self._benchmark_closers))
             self._benchmark_closers.clear()
@@ -1277,10 +1293,7 @@ class PreparationJob:
             obligation.request.plan.contract,
         )
         assignment = FrozenMapping(record["assignment"])
-        configuration.space.validate(assignment)
         config = contract._lower(configuration.query, configuration.device, assignment)
-        if contract.config_payload(config) != record["config"]:
-            raise ValueError("cached assignment no longer lowers to its saved config")
         obligation.selection = self._selection(obligation, config, "cached", assignment)
         obligation.coverage = dict(record["coverage"])
         self._cache_hits += 1
@@ -1424,8 +1437,9 @@ class PreparationJob:
                     declaration = _declaration_key(plan)
                     enumerated = enumerations.get(declaration)
                     if enumerated is not None:
-                        candidates, coverage = enumerated
+                        candidates, coverage, payloads = enumerated
                         obligation.candidates.extend(candidates)
+                        obligation.payloads.update(payloads)
                         complete = True
                     else:
                         iterator = plan.contract.iterate(configuration)
@@ -1453,10 +1467,12 @@ class PreparationJob:
                         }
                         # Equal declarations enumerate to the same candidates; an
                         # interrupted enumeration describes the stop, not the space.
+                        obligation.payloads.update(iterator.payloads)
                         if complete:
                             enumerations[declaration] = (
                                 tuple(obligation.candidates),
                                 coverage,
+                                iterator.payloads,
                             )
                     self._global_candidate_count = self._candidate_count = len(
                         obligation.candidates
@@ -1510,38 +1526,53 @@ class PreparationJob:
         return obligations
 
     def _describe_candidates(self, obligation):
+        """Complete program discovery for an obligation, waiting as needed."""
+        self._phase = "planning programs"
+        yield from self._advance_discovery(obligation, wait=True)
+
+    def _advance_discovery(self, obligation, *, wait):
+        """Advance one obligation's discovery; with ``wait`` it runs to completion.
+
+        Without ``wait`` the step never blocks on the pool or another rank's
+        discovery lock, so later obligations can be described while the current
+        race measures.
+        """
+        if obligation.candidate_program_identity is not None:
+            return
         plan = obligation.request.plan
         contract = plan.contract
-        declaration = _declaration_key(plan)
-        self._candidates_described = 0
-        self._phase = "planning programs"
-        cached = self._described_candidates.get(declaration)
-        if cached is not None:
-            (
-                obligation.candidate_program_identity,
-                obligation.compiled,
-                obligation.programs,
-            ) = cached
-            self._candidates_described = len(obligation.candidates)
-            return
-        candidates = []
-        for assignment, config in obligation.candidates:
-            if self._warmup_only:
+        state = obligation.discovery
+        if state is None or state.done:
+            cached = self._described_candidates.get(_declaration_key(plan))
+            if cached is not None:
+                (
+                    obligation.candidate_program_identity,
+                    obligation.compiled,
+                    obligation.programs,
+                ) = cached
+                if wait:
+                    self._candidates_described = len(obligation.candidates)
                 return
-            payload = contract.config_payload(config)
-            jobs = tuple(plan._compile_jobs(config, self.session.device))
-            obligation.jobs[payload] = jobs
-            candidates.append((assignment, payload, jobs))
-            if len(candidates) % 32 == 0:
-                yield "metadata"
-        with self._timing.span("discovery_key"):
-            key = discovery_key(candidates, self.session.device)
-        cache = self.session._race_progress_cache() if key is not None else None
-        lock = None
-        try:
-            record = cache.load_discovery(key) if cache is not None else None
-            if cache is not None and record is None:
-                lock = cache.discovery_lock(key)
+            candidates = []
+            for assignment, config in obligation.candidates:
+                if self._warmup_only:
+                    return
+                payload = self._payload(obligation, config)
+                jobs = tuple(plan._compile_jobs(config, self.session.device))
+                obligation.jobs[payload] = jobs
+                candidates.append((assignment, payload, jobs))
+                if len(candidates) % 32 == 0:
+                    yield "metadata"
+            with self._timing.span("discovery_key"):
+                key = discovery_key(candidates, self.session.device)
+            cache = self.session._race_progress_cache() if key is not None else None
+            state = obligation.discovery = _Discovery(tuple(candidates), key, cache)
+        if wait:
+            self._candidates_described = 0
+        if state.cache is not None and state.lock is None:
+            record = state.cache.load_discovery(state.key)
+            if record is None:
+                lock = state.cache.discovery_lock(state.key)
                 while True:
                     if self._warmup_only:
                         return
@@ -1549,62 +1580,88 @@ class PreparationJob:
                         lock.acquire(timeout=0)
                         break
                     except Timeout:
+                        if not wait:
+                            return
+                        yield from self._pump_pipeline(obligation)
                         yield "compile"
-                record = cache.load_discovery(key)
+                record = state.cache.load_discovery(state.key)
+                if record is None:
+                    state.lock = lock
+                    self._discovery_locks.add(lock)
+                else:
+                    lock.release()
             if record is not None:
                 (
                     obligation.candidate_program_identity,
                     obligation.compiled,
                     obligation.programs,
-                ) = restore_discovery(candidates, record)
-                self._candidates_described = len(candidates)
-            else:
-                yield from self._discover_candidates(obligation)
-                if obligation.candidate_program_identity is None:
-                    return
-                if cache is not None:
-                    cache.save_discovery(
-                        key,
-                        discovery_record(
-                            candidates,
-                            obligation.compiled,
-                            obligation.candidate_program_identity,
-                        ),
-                    )
-        finally:
-            if lock is not None:
-                lock.release()
-        self._described_candidates[declaration] = (
+                ) = restore_discovery(state.candidates, record)
+                self._finish_discovery(obligation, state, publish=False)
+                return
+        try:
+            completed = yield from self._discover_candidates(obligation, state, wait)
+        except BaseException:
+            self._release_discovery_lock(state)
+            raise
+        if not completed:
+            if self._warmup_only:
+                self._release_discovery_lock(state)
+            return
+        self._finish_discovery(obligation, state, publish=True)
+
+    def _release_discovery_lock(self, state):
+        lock, state.lock = state.lock, None
+        if lock is not None:
+            self._discovery_locks.discard(lock)
+            lock.release()
+
+    def _finish_discovery(self, obligation, state, *, publish):
+        if publish and state.cache is not None:
+            state.cache.save_discovery(
+                state.key,
+                discovery_record(
+                    state.candidates,
+                    obligation.compiled,
+                    obligation.candidate_program_identity,
+                ),
+            )
+        self._release_discovery_lock(state)
+        state.done = True
+        if obligation.request is self._active_request:
+            self._candidates_described = len(obligation.candidates)
+        self._described_candidates[_declaration_key(obligation.request.plan)] = (
             obligation.candidate_program_identity,
             obligation.compiled,
             obligation.programs,
         )
 
-    def _discover_candidates(self, obligation):
+    def _discover_candidates(self, obligation, state, wait):
+        """Describe programs through the pool; True once every candidate is known."""
         contract = obligation.request.plan.contract
         if self.session.compile_workers and self.session.device.ordinal is not None:
-            batch_size = 32 * self.session.compile_workers
-            for start in range(0, len(obligation.candidates), batch_size):
+            pool = self.session._compiler()
+            if not state.submitted:
+                batch_size = 32 * self.session.compile_workers
+                for start in range(0, len(obligation.candidates), batch_size):
+                    jobs, configs = [], []
+                    for _, config in obligation.candidates[start : start + batch_size]:
+                        payload = self._payload(obligation, config)
+                        candidate_jobs = obligation.jobs[payload]
+                        configs.append((payload, len(candidate_jobs)))
+                        jobs.extend(candidate_jobs)
+                    state.batches.append((pool.describe(jobs) if jobs else (), configs))
+                state.submitted = True
+            while state.batches:
                 if self._warmup_only:
-                    return
-                jobs, configs = [], []
-                for _, config in obligation.candidates[start : start + batch_size]:
-                    payload = contract.config_payload(config)
-                    candidate_jobs = obligation.jobs[payload]
-                    configs.append((payload, len(candidate_jobs)))
-                    jobs.extend(candidate_jobs)
-                if jobs:
-                    pool = self.session._compiler()
-                    keys = pool.describe(jobs)
-                    while True:
-                        if self._warmup_only:
-                            return
-                        descriptions = pool.descriptions(keys)
-                        if descriptions is not None:
-                            break
-                        yield "compile"
-                else:
-                    descriptions = ()
+                    return False
+                keys, configs = state.batches[0]
+                descriptions = pool.descriptions(keys) if keys else ()
+                if descriptions is None:
+                    if not wait:
+                        return False
+                    yield from self._pump_pipeline(obligation)
+                    yield "compile"
+                    continue
                 offset = 0
                 for payload, count in configs:
                     compiled = descriptions[offset : offset + count]
@@ -1613,28 +1670,158 @@ class PreparationJob:
                     obligation.programs[payload] = frozenset(
                         p for item in compiled for p in item.programs
                     )
-                    self._candidates_described += 1
+                    if wait:
+                        self._candidates_described += 1
+                state.batches.pop(0)
                 yield "metadata"
-        identities = []
-        for assignment, config in obligation.candidates:
+        checksum = hashlib.sha256()
+        for count, (assignment, config) in enumerate(obligation.candidates, 1):
             programs = yield from self._describe_programs(obligation, config)
             if self._warmup_only:
+                return False
+            checksum.update(
+                pickle.dumps(
+                    (
+                        assignment,
+                        self._payload(obligation, config),
+                        sorted((p.dialect, p.key) for p in programs),
+                    ),
+                    protocol=5,
+                )
+            )
+            if wait:
+                self._candidates_described = max(self._candidates_described, count)
+        obligation.candidate_program_identity = checksum.hexdigest()
+        return True
+
+    def _pump_pipeline(self, current):
+        """Run discovery, cache lookups and compile submission ahead of the race.
+
+        Later obligations are described while the current one measures, looked
+        up once their dependencies are selected, and their local candidates'
+        programs are queued behind the current race's compiles so the pool stays
+        busy. Nothing here blocks on the pool.
+        """
+        if (
+            self._warmup_only
+            or self.session.cache_only
+            or not self.autotune
+            or not self.session.compile_workers
+        ):
+            return
+        remaining = []
+        pipeline = self._pipeline
+        for position, obligation in enumerate(pipeline):
+            if self._locally_stopped:
+                self._pipeline = remaining + list(pipeline[position:])
                 return
-            identities.append(
-                {
-                    "assignment": assignment.to_dict(),
-                    "config": contract.config_payload(config).to_dict(),
-                    "programs": sorted((p.dialect, p.key) for p in programs),
-                }
+            if (
+                obligation.ready
+                or obligation.selection is not None
+                or obligation.compiles_submitted
+            ):
+                continue
+            remaining.append(obligation)
+            if obligation is current:
+                continue
+            yield from self._advance_discovery(obligation, wait=False)
+            if (
+                obligation.candidate_program_identity is None
+                or obligation.request.collective is not None
+            ):
+                continue
+            if obligation.key is None:
+                self._lookup(obligation, self._selections)
+            if obligation.selection is None and obligation.key is not None:
+                self._submit_candidate_compiles(obligation)
+        self._pipeline = [
+            item
+            for item in remaining
+            if not (item.ready or item.selection is not None or item.compiles_submitted)
+        ]
+
+    def _checkpoint_key(self, obligation, rank_index, rank_count):
+        return digest(
+            {
+                "race": obligation.key,
+                "shard_index": rank_index,
+                "shard_count": rank_count,
+                "rounds": self.session.rounds,
+                "samples": self.session.samples,
+            }
+        )
+
+    def _submit_candidate_compiles(self, obligation):
+        """Queue this shard's unmeasured candidates and a restored champion."""
+        rank_index = self.session._tuning_ranks.index(self.session._tuning_rank)
+        rank_count = len(self.session._tuning_ranks)
+        checkpoint = self.session._race_progress_cache().load(
+            self._checkpoint_key(obligation, rank_index, rank_count)
+        )
+        measured = (
+            frozenset()
+            if checkpoint is None
+            else frozenset(checkpoint.measurements) - {checkpoint.champion}
+        )
+        plans = []
+        for index in range(rank_index, len(obligation.candidates), rank_count):
+            if index in measured:
+                continue
+            payload = self._payload(obligation, obligation.candidates[index][1])
+            compiled = obligation.compiled.get(payload)
+            if compiled is None:
+                continue
+            self._all_programs.update(obligation.programs[payload])
+            plans.extend(
+                item for item in compiled if not self._programs_available(item.programs)
             )
-            self._candidates_described = max(
-                self._candidates_described, len(identities)
+        if plans:
+            self.session._compiler().submit_plans(plans, required=False)
+        obligation.compiles_submitted = True
+
+    def _ready_first(self, obligation, pending):
+        """Order remaining candidates ready first; return the order and cold count."""
+        contract = obligation.request.plan.contract
+        ready, cold = [], []
+        for item in pending:
+            programs = obligation.programs.get(
+                self._payload(obligation, item[1][1]), frozenset()
             )
-        obligation.candidate_program_identity = digest(identities)
+            (ready if self._programs_available(programs) else cold).append(item)
+        return ready + cold, len(cold)
+
+    def _payload(self, obligation, config):
+        """A candidate's payload from enumeration; other configs are encoded."""
+        payload = obligation.payloads.get(id(config))
+        if payload is None:
+            payload = obligation.request.plan.contract.config_payload(config)
+        return payload
+
+    def _prefetch(self, obligation, items):
+        """Queue object loads for the next batch of ready candidates."""
+        keys = []
+        for _, (_, config) in items[: self.session.race_batch]:
+            for program in obligation.programs.get(
+                self._payload(obligation, config), ()
+            ):
+                if program.dialect == "cute" and program not in _RESIDENT_PROGRAMS:
+                    keys.append(program.key)
+        if keys:
+            prefetch_cute_objects(keys)
+
+    def _programs_available(self, programs):
+        """Availability with a job-lifetime memo; published programs stay published."""
+        available = self._available_programs
+        for program in programs:
+            if program not in available:
+                if not compiled_program_available(program):
+                    return False
+                available.add(program)
+        return True
 
     def _describe_programs(self, obligation, config):
-        contract, plan = obligation.request.plan.contract, obligation.request.plan
-        payload = contract.config_payload(config)
+        plan = obligation.request.plan
+        payload = self._payload(obligation, config)
         if payload not in obligation.compiled:
             compiled = []
             if payload not in obligation.jobs:
@@ -1661,14 +1848,14 @@ class PreparationJob:
 
     def _compile(self, obligation, config, *, required):
         programs = yield from self._describe_programs(obligation, config)
-        payload = obligation.request.plan.contract.config_payload(config)
+        payload = self._payload(obligation, config)
         if payload not in obligation.compiled:
             return programs
         self._all_programs.update(programs)
         missing = [
             item
             for item in obligation.compiled[payload]
-            if any(not compiled_program_available(program) for program in item.programs)
+            if not self._programs_available(item.programs)
         ]
         if missing:
             if self._warmup_only:
@@ -1687,8 +1874,8 @@ class PreparationJob:
                 pool.submit_plans(missing, required=required)
         return programs
 
-    def _wait_programs(self, programs):
-        while not all(compiled_program_available(program) for program in programs):
+    def _wait_programs(self, programs, current=None):
+        while not self._programs_available(programs):
             if self._warmup_only:
                 return
             pool = self.session._pool
@@ -1698,6 +1885,7 @@ class PreparationJob:
                 raise RuntimeError(
                     "compiler completed without publishing required artifacts"
                 )
+            yield from self._pump_pipeline(current)
             yield "compile"
         if self.session._pool is not None:
             # Surface a factory failure even if another job published shared code.
@@ -1804,7 +1992,7 @@ class PreparationJob:
     ):
         request = obligation.request if request is None else request
         plan = request.plan
-        expected = obligation.programs[plan.contract.config_payload(selection.config)]
+        expected = obligation.programs[self._payload(obligation, selection.config)]
         expected = expected | frozenset(
             program
             for name in request.dependencies
@@ -1825,16 +2013,15 @@ class PreparationJob:
         if self.session._stop.is_set():
             return None
         request = obligation.request
-        programs = obligation.programs[request.plan.contract.config_payload(config)]
-        while not all(compiled_program_available(program) for program in programs):
+        programs = obligation.programs[self._payload(obligation, config)]
+        if not self._programs_available(programs):
+            yield from self._compile(obligation, config, required=True)
+        while not self._programs_available(programs):
             if self.session._stop.is_set():
                 return None
+            yield from self._pump_pipeline(obligation)
             yield "compile"
-            if self.session._pool is not None:
-                self.session._pool.pending
         selection = self._selection(obligation, config, "tuned", assignment)
-        with self._timing.span("memory_accounting"):
-            before = self.session._allocated()
         state, call, guard, retained = self._call(
             obligation,
             selection,
@@ -1842,12 +2029,10 @@ class PreparationJob:
             synchronize=False,
             reject_unlaunchable=True,
         )
-        with self._timing.span("memory_accounting"):
-            resident = max(0, self.session._allocated() - before)
         self._candidates_prepared += 1
         yield "gpu"
         self._temporaries.remove(guard.finish)
-        return _Trial(index, assignment, config, call, guard, retained, state, resident)
+        return _Trial(index, assignment, config, call, guard, retained, state)
 
     def _observe(self, race):
         self._completed_rounds = race.completed_rounds
@@ -1858,7 +2043,15 @@ class PreparationJob:
     def _release_race_resources(self):
         self._race_eviction = None
 
-    def _measure(self, trials, *, champion, sample_exchange=None, launch_exchange=None):
+    def _measure(
+        self,
+        trials,
+        *,
+        champion,
+        sample_exchange=None,
+        launch_exchange=None,
+        sample_observer=None,
+    ):
         from ._measurement import _l2_flush_fn, prepare_race_steps, measure_race_steps
 
         calls = [trial.call for trial in trials]
@@ -1904,6 +2097,7 @@ class PreparationJob:
                 champion=champion,
                 sample_exchange=sample_exchange,
                 launch_exchange=launch_exchange,
+                sample_observer=sample_observer,
             )
             response = None
             while sample_exchange is not None or not self.session._stop.is_set():
@@ -1944,15 +2138,7 @@ class PreparationJob:
         cache = checkpoint = checkpoint_key = None
         if obligation.key is not None:
             cache = self.session._race_progress_cache()
-            checkpoint_key = digest(
-                {
-                    "race": obligation.key,
-                    "shard_index": rank_index,
-                    "shard_count": rank_count,
-                    "rounds": self.session.rounds,
-                    "samples": self.session.samples,
-                }
-            )
+            checkpoint_key = self._checkpoint_key(obligation, rank_index, rank_count)
             checkpoint = cache.load(checkpoint_key)
         measurements = {} if checkpoint is None else dict(checkpoint.measurements)
         if not set(measurements).issubset(index for index, _ in local_candidates):
@@ -1961,24 +2147,38 @@ class PreparationJob:
         self._candidates_prepared = len(measurements)
         remaining = [item for item in local_candidates if item[0] not in measurements]
         best_index = None if checkpoint is None else checkpoint.champion
+        ledger = RaceLedger(
+            job=self,
+            obligation=obligation,
+            kind="local",
+            shard_index=rank_index,
+            shard_count=rank_count,
+            local_indices=[index for index, _ in local_candidates],
+            restored=measurements,
+        )
         compile_candidates = list(remaining)
         if remaining and best_index is not None:
             compile_candidates.append((best_index, obligation.candidates[best_index]))
         required_programs = ()
+        compile_started = time.perf_counter()
         if rank_count == 1 and remaining:
             required_programs = yield from self._compile(
                 obligation, obligation.configuration.default, required=True
             )
-        for _, (assignment, config) in compile_candidates:
+        for index, (assignment, config) in compile_candidates:
             if self.session._stop.is_set():
                 return None
+            ledger.note_precompiled(
+                index,
+                obligation.programs.get(self._payload(obligation, config), frozenset()),
+            )
             yield from self._compile(obligation, config, required=False)
             if self.session._stop.is_set():
                 return None
             compile_assignment = obligation.configuration.space.compile_assignment(
                 assignment
             )
-            actual = obligation.programs[request.plan.contract.config_payload(config)]
+            actual = obligation.programs[self._payload(obligation, config)]
             previous = obligation.compile_assignments.setdefault(
                 compile_assignment, actual
             )
@@ -1986,7 +2186,9 @@ class PreparationJob:
                 raise ValueError(
                     f"runtime parameter changed actual compile keys for {request.name}"
                 )
-        yield from self._wait_programs(required_programs)
+        yield from self._pump_pipeline(obligation)
+        yield from self._wait_programs(required_programs, obligation)
+        ledger.add_phase("compile", time.perf_counter() - compile_started)
         if not local_candidates:
             return TuningRequirement(
                 obligation.key,
@@ -1995,9 +2197,8 @@ class PreparationJob:
                 None,
                 None,
             )
-        budget = self.session._race_budget()
         pending = remaining
-        champion = carried = None
+        champion = None
         live = []
         rejected_count = 0
         try:
@@ -2017,7 +2218,7 @@ class PreparationJob:
                     return None
                 live.append(champion)
                 self._candidates_prepared -= 1
-            while pending or carried is not None:
+            while pending:
                 if self.session._stop.is_set():
                     return None
                 self._phase = "preparing candidates"
@@ -2025,13 +2226,15 @@ class PreparationJob:
                 self._batch_candidates = 0
                 self._completed_rounds = self._total_rounds = self._active_count = 0
                 self._latest_round_us = ()
-                batch, resident = [], 0 if champion is None else champion.resident
-                if carried is not None:
-                    batch.append(carried)
-                    resident += carried.resident
-                    carried = None
+                pending, cold = self._ready_first(obligation, pending)
+                self._prefetch(obligation, pending[: len(pending) - cold])
+                if cold and len(pending) - cold < self.session.race_batch:
+                    for _, (_, config) in pending[len(pending) - cold :]:
+                        yield from self._compile(obligation, config, required=True)
+                batch = []
                 while pending and len(batch) < self.session.race_batch:
                     index, (assignment, config) = pending.pop(0)
+                    trial_started = time.perf_counter()
                     try:
                         trial = yield from self._trial(
                             obligation, index, assignment, config
@@ -2039,6 +2242,7 @@ class PreparationJob:
                     except _CandidateLaunchRejected as error:
                         rejected_count += 1
                         self._rejected += 1
+                        ledger.reject(index, config, str(error))
                         logger.warning(
                             "Skipping %s candidate %d on rank %d: %r: %s",
                             request.name,
@@ -2056,12 +2260,13 @@ class PreparationJob:
                         continue
                     if trial is None:
                         return None
+                    ledger.prepared(
+                        trial,
+                        seconds=time.perf_counter() - trial_started,
+                        batch=self._batch_index,
+                    )
                     live.append(trial)
                     batch.append(trial)
-                    resident += trial.resident
-                    if budget is not None and resident > budget and len(batch) > 1:
-                        carried = batch.pop()
-                        break
                 if not batch:
                     continue
                 trials = ([] if champion is None else [champion]) + batch
@@ -2075,8 +2280,13 @@ class PreparationJob:
                     local_candidates=len(local_candidates),
                     remaining=len(pending),
                 )
+                # The next batch's objects load while this batch measures.
+                self._prefetch(obligation, pending)
+                measure_started = time.perf_counter()
                 measurement = yield from self._measure(
-                    trials, champion=champion is not None
+                    trials,
+                    champion=champion is not None,
+                    sample_observer=ledger.observer(trials),
                 )
                 if measurement is None:
                     return None
@@ -2095,6 +2305,14 @@ class PreparationJob:
                     for trial, latency in zip(
                         trials, measurement.latencies_us, strict=True
                     )
+                )
+                ledger.batch(
+                    self._batch_index,
+                    trials,
+                    measurement,
+                    champion=champion,
+                    winner=best_index,
+                    seconds=time.perf_counter() - measure_started,
                 )
                 if cache is not None:
                     with self._timing.span("race_checkpoint"):
@@ -2121,7 +2339,15 @@ class PreparationJob:
                     latencies_us=list(measurement.latencies_us),
                     winner=champion.index,
                 )
+                yield from self._pump_pipeline(obligation)
             obligation.coverage["measured_count"] = len(measurements)
+            if cache is not None and best_index is not None:
+                ledger.commit(
+                    lambda: cache,
+                    measurements=measurements,
+                    champion_index=best_index,
+                    rejected_count=rejected_count,
+                )
             if best_index is None:
                 if rank_count > 1:
                     return TuningRequirement(
@@ -2159,11 +2385,8 @@ class PreparationJob:
             obligation.cache_pending = rejected_count == 0
             return selection
         finally:
-            closers = [self.session._synchronize]
+            closers = [self.session._synchronize, discard_prefetched_cute_objects]
             closers.extend(trial.close for trial in live)
-            if carried is not None and carried not in live:
-                closers.append(carried.close)
-            closers.append(self._release_race_resources)
             _close_all(closers)
 
     def _publish(
@@ -2223,7 +2446,7 @@ class PreparationJob:
                 programs = yield from self._compile(
                     obligation, selection.config, required=True
                 )
-                yield from self._wait_programs(programs)
+                yield from self._wait_programs(programs, obligation)
             if self._warmup_only:
                 configuration = obligation.configuration
                 source = "override" if configuration.pinned is not None else "default"
@@ -2235,7 +2458,9 @@ class PreparationJob:
                 self._direct_compilation()
             if obligation.cache_pending:
                 with self._timing.span("cache_save"):
-                    self.session._selection_cache().save(
+                    cache = self.session._selection_cache()
+                    cache.deferred = True
+                    cache.save(
                         obligation.key,
                         assignment=selection.assignment,
                         config=plan.contract.config_payload(selection.config),
@@ -2435,7 +2660,11 @@ class PreparationJob:
         obligations = [
             item for item in obligations if id(item) not in terminal_ids
         ] + terminal_collectives
-        selections = {}
+        selections = self._selections = {}
+        self._pipeline = tuple(
+            item for item in obligations if not item.ready and item.selection is None
+        )
+        yield from self._pump_pipeline(None)
         pending = []
         pending_names = set()
         for obligation in obligations:
@@ -2513,6 +2742,9 @@ class PreparationJob:
                         )
             yield from self._install_obligation(obligation, selections)
         yield from self._consolidate(pending, selections)
+        if self.session._cache is not None:
+            with self._timing.span("cache_save"):
+                self.session._cache.flush()
         for name, (request, children) in composites.items():
             plan = request.plan
             child_plans = {count: child.plan for count, child in children.items()}
@@ -2541,6 +2773,7 @@ class PreparationJob:
                 request, None, state, None, None, programs, variants=plan.variants
             )
             yield "metadata"
+        self._release_race_resources()
         self._phase = "finishing"
         summary = yield from self.session._drain()
         if summary is not None:

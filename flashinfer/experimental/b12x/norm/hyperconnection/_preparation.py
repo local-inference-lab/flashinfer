@@ -322,6 +322,7 @@ def plan_hyperconnection(caps, *, invocation=FrozenMapping(), override=None):
         autotune_effort=capture_autotune_effort().value,
         **options,
     )
+    program_query = _program_query_payload(TUNING.encode_query(query))
     return Plan(
         contract=TUNING,
         query=query,
@@ -332,7 +333,7 @@ def plan_hyperconnection(caps, *, invocation=FrozenMapping(), override=None):
         _compile_jobs=lambda config, device: (
             CompileJob.create(
                 "b12x.norm.hyperconnection._preparation:_compile_hyperconnection",
-                _program_query_payload(TUNING.encode_query(query)),
+                program_query,
                 config.to_dict(),
                 CompileJob.DEVICE_ORDINAL,
             ),

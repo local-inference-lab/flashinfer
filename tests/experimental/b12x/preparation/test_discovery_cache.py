@@ -305,7 +305,7 @@ def test_cancelled_discovery_releases_lock_without_publishing(tmp_path, monkeypa
             blocker.release()
         engine._stop.clear()
 
-        def interrupted(obligation):
+        def interrupted(obligation, state, wait):
             yield "metadata"
             raise AssertionError("cancelled discovery was resumed")
 

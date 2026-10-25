@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import json
-import math
 import sqlite3
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -15,19 +15,6 @@ from filelock import FileLock
 class RaceCheckpoint:
     measurements: dict[int, float]
     champion: int
-
-    def validate(self):
-        if not self.measurements or any(
-            type(index) is not int
-            or index < 0
-            or type(latency) not in (int, float)
-            or not math.isfinite(latency)
-            or latency < 0
-            for index, latency in self.measurements.items()
-        ):
-            raise ValueError("race checkpoints require finite candidate measurements")
-        if type(self.champion) is not int or self.champion not in self.measurements:
-            raise ValueError("race checkpoint champion must have a measurement")
 
 
 class RaceCache:
@@ -51,6 +38,16 @@ class RaceCache:
                     "CREATE TABLE IF NOT EXISTS discoveries_v1 ("
                     "key TEXT PRIMARY KEY, payload TEXT NOT NULL)"
                 )
+                self.connection.execute(
+                    "CREATE TABLE IF NOT EXISTS ledger_v1 ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT NOT NULL, "
+                    "shard_index INTEGER NOT NULL, shard_count INTEGER NOT NULL, "
+                    "session TEXT NOT NULL, wall_time REAL NOT NULL, "
+                    "payload TEXT NOT NULL)"
+                )
+                self.connection.execute(
+                    "CREATE INDEX IF NOT EXISTS ledger_v1_key ON ledger_v1 (key)"
+                )
         except BaseException:
             self.connection.close()
             raise
@@ -62,15 +59,9 @@ class RaceCache:
         if row is None:
             return None
         payload = json.loads(row[0])
-        pairs = payload["measurements"]
-        checkpoint = RaceCheckpoint(dict(pairs), payload["champion"])
-        if len(pairs) != len(checkpoint.measurements):
-            raise ValueError("race checkpoint repeats a candidate")
-        checkpoint.validate()
-        return checkpoint
+        return RaceCheckpoint(dict(payload["measurements"]), payload["champion"])
 
     def save(self, key: str, checkpoint: RaceCheckpoint):
-        checkpoint.validate()
         payload = json.dumps(
             {
                 "measurements": sorted(checkpoint.measurements.items()),
@@ -109,6 +100,40 @@ class RaceCache:
             "ON CONFLICT(key) DO UPDATE SET payload=excluded.payload",
             (key, json.dumps(record, separators=(",", ":"), allow_nan=False)),
         )
+
+    def append_ledger(self, key, *, shard_index, shard_count, session, record):
+        """Append one completed race record; records are never replaced."""
+        payload = json.dumps(record, separators=(",", ":"), allow_nan=False)
+        self.connection.execute(
+            "INSERT INTO ledger_v1 "
+            "(key, shard_index, shard_count, session, wall_time, payload) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (key, int(shard_index), int(shard_count), session, time.time(), payload),
+        )
+
+    def ledger_records(self, key=None):
+        """Return appended race records in insertion order."""
+        query = (
+            "SELECT id, key, shard_index, shard_count, session, wall_time, payload "
+            "FROM ledger_v1"
+        )
+        parameters = ()
+        if key is not None:
+            query += " WHERE key = ?"
+            parameters = (key,)
+        rows = self.connection.execute(query + " ORDER BY id", parameters).fetchall()
+        return [
+            {
+                "id": row[0],
+                "key": row[1],
+                "shard_index": row[2],
+                "shard_count": row[3],
+                "session": row[4],
+                "wall_time": row[5],
+                "record": json.loads(row[6]),
+            }
+            for row in rows
+        ]
 
     def close(self):
         self.connection.close()

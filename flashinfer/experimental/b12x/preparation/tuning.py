@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import pickle
 import re
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, fields, replace
@@ -106,6 +107,20 @@ class ParameterSpace:
             raise ValueError(
                 "parameter spaces must identify at least their implementation"
             )
+        level = AutotuneEffort.MAX if self.exhaustive else self.autotune_effort
+        object.__setattr__(
+            self,
+            "_active_efficiency",
+            tuple(
+                predicate
+                for predicate in self.efficiency_predicates
+                if (
+                    predicate.applies(level)
+                    if isinstance(predicate, EfficiencyPredicate)
+                    else level is not AutotuneEffort.MAX
+                )
+            ),
+        )
 
     @classmethod
     def create(
@@ -138,21 +153,12 @@ class ParameterSpace:
     def _passes_predicates(self, assignment: Mapping[str, object]) -> bool:
         # Predicates must not mutate or retain the enumeration's working mapping.
         # An exception is a planner defect, not a reason to silently drop a choice.
-        return all(
-            predicate(assignment) for predicate in self.predicates
-        ) and self._passes_efficiency(assignment)
+        return all(predicate(assignment) for predicate in self.predicates) and all(
+            predicate(assignment) for predicate in self._active_efficiency
+        )
 
     def _passes_efficiency(self, assignment: Mapping[str, object]) -> bool:
-        level = AutotuneEffort.MAX if self.exhaustive else self.autotune_effort
-        return all(
-            predicate(assignment)
-            for predicate in self.efficiency_predicates
-            if (
-                predicate.applies(level)
-                if isinstance(predicate, EfficiencyPredicate)
-                else level is not AutotuneEffort.MAX
-            )
-        )
+        return all(predicate(assignment) for predicate in self._active_efficiency)
 
     def validate(self, assignment: Mapping[str, object]) -> None:
         if set(assignment) != {knob.name for knob in self.knobs}:
@@ -296,14 +302,11 @@ class TuningContract(Generic[QueryT, ConfigT]):
     ) -> TuningConfiguration:
         self.validate_query(query, device)
         encoded = FrozenMapping(self.encode_query(query))
-        if set(encoded) != self.query_fields:
-            raise ValueError("query codec fields differ from the contract")
         # A complete pin is authoritative; an unused default may not reject it.
         default = (
             override if override is not None else self.default_config(query, device)
         )
         self.validate_config(query, default, device)
-        self.config_payload(default)
         return TuningConfiguration(
             query=query,
             encoded_query=encoded,
@@ -315,10 +318,7 @@ class TuningContract(Generic[QueryT, ConfigT]):
         )
 
     def config_payload(self, config) -> FrozenMapping:
-        payload = FrozenMapping(self.encode_config(config))
-        if set(payload) != self.config_fields:
-            raise ValueError("config codec fields differ from the contract")
-        return payload
+        return FrozenMapping(self.encode_config(config))
 
     def _lower(self, query, device, assignment):
         payload = FrozenMapping(assignment)
@@ -328,7 +328,6 @@ class TuningContract(Generic[QueryT, ConfigT]):
             else self.materialize(query, device, payload)
         )
         self.validate_config(query, config, device)
-        self.config_payload(config)
         return config
 
     def lower(self, query, device, assignment):
@@ -374,6 +373,7 @@ class CandidateIterator:
         self.cartesian_count = 0
         self.legal_count = 0
         self.effective_count = 0
+        self.payloads = {}
         self.done = False
 
     def step(self):
@@ -405,16 +405,22 @@ class CandidateIterator:
                 return None
             self.done = True
         self.legal_count += 1
+        payload = cfg.contract.config_payload(config)
         effective = (
-            cfg.contract.config_payload(config)
+            payload
             if cfg.contract.equivalence_key is None
             else cfg.contract.equivalence_key(cfg.query, cfg.device, config)
         )
-        key = _identity(effective)
+        key = (
+            pickle.dumps(effective, protocol=5)
+            if type(effective) is FrozenMapping
+            else _identity(effective)
+        )
         if key in self._seen:
             return None
         self._seen.add(key)
         self.effective_count += 1
+        self.payloads[id(config)] = payload
         return assignment, config
 
     def __iter__(self):

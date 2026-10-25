@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import pickle
+import hashlib
 from collections.abc import Mapping
-from dataclasses import fields, is_dataclass
-from enum import Enum
 from functools import lru_cache
 import json
 from pathlib import Path
@@ -14,51 +14,6 @@ from b12x._lib.compile_pool import CompilationPlan
 from b12x._lib.source_dependencies import canonical_module, source_dependencies
 from ._cache import digest
 from .types import FrozenMapping
-
-
-def _metadata(value):
-    if value is None or type(value) in (bool, int, float, str):
-        return value
-    if isinstance(value, FrozenMapping):
-        return ["frozen_mapping", value.to_dict()]
-    if isinstance(value, Enum):
-        return [
-            "enum",
-            canonical_module(type(value).__module__),
-            type(value).__qualname__,
-            _metadata(value.value),
-        ]
-    if is_dataclass(value) and not isinstance(value, type):
-        return [
-            "dataclass",
-            canonical_module(type(value).__module__),
-            type(value).__qualname__,
-            [
-                [item.name, _metadata(getattr(value, item.name))]
-                for item in fields(value)
-            ],
-        ]
-    if isinstance(value, Mapping):
-        if all(type(key) is str for key in value):
-            return ["mapping", {key: _metadata(item) for key, item in value.items()}]
-        return [
-            "mapping",
-            sorted(
-                [(_metadata(key), _metadata(item)) for key, item in value.items()],
-                key=lambda item: json.dumps(item[0], sort_keys=True),
-            ),
-        ]
-    if isinstance(value, (tuple, list)):
-        return [type(value).__name__, [_metadata(item) for item in value]]
-    import torch
-
-    if isinstance(value, torch.dtype):
-        return ["dtype", str(value)]
-    if isinstance(value, torch.device):
-        if value.index is not None:
-            raise ValueError("compile job placement requires CompileJob.DEVICE_ORDINAL")
-        return ["device", value.type]
-    raise TypeError(f"unsupported discovery metadata: {type(value).__name__}")
 
 
 @lru_cache(maxsize=None)
@@ -117,9 +72,9 @@ def discovery_key(candidates, device):
     if sources is None:
         return None
     identity = device.identity
-    return digest(
+    header = digest(
         {
-            "schema": 1,
+            "schema": 2,
             "target": (
                 identity.vendor,
                 identity.compute_capability,
@@ -129,19 +84,14 @@ def discovery_key(candidates, device):
             ),
             "compiler": _compiler_context(identity.compute_capability),
             "sources": sources,
-            "candidates": [
-                (
-                    assignment.to_dict(),
-                    payload.to_dict(),
-                    [
-                        (job.factory, _metadata(job.args), _metadata(job.kwargs))
-                        for job in jobs
-                    ],
-                )
-                for assignment, payload, jobs in candidates
-            ],
         }
     )
+    # Candidates are metadata trees; their pickles are deterministic for one
+    # source and toolchain, which the header already identifies.
+    checksum = hashlib.sha256(header.encode())
+    for candidate in candidates:
+        checksum.update(pickle.dumps(candidate, protocol=5))
+    return checksum.hexdigest()
 
 
 def discovery_record(candidates, compiled, identity):
