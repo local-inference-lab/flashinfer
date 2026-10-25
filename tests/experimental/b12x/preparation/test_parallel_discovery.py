@@ -1,6 +1,7 @@
 """Program discovery preserves identities and shares bounded compiler admission."""
 
 import pickle
+import json
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -22,6 +23,34 @@ def finish(iterator):
             next(iterator)
         except StopIteration as done:
             return done.value
+
+
+def test_candidate_identity_ignores_metadata_reference_sharing(tmp_path):
+    from b12x.preparation import FrozenMapping
+    from b12x.preparation.session import _coalesce_requests
+
+    identities = []
+    for independent_strings in (False, True):
+        item = request(name="same", tuning=contract())
+        with session(tmp_path, compile_workers=0) as engine:
+            job = engine.begin((item,))
+            (obligation,) = finish(job._configure(_coalesce_requests((item,))))
+            if independent_strings:
+                obligation.candidates = [
+                    (
+                        FrozenMapping(json.loads(json.dumps(assignment.to_dict()))),
+                        config,
+                    )
+                    for assignment, config in obligation.candidates
+                ]
+            finish(job._describe_candidates(obligation))
+            identities.append(
+                (
+                    obligation.candidate_program_identity,
+                    job._choice_key(obligation, {}),
+                )
+            )
+    assert identities[0] == identities[1]
 
 
 @pytest.mark.parametrize("workers", [1, 4])

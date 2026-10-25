@@ -74,7 +74,7 @@ def discovery_key(candidates, device):
     identity = device.identity
     header = digest(
         {
-            "schema": 2,
+            "schema": 3,
             "target": (
                 identity.vendor,
                 identity.compute_capability,

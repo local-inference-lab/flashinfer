@@ -39,7 +39,7 @@ from b12x._lib.runtime_control import (
     KernelResolutionFrozenError,
     kernel_resolution_guard,
 )
-from ._cache import SelectionCache, cache_identity, digest
+from ._cache import SelectionCache, _json, cache_identity, digest
 from ._efficiency import AutotuneEffort, capture_autotune_effort
 from ._discovery import discovery_key, discovery_record, restore_discovery
 from ._measurement import DEFAULT_SAMPLES, SURVIVOR_ROUNDS
@@ -1686,14 +1686,13 @@ class PreparationJob:
             if self._warmup_only:
                 return False
             checksum.update(
-                pickle.dumps(
+                _json(
                     (
-                        assignment,
-                        self._payload(obligation, config),
+                        assignment.to_dict(),
+                        self._payload(obligation, config).to_dict(),
                         sorted((p.dialect, p.key) for p in programs),
-                    ),
-                    protocol=5,
-                )
+                    )
+                ).encode()
             )
             if wait:
                 self._candidates_described = max(self._candidates_described, count)
