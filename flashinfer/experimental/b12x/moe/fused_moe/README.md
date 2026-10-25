@@ -85,9 +85,12 @@ N64 inline candidates. SM121 retains its device-specific defaults.
 
 M16/M32 inline candidates at routing densities above one tile per expert are
 searched only at `B12X_AUTOTUNE_EFFORT=audit`; the default effort omits them.
-Resident-grid caps race a power-of-two and fractional ladder up to the
-cooperative residency bound at every effort. `off` selects the heuristic
-configuration. Effort is captured in the tuning query and does not affect
+Resident-grid caps race a power-of-two ladder plus half, three-quarter,
+seven-eighth and full rungs up to the cooperative residency bound. The
+default effort omits caps below a quarter of the SMs, and on the compact W4A8
+path it races the micro kernel only up to 16 tokens and the dynamic kernel only
+from 8 tokens; the audit races every rung and both kernels. `off` selects the
+heuristic configuration. Effort is captured in the tuning query and does not affect
 compiled program identities. Compact MXFP4 W4A8
 retains reconstructed K128 scale words across both K64 pipeline steps.
 

@@ -45,9 +45,12 @@ def query(m=8, n=1792, k=5120, **kwargs):
 def test_auto_includes_every_eligible_dense_configuration(m, n, k, effort):
     q = query(m, n, k, autotune_effort=effort)
     inner = quantized_query(q, expected_m=quantized_expected_m(q))
+    # Sixteen-wide dense N tiles never came within 2% of a winner; only the
+    # audit races them.
     expected = {
         DENSE_TUNING.config_payload(config)
         for _, config in DENSE_TUNING.choices(inner, IDENTITY)
+        if effort == "audit" or config.tile_n != 16
     }
     configs = [config for _, config in TUNING.choices(q, IDENTITY)]
     quantized = [config for config in configs if config.mode == "quantized"]
@@ -59,7 +62,8 @@ def test_auto_includes_every_eligible_dense_configuration(m, n, k, effort):
     }
     assert expected <= actual
     assert len(actual) == len(quantized) > 1
-    assert sum(config.mode == "a16" for config in configs) == 32
+    # Two N tiles, two K tiles, two warp counts and five K splits.
+    assert sum(config.mode == "a16" for config in configs) == 40
     for config in configs:
         assert TUNING.decode_config(FrozenMapping(config.to_dict())) == config
     for config in quantized:
@@ -169,8 +173,12 @@ def test_fp4_quantized_search_includes_dense_candidates(recipe, rows, effort):
         autotune_effort=effort,
     )
     inner = quantized_query(q, expected_m=quantized_expected_m(q))
+    # Sixteen-wide dense N tiles never came within 2% of a winner; only the
+    # audit races them.
     expected = {
-        DENSE_TUNING.config_payload(c) for _, c in DENSE_TUNING.choices(inner, IDENTITY)
+        DENSE_TUNING.config_payload(c)
+        for _, c in DENSE_TUNING.choices(inner, IDENTITY)
+        if effort == "audit" or c.tile_n != 16
     }
     configs = [c for _, c in TUNING.choices(q, IDENTITY)]
     quantized = [c for c in configs if c.mode == "quantized"]
@@ -204,15 +212,18 @@ def test_fp4_quantized_search_includes_dense_candidates(recipe, rows, effort):
 
 
 @pytest.mark.parametrize("rows", [128, 4096])
-def test_mxfp8_prefill_races_packed_tiles_beside_expanded_baseline(rows):
+@pytest.mark.parametrize("effort", ["default", "audit"])
+def test_mxfp8_prefill_races_packed_tiles_only_at_audit(rows, effort):
     from b12x.gemm.blockscaled._tuning import mxfp8_a16_dequant
 
-    q = query(m=rows)
+    # Packed-weight A16 tiles never came within 2% of a winner beside the
+    # expanded baseline, so the default races the baseline alone.
+    q = query(m=rows, autotune_effort=effort)
     configs = [c for _, c in TUNING.choices(q, IDENTITY)]
     expanded = [c for c in configs if mxfp8_a16_dequant(q, c)]
     packed = [c for c in configs if c.mode == "a16" and not mxfp8_a16_dequant(q, c)]
     assert len(expanded) == 1
-    assert len(packed) == 32
+    assert len(packed) == (40 if effort == "audit" else 0)
     assert all(c.a16_backend == "packed" for c in packed)
     assert {
         c for _, c in TUNING.choices(replace(q, activation_mode="a16"), IDENTITY)

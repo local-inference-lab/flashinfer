@@ -45,14 +45,14 @@ def _configs(query):
                     implementation=name, threads=threads, blocks=count
                 )
         elif name == "twoshot":
-            for count in (32, 64):
+            for count in (32, 64, 128):
                 yield CollectiveConfig(
                     implementation=name, threads=threads, blocks=count
                 )
         elif name == "dcp":
             setup = payload["setup"]
             thread_values = (threads,) if setup["threads_override"] else (128, 256, 512)
-            block_values = (blocks,) if setup["blocks_override"] else (8, 16, 32)
+            block_values = (blocks,) if setup["blocks_override"] else (8, 16, 32, 64)
             for threads in thread_values:
                 for count in block_values:
                     yield CollectiveConfig(
@@ -86,6 +86,14 @@ def _parameters(query, device):
             "blocks": tuple(dict.fromkeys(c.blocks for c in configs)),
         },
         predicates=(lambda value: CollectiveConfig(**value) in configs,),
+        # The eager pull transport is raced as an alternative only by the audit;
+        # it is still raced when it is the configured transport.
+        efficiency_predicates=(
+            lambda value: (
+                value["implementation"] != "pull"
+                or query.default.implementation == "pull"
+            ),
+        ),
         autotune_effort=effort,
     )
 

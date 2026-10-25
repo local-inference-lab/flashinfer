@@ -121,6 +121,7 @@ def _parameters(query, device):
         predicates=(
             lambda p: not p["direct_routes"] or query.routes <= query.first[6],
         ),
+        efficiency_predicates=(lambda p: p["groups_per_task"] not in (1, 64),),
         autotune_effort=query.autotune_effort,
     )
 

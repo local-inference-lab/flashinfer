@@ -167,10 +167,10 @@ def _config(config):
         len(config) != 3
         or config[0] not in (64, 128)
         or config[1] not in (64, 128)
-        or config[2] not in (1, 2, 4, 8)
+        or config[2] not in (1, 2, 4, 8, 16)
     ):
         raise ValueError(
-            "A16 config must be (N tile 64/128, K tile 64/128, split-K 1/2/4/8)"
+            "A16 config must be (N tile 64/128, K tile 64/128, split-K 1/2/4/8/16)"
         )
     return config
 

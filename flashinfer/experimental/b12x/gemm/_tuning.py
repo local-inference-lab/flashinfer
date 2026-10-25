@@ -420,7 +420,7 @@ def knob_values(query):
         tile_n=(16, 32, 64, 128),
         tile_k=(128, 256, 512)
         if fp4
-        else (64, 128)
+        else (64, 128, 256)
         if query.recipe in ("mxfp8", "tensor_fp8")
         else (128,),
         load_path=("tma", "cpasync") if query.recipe == "nvfp4" else ("tma",),

@@ -15,7 +15,11 @@ from b12x.preparation.tuning import (
 )
 
 _MHC_MULT = 4
-_PREFILL_TF32_MIN_TOKENS = 384
+_MIXES = 24
+# TF32 projection overtakes the native fused path at about fifty tokens on
+# SM120; long-M tile shapes start where the first TMA pipeline rules did.
+_TF32_MIN_TOKENS = 52
+_LONG_M_TOKENS = 384
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -116,95 +120,66 @@ def _tf32_config(
     )
 
 
+def _enough_split_work(query, splits):
+    """Long M keeps at least 2048 K columns per split."""
+    return query.max_tokens < 2048 or _MHC_MULT * query.hidden_size // splits >= 2048
+
+
+def _grid_filling_splits(query, device, *, m_warps, tile_n, tile_k):
+    """Largest legal K split whose grid fits the resident SMs."""
+    if device is None:
+        return 1
+    total_k = _MHC_MULT * query.hidden_size
+    sms = device.sm_count
+    m_tiles = (query.max_tokens + 16 * m_warps - 1) // (16 * m_warps)
+    n_tiles = (_MIXES + tile_n - 1) // tile_n
+    legal = [
+        splits
+        for splits in range(1, max(2, query.split_k))
+        if (total_k // tile_k) % splits == 0 and _enough_split_work(query, splits)
+    ]
+    fitting = [splits for splits in legal if m_tiles * n_tiles * splits <= sms]
+    return max(fitting) if fitting else min(legal)
+
+
 def _projection_default_config(
     query: MhcQuery,
-    _device: DeviceIdentity | None,
+    device: DeviceIdentity | None,
 ) -> MhcConfig:
     tokens = int(query.max_tokens)
-    hidden_size = int(query.hidden_size)
     eligible = _tf32_eligible(query)
     pin = _tf32_pin(query)
-    backend = (
-        "tf32_tma"
-        if eligible
-        and (pin is True or (pin is None and tokens >= _PREFILL_TF32_MIN_TOKENS))
-        else "native"
-    )
-    if hidden_size == 5_120 and tokens == 128:
+    tf32 = eligible and (pin is True or (pin is None and tokens >= _TF32_MIN_TOKENS))
+    if not tf32:
         return _tf32_config(
-            backend=backend,
-            tile_m=32,
+            backend="native",
+            tile_m=16,
             tile_n=8,
             tile_k=256,
             num_stages=1,
-            num_m_warps=2,
-            num_n_warps=1,
-            k_splits=8,
-        )
-    if hidden_size == 5_120 and tokens == 4_096:
-        return _tf32_config(
-            backend=backend,
-            tile_m=64,
-            tile_n=24,
-            tile_k=64,
-            num_stages=2,
-            num_m_warps=4,
-            num_n_warps=1,
-            k_splits=4,
-        )
-    if hidden_size == 4_096 and tokens >= 8_192:
-        return _tf32_config(
-            backend=backend,
-            tile_m=128,
-            tile_n=24,
-            tile_k=64,
-            num_stages=2,
-            num_m_warps=8,
-            num_n_warps=1,
-            k_splits=4,
-        )
-    if hidden_size == 4_096 and tokens >= 3_584:
-        return _tf32_config(
-            backend=backend,
-            tile_m=192,
-            tile_n=24,
-            tile_k=64,
-            num_stages=2,
-            num_m_warps=12,
-            num_n_warps=1,
-            k_splits=8,
-        )
-    if hidden_size == 4_096 and tokens >= 2_304:
-        return _tf32_config(
-            backend=backend,
-            tile_m=64,
-            tile_n=24,
-            tile_k=64,
-            num_stages=2 if tokens >= 3_072 else 3,
-            num_m_warps=4,
-            num_n_warps=1,
-            k_splits=8,
-        )
-    if hidden_size != 4_096 and tokens >= 4_096:
-        return _tf32_config(
-            backend=backend,
-            tile_m=32,
-            tile_n=8,
-            tile_k=256,
-            num_stages=1,
-            num_m_warps=2,
+            num_m_warps=1,
             num_n_warps=1,
             k_splits=1,
         )
+    # Short M splits the N tile across two warps over 16- or 32-row M tiles;
+    # long M keeps one N warp over whole-quad M tiles covering every mix. Both
+    # keep three TMA stages in flight and fill the SMs through the K split.
+    if tokens < _LONG_M_TOKENS:
+        m_warps = 1 if tokens <= 64 else 2
+        tile_n, n_warps, tile_k = 16, 2, 128
+    else:
+        m_warps = 4 if tokens < 2048 else 8
+        tile_n, n_warps, tile_k = _MIXES, 1, 64
     return _tf32_config(
-        backend=backend,
-        tile_m=16,
-        tile_n=8,
-        tile_k=256,
-        num_stages=1,
-        num_m_warps=1,
-        num_n_warps=1,
-        k_splits=1,
+        tile_m=16 * m_warps,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        num_stages=3,
+        num_m_warps=m_warps,
+        num_n_warps=n_warps,
+        k_splits=_grid_filling_splits(
+            query, device, m_warps=m_warps, tile_n=tile_n, tile_k=tile_k
+        ),
     )
 
 
@@ -225,17 +200,6 @@ def _tf32_eligible(query):
 
 def _default_config(query, device):
     config = _projection_default_config(query, device)
-    if config.backend == "native":
-        config = _tf32_config(
-            backend="native",
-            tile_m=16,
-            tile_n=8,
-            tile_k=256,
-            num_stages=1,
-            num_m_warps=1,
-            num_n_warps=1,
-            k_splits=1,
-        )
     threshold = int(query.controls.get("B12X_MHC_PREFILL_MIN_TOKENS", "96"))
     prepared = query.lagged_mix and config.backend == "native"
     if query.operation == "pre":
@@ -441,7 +405,7 @@ def _tuning_parameters(query: MhcQuery, device: DeviceIdentity | None):
             TUNING.knobs, values=values, autotune_effort=_autotune_effort(query)
         )
 
-    from ._kernels import MHCPrefillTf32ProjectTmaKernel, _MIXES
+    from ._kernels import MHCPrefillTf32ProjectTmaKernel
 
     smem_limit = query.smem_limit
     if type(smem_limit) is not int or smem_limit <= 0:
@@ -483,12 +447,22 @@ def _tuning_parameters(query: MhcQuery, device: DeviceIdentity | None):
             for smaller in m_warp_values
         )
 
-    def bounded_split_grid(p):
-        if (
-            p["backend"] != "tf32_tma"
-            or device is None
-            or p["projection_k_splits"] <= 8
-        ):
+    sms = None if device is None else device.sm_count
+
+    both_backends = len(backends) == 2
+
+    def tf32_regime(p):
+        # Native decode beats every TF32 geometry below this token count.
+        return not both_backends or p["backend"] != "tf32_tma" or query.max_tokens >= 32
+
+    def native_regime(p):
+        return not both_backends or p["backend"] != "native" or query.max_tokens < 128
+
+    def resident_grid(p):
+        # Winning grids fill at least 40% of the SMs unless no legal K split
+        # for the tile reaches that, and a K split never extends the grid
+        # past one wave.
+        if p["backend"] != "tf32_tma" or sms is None:
             return True
         tile_m = 16 * p["projection_num_m_warps"]
         grid = (
@@ -496,28 +470,48 @@ def _tuning_parameters(query: MhcQuery, device: DeviceIdentity | None):
             * ((_MIXES + p["projection_tile_n"] - 1) // p["projection_tile_n"])
             * p["projection_k_splits"]
         )
-        return grid <= 4 * device.sm_count
+        splits = p["projection_k_splits"]
+        k_tiles = total_k // p["projection_tile_k"]
+        largest = max(
+            candidate
+            for candidate in values["projection_k_splits"]
+            if k_tiles % candidate == 0 and _enough_split_work(query, candidate)
+        )
+        filled = 2 * sms <= 5 * grid or splits == largest
+        return filled and (splits == 1 or grid <= sms)
 
-    def prefill_warp_layout(p):
-        if p["backend"] != "tf32_tma" or query.max_tokens < 384:
+    def warp_layout(p):
+        # Short M splits the N tile one MMA tile per warp; long M keeps one N
+        # warp and draws its parallelism from M warps.
+        if p["backend"] != "tf32_tma":
+            return True
+        if query.max_tokens >= _LONG_M_TOKENS:
+            return p["projection_num_n_warps"] == 1
+        return p["projection_num_n_warps"] == p["projection_tile_n"] // 8
+
+    def tile_shape(p):
+        # Short M favors small M tiles and N tiles without padding; long M
+        # favors M tiles of whole warp quads and one N tile covering all mixes.
+        if p["backend"] != "tf32_tma":
             return True
         m_warps = p["projection_num_m_warps"]
-        return p["projection_num_n_warps"] == 1 and (
-            m_warps % 4 == 0 or p["projection_tile_n"] == 8
-        )
+        if query.max_tokens >= _LONG_M_TOKENS:
+            return m_warps % 4 == 0 and p["projection_tile_n"] >= _MIXES
+        return m_warps <= 4 and p["projection_tile_n"] <= _MIXES
 
-    def prefill_pipeline(p):
-        if p["backend"] != "tf32_tma" or query.max_tokens < 384:
+    def pipeline(p):
+        # Overlap TMA with at least two stages; short M keeps more K columns
+        # in flight per CTA because it has fewer M tiles to spread them over.
+        if p["backend"] != "tf32_tma":
             return True
         stages = p["projection_num_stages"]
-        buffered_k = stages * p["projection_tile_k"]
-        return 128 <= buffered_k <= 256 and (stages > 1 or p["projection_tile_n"] == 8)
+        buffered = stages * p["projection_tile_k"]
+        floor = 128 if query.max_tokens >= _LONG_M_TOKENS else 192
+        return p["projection_tile_k"] >= 64 and stages >= 2 and floor <= buffered <= 512
 
     def prefill_split_work(p):
-        return (
-            p["backend"] != "tf32_tma"
-            or query.max_tokens < 2048
-            or total_k // p["projection_k_splits"] >= 2048
+        return p["backend"] != "tf32_tma" or _enough_split_work(
+            query, p["projection_k_splits"]
         )
 
     return ParameterSpace.create(
@@ -561,9 +555,12 @@ def _tuning_parameters(query: MhcQuery, device: DeviceIdentity | None):
         ),
         # Scheduling, warp layout and pipeline guesses; the audit lifts them.
         efficiency_predicates=(
-            bounded_split_grid,
-            prefill_warp_layout,
-            prefill_pipeline,
+            tf32_regime,
+            native_regime,
+            resident_grid,
+            warp_layout,
+            tile_shape,
+            pipeline,
             prefill_split_work,
         ),
     )

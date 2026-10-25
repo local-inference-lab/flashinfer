@@ -122,22 +122,7 @@ def _prefill_eligible(query):
     )
 
 
-def _prefill_preferred(query):
-    return (query.out_features, query.in_features) in (
-        (384, 5120),
-        (512, 5120),
-        (1024, 5120),
-    )
-
-
 def default_config(query, device):
-    prefill_min_rows = 128 if query.out_features == 1024 else 256
-    if (
-        _prefill_eligible(query)
-        and _prefill_preferred(query)
-        and query.max_rows >= prefill_min_rows
-    ):
-        return GemvConfig(backend="prefill")
     if _torch_eligible(query) and query.max_rows > 8:
         return GemvConfig(backend="torch")
     n_tiles = (query.out_features + 63) // 64
@@ -223,10 +208,12 @@ def _parameters(query, device):
         TUNING.knobs,
         values={"backend": tuple(backends)},
         predicates=(_eligible,),
+        # The prefill GEMM is raced only by the audit; it never came within 2%
+        # of a winner on the shapes it was preferred for.
         efficiency_predicates=(
             lambda choice: (
                 (choice["backend"] != "mma" or _mma_preferred(query))
-                and (choice["backend"] != "prefill" or _prefill_preferred(query))
+                and choice["backend"] != "prefill"
             ),
         ),
         autotune_effort=query.autotune_effort,

@@ -124,9 +124,8 @@ def test_audit_keeps_backend_support_mandatory(backend, changes):
 def test_default_preserves_projection_defaults():
     q = query()
     assert TUNING.default_config(q, None).backend == "torch"
-    assert (
-        TUNING.default_config(replace(q, out_features=384), None).backend == "prefill"
-    )
+    # The prefill GEMM lost every race on the shapes it used to be chosen for.
+    assert TUNING.default_config(replace(q, out_features=384), None).backend == "torch"
     assert TUNING.default_config(replace(q, max_rows=1), None) == GemvConfig(
         backend="simt", rows_per_tile=2
     )

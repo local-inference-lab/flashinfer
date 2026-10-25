@@ -83,10 +83,10 @@ def test_w4a16_ordered_domain_with_conditional_grid(multi, effort):
 
 def test_ladder_traversal_counts():
     device = DeviceIdentity("nvidia", (12, 0), 188, "Blackwell")
-    for tokens, expected_raw, expected_legal in (
-        (8, 2256, 300),
-        (16, 2112, 228),
-        (24, 2112, 84),
+    for tokens, expected_raw, expected_legal, expected_audit in (
+        (8, 2444, 175, 325),
+        (16, 2288, 133, 247),
+        (24, 2288, 49, 91),
     ):
         q = replace(query(tokens=tokens), intermediate_size=576, csf_inline_scales=True)
         configuration = TUNING.configure(q, device=device)
@@ -94,3 +94,32 @@ def test_ladder_traversal_counts():
         list(iterator)
         assert iterator.cartesian_count == expected_raw
         assert iterator.legal_count == expected_legal
+        audit = TUNING.iterate(
+            TUNING.configure(replace(q, autotune_effort="audit"), device=device)
+        )
+        list(audit)
+        assert audit.legal_count == expected_audit
+
+
+def test_default_omits_small_caps_and_off_band_backends():
+    device = DeviceIdentity("nvidia", (12, 0), 188, "Blackwell")
+    for tokens, backends in (
+        (4, {"micro"}),
+        (12, {"micro", "dynamic"}),
+        (24, {"dynamic"}),
+    ):
+        q = replace(query(tokens=tokens), intermediate_size=576, csf_inline_scales=True)
+        raced = [config for _, config in TUNING.choices(q, device)]
+        assert {config.backend for config in raced} == backends
+        caps = {config.max_active_clusters for config in raced} - {None}
+        assert caps and min(caps) >= device.sm_count // 4
+        audited = [
+            config
+            for _, config in TUNING.choices(replace(q, autotune_effort="audit"), device)
+        ]
+        assert {config.backend for config in audited} >= backends
+        assert min({c.max_active_clusters for c in audited} - {None}) == 1
+    # Below eight tokens the dynamic kernel is legal but only the audit races it.
+    q = replace(query(tokens=4), intermediate_size=576, csf_inline_scales=True)
+    audited = TUNING.choices(replace(q, autotune_effort="audit"), device)
+    assert {config.backend for _, config in audited} == {"micro", "dynamic"}

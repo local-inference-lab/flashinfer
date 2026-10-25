@@ -894,7 +894,7 @@ def _launch_parameter_space(query, device):
         sms = device.sm_count
         ladder = sorted(
             {1 << exponent for exponent in range(sms.bit_length())}
-            | {max(1, sms // 2), max(1, 3 * sms // 4), sms}
+            | {max(1, sms // 2), max(1, 3 * sms // 4), max(1, 7 * sms // 8), sms}
         )
         return ParameterSpace.create(
             tuple(
@@ -922,7 +922,7 @@ def _launch_parameter_space(query, device):
         limit = 2 * device.sm_count
         ladder = sorted(
             {1 << exponent for exponent in range(limit.bit_length())}
-            | {device.sm_count, max(1, 3 * limit // 4), limit}
+            | {device.sm_count, max(1, 3 * limit // 4), max(1, 7 * limit // 8), limit}
         )
         return ParameterSpace.create(
             tuple(
@@ -957,6 +957,7 @@ def _launch_parameter_space(query, device):
             clamp,
             min(clamp, max(1, device.sm_count // 2)),
             min(clamp, max(1, 3 * device.sm_count // 4)),
+            min(clamp, max(1, 7 * device.sm_count // 8)),
         }
     )
     return {"max_active_clusters": (None, *ladder)}
@@ -993,17 +994,40 @@ def _tuning_parameters(query, device):
             "w4a16_block_size_m": (None, *blocks),
             "w4a16_pipeline_stages": (None, 2, 3, 4, 5),
         }
+    # Compact W4A8 decode: the per-row micro kernel wins up to 16 tokens and
+    # the M16 dynamic kernel from about 8 tokens; outside those bands the other
+    # backend never comes within 2% of the winner.
+    compact = _compact_w4a8_query(launch_query)
+    micro_tokens = 16 if compact else None
+    dynamic_tokens = 8 if compact else None
+    grid_knob = next(knob for knob in space.knobs if knob.name == "max_active_clusters")
+    top_cap = max((value for value in grid_knob.values if value is not None), default=0)
     return ParameterSpace.create(
         space.knobs,
         values=w4a16_values,
         predicates=space.predicates,
         efficiency_predicates=(
             lambda p: (
+                micro_tokens is None
+                or p["backend"] != "micro"
+                or query.num_tokens <= micro_tokens
+            ),
+            lambda p: (
+                dynamic_tokens is None
+                or p["backend"] != "dynamic"
+                or query.num_tokens >= dynamic_tokens
+            ),
+            lambda p: (
                 not (
                     p["csf_inline_scales"]
                     and p["backend"] == "dynamic"
                     and query.routed_rows > query.num_experts * p["dynamic_tile_m"]
                 )
+            ),
+            # Caps below a quarter of the ladder's top rung never win a race.
+            lambda p: (
+                p["max_active_clusters"] is None
+                or 4 * p["max_active_clusters"] >= top_cap
             ),
         ),
         autotune_effort=query.autotune_effort,

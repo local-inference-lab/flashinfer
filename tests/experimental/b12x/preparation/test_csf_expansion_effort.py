@@ -31,13 +31,14 @@ def test_nested_candidates_and_heuristic_default(routes):
         if effort == "off":
             assert configs == {default}
         candidates.append(configs)
-    assert candidates[0] <= candidates[1] == candidates[2]
+    assert candidates[0] <= candidates[1] < candidates[2]
+    assert {c.groups_per_task for c in candidates[2] - candidates[1]} == {1, 64}
     if 384 < routes < 6144:
-        assert len(candidates[1]) == 28
+        assert (len(candidates[1]), len(candidates[2])) == (20, 28)
     elif 64 <= routes <= 384:
-        assert len(candidates[1]) == 42
+        assert (len(candidates[1]), len(candidates[2])) == (30, 42)
     else:
-        assert len(candidates[1]) == 14
+        assert (len(candidates[1]), len(candidates[2])) == (10, 14)
 
 
 def test_above_expert_count_direct_routes_are_never_raced_but_can_be_pinned():
@@ -82,7 +83,7 @@ def test_effort_captured_by_query_and_excluded_from_program_metadata(monkeypatch
     monkeypatch.setenv("B12X_AUTOTUNE_EFFORT", "off")
     assert captured.autotune_effort == "audit"
     assert len(expansion.TUNING.eligible_plan(captured, None).candidates) == 28
-    assert len(expansion.TUNING.eligible_plan(base, None).candidates) == 28
+    assert len(expansion.TUNING.eligible_plan(base, None).candidates) == 20
     assert expansion.TUNING.encode_query(captured) != expansion.TUNING.encode_query(
         base
     )
@@ -93,10 +94,14 @@ def test_effort_captured_by_query_and_excluded_from_program_metadata(monkeypatch
     calls = []
     monkeypatch.setattr(expansion.torch.cuda, "device", lambda ordinal: nullcontext())
     monkeypatch.setattr(
-        expansion, "compile_nvfp4_csf_pair", lambda *args: calls.append(args)
+        expansion,
+        "compile_nvfp4_csf_pair",
+        lambda *args, **kwargs: calls.append(args),
     )
     monkeypatch.setattr(
-        expansion, "compile_csf_active_experts", lambda *args: calls.append(args)
+        expansion,
+        "compile_csf_active_experts",
+        lambda *args, **kwargs: calls.append(args),
     )
     config = asdict(expansion.CsfExpansionConfig())
     for effort in ("off", "default", "audit"):
@@ -105,5 +110,5 @@ def test_effort_captured_by_query_and_excluded_from_program_metadata(monkeypatch
             config,
             0,
         )
-    assert len(calls) == 12
-    assert calls[:4] == calls[4:8] == calls[8:]
+    assert len(calls) == 18
+    assert calls[:6] == calls[6:12] == calls[12:]

@@ -417,6 +417,21 @@ def _parameters(query, device):
                     )
             configs.extend(FrozenMapping(config.to_dict()) for config in variants)
         choices = tuple(dict.fromkeys(configs))
+
+    def proven_variants(p):
+        # Sixteen-bit merges, two-way partitions, batched score tiles, compact
+        # shared cutoffs, four score passes and unordered output never came
+        # within 2% of a winner; the audit still races them.
+        fused = p["mxfp4"]
+        return fused is None or (
+            fused["mxfp4_merge_bits"] == 8
+            and fused["mxfp4_partition_count"] != 2
+            and fused["mxfp4_score_batch_tiles"] == 1
+            and fused["mxfp4_cutoff_strategy"] != "shared_compact"
+            and fused["mxfp4_score_passes"] != 4
+            and fused["ordered_output"]
+        )
+
     return ParameterSpace.create(
         TUNING.knobs,
         values={
@@ -424,6 +439,7 @@ def _parameters(query, device):
             "fused_merge": (FUSED_MERGE_AUTO,),
             "mxfp4": choices,
         },
+        efficiency_predicates=(proven_variants,),
         autotune_effort=query.autotune_effort,
     )
 

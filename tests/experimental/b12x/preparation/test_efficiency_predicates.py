@@ -133,15 +133,32 @@ def test_mhc_audit_preserves_correctness_rules(changes):
         TUNING.parameter_space(_audit(_query()), None).validate(_choice(**changes))
 
 
-def test_mhc_underoccupied_projection_remains_eligible():
-    from b12x.norm.mhc._tuning import TUNING
+def test_mhc_grid_fill_scales_with_sm_count_and_preserves_pins():
+    from b12x.norm.mhc._tuning import MhcConfig, TUNING
 
-    query = replace(_query(), max_tokens=1)
-    choice = _choice(projection_num_m_warps=1, projection_k_splits=8)
-    for capability, sm in (((12, 1), 48), ((12, 0), 188)):
-        TUNING.parameter_space(
-            query, DeviceIdentity("nvidia", capability, sm, "Blackwell")
-        ).validate(choice)
+    # Eight K splits over four 16-row M tiles fill two thirds of a 48-SM device
+    # and a sixth of a 188-SM device; the default tier wants at least 40%.
+    query = _query()
+    choice = _choice(
+        projection_num_m_warps=1,
+        projection_num_n_warps=3,
+        projection_num_stages=3,
+        projection_k_splits=8,
+    )
+    small = DeviceIdentity("nvidia", (12, 1), 48, "GB10")
+    large = DeviceIdentity("nvidia", (12, 0), 188, "RTX PRO 6000")
+    TUNING.parameter_space(query, small).validate(choice)
+    with pytest.raises(ValueError, match="efficiency predicates"):
+        TUNING.parameter_space(query, large).validate(choice)
+    TUNING.parameter_space(_audit(query), large).validate(choice)
+    config = MhcConfig(projection_tile_m=16, **choice)
+    assert TUNING.configure(query, device=large, override=config).pinned == config
+    # A K split never extends the grid past one wave on either device.
+    wide = {**choice, "projection_k_splits": 64}
+    for device in (small, large):
+        with pytest.raises(ValueError, match="efficiency predicates"):
+            TUNING.parameter_space(query, device).validate(wide)
+        TUNING.parameter_space(_audit(query), device).validate(wide)
 
 
 def test_mhc_declaration_captures_effort(monkeypatch):
@@ -180,97 +197,109 @@ def test_effort_does_not_change_compiled_program_identity(monkeypatch):
         _static_compile_cache_context.cache_clear()
 
 
-@pytest.mark.parametrize("capability,sm", [((12, 0), 188), ((12, 1), 48)])
 @pytest.mark.parametrize(
-    "boundary,changes",
+    "short,long",
     [
-        (384, {"projection_num_m_warps": 1, "projection_num_n_warps": 3}),
-        (384, {"projection_num_m_warps": 3}),
-        (384, {"projection_tile_k": 32}),
-        (384, {"projection_tile_k": 128, "projection_num_stages": 3}),
-        (2048, {"projection_k_splits": 16}),
+        # Short M splits the N tile one MMA tile per warp; long M keeps one N warp.
+        (
+            dict(
+                projection_num_m_warps=2,
+                projection_num_n_warps=3,
+                projection_k_splits=10,
+            ),
+            dict(
+                projection_num_m_warps=4,
+                projection_num_n_warps=1,
+                projection_k_splits=20,
+            ),
+        ),
+        # Short M admits any M tile up to 64 rows; long M wants whole warp quads.
+        (
+            dict(
+                projection_num_m_warps=3,
+                projection_num_n_warps=3,
+                projection_k_splits=10,
+            ),
+            dict(
+                projection_num_m_warps=8,
+                projection_num_n_warps=1,
+                projection_k_splits=40,
+            ),
+        ),
     ],
 )
-def test_mhc_prefill_correlations_preserve_products_and_pins(
-    capability, sm, boundary, changes
-):
+def test_mhc_long_m_boundary_swaps_warp_layout_and_preserves_pins(short, long):
     from b12x.norm.mhc._tuning import MhcConfig, TUNING
 
-    device = DeviceIdentity("nvidia", capability, sm, "Blackwell")
-    query = replace(_query(), max_tokens=boundary)
-    choice = _choice(
-        **(dict(projection_num_m_warps=4, projection_k_splits=8) | changes)
-    )
-    before = TUNING.parameter_space(replace(query, max_tokens=boundary - 1), device)
-    after = TUNING.parameter_space(query, device)
-    if sm == 48 and changes == {"projection_k_splits": 16}:
+    device = DeviceIdentity("nvidia", (12, 0), 188, "Blackwell")
+    below = replace(_query(), max_tokens=383)
+    above = replace(_query(), max_tokens=384)
+    for favored, other, choice in ((below, above, short), (above, below, long)):
+        choice = _choice(projection_num_stages=3, **choice)
+        TUNING.parameter_space(favored, device).validate(choice)
         with pytest.raises(ValueError, match="efficiency predicates"):
-            before.validate(choice)
-    else:
-        before.validate(choice)
-    with pytest.raises(ValueError, match="efficiency predicates"):
-        after.validate(choice)
-    replace(after, autotune_effort="audit").validate(choice)
-    config = MhcConfig(
-        projection_tile_m=16 * choice["projection_num_m_warps"], **choice
+            TUNING.parameter_space(other, device).validate(choice)
+        TUNING.parameter_space(_audit(other), device).validate(choice)
+        config = MhcConfig(
+            projection_tile_m=16 * choice["projection_num_m_warps"], **choice
+        )
+        assert TUNING.configure(other, device=device, override=config).pinned == config
+    assert (
+        TUNING.parameter_space(below, device).knobs
+        == TUNING.parameter_space(above, device).knobs
     )
-    assert TUNING.configure(query, device=device, override=config).pinned == config
-    assert before.knobs == after.knobs
 
 
-@pytest.mark.parametrize("capability,sm", [((12, 0), 188), ((12, 1), 48)])
 @pytest.mark.parametrize(
-    "hidden,m,tm,tn,tk,nw,stages,splits",
+    "hidden,tokens,m_warps,tn,tk,nw,stages,splits",
     [
-        (5120, 64, 16, 24, 64, 3, 3, 40),
-        (5120, 4096, 128, 24, 128, 1, 2, 5),
-        (5120, 4096, 128, 32, 64, 1, 2, 5),
-        (4096, 384, 64, 24, 64, 1, 3, 8),
-        (4096, 1024, 32, 8, 256, 1, 1, 1),
-        (7168, 3584, 64, 24, 64, 1, 3, 8),
-        (4096, 8192, 128, 24, 64, 1, 2, 4),
+        # Race winners on a 188-SM SM120 device: hidden 5120 from the tuning
+        # ledger, hidden 4096 from audit races over the whole legal space.
+        (5120, 64, 1, 24, 64, 3, 3, 20),
+        (5120, 128, 2, 16, 128, 2, 2, 20),
+        (5120, 512, 4, 24, 64, 1, 3, 20),
+        (5120, 2048, 4, 24, 64, 1, 3, 5),
+        (5120, 4096, 8, 24, 64, 1, 3, 5),
+        (4096, 3072, 12, 32, 64, 1, 3, 8),
+        (4096, 4096, 12, 24, 64, 1, 3, 8),
+        (4096, 8192, 8, 32, 64, 1, 3, 2),
+        (4096, 16384, 8, 32, 128, 1, 2, 1),
     ],
 )
-def test_mhc_prefill_correlations_retain_measured_winner_geometries(
-    capability,
-    sm,
-    hidden,
-    m,
-    tm,
-    tn,
-    tk,
-    nw,
-    stages,
-    splits,
+def test_mhc_default_tier_retains_measured_winner_geometries(
+    hidden, tokens, m_warps, tn, tk, nw, stages, splits
 ):
     from b12x.norm.mhc._tuning import TUNING
 
-    query = replace(_query(), max_tokens=m, hidden_size=hidden, split_k=hidden // 64)
+    query = replace(
+        _query(), max_tokens=tokens, hidden_size=hidden, split_k=hidden // 64
+    )
     choice = _choice(
-        projection_num_m_warps=tm // 16,
+        projection_num_m_warps=m_warps,
         projection_tile_n=tn,
         projection_tile_k=tk,
         projection_num_n_warps=nw,
         projection_num_stages=stages,
         projection_k_splits=splits,
     )
-    TUNING.parameter_space(
-        query, DeviceIdentity("nvidia", capability, sm, "Blackwell")
-    ).validate(choice)
-
-
-def test_mhc_excess_split_grid_scales_with_sm_count_and_preserves_pins():
-    from b12x.norm.mhc._tuning import MhcConfig, TUNING
-
-    query = replace(_query(), max_tokens=384)
-    choice = _choice(projection_num_m_warps=4, projection_tile_n=8)
-    small = DeviceIdentity("nvidia", (12, 1), 48, "GB10")
-    large = DeviceIdentity("nvidia", (12, 0), 188, "RTX PRO 6000")
-    TUNING.parameter_space(query, large).validate(choice)
-    with pytest.raises(ValueError, match="efficiency predicates"):
-        TUNING.parameter_space(query, small).validate(choice)
-    replace(TUNING.parameter_space(query, small), autotune_effort="audit").validate(
-        choice
+    device = DeviceIdentity("nvidia", (12, 0), 188, "RTX PRO 6000")
+    TUNING.parameter_space(query, device).validate(choice)
+    assert (
+        FrozenMapping(choice) in TUNING.parameter_space(query, device).configurations()
     )
-    config = MhcConfig(projection_tile_m=64, **choice)
-    assert TUNING.configure(query, device=small, override=config).pinned == config
+
+
+@pytest.mark.parametrize("hidden", [4096, 5120, 7168])
+@pytest.mark.parametrize("sm", [48, 132, 188])
+@pytest.mark.parametrize(
+    "tokens", [1, 31, 32, 52, 127, 128, 383, 384, 2048, 4096, 16384, 32768]
+)
+def test_mhc_heuristic_default_is_raced_at_default_effort(hidden, sm, tokens):
+    from b12x.norm.mhc._tuning import TUNING
+
+    query = replace(
+        _query(), max_tokens=tokens, hidden_size=hidden, split_k=hidden // 64
+    )
+    device = DeviceIdentity("nvidia", (12, 0), sm, "Blackwell")
+    default = TUNING.default_config(query, device)
+    assert default in [config for _, config in TUNING.choices(query, device)]

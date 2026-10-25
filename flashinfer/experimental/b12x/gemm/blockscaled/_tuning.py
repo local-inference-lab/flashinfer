@@ -428,7 +428,7 @@ def _validate_config(query, config, device):
                 else (64, 128)
             )
             or type(config.split_k) is not int
-            or config.split_k not in ((1,) if simt else (1, 2, 4, 8))
+            or config.split_k not in ((1,) if simt else (1, 2, 4, 8, 16))
         ):
             raise ValueError("invalid A16 launch geometry")
         if query.padded_in_features % 32 or query.out_features % 8:
@@ -556,6 +556,13 @@ def _tuning_parameters(query, device):
             or (query.recipe == "q8_0" and query.out_features >= query.in_features)
         )
 
+    def expanded_a16(parameters):
+        return parameters["a16_backend"] == "auto"
+
+    def dense_tile_n(parameters):
+        dense = parameters["dense_config"]
+        return dense is None or dense["tile_n"] != 16
+
     return ParameterSpace.create(
         TUNING.knobs,
         values={
@@ -579,7 +586,7 @@ def _tuning_parameters(query, device):
             ),
         ),
         autotune_effort=query.autotune_effort,
-        efficiency_predicates=(row_padding, narrow_output),
+        efficiency_predicates=(row_padding, narrow_output, expanded_a16, dense_tile_n),
     )
 
 
@@ -636,7 +643,9 @@ TUNING = TuningContract(
         ),
         Knob(name="tile_n", values=(4, 64, 128), when=FrozenMapping({"mode": "a16"})),
         Knob(name="tile_k", values=(64, 128, 256), when=FrozenMapping({"mode": "a16"})),
-        Knob(name="split_k", values=(1, 2, 4, 8), when=FrozenMapping({"mode": "a16"})),
+        Knob(
+            name="split_k", values=(1, 2, 4, 8, 16), when=FrozenMapping({"mode": "a16"})
+        ),
         Knob(
             name="mma_warps",
             values=None,

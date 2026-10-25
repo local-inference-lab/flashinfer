@@ -128,6 +128,7 @@ def test_mhc_predicates_remove_inactive_work_without_rejecting_useful_tails():
         has_norm_weight=True,
         norm_eps=1e-6,
         smem_limit=100 << 10,
+        controls=FrozenMapping({"B12X_AUTOTUNE_EFFORT": "audit"}),
     )
     choice = dict(
         backend="tf32_tma",
@@ -140,16 +141,19 @@ def test_mhc_predicates_remove_inactive_work_without_rejecting_useful_tails():
         projection_num_n_warps=1,
         projection_k_splits=8,
     )
+    # Dominance rules hold even for the audit: padded M tiles, wholly masked N
+    # warps, N tiles past the covering power of two, and idle pipeline stages.
     decode = component.TUNING.parameter_space(query, None)
-    with pytest.raises(ValueError, match="predicates"):
+    decode.validate(choice)
+    with pytest.raises(ValueError, match="correctness predicates"):
         decode.validate({**choice, "projection_num_m_warps": 2})
-    with pytest.raises(ValueError, match="predicates"):
+    with pytest.raises(ValueError, match="correctness predicates"):
         decode.validate(
             {**choice, "projection_tile_n": 32, "projection_num_n_warps": 4}
         )
-    with pytest.raises(ValueError, match="predicates"):
+    with pytest.raises(ValueError, match="correctness predicates"):
         decode.validate({**choice, "projection_tile_n": 64})
-    with pytest.raises(ValueError, match="predicates"):
+    with pytest.raises(ValueError, match="correctness predicates"):
         decode.validate(
             {
                 **choice,
@@ -159,23 +163,34 @@ def test_mhc_predicates_remove_inactive_work_without_rejecting_useful_tails():
             }
         )
 
-    boundary = component.TUNING.parameter_space(replace(query, max_tokens=128), None)
-    # Forty-eight-row tiles have a partial final CTA at M128, but every warp
-    # still does useful work in earlier CTAs. N32 remains a useful N24 overtile.
+    # At M128 a 48-row tile has a partial final CTA but no idle warp, and N32
+    # over 24 mixes is a legal overtile: both stay legal, and the default tier
+    # races them only when they also follow its warp-layout and tile guesses.
+    boundary = replace(query, max_tokens=128)
     tail = {
         **choice,
         "projection_num_m_warps": 3,
         "projection_tile_n": 32,
         "projection_num_n_warps": 2,
+        "projection_num_stages": 3,
     }
-    assignments = set(boundary.configurations())
-    assert FrozenMapping(tail) in assignments
-    assert (
-        FrozenMapping({**choice, "projection_tile_n": 24, "projection_num_n_warps": 3})
-        in assignments
+    aligned = {
+        **choice,
+        "projection_tile_n": 24,
+        "projection_num_n_warps": 3,
+        "projection_num_stages": 3,
+    }
+    audited = set(component.TUNING.parameter_space(boundary, None).configurations())
+    assert FrozenMapping(tail) in audited
+    assert FrozenMapping(aligned) in audited
+    default_tier = component.TUNING.parameter_space(
+        replace(boundary, controls=FrozenMapping()), None
     )
-    with pytest.raises(ValueError, match="predicates"):
-        boundary.validate(
+    assert FrozenMapping(aligned) in set(default_tier.configurations())
+    with pytest.raises(ValueError, match="efficiency predicates"):
+        default_tier.validate(tail)
+    with pytest.raises(ValueError, match="correctness predicates"):
+        default_tier.validate(
             {
                 **choice,
                 "projection_num_m_warps": 8,
@@ -205,6 +220,8 @@ def test_mhc_tf32_rejects_short_weight_rows(tile_k, operation):
         norm_eps=1e-20,
         rms_eps=1e-20,
         smem_limit=100 << 10,
+        # The audit lifts the performance guesses, leaving the kernel's rules.
+        controls=FrozenMapping({"B12X_AUTOTUNE_EFFORT": "audit"}),
     )
     choice = dict(
         backend="tf32_tma",
@@ -218,7 +235,7 @@ def test_mhc_tf32_rejects_short_weight_rows(tile_k, operation):
         projection_k_splits=2,
     )
     space = component.TUNING.parameter_space(query, None)
-    with pytest.raises(ValueError, match="predicates"):
+    with pytest.raises(ValueError, match="correctness predicates"):
         space.validate(choice)
     config = component.MhcConfig(projection_tile_m=16, **choice)
     with pytest.raises(ValueError, match="at least 32"):
@@ -457,28 +474,32 @@ def test_moe_cluster_ladder_stops_at_the_planned_task_queue():
         controls=FrozenMapping(),
     )
     space = component.TUNING.parameter_space(query, IDENTITY)
-    clusters = {
-        assignment["max_active_clusters"]
+
+    def clusters(space):
+        return {
+            assignment["max_active_clusters"]
+            for assignment in space.configurations()
+            if assignment["route_planner"] == "triton"
+        }
+
+    # Ten routed rows over three N128 slices plan thirty grouped tasks; wider
+    # grids only add clusters that take no task. The default tier also omits
+    # caps below a quarter of that top rung.
+    assert clusters(space) == {None, 8, 16, 30}
+    assert clusters(replace(space, autotune_effort="audit")) == {
+        None,
+        1,
+        2,
+        4,
+        8,
+        16,
+        30,
+    }
+    triton = next(
+        dict(assignment)
         for assignment in space.configurations()
         if assignment["route_planner"] == "triton"
-    }
-    # Ten routed rows over three N128 slices plan thirty grouped tasks; wider
-    # grids only add clusters that take no task.
-    assert clusters == {None, 1, 2, 4, 8, 16, 30}
-    triton = dict(
-        backend="dynamic",
-        route_planner="triton",
-        dynamic_tile_m=16,
-        dynamic_mma_warps=None,
-        dynamic_route_mode="grouped",
-        w4a16_route_mode=None,
-        max_active_clusters=30,
-        nvfp4_share_input=False,
-        nvfp4_materialize_intermediate=False,
-        csf_inline_scales=False,
-        w4a16_tile_config=None,
-        w4a16_block_size_m=None,
-        w4a16_pipeline_stages=None,
+        and assignment["max_active_clusters"] == 30
     )
     space.validate(triton)
     for outside in (31, 64, 188):

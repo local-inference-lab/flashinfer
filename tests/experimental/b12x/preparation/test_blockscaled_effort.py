@@ -23,10 +23,18 @@ def query(recipe="nvfp4", m=8, n=128, k=256, **kwargs):
     )
 
 
+def _hashable(value):
+    if hasattr(value, "items"):
+        return tuple(sorted((k, _hashable(v)) for k, v in value.items()))
+    if isinstance(value, (list, tuple)):
+        return tuple(_hashable(v) for v in value)
+    return value
+
+
 def candidates(q, level):
     q = replace(q, autotune_effort=level)
     return {
-        tuple(sorted(TUNING.equivalence_key(q, DEVICE, config).items()))
+        _hashable(TUNING.equivalence_key(q, DEVICE, config))
         for _, config in TUNING.choices(q, DEVICE)
     }
 
@@ -42,7 +50,7 @@ def test_levels_are_nested_and_naturally_include_heuristic(recipe, m, n, k):
     q = query(recipe, m, n, k)
     default = TUNING.default_config(q, DEVICE)
     TUNING.validate_config(q, default, DEVICE)
-    key = tuple(sorted(TUNING.equivalence_key(q, DEVICE, default).items()))
+    key = _hashable(TUNING.equivalence_key(q, DEVICE, default))
     previous = set()
     for level in LEVELS:
         choices = candidates(q, level)

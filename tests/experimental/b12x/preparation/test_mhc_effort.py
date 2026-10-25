@@ -48,7 +48,7 @@ def test_heuristic_naturally_survives(effort, hidden, tokens, pin):
     "changes",
     [
         {"projection_num_n_warps": 3},
-        {"projection_tile_k": 128, "projection_num_stages": 3},
+        {"projection_num_stages": 1},
         {"projection_k_splits": 16},
     ],
 )
