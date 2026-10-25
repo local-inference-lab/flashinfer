@@ -20,6 +20,8 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, Int64, Uint32
+from cutlass._mlir.dialects import llvm
+from cutlass.cutlass_dsl import T, dsl_user_op
 
 from b12x._lib.compile_plan import attach_programs
 from b12x._lib.program_cache import program_cache
@@ -50,7 +52,6 @@ from ._twoshot_cute import (
     _fence_sc_sys,
     _ld_generic_v4_u32,
     _ld_global_u32,
-    _ld_relaxed_sys_u32,
     _st_generic_v4_u32,
     _st_global_u32,
     _st_relaxed_sys_u32,
@@ -58,6 +59,25 @@ from ._twoshot_cute import (
 
 _PACK_ELEMS = 8  # bf16 values per 16-byte pack
 _SUPPORTED_WORLD_SIZES = (2, 3, 4, 6, 8, 10)
+
+
+@dsl_user_op
+def _ld_acquire_sys_u32(address: Int64, *, loc=None, ip=None) -> Uint32:
+    """Barrier flag load that acquires the peer's ``fence.sc.sys`` release."""
+
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Int64(address).ir_value(loc=loc, ip=ip)],
+            "ld.acquire.sys.global.u32 $0, [$1];",
+            "=r,l",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
 
 
 class _TwoShotBf16Launch:
@@ -233,9 +253,13 @@ class _TwoShotBf16Launch:
                 * Int64(4)
             )
             _st_relaxed_sys_u32(peer_counter_address, value)
-            observed = _ld_relaxed_sys_u32(self_counter_address)
+            # A relaxed load followed by the CTA barrier would not order this
+            # block's later peer-data loads after the peer's release; the
+            # system-scope acquire does, and the CTA barrier extends it to
+            # every thread.
+            observed = _ld_acquire_sys_u32(self_counter_address)
             while observed != value:
-                observed = _ld_relaxed_sys_u32(self_counter_address)
+                observed = _ld_acquire_sys_u32(self_counter_address)
         cute.arch.barrier()
 
     @cute.jit
@@ -1027,7 +1051,7 @@ def get_twoshot_bf16_allreduce_launcher(
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "comm.pcie.twoshot_bf16.all_reduce_pull",
-            2,
+            3,
             cache_key,
         ),
     )
