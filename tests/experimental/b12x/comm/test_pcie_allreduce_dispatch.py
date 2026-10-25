@@ -7,7 +7,7 @@ import torch
 
 from b12x.comm.pcie import pcie_allreduce as dispatch
 from b12x.comm.pcie import pcie_oneshot as oneshot
-from b12x.comm.pcie.pcie_twoshot_bf16 import PCIeTwoShotBF16
+from b12x.comm.pcie.pcie_twoshot_bf16 import PCIeTwoShotBF16, _make_layout
 
 
 @pytest.mark.parametrize(
@@ -80,6 +80,164 @@ def test_output_aware_twoshot_size_band(nbytes, payload_ready):
     assert manager._use_bf16_twoshot(inp, out) == expected
     assert manager._use_bf16_twoshot(inp, None) == expected
     assert not manager._use_bf16_twoshot(inp, inp)
+
+
+def _prepared_twoshot_runtime(capacity=2 << 20):
+    """A host two-shot runtime with the dispatcher's one-pack native rows."""
+    max_rows = (capacity + 63) // 64 * 4
+    layout = _make_layout(max_rows, 8, 4)
+    base = 1 << 32
+    return PCIeTwoShotBF16._from_prepared_factory(
+        rank=0,
+        world_size=4,
+        device=torch.device("cpu"),
+        signal_ptrs=(base,) * 8,
+        staging_ptrs=tuple(
+            (base + layout.signal_bytes + slot * layout.slot_bytes,) * 8
+            for slot in (0, 1)
+        ),
+        owned_buffers=(),
+        ipc=None,
+        exchange_group=None,
+        max_rows=max_rows,
+        row_elems=8,
+        pack_stride=layout.pack_stride,
+        reduced_offset=layout.reduced_offset,
+        slot_bytes=layout.slot_bytes,
+    )
+
+
+def _oneshot_query(nbytes, transport, *, payload_ready):
+    """The staged one-shot declaration a TP4 single-channel runtime reports."""
+    from b12x.comm.pcie._tuning import PcieQuery
+    from b12x.preparation import FrozenMapping
+
+    return PcieQuery(
+        surface="OneshotAllReduce.all_reduce",
+        world_size=4,
+        rank=0,
+        topology="pcie_ipc",
+        call=FrozenMapping(
+            {
+                "dtype": "bfloat16",
+                "transport": transport,
+                "threads": 256,
+                "blocks": 16,
+                "eager_transport": "pull",
+                "eager_threads": 512,
+                "eager_blocks": 36,
+                "size_packs": nbytes // 16,
+                "stage_input": True,
+                "device_index": 0,
+                "remote_push_region_packs": (4 << 20) // 16 if payload_ready else 0,
+            }
+        ),
+        setup=FrozenMapping({"shape": (nbytes // 2,), "dtype": "bfloat16"}),
+    )
+
+
+@pytest.mark.parametrize("nbytes", (24 << 10, 65600, 73728, 640 << 10, 2 << 20))
+@pytest.mark.parametrize("payload_ready", (False, True))
+def test_tp4_plan_declares_push_and_pull_twoshot_candidates(
+    monkeypatch, nbytes, payload_ready
+):
+    from b12x.comm.pcie import _preparation, _twoshot_preparation
+    from b12x.comm.pcie._collective_tuning import (
+        TUNING,
+        CollectiveConfig,
+        CollectiveQuery,
+    )
+    from b12x.preparation import autotune_effort
+    from b12x.preparation.types import _plan_scope
+
+    twoshot = _prepared_twoshot_runtime()
+    channel = SimpleNamespace(device=torch.device("cpu"))
+    primary = SimpleNamespace(
+        rank=0,
+        world_size=4,
+        device=torch.device("cpu"),
+        max_size=(2 << 20) + 64,
+        single_channel=True,
+        _sentinel_supported=payload_ready,
+        _transport_policy=(False, True, True, True, True),
+        _prepared_channel_for_stream=lambda stream, channel_id: channel,
+    )
+    manager = dispatch.PCIeAllReduce(
+        primary, "oneshot", bf16_twoshot=twoshot, algorithm_override="auto"
+    )
+    oneshot_transport = (
+        dispatch.tp4_bf16_transport(nbytes, payload_ready=True, twoshot_available=False)
+        if payload_ready
+        else "pull"
+    )
+
+    def query_from_runtime(runtime, *, surface, call):
+        if surface.startswith("OneshotAllReduce."):
+            return _oneshot_query(
+                nbytes, oneshot_transport, payload_ready=payload_ready
+            )
+        return _twoshot_preparation.query_from_runtime(
+            runtime, surface=surface, call=call
+        )
+
+    monkeypatch.setattr(_preparation, "query_from_runtime", query_from_runtime)
+    inp = torch.empty(nbytes // 2, dtype=torch.bfloat16)
+    out = torch.empty_like(inp)
+    plan = manager.plan(inp, out=out)
+    query = plan.query
+    assert isinstance(query, CollectiveQuery)
+    candidates = query.alternatives
+    assert candidates["twoshot"]["call"]["transport"] == "push"
+    assert candidates["twoshot_pull"]["call"]["transport"] == "pull"
+    assert candidates["twoshot_pull"]["setup"]["push_shard_nbytes"] == 0
+    # Without tuning the static crossover policy applies; it never picks pull.
+    static = "twoshot" if manager._use_bf16_twoshot(inp, out) else oneshot_transport
+    assert query.default.implementation == static
+    with autotune_effort("off"):
+        off = [
+            config for _, config in TUNING.iterate(TUNING.configure(query, device=None))
+        ]
+    with autotune_effort("default"):
+        default = [
+            config for _, config in TUNING.iterate(TUNING.configure(query, device=None))
+        ]
+    pull = CollectiveConfig(implementation="twoshot_pull", threads=512, blocks=64)
+    # Tuning off prepares the static choice alone; the default search races pull.
+    assert off == [query.default]
+    assert pull in default
+    assert {
+        (config.threads, config.blocks)
+        for config in default
+        if config.implementation == "twoshot_pull"
+    } == {(512, 32), (512, 64)}
+    narrow = CollectiveConfig(implementation="twoshot_pull", threads=512, blocks=32)
+    assert TUNING.configure(query, device=None, override=narrow).pinned == narrow
+    with pytest.raises(ValueError, match="outside the native collective"):
+        TUNING.configure(
+            query,
+            device=None,
+            override=CollectiveConfig(
+                implementation="twoshot_pull", threads=512, blocks=48
+            ),
+        )
+    # A selected pull candidate lowers to the pull declaration and its geometry.
+    (job,) = plan._compile_jobs(narrow, None)
+    lowered = job.args[0]
+    assert lowered["call"]["transport"] == "pull"
+    assert lowered["call"]["block_limit"] == 32
+    with _plan_scope(plan):
+        pull_memory = plan._memory_requirements(narrow, None)
+        push_memory = plan._memory_requirements(
+            CollectiveConfig(implementation="twoshot", threads=512, blocks=64), None
+        )
+    slab = candidates["twoshot"]["setup"]["slab_nbytes"]
+    assert [entry.required_nbytes for entry in pull_memory.persistent] == [slab]
+    assert sorted(entry.required_nbytes for entry in push_memory.persistent) == sorted(
+        (slab, (2 << 20) // 4)
+    )
+    # Aliased output keeps the one-shot candidates only.
+    aliased = manager.plan(inp, out=inp)
+    assert not {"twoshot", "twoshot_pull"} & set(aliased.query.alternatives)
 
 
 def test_twoshot_rejects_partially_overlapping_output():

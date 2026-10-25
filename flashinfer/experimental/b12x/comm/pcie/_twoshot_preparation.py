@@ -58,6 +58,22 @@ def _operation(surface: str) -> str:
     raise ValueError(f"unsupported two-shot preparation surface {surface!r}")
 
 
+def _transport(surface: str, transport: object) -> str:
+    """Validate the all-reduce transport; every other operation pushes."""
+    if transport not in ("push", "pull"):
+        raise ValueError("two-shot transport must be push or pull")
+    if transport == "pull" and surface != "PCIeTwoShotBF16.all_reduce":
+        raise ValueError("only the BF16 two-shot all-reduce has a pull transport")
+    return transport
+
+
+def _push_shard_nbytes(runtime, surface: str, transport: str) -> int:
+    """Persistent reduce-scatter result of the push BF16 all-reduce."""
+    if surface not in _BF16_SURFACES or transport == "pull":
+        return 0
+    return int(runtime._pack_stride) * 16
+
+
 def _tensor(values: Mapping[str, object], name: str) -> torch.Tensor:
     value = values.get(name)
     if not isinstance(value, torch.Tensor):
@@ -157,6 +173,7 @@ def query_from_runtime(runtime, *, surface: str, call) -> PcieQuery:
             raise TypeError("BF16 two-shot payload must be bfloat16")
         dtype, scale_dtype = "bfloat16", None
         scale_shape, scale_stride, scale_alignment = None, None, None
+    transport = _transport(surface, values.get("transport", "push"))
     threads = int(values.get("threads", 512))
     block_limit = int(values.get("block_limit", 64))
     if threads <= 0 or threads > 512 or threads % 32:
@@ -191,6 +208,7 @@ def query_from_runtime(runtime, *, surface: str, call) -> PcieQuery:
             if output is None
             else str(output.dtype).removeprefix("torch."),
             "output_alignment": None if output is None else _alignment(output),
+            "transport": transport,
             "threads": threads,
             "block_limit": block_limit,
             "device_slot_variants": ((False, 0), (True, 0), (True, 1)),
@@ -203,9 +221,7 @@ def query_from_runtime(runtime, *, surface: str, call) -> PcieQuery:
             "max_rows": int(runtime.max_rows),
             "pack_stride": int(runtime._pack_stride),
             "slot_bytes": int(runtime._slot_bytes),
-            "push_shard_nbytes": (
-                int(runtime._pack_stride) * 16 if surface in _BF16_SURFACES else 0
-            ),
+            "push_shard_nbytes": _push_shard_nbytes(runtime, surface, transport),
             "slots": 2,
             "signal_ptr_count": len(runtime._signal_ptrs),
             "staging_ptr_count": tuple(len(slot) for slot in runtime._staging_ptrs),
@@ -234,10 +250,12 @@ def query_from_metadata(
     dtype: torch.dtype,
     strides: tuple[int, ...] | None = None,
     alignment: int = 16,
+    transport: str = "push",
 ) -> PcieQuery:
     """Declare a BF16 all-reduce from producer metadata without an activation."""
     if surface != "PCIeTwoShotBF16.all_reduce":
         raise ValueError(f"unsupported metadata two-shot surface {surface!r}")
+    transport = _transport(surface, transport)
     if dtype is not torch.bfloat16:
         raise TypeError("BF16 two-shot metadata requires bfloat16")
     if not shape or any(type(extent) is not int or extent <= 0 for extent in shape):
@@ -277,6 +295,7 @@ def query_from_metadata(
             "output_stride": tuple(strides),
             "output_dtype": "bfloat16",
             "output_alignment": alignment,
+            "transport": transport,
             "threads": 512,
             "block_limit": 64,
             "device_slot_variants": ((False, 0), (True, 0), (True, 1)),
@@ -287,9 +306,7 @@ def query_from_metadata(
             "max_rows": int(runtime.max_rows),
             "pack_stride": int(runtime._pack_stride),
             "slot_bytes": int(runtime._slot_bytes),
-            "push_shard_nbytes": (
-                int(runtime._pack_stride) * 16 if surface in _BF16_SURFACES else 0
-            ),
+            "push_shard_nbytes": _push_shard_nbytes(runtime, surface, transport),
             "slots": 2,
             "signal_ptr_count": len(runtime._signal_ptrs),
             "staging_ptr_count": tuple(len(slot) for slot in runtime._staging_ptrs),
@@ -346,11 +363,31 @@ def compile_twoshot_surface(query_payload, ordinal: int):
                 )
                 for device_slot, bias in call["device_slot_variants"]
             }
-        from ._twoshot_bf16_cute import get_twoshot_bf16_launcher
+        from ._twoshot_bf16_cute import (
+            get_twoshot_bf16_allreduce_launcher,
+            get_twoshot_bf16_launcher,
+        )
 
-        # The BF16 all-reduce runs as a reduce-scatter followed by an all-gather on the
-        # same serialized channel. Both push payload shards into peer staging,
-        # avoiding remote payload loads.
+        if call["transport"] == "pull":
+            # One launch stages locally, then reads peer slabs for the reduction
+            # and for the reduced shards.
+            return {
+                ("all_reduce", bool(device_slot), int(bias)): (
+                    get_twoshot_bf16_allreduce_launcher(
+                        query.world_size,
+                        query.rank,
+                        bool(device_slot),
+                        int(bias),
+                        int(call["threads"]),
+                        int(call["row_elems"]),
+                        int(ordinal),
+                    )
+                )
+                for device_slot, bias in call["device_slot_variants"]
+            }
+        # The push BF16 all-reduce runs as a reduce-scatter followed by an
+        # all-gather on the same serialized channel. Both push payload shards
+        # into peer staging, avoiding remote payload loads.
         operations = (
             ("reduce_scatter", "all_gather")
             if call["operation"] == "all_reduce"

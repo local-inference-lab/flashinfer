@@ -11,13 +11,15 @@ tuning keys. Every caller still binds its own serving operands.
 
 | Declaration | Candidates |
 | --- | --- |
-| Staged `AllReduce.all_reduce`, direct peer groups | Native pull; LL and Simple peer push; BF16 payload-ready full reduction and reduce-scatter/all-gather; provisioned BF16 two-shot |
+| Staged `AllReduce.all_reduce`, direct peer groups | Native pull; LL and Simple peer push; BF16 payload-ready full reduction and reduce-scatter/all-gather; provisioned BF16 two-shot, as push reduce-scatter/all-gather or (disjoint output) single-launch pull |
 | Staged fused residual addition and RMSNorm | Native staged transports compatible with declared input, residual, normalization, grouping, and output arithmetic |
 | DCP `all_gather_heads` and `lse_reduce_scatter`, TP2/4/8 | Thread count and block limit; equivalent effective grids are measured once |
 
 Payload-ready transports require their reserved incoming slots, BF16 support,
 and sufficient SMs to keep their grid resident. Two-shot retains its native
-capacity and alignment constraints.
+capacity and alignment constraints. Its push form uses posted peer writes and
+its pull form reads peer slabs; which is faster depends on the PCIe fabric, so
+the static default keeps push and the tuner measures both.
 Unsupported alternatives are absent, rather than failing over during execution.
 Plain tuning admits FP16/BF16 tensors with positive 16-byte-packed payloads
 within the prepared staging capacity. LL requires two capacity shards per remote

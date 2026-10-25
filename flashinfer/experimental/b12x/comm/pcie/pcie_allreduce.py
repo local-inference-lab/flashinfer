@@ -142,7 +142,8 @@ class PCIeAllReduce:
     only when peer mappings are unavailable and rollback completes. Other TP10
     declarations and TP9, TP12, and TP16 use hierarchical transports. Serialized
     BF16 declarations also admit single-rounding two-shot when every rank has
-    at least 64 visible SMs and the output is an exact input alias or disjoint.
+    at least 64 visible SMs and the output is an exact input alias or disjoint; push
+    and pull two-shot are both joint-tuning candidates when the output is disjoint.
     """
 
     def __init__(
@@ -528,12 +529,20 @@ class PCIeAllReduce:
                     and twoshot.accepts(inp)
                     and (inplace or disjoint)
                 ):
-                    native = query_from_runtime(
-                        twoshot,
-                        surface="PCIeTwoShotBF16.all_reduce",
-                        call={"inp": inp, **call},
-                    )
-                    alternatives["twoshot"] = (native, twoshot)
+                    # Posted peer writes and peer reads perform differently
+                    # across PCIe hosts; the static default stays on push. The
+                    # pull kernel publishes its reduced shard beside the staged
+                    # payload, so it needs a disjoint output.
+                    candidates = [("twoshot", "push")]
+                    if disjoint and not inplace:
+                        candidates.append(("twoshot_pull", "pull"))
+                    for name, transport in candidates:
+                        native = query_from_runtime(
+                            twoshot,
+                            surface="PCIeTwoShotBF16.all_reduce",
+                            call={"inp": inp, **call, "transport": transport},
+                        )
+                        alternatives[name] = (native, twoshot)
                     if self._use_bf16_twoshot(inp, output):
                         default = "twoshot"
                 return collective_plan(

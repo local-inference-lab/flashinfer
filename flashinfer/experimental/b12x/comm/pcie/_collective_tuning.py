@@ -94,6 +94,12 @@ def _configs(query):
                     yield CollectiveConfig(
                         implementation=name, threads=count_threads, blocks=count
                     )
+        elif name == "twoshot_pull":
+            # The pull kernel's block-pair barrier holds 64 blocks of flags.
+            for count in (32, 64):
+                yield CollectiveConfig(
+                    implementation=name, threads=threads, blocks=count
+                )
         elif name == "dcp":
             setup = payload["setup"]
             thread_values = (

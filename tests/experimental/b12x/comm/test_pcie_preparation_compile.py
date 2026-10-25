@@ -39,6 +39,11 @@ from b12x.preparation import FrozenMapping
             "get_twoshot_bf16_launcher",
             ("reduce_scatter", 4, 0, False, 0, 512, 4096, 0),
         ),
+        (
+            "_twoshot_bf16_cute",
+            "get_twoshot_bf16_allreduce_launcher",
+            (4, 0, False, 0, 512, 4096, 0),
+        ),
     ],
 )
 def test_launcher_planning_memo_is_evicted_before_in_process_compile(

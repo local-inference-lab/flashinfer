@@ -4,11 +4,15 @@ Host-side twin of :mod:`pcie_twoshot` without the fp8 wire codec: payloads
 travel as bf16 packs, are accumulated in fp32 in a fixed rank order and
 rounded once.  Intended for TP decode all-reduces above the one-shot
 ceiling (tens of KB) and below the DMA ring floor (MB), where NCCL ring is
-the incumbent.  Graph capture follows the two-shot contract: enter
-``runtime.capture()`` around ``torch.cuda.graph``. All eager launches and graph
-replays from one instance must be serialized. CUDA graph capture requires a
-caller-owned preallocated output for every operation. Callers must stop
-submitting work before closing that instance.
+the incumbent.  The all-reduce has two transports on the same channel: a
+push reduce-scatter followed by a push all-gather (posted peer writes), and a
+single-launch pull kernel that reads peer slabs. Which one is faster depends
+on the host's PCIe fabric, so both are declared as tuning candidates.  Graph
+capture follows the two-shot contract: enter ``runtime.capture()`` around
+``torch.cuda.graph``. All eager launches and graph replays from one instance
+must be serialized. CUDA graph capture requires a caller-owned preallocated
+output for every operation. Callers must stop submitting work before closing
+that instance.
 """
 
 from __future__ import annotations
@@ -65,6 +69,7 @@ def _pad_scalar_peer_ptrs(
 class _TwoShotBf16Layout:
     signal_bytes: int
     pack_stride: int
+    reduced_offset: int
     slot_bytes: int
     slab_bytes: int
 
@@ -81,11 +86,15 @@ def _make_layout(max_rows: int, row_elems: int, world_size: int) -> _TwoShotBf16
     total_packs = max_rows * (row_elems // _PACK_ELEMS)
     pack_stride = _align_up((total_packs + world_size - 1) // world_size, 16)
     payload_bytes = world_size * pack_stride * 16
-    slot_bytes = _align_up(payload_bytes, IPC_SLAB_ALIGNMENT)
+    # The pull all-reduce publishes one reduced shard (pack_stride packs) per
+    # slot after the staged payload; the push transports leave it unused.
+    reduced_offset = _align_up(payload_bytes, IPC_SLAB_ALIGNMENT)
+    slot_bytes = _align_up(reduced_offset + pack_stride * 16, IPC_SLAB_ALIGNMENT)
     signal_bytes = _align_up(_SIGNAL_BYTES, IPC_SLAB_ALIGNMENT)
     return _TwoShotBf16Layout(
         signal_bytes=signal_bytes,
         pack_stride=pack_stride,
+        reduced_offset=reduced_offset,
         slot_bytes=slot_bytes,
         slab_bytes=signal_bytes + 2 * slot_bytes,
     )
@@ -133,6 +142,7 @@ class PCIeTwoShotBF16:
         max_rows: int,
         row_elems: int,
         pack_stride: int,
+        reduced_offset: int,
         slot_bytes: int,
     ) -> "PCIeTwoShotBF16":
         self = object.__new__(cls)
@@ -156,8 +166,10 @@ class PCIeTwoShotBF16:
         self.max_rows = max_rows
         self.row_elems = row_elems
         self._pack_stride = int(pack_stride)
+        self._reduced_offset = int(reduced_offset)
         self._slot_bytes = int(slot_bytes)
-        # The all-reduce's reduce-scatter result; all-reduces on this serial channel reuse it.
+        # The push all-reduce's reduce-scatter result; push all-reduces on this
+        # serial channel reuse it.
         self._push_shard = torch.empty(
             (pack_stride * _PACK_ELEMS,),
             dtype=torch.bfloat16,
@@ -265,6 +277,7 @@ class PCIeTwoShotBF16:
                 max_rows=max_rows,
                 row_elems=row_elems,
                 pack_stride=layout.pack_stride,
+                reduced_offset=layout.reduced_offset,
                 slot_bytes=layout.slot_bytes,
             )
         except Exception as exc:
@@ -380,7 +393,11 @@ class PCIeTwoShotBF16:
         if capturing and not self._device_slot_selection:
             self._device_slot_bias = self._slot & 1
             self._device_slot_selection = True
-        if operation == "all_reduce":
+        # Each native launch consumes one slot and one graph epoch.
+        pull = operation == "all_reduce" and state.query.call["transport"] == "pull"
+        if pull:
+            steps = (("all_reduce", payload, out),)
+        elif operation == "all_reduce":
             shard = self._push_shard[: shard_packs * _PACK_ELEMS]
             steps = (("reduce_scatter", payload, shard), ("all_gather", shard, out))
         else:
@@ -397,7 +414,9 @@ class PCIeTwoShotBF16:
                 self._signal_ptrs,
                 destination.data_ptr(),
                 self.rank,
-                self._pack_stride,
+                # The pull kernel takes its reduced-shard offset where the push
+                # kernels take the per-rank pack stride.
+                self._reduced_offset if pull else self._pack_stride,
                 self._slot_bytes,
                 shard_packs,
                 total_packs,
