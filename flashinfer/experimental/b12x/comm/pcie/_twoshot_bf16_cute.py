@@ -683,15 +683,21 @@ def get_twoshot_bf16_launcher(
 class _TwoShotPullAllReduceLaunch(_TwoShotBf16Launch):
     """Single-launch BF16 all-reduce with one rounding, using remote reads.
 
-    The kernel stages this rank's full payload into its own IPC slab using a
-    local copy. After the first barrier, every rank pulls its shard (P/world
-    for a per-rank payload of P bytes) from every peer's staged payload,
-    accumulates in fp32 (rank order: self, then
-    ``(rank + i) % world``), rounds once to bf16 and writes the reduced shard
-    both to the output and to its slab's reduced region. After the second
-    barrier, every rank pulls the other ranks' reduced shards into the output.
-    PCIe read volume per rank is 2P*(world - 1)/world, which is 1.5P for world
-    size 4; synchronization uses two barriers.
+    The kernel copies the shards its peers reduce from this rank's payload into
+    its own IPC slab (a local copy; the local shard is reduced straight from
+    the payload). After the first barrier, every rank pulls its shard (P/world
+    for a per-rank payload of P bytes) from every peer's staging, accumulates
+    in fp32 (rank order: self, then ``(rank + i) % world``), rounds once to
+    bf16 and writes the reduced shard both to the output and to its slab's
+    reduced region. After the second barrier, every rank pulls the other
+    ranks' reduced shards into the output. PCIe read volume per rank is
+    2P*(world - 1)/world, which is 1.5P for world size 4; synchronization uses
+    two barriers.
+
+    The barriers pair block ``b`` only with block ``b`` of each peer, so every
+    phase walks the same shard-local pack indices: shard-local pack ``i`` of
+    every shard is staged, reduced and published by the block that owns ``i``
+    on every rank.
     """
 
     def __init__(
@@ -834,7 +840,6 @@ class _TwoShotPullAllReduceLaunch(_TwoShotBf16Launch):
         local_rank = rank
         packs_per_row = Int32(self._row_elems // _PACK_ELEMS)
         shard_packs = Int64(rows_per_rank) * Int64(packs_per_row)
-        full_packs = shard_packs * Int64(self._world_size)
         threads = Int64(self._threads)
         grid_threads = Int64(gdim) * threads
         flat = Int64(bidx) * threads + Int64(tidx)
@@ -857,22 +862,33 @@ class _TwoShotPullAllReduceLaunch(_TwoShotBf16Launch):
                 )
         self_base = self._select_address(staging, local_rank) + staging_slot_offset
 
-        # Stage the full local payload into this rank's own slab.
+        # Stage the peers' shards. Pack ``index`` of each shard must come from
+        # the block that reduces ``index`` on the peer: the barrier waits only
+        # for the same block index on every peer, so a full-payload grid
+        # stride would leave remote reads unordered against their staging.
         index = flat
-        while index < full_packs:
-            words = ld_global_nc_v4_u32(payload_address + index * Int64(16))
-            st_global_v4_u32(
-                self_base + index * Int64(16),
-                words[0],
-                words[1],
-                words[2],
-                words[3],
-            )
+        while index < shard_packs:
+            staged_offsets = []
+            staged_words = []
+            for peer_index in cutlass.range_constexpr(1, self._world_size):
+                shard_rank = (local_rank + Int32(peer_index)) % Int32(self._world_size)
+                offset = (Int64(shard_rank) * shard_packs + index) * Int64(16)
+                staged_offsets.append(offset)
+                staged_words.append(ld_global_nc_v4_u32(payload_address + offset))
+            for peer_index in cutlass.range_constexpr(self._world_size - 1):
+                words = staged_words[peer_index]
+                st_global_v4_u32(
+                    self_base + staged_offsets[peer_index],
+                    words[0],
+                    words[1],
+                    words[2],
+                    words[3],
+                )
             index += grid_threads
 
         self._barrier(signals, local_rank)
 
-        # Pull and reduce this rank's shard from every staged peer payload.
+        # Pull and reduce this rank's shard from every peer's staging.
         shard_base = Int64(local_rank) * shard_packs
         index = flat
         while index < shard_packs:
@@ -1011,7 +1027,7 @@ def get_twoshot_bf16_allreduce_launcher(
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "comm.pcie.twoshot_bf16.all_reduce_pull",
-            1,
+            2,
             cache_key,
         ),
     )

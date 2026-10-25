@@ -345,6 +345,28 @@ def _fill(tensor, rank, step):
     )
 
 
+def _fill_order_sensitive(tensor, rank, step):
+    """Fill one rank's slice of a payload whose sum depends on the FP32 order.
+
+    Half of the elements carry a pair of cancelling large values on two ranks.
+    The large value absorbs smaller addends until its partner cancels it, so
+    accumulation order and a single final rounding both change the result.
+    Every rank draws the same four-rank payload and keeps its own slice.
+    """
+    generator = torch.Generator().manual_seed(7919 * step + 13)
+    shape = (4, *tensor.shape)
+    values = torch.randn(shape, generator=generator)
+    values *= torch.exp2(torch.randint(-8, 9, shape, generator=generator).float())
+    large = torch.exp2(torch.randint(24, 33, shape[1:], generator=generator).float())
+    first = torch.randint(0, 4, shape[1:], generator=generator)
+    second = (first + torch.randint(1, 4, shape[1:], generator=generator)) % 4
+    paired = torch.rand(shape[1:], generator=generator) < 0.5
+    ranks = torch.arange(4).view(4, *([1] * tensor.dim()))
+    values = torch.where(paired & (ranks == first), large, values)
+    values = torch.where(paired & (ranks == second), -large, values)
+    tensor.copy_(values[rank])
+
+
 def _reference(inp, *, owner_reduction=True):
     world = dist.get_world_size()
     values = [torch.empty_like(inp) for _ in range(world)]
@@ -680,6 +702,143 @@ def _epoch(runtime):
     return value.value
 
 
+def _assert_on_every_rank(ok, context):
+    """Fail on every rank together, naming the ranks whose check failed."""
+    flags = [None] * dist.get_world_size()
+    dist.all_gather_object(flags, bool(ok))
+    failed = [peer for peer, flag in enumerate(flags) if not flag]
+    assert not failed, (context, "failed on ranks", failed)
+
+
+# Pull all-reduce shapes: two full blocks at 64 KiB, the two sizes whose
+# staging crossed blocks before the shard-local repair (65,600 B leaves one
+# active thread in the last block; 73,728 B is six 6144-wide BF16 rows), and
+# larger partial grids.
+_PULL_ORDERING_SHAPES = ((1024, 32), (1025, 32), (6, 6144), (2049, 32), (10239, 32))
+_RANK_SKEW_CYCLES = 1 << 21
+
+
+def _check_pull_ordering(session, manager, rank):
+    """Exact pinned pull all-reduces under eager calls, replays and rank skew."""
+    cases = []
+    for shape in _PULL_ORDERING_SHAPES:
+        inp = torch.empty(shape, dtype=torch.bfloat16, device=manager.device)
+        out = torch.empty_like(inp)
+        _fill_order_sensitive(inp, rank, 0)
+        plan = _prepare(session, manager, "all_reduce", inp, out, transport="pull")
+        executed = _executed(plan, manager.device)
+        assert (executed.surface, executed.call["transport"]) == (
+            "PCIeTwoShotBF16.all_reduce",
+            "pull",
+        ), shape
+        graph = torch.cuda.CUDAGraph()
+        dist.barrier()
+        with session.capture(), manager.capture(), torch.cuda.graph(graph):
+            manager.all_reduce(inp, plan=plan, out=out)
+        cases.append((inp, out, plan, graph))
+    for step in range(8):
+        # One rank at a time starts each collective late on its stream.
+        skewed = step % 4
+        for inp, out, plan, graph in cases[:: 1 if step % 2 else -1]:
+            for replay in (False, True):
+                seed = 2 * (100 * step + inp.numel()) + replay
+                _fill_order_sensitive(inp, rank, seed)
+                expected = _reference(inp)
+                out.fill_(float("nan"))
+                torch.cuda.synchronize()
+                dist.barrier()
+                before = _allocation_state(manager.device)
+                if rank == skewed:
+                    torch.cuda._sleep(_RANK_SKEW_CYCLES)
+                if replay:
+                    with (
+                        session.capture(),
+                        kernel_resolution_guard("pull all-reduce replay"),
+                    ):
+                        graph.replay()
+                else:
+                    with session.capture():
+                        manager.all_reduce(inp, plan=plan, out=out)
+                torch.cuda.synchronize()
+                # Sample allocations before comparing: torch.equal allocates.
+                stable = _allocation_state(manager.device) == before
+                _assert_on_every_rank(
+                    stable and torch.equal(out, expected),
+                    ("graph" if replay else "eager", tuple(inp.shape), step, skewed),
+                )
+    _check_pull_queued(session, manager, rank, [plan for _, _, plan, _ in cases])
+    for *_, graph in cases:
+        graph.reset()
+
+
+def _check_pull_queued(session, manager, rank, plans):
+    """Queued mixed-size pull all-reduces while ranks drift apart.
+
+    Every size runs once from a captured graph and once eagerly, each from its
+    own storage, back to back without draining. One rank starts the queue late
+    and another stalls halfway, so ranks reach consecutive launches, and reuse
+    each slot, at different times. Each launch advances the epoch once.
+    """
+    pool = manager._bf16_twoshot
+    entries = []
+    for plan in plans:
+        shape = tuple(_executed(plan, manager.device).call["shape"])
+        for captured in (True, False):
+            inp = torch.empty(shape, dtype=torch.bfloat16, device=manager.device)
+            out = torch.empty_like(inp)
+            graph = None
+            if captured:
+                graph = torch.cuda.CUDAGraph()
+                dist.barrier()
+                with session.capture(), manager.capture(), torch.cuda.graph(graph):
+                    manager.all_reduce(inp, plan=plan, out=out)
+            entries.append((inp, out, plan, graph))
+    # Captured entries by ascending size, then eager ones by descending size.
+    order = entries[0::2] + entries[1::2][::-1]
+    owners = tuple((b.local_ptr, tuple(b.remote_ptrs)) for b in pool._owned_buffers)
+    for step in range(4):
+        late, stalled = step % 4, (step + 2) % 4
+        queue = order if step % 2 == 0 else order[::-1]
+        expected = []
+        for index, (inp, out, _, _) in enumerate(queue):
+            _fill_order_sensitive(inp, rank, 50_000 + 100 * step + index)
+            expected.append(_reference(inp))
+            out.fill_(float("nan"))
+        epoch = _epoch(pool)
+        torch.cuda.synchronize()
+        dist.barrier()
+        before = _allocation_state(manager.device)
+        if rank == late:
+            torch.cuda._sleep(_RANK_SKEW_CYCLES)
+        with session.capture():
+            for index, (inp, out, plan, graph) in enumerate(queue):
+                if rank == stalled and index == len(queue) // 2:
+                    torch.cuda._sleep(_RANK_SKEW_CYCLES)
+                if graph is not None:
+                    graph.replay()
+                else:
+                    manager.all_reduce(inp, plan=plan, out=out)
+        torch.cuda.synchronize()
+        # Sample allocations before comparing: torch.equal allocates.
+        stable = _allocation_state(manager.device) == before
+        current = tuple(
+            (b.local_ptr, tuple(b.remote_ptrs)) for b in pool._owned_buffers
+        )
+        exact = [
+            torch.equal(out, want) for (_, out, _, _), want in zip(queue, expected)
+        ]
+        _assert_on_every_rank(
+            stable
+            and all(exact)
+            and _epoch(pool) == (epoch + len(queue)) & 0xFFFFFFFF
+            and current == owners,
+            ("queued", step, late, stalled, stable, exact),
+        )
+    for *_, graph in entries:
+        if graph is not None:
+            graph.reset()
+
+
 def _check_dispatch(session, manager, rank, *, benchmark=False, benchmark_only=False):
     sizes = (
         (24 << 10) - 64,
@@ -688,6 +847,7 @@ def _check_dispatch(session, manager, rank, *, benchmark=False, benchmark_only=F
         65536 - 64,
         65536,
         65536 + 64,
+        73728,
         (640 << 10) - 64,
         640 << 10,
         (640 << 10) + 64,
@@ -1039,12 +1199,14 @@ def main():
         )
         if not args.benchmark_only:
             _check_dispatch_contracts(session, manager, rank)
+            _check_pull_ordering(session, manager, rank)
             _check_payload_ready(session, manager, rank)
             _check_payload_protocol_transitions(session, manager, rank)
             _check_mixed(session, manager._bf16_twoshot, rank)
             if rank == 0:
                 print(
-                    "TP4 BF16 prepared dispatch and mixed eager/graph correctness OK",
+                    "TP4 BF16 prepared dispatch, pull ordering and mixed "
+                    "eager/graph correctness OK",
                     flush=True,
                 )
     finally:
