@@ -78,10 +78,10 @@ def test_inline_scale_override_rejects_incompatible_storage_or_geometry(changes)
 
 
 @pytest.mark.parametrize("mode", ["nvfp4", "w4a8_mx"])
-@pytest.mark.parametrize(
-    "tokens,inline_tiles", [(128, {16, 32}), (129, {32}), (256, {32}), (257, set())]
-)
-def test_inline_tuning_prunes_repeated_expert_tiles(tokens, inline_tiles, mode):
+@pytest.mark.parametrize("tokens", [128, 129, 256, 257])
+def test_inline_tuning_races_repeated_expert_tiles(tokens, mode):
+    # Inline scales are a raced choice. The old density predicate pruned them
+    # above 16 rows/expert, which hid a measured GB10 win at 24-32 rows/expert.
     query = replace(
         _nvfp4_query(),
         quant_mode=mode,
@@ -92,7 +92,7 @@ def test_inline_tuning_prunes_repeated_expert_tiles(tokens, inline_tiles, mode):
         csf_inline_scales=True,
     )
     configs = [c for _, c in TUNING.eligible_plan(query, DEVICE).candidates]
-    assert {c.dynamic_tile_m for c in configs if c.csf_inline_scales} == inline_tiles
+    assert {c.dynamic_tile_m for c in configs if c.csf_inline_scales} == {16, 32}
     assert any(not c.csf_inline_scales for c in configs)
     override = MoeDecodeConfig(
         backend="dynamic",

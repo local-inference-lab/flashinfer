@@ -994,12 +994,11 @@ def _tuning_parameters(query, device):
             "w4a16_block_size_m": (None, *blocks),
             "w4a16_pipeline_stages": (None, 2, 3, 4, 5),
         }
-    # Compact W4A8 decode: the per-row micro kernel wins up to 16 tokens and
-    # the M16 dynamic kernel from about 8 tokens; outside those bands the other
-    # backend never comes within 2% of the winner.
-    compact = _compact_w4a8_query(launch_query)
-    micro_tokens = 16 if compact else None
-    dynamic_tokens = 8 if compact else None
+    # Compact W4A8 backend, tile, and inline-scale choices are measured, not
+    # pruned. The per-row micro kernel, the M16 dynamic kernel, and inline
+    # scales each win in a band that depends on the device and routing density;
+    # a token-count guess here hid the winning inline choice on GB10 between 8
+    # and 2048 tokens. Only the cluster-cap dominance rule remains.
     grid_knob = next(knob for knob in space.knobs if knob.name == "max_active_clusters")
     top_cap = max((value for value in grid_knob.values if value is not None), default=0)
     return ParameterSpace.create(
@@ -1007,23 +1006,6 @@ def _tuning_parameters(query, device):
         values=w4a16_values,
         predicates=space.predicates,
         efficiency_predicates=(
-            lambda p: (
-                micro_tokens is None
-                or p["backend"] != "micro"
-                or query.num_tokens <= micro_tokens
-            ),
-            lambda p: (
-                dynamic_tokens is None
-                or p["backend"] != "dynamic"
-                or query.num_tokens >= dynamic_tokens
-            ),
-            lambda p: (
-                not (
-                    p["csf_inline_scales"]
-                    and p["backend"] == "dynamic"
-                    and query.routed_rows > query.num_experts * p["dynamic_tile_m"]
-                )
-            ),
             # Caps below a quarter of the ladder's top rung never win a race.
             lambda p: (
                 p["max_active_clusters"] is None
@@ -1131,7 +1113,7 @@ TUNING = TuningContract(
     validate_query=_validate_query,
     validate_config=validate_moe_decode_config,
     default_config=_default_config,
-    candidate_contract_version=62,
+    candidate_contract_version=63,
     knobs=(
         Knob(
             name="backend",
