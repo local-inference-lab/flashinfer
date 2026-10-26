@@ -28,7 +28,11 @@ def query(tokens=8192, hidden=5120, effort="default", pin=None):
 
 
 def assignment(config):
-    return {k: v for k, v in config.to_dict().items() if k != "projection_tile_m"}
+    values = {k: v for k, v in config.to_dict().items() if k != "projection_tile_m"}
+    values["fused_tile_m"] = (
+        config.projection_tile_m if config.backend == "tf32_fused" else 16
+    )
+    return values
 
 
 @pytest.mark.parametrize("effort", ["default", "audit"])
