@@ -20,6 +20,7 @@ _MIXES = 24
 # SM120; long-M tile shapes start where the first TMA pipeline rules did.
 _TF32_MIN_TOKENS = 52
 _LONG_M_TOKENS = 384
+_LAGGED_TMA_MIN_TOKENS = 1024
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -199,6 +200,12 @@ def _tf32_eligible(query):
 
 
 def _default_config(query, device):
+    if (
+        _fused_eligible(query)
+        and _tf32_pin(query) is None
+        and (not _tf32_eligible(query) or query.max_tokens < _LAGGED_TMA_MIN_TOKENS)
+    ):
+        return _fused_config(query)
     config = _projection_default_config(query, device)
     threshold = int(query.controls.get("B12X_MHC_PREFILL_MIN_TOKENS", "96"))
     prepared = query.lagged_mix and config.backend == "native"
@@ -414,11 +421,14 @@ def _tuning_parameters(query: MhcQuery, device: DeviceIdentity | None):
     total_k = _MHC_MULT * query.hidden_size
     tf32 = _tf32_eligible(query)
     pin = _tf32_pin(query)
-    backends = ("native", "tf32_tma") if tf32 else ("native",)
-    if tf32 and pin is not None:
-        backends = ("tf32_tma",) if pin else ("native",)
     if _fused_eligible(query) and pin is None:
-        backends += ("tf32_fused",)
+        backends = ("tf32_fused",)
+        if tf32 and query.max_tokens >= _LAGGED_TMA_MIN_TOKENS:
+            backends += ("tf32_tma",)
+    else:
+        backends = ("native", "tf32_tma") if tf32 else ("native",)
+        if tf32 and pin is not None:
+            backends = ("tf32_tma",) if pin else ("native",)
     partials = query.controls.get("B12X_MHC_PARTIALS_PER_CTA")
     values = {
         "backend": backends,
@@ -625,7 +635,7 @@ TUNING = TuningContract(
     default_config=_default_config,
     validate_query=_validate_query,
     validate_config=_validate,
-    candidate_contract_version=30,
+    candidate_contract_version=31,
     knobs=(
         Knob(
             name="backend",

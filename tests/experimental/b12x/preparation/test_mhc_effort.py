@@ -32,6 +32,9 @@ def assignment(config):
     values["fused_tile_m"] = (
         config.projection_tile_m if config.backend == "tf32_fused" else 16
     )
+    for knob in _tuning.TUNING.knobs:
+        if not knob.active(values):
+            values[knob.name] = knob.otherwise
     return values
 
 
@@ -209,3 +212,35 @@ def test_off_returns_lowerable_assignment_for_materialized_default():
     assert config == configuration.default
     assert "projection_tile_m" not in choice
     assert _tuning.TUNING.lower(q, None, choice) == config
+
+
+@pytest.mark.parametrize("tokens", [512, 1023, 1024])
+@pytest.mark.parametrize("operation", ["pre", "post_pre"])
+@pytest.mark.parametrize("with_norm", [False, True])
+def test_lagged_search_uses_fused_until_tma_prefill(tokens, operation, with_norm):
+    q = replace(
+        query(tokens=tokens),
+        operation=operation,
+        expanded_residual=operation == "pre",
+        has_norm_weight=with_norm,
+    )
+    configurations = [config for _, config in _tuning.TUNING.choices(q, None)]
+    expected = {"tf32_fused"}
+    if with_norm and tokens >= 1024:
+        expected.add("tf32_tma")
+    assert {config.backend for config in configurations} == expected
+    assert _tuning.TUNING.default_config(q, None) in configurations
+
+
+def test_broadcast_lagged_pre_keeps_native():
+    q = replace(query(tokens=8), operation="pre", expanded_residual=False)
+    assert {config.backend for _, config in _tuning.TUNING.choices(q, None)} == {
+        "native"
+    }
+
+
+def test_nonlagged_decode_keeps_native():
+    q = replace(query(tokens=8), lagged_mix=False)
+    assert {config.backend for _, config in _tuning.TUNING.choices(q, None)} == {
+        "native"
+    }
