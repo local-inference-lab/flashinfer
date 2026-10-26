@@ -37,15 +37,9 @@ def _query(tokens, effort="default", **changes):
 
 
 def _choices(device, tokens, effort="default"):
-    space = TUNING.parameter_space(_query(tokens, effort), device)
-    seen = set()
-    for assignment in space.configurations():
-        seen.add((assignment["backend"], assignment["csf_inline_scales"]))
-        inline = {value for _, value in seen}
-        backends = {name for name, _ in seen}
-        if inline == {False, True} and {"micro", "dynamic"} <= backends:
-            break
-    return seen
+    """The production candidate set: every entry has been materialized."""
+    plan = TUNING.eligible_plan(_query(tokens, effort), device)
+    return {(config.backend, config.csf_inline_scales) for _, config in plan.candidates}
 
 
 @pytest.mark.parametrize("device", [GB10, RTX])
@@ -57,10 +51,16 @@ def test_inline_and_expansion_are_both_candidates(device, effort, tokens):
     assert any(not inline for _, inline in choices)
 
 
-@pytest.mark.parametrize("tokens", [4, 8, 16, 64])
-def test_micro_and_dynamic_are_both_candidates(tokens):
-    choices = _choices(GB10, tokens)
-    assert {"micro", "dynamic"} <= {backend for backend, _ in choices}
+@pytest.mark.parametrize("tokens", [4, 8, 16, 64, 1024])
+def test_micro_and_dynamic_race_through_1024_tokens(tokens):
+    assert {"micro", "dynamic"} <= {backend for backend, _ in _choices(GB10, tokens)}
+
+
+@pytest.mark.parametrize("tokens", [2048, 4096])
+def test_uncapped_micro_is_rejected_past_the_grid_limit(tokens):
+    # Direct compact FC2 uses grid.z = tokens * ceil(hidden / 128); without a
+    # cluster cap it would exceed CUDA's 65535 limit here.
+    assert "micro" not in {backend for backend, _ in _choices(GB10, tokens)}
 
 
 def test_off_effort_keeps_expansion():

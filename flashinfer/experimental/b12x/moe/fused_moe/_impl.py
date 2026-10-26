@@ -2618,8 +2618,10 @@ def _w4a8_mx_micro_supported(
             )
         )
     if source_format == "fp4_e8m0_k32" and n % 128 == 64:
+        # The compact micro kernel grid-strides any token count; the 16-token
+        # preference is a heuristic choice, not a capability limit.
         return bool(
-            1 <= num_tokens <= _COMPACT_W4A8_MAX_TOKENS
+            1 <= num_tokens
             and k % 256 == 0
             and activation == "silu"
             and 0 < num_topk <= 32
@@ -2651,6 +2653,14 @@ def _w4a8_mx_micro_preferred(
         source_format=query.source_format,
         deterministic_output=query.deterministic_output,
     ):
+        return False
+    if (
+        query.source_format == "fp4_e8m0_k32"
+        and query.intermediate_size % 128 == 64
+        and query.num_tokens > _COMPACT_W4A8_MAX_TOKENS
+    ):
+        # No-tune heuristic: compact decode stays on the per-row micro kernel
+        # only through 16 tokens. Larger launches race it instead.
         return False
     capability = (
         device.compute_capability

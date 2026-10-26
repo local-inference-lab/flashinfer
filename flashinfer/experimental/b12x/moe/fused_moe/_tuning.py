@@ -998,13 +998,37 @@ def _tuning_parameters(query, device):
     # pruned. The per-row micro kernel, the M16 dynamic kernel, and inline
     # scales each win in a band that depends on the device and routing density;
     # a token-count guess here hid the winning inline choice on GB10 between 8
-    # and 2048 tokens. Only the cluster-cap dominance rule remains.
+    # and 2048 tokens.
+    #
+    # The one remaining backend bound is capability, not performance: the micro
+    # kernel has a hard token ceiling (`_policy_micro_supported`), and
+    # `_materialize_tuning` already rejects anything above it. Enforcing it as a
+    # correctness predicate keeps the raced space honest at every effort tier.
+    from ._impl import _policy_micro_supported
+
+    micro_supported = _policy_micro_supported(launch_query)
+    # Direct compact FC2 launches on grid.z = tokens * ceil(hidden / 128). With
+    # no cluster cap that exceeds CUDA's 65535 limit on long launches, so the
+    # uncapped assignment is a resource violation, not a slow choice.
+    micro_z_factor = -(-launch_query.hidden_size // 128)
+
+    def micro_grid_fits(p):
+        if p["backend"] != "micro":
+            return True
+        if p["route_planner"] == "triton" and p["max_active_clusters"] is not None:
+            return True
+        return launch_query.num_tokens * micro_z_factor <= 65535
+
     grid_knob = next(knob for knob in space.knobs if knob.name == "max_active_clusters")
     top_cap = max((value for value in grid_knob.values if value is not None), default=0)
     return ParameterSpace.create(
         space.knobs,
         values=w4a16_values,
-        predicates=space.predicates,
+        predicates=space.predicates
+        + (
+            lambda p: p["backend"] != "micro" or micro_supported,
+            micro_grid_fits,
+        ),
         efficiency_predicates=(
             # Caps below a quarter of the ladder's top rung never win a race.
             lambda p: (
