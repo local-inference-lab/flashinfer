@@ -446,35 +446,56 @@ def measure_race_steps(
                     sample_count=prepared.sample_count,
                     compilation_active=compilation_active,
                 )
+                sample_groups = tuple(
+                    prepared.timers[index].samples() for index in indices
+                )
+                if sample_exchange is not None:
+                    sample_groups = yield from sample_exchange(
+                        indices, turn, repetition, sample_groups
+                    )
+                scored_batches = ((indices, sample_groups),)
             else:
                 import torch
 
+                scored_batches = []
                 with torch.cuda.device(device_ordinal), no_compilation():
                     stream = torch.cuda.current_stream(device_ordinal)
-                    # Queue the entire sample block before any peer starts it.
-                    with _collection_paused(), prepared.collective_gate.hold(stream):
-                        for index in indices:
+                    # Release each candidate's gate before submitting another
+                    # candidate's reset and input-production work. A blocked
+                    # stream cannot drain an unbounded queue of those copies.
+                    for index in indices:
+                        candidate_indices = (index,)
+                        with (
+                            _collection_paused(),
+                            prepared.collective_gate.hold(stream),
+                        ):
                             prepared.timers[index].replay(align=True)
-                        yield from launch_exchange(indices, turn, repetition)
-                    stream.synchronize()
-            sample_groups = tuple(prepared.timers[index].samples() for index in indices)
-            if sample_exchange is not None:
-                sample_groups = yield from sample_exchange(
-                    indices, turn, repetition, sample_groups
-                )
-            for index, samples in zip(indices, sample_groups, strict=True):
-                if sample_observer is not None:
-                    sample_observer(index, turn, repetition, samples)
-                latency = statistics.fmean(samples)
-                if not math.isfinite(latency) or latency <= 0:
-                    raise RuntimeError("candidate race produced an invalid latency")
-                totals[index] += latency
-                if adaptive_repeats and turn == 0 and repetition == 0:
-                    # The first scored replay also sizes the remaining work.
-                    repeats[index] = max(
-                        1,
-                        math.ceil(ROUND_BUDGET_US / (prepared.sample_count * latency)),
-                    )
+                            yield from launch_exchange(
+                                candidate_indices, turn, repetition
+                            )
+                        stream.synchronize()
+                        sample_groups = (prepared.timers[index].samples(),)
+                        if sample_exchange is not None:
+                            sample_groups = yield from sample_exchange(
+                                candidate_indices, turn, repetition, sample_groups
+                            )
+                        scored_batches.append((candidate_indices, sample_groups))
+            for scored_indices, sample_groups in scored_batches:
+                for index, samples in zip(scored_indices, sample_groups, strict=True):
+                    if sample_observer is not None:
+                        sample_observer(index, turn, repetition, samples)
+                    latency = statistics.fmean(samples)
+                    if not math.isfinite(latency) or latency <= 0:
+                        raise RuntimeError("candidate race produced an invalid latency")
+                    totals[index] += latency
+                    if adaptive_repeats and turn == 0 and repetition == 0:
+                        # The first scored replay also sizes the remaining work.
+                        repeats[index] = max(
+                            1,
+                            math.ceil(
+                                ROUND_BUDGET_US / (prepared.sample_count * latency)
+                            ),
+                        )
             repetition += 1
             yield
         for index in order:
