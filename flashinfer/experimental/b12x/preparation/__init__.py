@@ -4,6 +4,7 @@ from ._efficiency import AutotuneEffort, autotune_effort
 from .device import DetectedDevice, detect_device
 from .session import CollectiveBarrierTimeout, PreparationJob, PreparationSession
 from .session import prepare_default
+from .context import ContextCandidate, ContextRaceResult
 from ._progress import PreparationDisplay
 from .tuning import (
     BackendConfig,
@@ -29,6 +30,9 @@ from .types import (
     PreparationResult,
     PreparedCall,
     Selection,
+    Finalist,
+    FinalistPolicy,
+    FinalistRecord,
     TuningCacheRequirement,
     TuningRequirement,
     current_plan,
@@ -64,6 +68,11 @@ __all__ = [
     "PreparationResult",
     "PreparedCall",
     "Selection",
+    "Finalist",
+    "FinalistPolicy",
+    "FinalistRecord",
+    "ContextCandidate",
+    "ContextRaceResult",
     "TuningCacheRequirement",
     "TuningConfiguration",
     "TuningContract",

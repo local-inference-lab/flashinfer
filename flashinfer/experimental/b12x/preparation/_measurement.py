@@ -215,10 +215,11 @@ def _collection_paused():
 
 
 class _TimedCall:
-    def __init__(self, call, eviction, samples, gate):
+    def __init__(self, call, eviction, samples, gate, *, eviction_after_produce=False):
         import torch
 
         self.call, self.eviction = call, eviction
+        self.eviction_after_produce = eviction_after_produce
         self.gate = gate
         self.producers = call.benchmark_producers or (call.produce,)
         self.events = tuple(
@@ -241,11 +242,13 @@ class _TimedCall:
                 self.producers[0]()
                 self.call.invoke()
             for index, (start, end) in enumerate(self.events):
-                if self.eviction is not None:
+                if self.eviction is not None and not self.eviction_after_produce:
                     self.eviction()
                 if self.call.reset is not None:
                     self.call.reset()
                 self.producers[index % len(self.producers)]()
+                if self.eviction is not None and self.eviction_after_produce:
+                    self.eviction()
                 with _collection_paused(), self.gate.hold(stream):
                     start.record(stream)
                     self.call.invoke()
@@ -256,6 +259,7 @@ class _TimedCall:
 
     def close(self):
         self.call = self.eviction = self.gate = None
+        self.eviction_after_produce = False
         self.events = ()
         self.producers = ()
 
@@ -318,6 +322,7 @@ def prepare_race_steps(
     primed=False,
     eviction=None,
     cache_policy="cold",
+    eviction_after_produce=False,
 ):
     """Prepare event pairs for asynchronous calls on the current CUDA stream."""
     import torch
@@ -355,7 +360,15 @@ def prepare_race_steps(
         yield
         for call in calls:
             with torch.cuda.device(device_ordinal), no_compilation():
-                timers.append(_TimedCall(call, eviction, samples, gate))
+                timers.append(
+                    _TimedCall(
+                        call,
+                        eviction,
+                        samples,
+                        gate,
+                        eviction_after_produce=eviction_after_produce,
+                    )
+                )
             yield
         completed = True
         return PreparedRace(tuple(timers), eviction, sample_count, gate=gate)

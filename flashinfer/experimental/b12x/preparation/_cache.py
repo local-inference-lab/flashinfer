@@ -146,21 +146,30 @@ class SelectionCache:
             self._pending = pending
             raise
 
-    def save(self, key, *, assignment, config, coverage, programs):
+    def save(self, key, *, assignment, config, coverage, programs, finalists=None):
         """Record a completed selection; it reaches the file at the next flush."""
-        update = {
-            key: {
-                "assignment": FrozenMapping(assignment).to_dict(),
-                "config": FrozenMapping(config).to_dict(),
-                "coverage": dict(coverage),
-                "programs": [
-                    list(item)
-                    for item in sorted(
-                        {(program.dialect, program.key) for program in programs}
-                    )
-                ],
-            }
+        record = {
+            "assignment": FrozenMapping(assignment).to_dict(),
+            "config": FrozenMapping(config).to_dict(),
+            "coverage": dict(coverage),
+            "programs": [
+                list(item)
+                for item in sorted(
+                    {(program.dialect, program.key) for program in programs}
+                )
+            ],
         }
+        if finalists is not None:
+            record["finalists"] = [
+                {
+                    "assignment": item.assignment.to_dict(),
+                    "family": item.family.to_dict(),
+                    "candidate_index": item.candidate_index,
+                    "latency_us": item.latency_us,
+                }
+                for item in finalists
+            ]
+        update = {key: record}
         self.records.update(update)
         if self._agreed_records is not None:
             self._agreed_records.update(update)
