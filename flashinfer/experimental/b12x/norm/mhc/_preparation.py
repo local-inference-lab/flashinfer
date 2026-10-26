@@ -333,6 +333,8 @@ def _compile_mhc(query_payload, config_payload, native_payload, ordinal):
                 pre_mix=mix,
                 y=y,
                 pre_only=query.operation == "pre",
+                tile_m=config.projection_tile_m,
+                fuse_norm=query.has_norm_weight,
             )
             programs["finalize"] = _fused_tf32.finalize(
                 residual=out,
@@ -484,6 +486,7 @@ def _fused_numerics(query):
         hc_eps=query.hc_eps,
         norm_eps=query.norm_eps,
         sinkhorn_iters=query.sinkhorn_iters,
+        fuse_norm=query.has_norm_weight,
     )
 
 
@@ -599,6 +602,8 @@ def _launchers(query, config, native, programs):
                 partial(
                     _fused_tf32.partial,
                     pre_only=query.operation == "pre",
+                    tile_m=config.projection_tile_m,
+                    fuse_norm=query.has_norm_weight,
                     _prepared=programs["partial"],
                 ),
                 programs,

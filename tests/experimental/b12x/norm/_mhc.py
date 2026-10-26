@@ -18,6 +18,7 @@ def declaration(
     capacity=None,
     output_mode="provided",
     backend=None,
+    fused_tile_m=16,
     lagged_prepare=None,
     partials_per_cta=None,
 ):
@@ -55,7 +56,7 @@ def declaration(
                 config, backend=backend, lagged_prepare=False, partials_per_cta=4
             )
         if backend == "tf32_fused":
-            config = _fused_config(plan.query)
+            config = _fused_config(plan.query, fused_tile_m)
         if lagged_prepare is not None:
             config = replace(
                 config,

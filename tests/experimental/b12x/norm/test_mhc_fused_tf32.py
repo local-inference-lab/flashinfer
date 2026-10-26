@@ -11,12 +11,17 @@ from .test_mhc_lagged import _lagged_reference
 
 
 @pytest.mark.parametrize(
-    "backend,unaligned_weights",
-    [("native", False), ("tf32_fused", False), ("tf32_fused", True)],
+    "backend,unaligned_weights,tile_m",
+    [
+        ("native", False, 16),
+        ("tf32_fused", False, 16),
+        ("tf32_fused", True, 16),
+        ("tf32_fused", False, 32),
+    ],
 )
 @pytest.mark.parametrize("phase", ["pre", "post_pre"])
 @pytest.mark.parametrize("rows", [1, 8, 17, 32, 128, 256])
-def test_fused_tf32_graph(phase, rows, backend, unaligned_weights, mhc_session):
+def test_fused_tf32_graph(phase, rows, backend, unaligned_weights, tile_m, mhc_session):
     device = require_sm120()
     hidden = 5120
     residual, x, fn, scale, bias = make_inputs(
@@ -62,6 +67,7 @@ def test_fused_tf32_graph(phase, rows, backend, unaligned_weights, mhc_session):
         args,
         options,
         backend=backend,
+        fused_tile_m=tile_m,
         lagged_prepare=backend == "native",
     )
     predicted = torch.empty_like(incoming)

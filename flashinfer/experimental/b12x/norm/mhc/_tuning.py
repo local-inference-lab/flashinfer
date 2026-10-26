@@ -263,24 +263,16 @@ def _validate(
     if not config.lagged_prepare and config.partials_per_cta != 4:
         raise ValueError("partial grouping requires the fused lagged producer")
     if config.backend == "tf32_fused":
-        if config != _fused_config(query):
+        if config.projection_tile_m not in (16, 32) or config != _fused_config(
+            query, config.projection_tile_m
+        ):
             raise ValueError(
                 "fused TF32 requires its declared row-tile projection geometry"
             )
         if query.hidden_size % 512:
             raise ValueError("fused TF32 requires hidden size divisible by 512")
-        if not (
-            query.lagged_mix
-            and query.has_norm_weight
-            and (
-                query.operation == "post_pre"
-                or query.operation == "pre"
-                and query.expanded_residual
-            )
-        ):
-            raise ValueError(
-                "fused TF32 requires expanded lagged mHC with normalization"
-            )
+        if not _fused_eligible(query):
+            raise ValueError("fused TF32 requires expanded lagged mHC")
         return
     if config.backend == "native":
         return
@@ -320,14 +312,22 @@ def _validate(
         raise ValueError("projection geometry exceeds the CUDA thread-block limit")
 
 
-def _fused_config(query):
+def _fused_eligible(query):
+    return query.lagged_mix and (
+        query.operation == "post_pre"
+        or query.operation == "pre"
+        and query.expanded_residual
+    )
+
+
+def _fused_config(query, tile_m=16):
     return MhcConfig(
         backend="tf32_fused",
-        projection_tile_m=16,
+        projection_tile_m=tile_m,
         projection_tile_n=24,
         projection_tile_k=128,
         projection_num_stages=1,
-        projection_num_m_warps=1,
+        projection_num_m_warps=tile_m // 16,
         projection_num_n_warps=3,
         projection_k_splits=query.hidden_size // 32,
     )
@@ -417,11 +417,12 @@ def _tuning_parameters(query: MhcQuery, device: DeviceIdentity | None):
     backends = ("native", "tf32_tma") if tf32 else ("native",)
     if tf32 and pin is not None:
         backends = ("tf32_tma",) if pin else ("native",)
-    if tf32 and query.lagged_mix and pin is None:
+    if _fused_eligible(query) and pin is None:
         backends += ("tf32_fused",)
     partials = query.controls.get("B12X_MHC_PARTIALS_PER_CTA")
     values = {
         "backend": backends,
+        "fused_tile_m": (16,) if query.max_tokens < 128 else (16, 32),
         "lagged_prepare": (False, True) if query.lagged_mix else (False,),
         "partials_per_cta": (int(partials),)
         if partials not in (None, "")
@@ -603,8 +604,9 @@ def _tuning_parameters(query: MhcQuery, device: DeviceIdentity | None):
 
 def _materialize_tuning(query, device, choice):
     if choice["backend"] == "tf32_fused":
-        return _fused_config(query)
+        return _fused_config(query, choice["fused_tile_m"])
     values = dict(choice)
+    values.pop("fused_tile_m", None)
     # The production M tile is fixed by its MMA warp layout.
     values["projection_tile_m"] = 16 * values["projection_num_m_warps"]
     config = MhcConfig.from_config(FrozenMapping(values))
@@ -623,12 +625,19 @@ TUNING = TuningContract(
     default_config=_default_config,
     validate_query=_validate_query,
     validate_config=_validate,
-    candidate_contract_version=26,
+    candidate_contract_version=30,
     knobs=(
         Knob(
             name="backend",
             values=("native", "tf32_tma", "tf32_fused"),
             binding=ParameterBinding.COMPILE,
+        ),
+        Knob(
+            name="fused_tile_m",
+            values=(16, 32),
+            binding=ParameterBinding.COMPILE,
+            when=FrozenMapping({"backend": "tf32_fused"}),
+            otherwise=16,
         ),
         Knob(
             name="lagged_prepare",

@@ -56,9 +56,11 @@ def _pack_bf16_pair(lo: Float32, hi: Float32, *, loc=None, ip=None) -> Uint32:
 
 
 class _FusedPartial:
-    def __init__(self, hidden, pre_only):
+    def __init__(self, hidden, pre_only, tile_m, fuse_norm):
         self.hidden = hidden
         self.pre_only = pre_only
+        self.tile_m = tile_m
+        self.fuse_norm = fuse_norm
         self.splits = hidden // 32
 
     @cute.jit
@@ -79,7 +81,7 @@ class _FusedPartial:
         self.kernel(
             x, residual, post, comb, fn, incoming, out, y, partials, tokens
         ).launch(
-            grid=((tokens + 15) // 16, self.splits, 1),
+            grid=((tokens + self.tile_m - 1) // self.tile_m, self.splits, 1),
             block=(256, 1, 1),
             stream=stream,
             use_pdl=_MHC_PDL,
@@ -108,11 +110,11 @@ class _FusedPartial:
         hbase = split * 32
         bbase = shared_ptr_to_u32(b.iterator)
         incoming_values = cute.make_rmem_tensor(
-            cute.make_layout((2, 4), stride=(4, 1)), Float32
+            cute.make_layout((self.tile_m // 8, 4), stride=(4, 1)), Float32
         )
         incoming_values.fill(0.0)
-        for mi in cutlass.range_constexpr(2):
-            row = tile * 16 + warp + mi * 8
+        for mi in cutlass.range_constexpr(self.tile_m // 8):
+            row = tile * self.tile_m + warp + mi * 8
             if row < tokens:
                 for stream in cutlass.range_constexpr(4):
                     incoming_values[mi, stream] = Float32(incoming[row, stream])
@@ -133,9 +135,9 @@ class _FusedPartial:
                     cp_async_u32_shared_global(
                         dst + part * 4, address + Int64(part * 4)
                     )
-        for mi in cutlass.range_constexpr(2):
+        for mi in cutlass.range_constexpr(self.tile_m // 8):
             localrow = warp + mi * 8
-            row = tile * 16 + localrow
+            row = tile * self.tile_m + localrow
             for half in cutlass.range_constexpr(1):
                 h = hbase + half * 32 + lane
                 r0, r1, r2, r3 = Float32(0), Float32(0), Float32(0), Float32(0)
@@ -210,7 +212,8 @@ class _FusedPartial:
                 stats[mi, 0] += _warp_allreduce_sum(
                     r0 * r0 + r1 * r1 + r2 * r2 + r3 * r3
                 )
-                stats[mi, 1] += _warp_allreduce_sum(yv * yv)
+                if const_expr(self.fuse_norm):
+                    stats[mi, 1] += _warp_allreduce_sum(yv * yv)
         cute.arch.cp_async_commit_group()
 
     @cute.kernel
@@ -235,13 +238,15 @@ class _FusedPartial:
         smem = utils.SmemAllocator()
         a = smem.allocate_tensor(
             cutlass.BFloat16,
-            cute.make_layout((16, 128), stride=(132, 1)),
+            cute.make_layout((self.tile_m, 128), stride=(132, 1)),
             16,
         )
         b = smem.allocate_tensor(
             Float32, cute.make_layout((24, 128), stride=(132, 1)), 16
         )
-        stats = cute.make_rmem_tensor(cute.make_layout((2, 2), stride=(2, 1)), Float32)
+        stats = cute.make_rmem_tensor(
+            cute.make_layout((self.tile_m // 8, 2), stride=(2, 1)), Float32
+        )
         stats.fill(0.0)
         total = cute.make_rmem_tensor(cute.make_layout((4,)), Float32)
         hi = cute.make_rmem_tensor(cute.make_layout((4,)), Float32)
@@ -270,7 +275,7 @@ class _FusedPartial:
         )
         cute.arch.cp_async_wait_group(0)
         cute.arch.sync_threads()
-        if warp < 3:
+        if warp < self.tile_m // 16 * 3:
             for kk in cutlass.range_constexpr(16):
                 k0, k1 = kk * 8 + sub, kk * 8 + sub + 4
                 a0, a1 = (
@@ -308,29 +313,31 @@ class _FusedPartial:
                         total[j] += hi[j] + lo[j]
                         hi[j], lo[j] = Float32(0), Float32(0)
         cute.arch.sync_threads()
-        if warp < 3:
+        if warp < self.tile_m // 16 * 3:
             n0 = (warp % 3) * 8 + sub * 2
-            if tile * 16 + row0 < tokens:
-                partials[tile * 16 + row0, split, n0 + 1] = total[0]
-                partials[tile * 16 + row0, split, n0 + 2] = total[1]
-            if tile * 16 + row1 < tokens:
-                partials[tile * 16 + row1, split, n0 + 1] = total[2]
-                partials[tile * 16 + row1, split, n0 + 2] = total[3]
+            if tile * self.tile_m + row0 < tokens:
+                partials[tile * self.tile_m + row0, split, n0 + 1] = total[0]
+                partials[tile * self.tile_m + row0, split, n0 + 2] = total[1]
+            if tile * self.tile_m + row1 < tokens:
+                partials[tile * self.tile_m + row1, split, n0 + 1] = total[2]
+                partials[tile * self.tile_m + row1, split, n0 + 2] = total[3]
         if lane == 0:
-            for mi in cutlass.range_constexpr(2):
-                row = tile * 16 + warp + mi * 8
+            for mi in cutlass.range_constexpr(self.tile_m // 8):
+                row = tile * self.tile_m + warp + mi * 8
                 if row < tokens:
                     partials[row, split, 0] = stats[mi, 0]
-                    partials[row, split, 25] = stats[mi, 1]
+                    if const_expr(self.fuse_norm):
+                        partials[row, split, 25] = stats[mi, 1]
         if const_expr(_MHC_PDL):
             cute.arch.sync_threads()
             cute.arch.griddepcontrol_launch_dependents()
 
 
 class _FusedFinalize:
-    def __init__(self, hidden, rms_eps, hc_eps, norm_eps, sinkhorn_iters):
+    def __init__(self, hidden, rms_eps, hc_eps, norm_eps, sinkhorn_iters, fuse_norm):
         self.hidden, self.rms_eps, self.hc_eps = hidden, rms_eps, hc_eps
         self.norm_eps, self.sinkhorn_iters = norm_eps, sinkhorn_iters
+        self.fuse_norm = fuse_norm
         self.splits = hidden // 32
 
     @cute.jit
@@ -348,7 +355,10 @@ class _FusedFinalize:
         stream: cuda.CUstream,
     ):
         self.kernel(partials, scale, bias, norm, y, pre, post, comb).launch(
-            grid=(tokens, 1, 1), block=(160, 1, 1), stream=stream, use_pdl=_MHC_PDL
+            grid=(tokens, 1, 1),
+            block=(160 if self.fuse_norm else 32, 1, 1),
+            stream=stream,
+            use_pdl=_MHC_PDL,
         )
 
     @cute.kernel
@@ -413,7 +423,7 @@ class _FusedFinalize:
                 cvalue *= cute.arch.rcp_approx(colsum)
             if lane < 16:
                 comb[row, lane // 4, lane % 4] = cvalue
-        else:
+        elif const_expr(self.fuse_norm):
             square = Float32(0)
             for group in cutlass.range_constexpr((self.splits + 31) // 32):
                 split = lane + group * 32
@@ -475,13 +485,13 @@ class _FusedFinalize:
 
 
 @cache
-def _partial(hidden, pre_only):
-    return _FusedPartial(hidden, pre_only)
+def _partial(hidden, pre_only, tile_m, fuse_norm):
+    return _FusedPartial(hidden, pre_only, tile_m, fuse_norm)
 
 
 @cache
-def _finalize(hidden, rms_eps, hc_eps, norm_eps, sinkhorn_iters):
-    return _FusedFinalize(hidden, rms_eps, hc_eps, norm_eps, sinkhorn_iters)
+def _finalize(hidden, rms_eps, hc_eps, norm_eps, sinkhorn_iters, fuse_norm):
+    return _FusedFinalize(hidden, rms_eps, hc_eps, norm_eps, sinkhorn_iters, fuse_norm)
 
 
 def _compact_tensor(value):
@@ -520,7 +530,7 @@ def _launch(kernel, family, operands, *, _prepared, constants):
     ) + tuple(constants)
     return _compile_mhc_entry(
         kernel,
-        compile_spec=KernelCompileSpec.from_key(family, 3, key),
+        compile_spec=KernelCompileSpec.from_key(family, 4, key),
         compile_args=args,
         runtime_args=args,
     )
@@ -535,6 +545,8 @@ def partial(
     pre_mix,
     y,
     pre_only=False,
+    tile_m=16,
+    fuse_norm=True,
     x=None,
     prev_post=None,
     prev_comb=None,
@@ -553,11 +565,15 @@ def partial(
         partials=partials,
     )
     return _launch(
-        _partial(residual.shape[-1], pre_only),
+        _partial(residual.shape[-1], pre_only, tile_m, fuse_norm),
         "norm.mhc.fused_tf32_partial",
         operands,
         _prepared=_prepared,
-        constants=(("pre_only", pre_only),),
+        constants=(
+            ("pre_only", pre_only),
+            ("tile_m", tile_m),
+            ("fuse_norm", fuse_norm),
+        ),
     )
 
 
@@ -577,20 +593,23 @@ def finalize(
     hc_eps,
     norm_eps,
     sinkhorn_iters,
+    fuse_norm=True,
     _prepared=None,
 ):
     operands = dict(
         partials=partials,
         scale=scale,
         bias=bias,
-        norm=norm_weight,
+        norm=norm_weight if fuse_norm else bias,
         y=y,
         pre=pre_out,
         post=post,
         comb=comb,
     )
     return _launch(
-        _finalize(residual.shape[-1], rms_eps, hc_eps, norm_eps, sinkhorn_iters),
+        _finalize(
+            residual.shape[-1], rms_eps, hc_eps, norm_eps, sinkhorn_iters, fuse_norm
+        ),
         "norm.mhc.fused_tf32_finalize",
         operands,
         _prepared=_prepared,
@@ -599,5 +618,6 @@ def finalize(
             ("hc_eps", hc_eps),
             ("norm_eps", norm_eps),
             ("sinkhorn_iters", sinkhorn_iters),
+            ("fuse_norm", fuse_norm),
         ),
     )
