@@ -26,7 +26,7 @@ PYTHONPATH="$CONTROL/flashinfer/experimental:$CONTROL" python "$BENCHMARK" \
   --compile-workers 16 --rounds 9 --samples 4 --output control-a.json
 ```
 
- Plans use normal default-tier
+Plans use normal default-tier
 autotuning within the declared BF16 arithmetic contract; no split count, tile
 or implementation is pinned. Both cold and warm policies use one stream-gated
 interval around the captured call. Binding occurs **inside capture**, followed
@@ -36,13 +36,37 @@ reference checks happen outside timing. The benchmark checks the packed-cache
 numerical reference and three poisoned-scratch replays before measurement.
 
 The fixture and gated measurement loop are the direct-FI form of the measured
-component wrapper. The portable entrypoint has CPU help/syntax/source review;
-its GPU execution has not been rerun. Source review preserves the emitted
-bind+attention operation and input generator, but its direct-FI preparation
-replaces the wrapper's preparation owner. Do not treat it as an additional GPU
-qualification until run on the intended hardware.
+component wrapper. The entrypoint is GPU-qualified by the four-case paired
+measurement below, with the reference and three poisoned-scratch replay checks
+preserved.
 
-## Recorded conditions and results
+## Portable entrypoint measurements
+
+[Raw portable measurements](compressed_mla_binding_portable_sm120.json) use this
+exact entrypoint with public main `344e4837` and patch revision `6351ddac0` in A/B/B/A order.
+Each policy has nine gated rounds of four samples per case. The reported values
+average the two matching arm medians. All numerical and poisoned-replay checks
+pass, with normal default-tier tuning and no plan overrides.
+
+| Context / ratio | Control warm | Removal warm | Control cold | Removal cold |
+| --- | ---: | ---: | ---: | ---: |
+| 4096 / 1 | 10.8440us | 8.9440us | 13.0080us | 11.4160us |
+| 4096 / 2 | 10.8080us | 9.0320us | 13.0440us | 11.0000us |
+| 8192 / 1 | 10.8880us | 9.0200us | 13.0480us | 11.3640us |
+| 8192 / 2 | 10.8360us | 9.1800us | 13.0240us | 11.2440us |
+
+At 4096 both arms select 54 splits/chunk 12, so those rows compare matched plans.
+At 8192 the control selects 10 splits/chunk 64 and fill removal selects 54/chunk 12;
+those before/after numbers include normal plan selection and are not an isolated
+fill-cost attribution. All plans retain BF16 arithmetic and 16 heads. Raw records
+include every selected config and event interval.
+
+RTX PRO 6000 Blackwell SM120, Torch 2.14.1+cu132/CUDA 13.2; automatic core policy and
+existing +6000 MHz memory offset without a benchmark clock lock. Resident services
+stay idle with counters/GPU owners unchanged. No full-model/HTTP gain is claimed;
+SM121 remains unqualified.
+
+## Historical component-wrapper measurements
 
 [Raw per-round samples and selected configurations](compressed_mla_binding_sm120.json)
 cover rows8, heads16, head dimension512, 128 window and 512 indexed entries,
@@ -53,8 +77,8 @@ produce a median round mean; the table averages the two matching ABBA-arm
 medians. Every arm selects BF16, heads16, ten splits and chunk size64 through
 normal tuning.
 
-RTX PRO 6000 Blackwell SM120, Torch2.14.1+cu132/CUDA13.2; automatic core policy
-and existing +6000MHz memory offset, without a benchmark clock lock. Resident
+RTX PRO 6000 Blackwell SM120, Torch 2.14.1+cu132/CUDA 13.2; automatic core policy
+and existing +6000 MHz memory offset, without a benchmark clock lock. Resident
 services were idle, with request counters/GPU owners unchanged before/after.
 
 | Context / ratio | Control warm | Fill removal warm | Control cold | Fill removal cold |
