@@ -174,6 +174,10 @@ def stack_limit_bytes():
 
 def _local_memory_bytes(executable):
     """The largest static local memory footprint among an executable's loaded kernels."""
+    from .cuda_program import CudaProgram, _CudaKernelOwner
+
+    if isinstance(executable, (CudaProgram, _CudaKernelOwner)):
+        return executable.local_memory_bytes()
     from cuda.bindings import driver, runtime
     from triton.compiler.compiler import CompiledKernel
 

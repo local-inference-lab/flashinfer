@@ -83,6 +83,12 @@ def _planning_artifacts(
     ):
         return
     seen.add(id(value))
+    from .cuda_program import CudaProgram, cuda_program_available
+
+    if isinstance(value, CudaProgram):
+        if not value._owners and not cuda_program_available(value.spec.key):
+            yield value.spec.program
+        return
     if isinstance(value, (DeferredCuTeKernel, DeferredTritonKernel)):
         if value._resolved is None:
             yield value.__b12x_programs__[0]
@@ -160,6 +166,10 @@ def compiled_program_available(program: ProgramKey) -> bool:
     """Check an executable or actual artifact, never an unresolved factory."""
     if program in _RESIDENT_PROGRAMS:
         return True
+    if program.dialect == "cuda":
+        from .cuda_program import cuda_program_available
+
+        return cuda_program_available(program.key)
     if program.dialect == "cute":
         from .compiler import _valid_cute_compile_cache
 
@@ -428,6 +438,7 @@ def load_programs(value: Any) -> Any:
         raise RuntimeError("executable loading is not a metadata-only operation")
     from triton.compiler.compiler import CompiledKernel
     from .runtime_control import raise_if_kernel_resolution_frozen
+    from .cuda_program import CudaProgram
 
     visited = set()
 
@@ -444,6 +455,8 @@ def load_programs(value: Any) -> Any:
         elif isinstance(item, (tuple, list)):
             for child in item:
                 load(child)
+        elif isinstance(item, CudaProgram):
+            item._load()
         elif isinstance(item, (DeferredCuTeKernel, DeferredTritonKernel)):
             load(item._load())
         elif isinstance(item, CompiledCuTeProgram):

@@ -114,7 +114,9 @@ def test_cancelled_compiler_wait_terminates_pool_and_primes_default(
         active_compilations = 1
 
         def summary(self):
-            return SimpleNamespace(cute_compilations=0, triton_compilations=0)
+            return SimpleNamespace(
+                cute_compilations=0, triton_compilations=0, cuda_compilations=0
+            )
 
         def submit_plans(self, *_args, **_kwargs):
             events.append("queued")

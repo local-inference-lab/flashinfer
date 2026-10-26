@@ -911,7 +911,11 @@ class PreparationJob:
         active_compilations = 0
         if self.session._pool is not None:
             summary = self.session._pool.summary()
-            self._compilations = summary.cute_compilations + summary.triton_compilations
+            self._compilations = (
+                summary.cute_compilations
+                + summary.triton_compilations
+                + summary.cuda_compilations
+            )
             active_compilations = self.session._pool.active_compilations
         phase = (
             "ready"
@@ -2782,7 +2786,11 @@ class PreparationJob:
         self._phase = "finishing"
         summary = yield from self.session._drain()
         if summary is not None:
-            self._compilations = summary.cute_compilations + summary.triton_compilations
+            self._compilations = (
+                summary.cute_compilations
+                + summary.triton_compilations
+                + summary.cuda_compilations
+            )
         from b12x._lib.program_cache import evict_unretained
 
         keep = frozenset(
@@ -2810,7 +2818,7 @@ class PreparationJob:
                 dialect: sum(
                     program.dialect == dialect for program in self._all_programs
                 )
-                for dialect in ("cute", "triton")
+                for dialect in ("cute", "triton", "cuda")
             },
         )
         self._benchmark_closers = []

@@ -409,6 +409,9 @@ def _run_job(payload: bytes, expected: tuple[ProgramKey, ...]):
     job = pickle.loads(payload)
     before_cute = int(compile_cache_info()["compile_misses"])
     before_triton = _WORKER_TRITON_COMPILES
+    from .cuda_program import cuda_compile_count
+
+    before_cuda = cuda_compile_count()
     try:
         with observe_programs() as observed, serialized_compilations():
             result = job.invoke()
@@ -435,6 +438,7 @@ def _run_job(payload: bytes, expected: tuple[ProgramKey, ...]):
         os.getpid(),
         int(compile_cache_info()["compile_misses"]) - before_cute,
         _WORKER_TRITON_COMPILES - before_triton,
+        cuda_compile_count() - before_cuda,
         expected,
     )
 
@@ -476,6 +480,8 @@ class CompilationSummary:
     triton_compilations: int
     peak_parallel_cute_compilations: int
     elapsed_seconds: float
+    cuda_programs: int = 0
+    cuda_compilations: int = 0
 
 
 class CompilePool:
@@ -528,7 +534,7 @@ class CompilePool:
         self._planning_jobs: dict[bytes, CompileJob] = {}
         self._descriptions = deque()
         self._submitted: set[ProgramKey] = set()
-        self._cute_programs = self._triton_programs = 0
+        self._cute_programs = self._triton_programs = self._cuda_programs = 0
         self._completed: set[ProgramKey] = set()
         self._required: deque[CompilationPlan] = deque()
         self._optional: deque[CompilationPlan] = deque()
@@ -542,7 +548,8 @@ class CompilePool:
         self._optional_cancelled = False
         self._errors: list[BaseException] = []
         self._pids = set()
-        self._cute_count = self._triton_count = self._requested_jobs = self._jobs = 0
+        self._cute_count = self._triton_count = self._cuda_count = 0
+        self._requested_jobs = self._jobs = 0
         context = multiprocessing.get_context("spawn")
         self._activity = context.Array("q", (0, 0))
         with _offline_compiler_spawn_environment():
@@ -563,11 +570,12 @@ class CompilePool:
         self._workers = tuple(self._pool._pool)
 
     def _finish(self, result):
-        pid, cute, triton, programs = result
+        pid, cute, triton, cuda, programs = result
         with self._condition:
             self._pids.add(pid)
             self._cute_count += cute
             self._triton_count += triton
+            self._cuda_count += cuda
             self._completed.update(programs)
             self._inflight -= 1
             self._dispatch()
@@ -653,6 +661,7 @@ class CompilePool:
                 self._queued.pop(program, None)
             self._cute_programs += sum(p.dialect == "cute" for p in added)
             self._triton_programs += sum(p.dialect == "triton" for p in added)
+            self._cuda_programs += sum(p.dialect == "cuda" for p in added)
             self._jobs += 1
             self._inflight += 1
             self._pool.apply_async(
@@ -797,6 +806,8 @@ class CompilePool:
                 workers_used=len(self._pids),
                 cute_compilations=self._cute_count,
                 triton_compilations=self._triton_count,
+                cuda_programs=self._cuda_programs,
+                cuda_compilations=self._cuda_count,
                 peak_parallel_cute_compilations=int(self._activity[1]),
                 elapsed_seconds=time.monotonic() - self._started,
             )
