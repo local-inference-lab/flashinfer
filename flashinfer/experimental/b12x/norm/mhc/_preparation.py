@@ -76,6 +76,8 @@ def _lower_native(query, config, device):
     tokens, hidden = query.max_tokens, query.hidden_size
     capability = None if device.identity is None else device.identity.compute_capability
     route = query.operation
+    if config.backend == "tf32_fused":
+        return _NativeLaunch("tf32_fused")
     if query.operation == "pre" and query.lagged_mix and config.backend == "tf32_tma":
         route = "lagged_tf32"
     elif route == "post_pre" and config.lagged_prepare:
@@ -238,7 +240,7 @@ class _MhcCompileOperands:
 
 
 @program_cache(scope="preparation")
-def _fake_operands(query_payload, ordinal):
+def _fake_operands(query_payload, ordinal, fused=False):
     """Reuse shape-faithful operands across a query's compile configurations."""
     from torch._subclasses.fake_tensor import FakeTensorMode
 
@@ -261,7 +263,9 @@ def _fake_operands(query_payload, ordinal):
             values.update(
                 prev_post=empty((m, 4), torch.float32),
                 prev_comb=empty((m, 4, 4), torch.float32),
-                partials=empty((m, s, 25), torch.float32),
+                partials=empty(
+                    (m, h // 32, 26) if fused else (m, s, 25), torch.float32
+                ),
                 fn=empty(
                     (
                         24,
@@ -290,7 +294,7 @@ def _compile_mhc(query_payload, config_payload, native_payload, ordinal):
     query = _decode_query(query_payload)
     config = MhcConfig.from_config(FrozenMapping(config_payload))
     native = _NativeLaunch(**native_payload)
-    fake = _fake_operands(query_payload, ordinal)
+    fake = _fake_operands(query_payload, ordinal, config.backend == "tf32_fused")
     operands = fake.tensors
     programs = {}
     with fake.mode, compile_only_launches():
@@ -313,6 +317,37 @@ def _compile_mhc(query_payload, config_payload, native_payload, ordinal):
                 "bias",
             )
         )
+
+        if native.route == "tf32_fused":
+            from . import _fused_tf32
+
+            mix, y = operands["mix"], operands["y"]
+            programs["partial"] = _fused_tf32.partial(
+                x=x,
+                residual=residual,
+                prev_post=prev_post,
+                prev_comb=prev_comb,
+                fn=fn,
+                partials=partials,
+                out=out,
+                pre_mix=mix,
+                y=y,
+                pre_only=query.operation == "pre",
+            )
+            programs["finalize"] = _fused_tf32.finalize(
+                residual=out,
+                partials=partials,
+                scale=scale,
+                bias=bias,
+                y=y,
+                post=prev_post,
+                comb=prev_comb,
+                norm_weight=norm,
+                pre_mix=mix,
+                pre_out=mix,
+                **_fused_numerics(query),
+            )
+            return programs
 
         def post_pre_programs(pre_mix=None, y=None):
             args = dict(
@@ -443,6 +478,15 @@ def _compile_mhc(query_payload, config_payload, native_payload, ordinal):
     return programs
 
 
+def _fused_numerics(query):
+    return dict(
+        rms_eps=query.rms_eps,
+        hc_eps=query.hc_eps,
+        norm_eps=query.norm_eps,
+        sinkhorn_iters=query.sinkhorn_iters,
+    )
+
+
 def _projection_options(config):
     return {
         "tile_m": config.projection_tile_m,
@@ -547,6 +591,27 @@ def _post_pre_primary(query, config, native, programs):
 def _launchers(query, config, native, programs):
     from . import _kernels as kernels
 
+    if native.route == "tf32_fused":
+        from . import _fused_tf32
+
+        return {
+            "partial": attach_programs(
+                partial(
+                    _fused_tf32.partial,
+                    pre_only=query.operation == "pre",
+                    _prepared=programs["partial"],
+                ),
+                programs,
+            ),
+            "finalize": attach_programs(
+                partial(
+                    _fused_tf32.finalize,
+                    _prepared=programs["finalize"],
+                    **_fused_numerics(query),
+                ),
+                programs,
+            ),
+        }
     if query.operation == "post":
         return {
             "post": attach_programs(
@@ -694,7 +759,7 @@ def plan_mhc(caps, *, invocation=FrozenMapping(), override=None):
     def memory(config, device):
         if query.operation in ("post", "collapse") or query.output_mode == "functional":
             return MemoryRequirements()
-        layout = _layout_mhc_scratch(caps)
+        layout = _layout_mhc_scratch(caps, config)
         return MemoryRequirements(
             scratch=(
                 scratch_buffer_spec(
@@ -717,7 +782,7 @@ def plan_mhc(caps, *, invocation=FrozenMapping(), override=None):
             caps=caps,
             query=query,
             config=selection.config,
-            layout=_layout_mhc_scratch(caps),
+            layout=_layout_mhc_scratch(caps, selection.config),
             _scratch_specs=memory(selection.config, device).scratch,
             launchers=MappingProxyType(
                 _launchers(query, selection.config, selected_native, compiled)

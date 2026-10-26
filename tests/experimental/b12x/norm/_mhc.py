@@ -6,7 +6,7 @@ import torch
 
 from b12x.norm import mhc
 from b12x.norm.mhc import _impl
-from b12x.norm.mhc._tuning import TUNING
+from b12x.norm.mhc._tuning import TUNING, _fused_config
 from b12x.preparation import FrozenMapping, PreparedCall
 
 
@@ -54,6 +54,8 @@ def declaration(
             config = replace(
                 config, backend=backend, lagged_prepare=False, partials_per_cta=4
             )
+        if backend == "tf32_fused":
+            config = _fused_config(plan.query)
         if lagged_prepare is not None:
             config = replace(
                 config,

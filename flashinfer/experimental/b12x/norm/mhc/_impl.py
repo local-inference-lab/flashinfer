@@ -290,6 +290,12 @@ class _MhcState:
                     "MHC numerical recipe differs from prepared invocation"
                 )
 
+    @property
+    def partial_shape(self):
+        if self.config.backend == "tf32_fused":
+            return (self.caps.hidden_size // 32, 26)
+        return (self.caps.split_k, MHC_PARTIALS)
+
     def scratch_specs(self) -> tuple[ScratchBufferSpec, ...]:
         return self._scratch_specs
 
@@ -307,11 +313,11 @@ class _MhcState:
             owner="mHC",
         )
         max_tokens = int(self.caps.max_tokens)
-        split_k = int(self.caps.split_k)
+        split_k, partial_columns = self.partial_shape
         partials, _ = materialize_scratch_view(
             scratch_storage,
             offset_bytes=self.layout.partials_offset_bytes,
-            shape=(max_tokens, split_k, MHC_PARTIALS),
+            shape=(max_tokens, split_k, partial_columns),
             dtype=torch.float32,
         )
         return partials
@@ -355,7 +361,8 @@ class _MhcState:
             out=out,
             tokens=live_tokens,
             hidden_size=int(self.caps.hidden_size),
-            split_k=int(self.caps.split_k),
+            split_k=self.partial_shape[0],
+            partial_columns=self.partial_shape[1],
             dtype=self.caps.dtype,
             device=self.caps.device,
         )
@@ -424,11 +431,12 @@ def _validate_mhc_binding_views(
     split_k: int,
     dtype: torch.dtype,
     device: torch.device,
+    partial_columns: int = MHC_PARTIALS,
 ) -> None:
     if partials is not None:
         _validate_optional_view(
             partials,
-            shape=(tokens, split_k, MHC_PARTIALS),
+            shape=(tokens, split_k, partial_columns),
             dtype=torch.float32,
             device=device,
             name="mHC partials",
@@ -499,7 +507,7 @@ def _slice_capacity_view(
     )
 
 
-def _layout_mhc_scratch(caps: B12XMHCScratchCaps) -> _MHCScratchLayout:
+def _layout_mhc_scratch(caps: B12XMHCScratchCaps, config=None) -> _MHCScratchLayout:
     cursor = 0
 
     def reserve(shape: tuple[int, ...], dtype: torch.dtype) -> tuple[int, int]:
@@ -509,7 +517,9 @@ def _layout_mhc_scratch(caps: B12XMHCScratchCaps) -> _MHCScratchLayout:
         return offset, cursor
 
     partials_offset_bytes, _ = reserve(
-        (int(caps.max_tokens), int(caps.split_k), MHC_PARTIALS),
+        (int(caps.max_tokens), caps.hidden_size // 32, 26)
+        if config is not None and config.backend == "tf32_fused"
+        else (int(caps.max_tokens), int(caps.split_k), MHC_PARTIALS),
         torch.float32,
     )
     return _MHCScratchLayout(
@@ -808,9 +818,10 @@ def _b12x_mhc_pre_impl(
             "MHC lagged coefficient presence differs from prepared invocation"
         )
 
+    split_k, partial_columns = _state.partial_shape
     if partials is None:
         partials = torch.empty(
-            (tokens, split_k, MHC_PARTIALS),
+            (tokens, split_k, partial_columns),
             dtype=torch.float32,
             device=residual.device,
         )
@@ -819,7 +830,7 @@ def _b12x_mhc_pre_impl(
         partials = _slice_capacity_view(
             partials,
             tokens=tokens,
-            tail_shape=(split_k, MHC_PARTIALS),
+            tail_shape=(split_k, partial_columns),
             dtype=torch.float32,
             device=residual.device,
             name="mHC partials",
@@ -922,7 +933,7 @@ def _b12x_mhc_pre_impl(
 
     if _state.query.lagged_mix:
         assert pre_mix is not None and pre_out is not None
-        if _state.config.lagged_prepare:
+        if _state.config.lagged_prepare or _state.config.backend == "tf32_fused":
             _validate_lagged_y_output(
                 y_out,
                 (residual, fn, hc_scale, hc_base, norm_weight, residual_out, partials),
@@ -1130,11 +1141,14 @@ def _b12x_mhc_post_pre_impl(
     if block_h <= 0:
         raise ValueError(f"block_h must be positive, got {block_h}")
 
+    split_k, partial_columns = _state.partial_shape
     if partials is None:
         # The Gram post_pre needs a partials scratch buffer (the launch boundary
         # between the partial pass and the multi-CTA finalize).
         partials = torch.empty(
-            (tokens, split_k, MHC_PARTIALS), dtype=torch.float32, device=residual.device
+            (tokens, split_k, partial_columns),
+            dtype=torch.float32,
+            device=residual.device,
         )
     # The source-tile CuTe post_pre path uses the shared scratch partials as
     # the launch boundary between post+partial reduction and y/post/comb finalize.
@@ -1142,7 +1156,7 @@ def _b12x_mhc_post_pre_impl(
         partials = _slice_capacity_view(
             partials,
             tokens=tokens,
-            tail_shape=(split_k, MHC_PARTIALS),
+            tail_shape=(split_k, partial_columns),
             dtype=torch.float32,
             device=residual.device,
             name="mHC partials",
@@ -1242,7 +1256,7 @@ def _b12x_mhc_post_pre_impl(
 
     if _state.query.lagged_mix:
         assert pre_mix is not None and pre_out is not None
-        if _state.config.lagged_prepare:
+        if _state.config.lagged_prepare or _state.config.backend == "tf32_fused":
             _validate_lagged_y_output(
                 y_out,
                 (
