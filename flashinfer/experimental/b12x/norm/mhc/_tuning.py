@@ -16,8 +16,9 @@ from b12x.preparation.tuning import (
 
 _MHC_MULT = 4
 _MIXES = 24
-# TF32 projection overtakes the native fused path at about fifty tokens on
-# SM120; long-M tile shapes start where the first TMA pipeline rules did.
+# Off-effort fallback only. The native/TF32 crossover is measured by the race
+# at default and audit effort, so this single-part constant never decides a
+# tuned plan; it exists for `effort=off`, which runs no race at all.
 _TF32_MIN_TOKENS = 52
 _LONG_M_TOKENS = 384
 _LAGGED_TMA_MIN_TOKENS = 1024
@@ -495,15 +496,6 @@ def _tuning_parameters(query: MhcQuery, device: DeviceIdentity | None):
 
     sms = None if device is None else device.sm_count
 
-    both_backends = "native" in backends and "tf32_tma" in backends
-
-    def tf32_regime(p):
-        # Native decode beats every TF32 geometry below this token count.
-        return not both_backends or p["backend"] != "tf32_tma" or query.max_tokens >= 32
-
-    def native_regime(p):
-        return not both_backends or p["backend"] != "native" or query.max_tokens < 128
-
     def resident_grid(p):
         # Winning grids fill at least 40% of the SMs unless no legal K split
         # for the tile reaches that, and a K split never extends the grid
@@ -600,9 +592,10 @@ def _tuning_parameters(query: MhcQuery, device: DeviceIdentity | None):
             ),
         ),
         # Scheduling, warp layout and pipeline guesses; the audit lifts them.
+        # The native/TF32 crossover is deliberately not here: it is a measured
+        # decision, and a token-count guess pruned the winning backend on
+        # devices whose SM count differs from the reference part.
         efficiency_predicates=(
-            tf32_regime,
-            native_regime,
             resident_grid,
             warp_layout,
             tile_shape,
@@ -635,7 +628,7 @@ TUNING = TuningContract(
     default_config=_default_config,
     validate_query=_validate_query,
     validate_config=_validate,
-    candidate_contract_version=31,
+    candidate_contract_version=32,
     knobs=(
         Knob(
             name="backend",

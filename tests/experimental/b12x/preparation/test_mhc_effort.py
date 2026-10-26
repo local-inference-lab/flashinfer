@@ -239,8 +239,11 @@ def test_broadcast_lagged_pre_keeps_native():
     }
 
 
-def test_nonlagged_decode_keeps_native():
+def test_nonlagged_decode_races_both_backends():
+    # The native/TF32 crossover is measured. Pruning TF32 below a token count
+    # was a 188-SM guess and is no longer an efficiency predicate.
     q = replace(query(tokens=8), lagged_mix=False)
     assert {config.backend for _, config in _tuning.TUNING.choices(q, None)} == {
-        "native"
+        "native",
+        "tf32_tma",
     }
