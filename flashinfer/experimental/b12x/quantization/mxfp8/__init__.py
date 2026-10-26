@@ -4,6 +4,8 @@
 ``plan`` declares the fixed CuTe specialization.  A ``PreparationSession``
 compiles and primes it; ``quantize_rows(..., plan=plan)`` writes the
 caller-owned values and scale buffers without selection or JIT at run time.
+``query_from_call(..., min_amax=1e-4)`` applies an absolute-maximum floor
+before scale selection; the default 0.0 retains unfloored quantization.
 """
 
 from __future__ import annotations

@@ -63,6 +63,7 @@ _OPS: tuple[str, ...] = (
     "norm.hyperconnection",
     "norm.mhc",
     "quantization.mxfp8",
+    "quantization.mla_norm_mxfp8",
     "quantization.nvfp4",
     "sequence.ple_hash",
     "sequence.ple_embedding",

@@ -40,6 +40,24 @@ RECIPES = (
 
 @dataclass(frozen=True, kw_only=True)
 class DenseGemmQuery:
+    """Immutable encoded operands and arithmetic for a prepared dense GEMM.
+
+    ``scale_domain="ue8m0"`` permits the full UE8M0 input domain.
+    ``"bounded_fp32_products"`` is a producer guarantee for MXFP8: scale bytes
+    64–190 are powers of two whose pairwise FP32 products are normal and
+    finite; byte 0 appears only on encoded blocks containing exclusively zeros.
+    Other scale bytes never appear. This narrower
+    domain admits a CUDA candidate whose zero-block sentinel decoding differs
+    from UE8M0 only on inputs excluded by the guarantee. It does not select a
+    kernel, inspect tensor contents, or change activation encoding.
+
+    ``rhs_prefetch_ready`` permits reading RHS values and scales before waiting
+    for the preceding grid. They must be ready before that grid can release
+    dependent launches and remain unchanged through GEMM completion. Immutable
+    model weights satisfy this guarantee. The default retains ordinary stream
+    dependencies for both operands.
+    """
+
     recipe: str
     entry_point: str
     weight_storage: str
@@ -57,6 +75,8 @@ class DenseGemmQuery:
     sm_count: int | None = None
     workspace_form: str = "owned"
     sfb_k_replicated: bool = False
+    scale_domain: str = "ue8m0"
+    rhs_prefetch_ready: bool = False
     autotune_effort: str = field(default_factory=capture_autotune_effort)
 
     def __post_init__(self):
@@ -93,6 +113,8 @@ class DenseGemmConfig:
     split_k_slices: int | None
     large_m_unroll: bool | None
     target_occupancy: int | None
+    programmatic_serialization: bool = False
+    evict_first: bool = False
 
 
 def validate_query(query):
@@ -125,6 +147,12 @@ def validate_query(query):
         type(query.sm_count) is not int or query.sm_count <= 0
     ):
         raise ValueError("SM capacity must be a positive integer or None")
+    if query.scale_domain not in ("ue8m0", "bounded_fp32_products"):
+        raise ValueError("unknown dense scale operand domain")
+    if query.scale_domain != "ue8m0" and query.recipe != "mxfp8":
+        raise ValueError("finite MXFP8 scales require the MXFP8 recipe")
+    if type(query.rhs_prefetch_ready) is not bool:
+        raise TypeError("RHS prefetch readiness must be boolean")
     if type(query.sfb_k_replicated) is not bool:
         raise TypeError("weight-scale replication must be a boolean")
     if query.sfb_k_replicated and query.recipe != "mxfp8":
@@ -410,12 +438,42 @@ def launch_options(query, config):
     return options
 
 
+def streaming_eligible(query, device=None):
+    """Eligibility for finite encoded MXFP8 operands with zero-block sentinels.
+
+    Scale bytes 64–190 have finite normal pairwise FP32 products. Byte 0 is
+    permitted only when all corresponding encoded values are zero; every
+    other scale byte is excluded.
+    This producer guarantee makes the CUDA zero-scale decoding equivalent to
+    the standard UE8M0 matrix-multiplication contract without scanning inputs.
+    """
+    return (
+        query.recipe == "mxfp8"
+        and query.weight_storage == "native"
+        and query.scale_domain == "bounded_fp32_products"
+        and query.output_dtype == "bfloat16"
+        and query.batch == 1
+        and 1 <= query.max_rows <= 8
+        and 0 < query.in_features <= 2**31 - 1
+        and 0 < query.out_features <= 2**31 - 1
+        and query.in_features % 128 == 0
+        and ((query.out_features + 127) // 128) * query.in_features <= 2**31 - 1
+        and query.alpha_mode == "unit"
+        and query.output_mode == "provided"
+        and not query.sfb_k_replicated
+        and not query.overrides
+        and (device is None or device.compute_capability == (12, 0))
+    )
+
+
 def knob_values(query):
     """Recipe-specific host knob choices; validate_config applies interdependent launch constraints."""
     fp4 = query.recipe in ("nvfp4", "mxfp4")
     fp8 = query.recipe in ("mxfp8", "tensor_fp8", "block_fp8")
     return dict(
-        backend=("cutedsl",),
+        backend=("cutedsl", "cuda_streaming")
+        if streaming_eligible(query)
+        else ("cutedsl",),
         tile_m=(16, 32, 64, 128),
         tile_n=(16, 32, 64, 128),
         tile_k=(128, 256, 512)
@@ -438,6 +496,48 @@ def knob_values(query):
 def validate_config(query, config, device):
     if not isinstance(config, DenseGemmConfig):
         raise ValueError("dense GEMM requires a typed launch config")
+    if (
+        type(config.programmatic_serialization) is not bool
+        or type(config.evict_first) is not bool
+    ):
+        raise TypeError("CUDA launch/cache settings must be boolean")
+    if config.backend == "cuda_streaming":
+        if not streaming_eligible(query, device):
+            raise ValueError(
+                "streaming CUDA GEMM is outside its encoded MXFP8 contract"
+            )
+        fixed = (
+            config.tile_m,
+            config.tile_n,
+            config.tile_k,
+            config.load_path,
+            config.swap_ab,
+            config.split_k_slices,
+            config.large_m_unroll,
+            config.target_occupancy,
+        )
+        if fixed != (16, 8, 128, "streaming", False, 1, False, None):
+            raise ValueError(
+                "streaming CUDA tile/reduction fields describe its fixed device algorithm"
+            )
+        if (
+            type(config.programmatic_serialization) is not bool
+            or type(config.evict_first) is not bool
+        ):
+            raise TypeError("CUDA launch/cache settings must be boolean")
+        if config.programmatic_serialization and not query.rhs_prefetch_ready:
+            raise ValueError(
+                "programmatic weight prefetch requires declared RHS readiness"
+            )
+        if config.evict_first and not config.programmatic_serialization:
+            raise ValueError(
+                "evict-first weight prefetch requires programmatic serialization"
+            )
+        return
+    if config.programmatic_serialization or config.evict_first:
+        raise ValueError(
+            "CUDA launch/cache settings require the streaming CUDA backend"
+        )
     for name, values in knob_values(query).items():
         value = getattr(config, name)
         if not any(
@@ -588,6 +688,12 @@ def default_config(query, device):
 
 def _parameters(query, device):
     values = knob_values(query)
+    if device is not None and device.compute_capability != (12, 0):
+        values["backend"] = ("cutedsl",)
+    values["programmatic_serialization"] = (
+        (False, True) if query.rhs_prefetch_ready else (False,)
+    )
+    values["evict_first"] = (False, True) if query.rhs_prefetch_ready else (False,)
     mapping = {
         "load_path": "load_path",
         "swap_ab": "swap_ab",
@@ -643,7 +749,15 @@ def _parameters(query, device):
         TUNING.knobs,
         values=values,
         autotune_effort=query.autotune_effort,
-        predicates=(short_unswapped_async, bounded_prefill_k_tile)
+        predicates=(
+            lambda p: (
+                p["backend"] != "cuda_streaming"
+                or not p["evict_first"]
+                or p["programmatic_serialization"]
+            ),
+            short_unswapped_async,
+            bounded_prefill_k_tile,
+        )
         if constrained
         else (),
         efficiency_predicates=(bounded_row_padding, narrow_output_swap, reuse_rows)
@@ -660,8 +774,8 @@ def _validate_query(query, device):
 
 TUNING = TuningContract(
     component_id="gemm.mm",
-    query_schema_version=22,
-    config_schema_version=22,
+    query_schema_version=23,
+    config_schema_version=23,
     query_fields=frozenset(field.name for field in fields(DenseGemmQuery)),
     config_fields=frozenset(field.name for field in fields(DenseGemmConfig)),
     encode_query=lambda query: {
@@ -672,34 +786,82 @@ TUNING = TuningContract(
     default_config=default_config,
     validate_query=_validate_query,
     validate_config=validate_config,
-    candidate_contract_version=4,
+    candidate_contract_version=5,
     knobs=(
-        Knob(name="backend", values=("cutedsl",), binding=ParameterBinding.COMPILE),
-        Knob(name="tile_m", values=(16, 32, 64, 128), binding=ParameterBinding.COMPILE),
-        Knob(name="tile_n", values=(16, 32, 64, 128), binding=ParameterBinding.COMPILE),
         Knob(
-            name="tile_k", values=(64, 128, 256, 512), binding=ParameterBinding.COMPILE
+            name="backend",
+            values=("cutedsl", "cuda_streaming"),
+            binding=ParameterBinding.COMPILE,
+        ),
+        Knob(
+            name="tile_m",
+            values=(16, 32, 64, 128),
+            binding=ParameterBinding.COMPILE,
+            when=FrozenMapping({"backend": "cutedsl"}),
+            otherwise=16,
+        ),
+        Knob(
+            name="tile_n",
+            values=(8, 16, 32, 64, 128),
+            binding=ParameterBinding.COMPILE,
+            when=FrozenMapping({"backend": "cutedsl"}),
+            otherwise=8,
+        ),
+        Knob(
+            name="tile_k",
+            values=(64, 128, 256, 512),
+            binding=ParameterBinding.COMPILE,
+            when=FrozenMapping({"backend": "cutedsl"}),
+            otherwise=128,
         ),
         Knob(
             name="load_path",
-            values=("tma", "cpasync"),
+            values=("tma", "cpasync", "streaming"),
             binding=ParameterBinding.COMPILE,
+            when=FrozenMapping({"backend": "cutedsl"}),
+            otherwise="streaming",
         ),
-        Knob(name="swap_ab", values=(False, True), binding=ParameterBinding.COMPILE),
+        Knob(
+            name="swap_ab",
+            values=(False, True),
+            binding=ParameterBinding.COMPILE,
+            when=FrozenMapping({"backend": "cutedsl"}),
+            otherwise=False,
+        ),
         Knob(
             name="split_k_slices",
             values=(None, 1, 2, 4),
             binding=ParameterBinding.COMPILE,
+            when=FrozenMapping({"backend": "cutedsl"}),
+            otherwise=1,
         ),
         Knob(
             name="large_m_unroll",
             values=(None, False, True),
             binding=ParameterBinding.COMPILE,
+            when=FrozenMapping({"backend": "cutedsl"}),
+            otherwise=False,
         ),
         Knob(
             name="target_occupancy",
             values=(None, 1, 2, 3, 4),
             binding=ParameterBinding.COMPILE,
+            when=FrozenMapping({"backend": "cutedsl"}),
+            otherwise=None,
+        ),
+        Knob(
+            name="programmatic_serialization",
+            values=(False, True),
+            binding=ParameterBinding.COMPILE,
+            when=FrozenMapping({"backend": "cuda_streaming"}),
+            otherwise=False,
+        ),
+        Knob(
+            name="evict_first",
+            values=(False, True),
+            binding=ParameterBinding.COMPILE,
+            when=FrozenMapping({"backend": "cuda_streaming"}),
+            otherwise=False,
         ),
     ),
     parameters=_parameters,

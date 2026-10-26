@@ -81,6 +81,8 @@ def test_audit_admits_mxfp8_geometry(m, n, k, changes):
     choice = (
         dict(
             backend="cutedsl",
+            programmatic_serialization=False,
+            evict_first=False,
             tile_m=64,
             tile_n=64,
             tile_k=128,
@@ -111,6 +113,8 @@ def test_nvfp4_dominated_variants_are_never_raced_but_can_be_pinned(m, changes):
     choice = (
         dict(
             backend="cutedsl",
+            programmatic_serialization=False,
+            evict_first=False,
             tile_m=64,
             tile_n=64,
             tile_k=128,

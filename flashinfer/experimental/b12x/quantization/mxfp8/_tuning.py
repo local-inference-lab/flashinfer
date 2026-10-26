@@ -17,6 +17,7 @@ class Mxfp8Query:
     scale_rows_storage: str
     scale_mma_layout: str
     scale_mma_storage: str
+    min_amax: float = 0.0
 
 
 Mxfp8Config = BackendConfig
@@ -34,6 +35,8 @@ def _validate_query(query: Mxfp8Query, device) -> None:
         raise ValueError("MXFP8 planned rows must be a positive integer")
     if type(query.columns) is not int or query.columns <= 0 or query.columns % 32:
         raise ValueError("MXFP8 CuTe quantizer requires K divisible by 32")
+    if type(query.min_amax) not in (float, int) or query.min_amax not in (0.0, 1e-4):
+        raise ValueError("MXFP8 min_amax must be 0.0 or 1e-4")
     if query.dtype not in ("bfloat16", "float16"):
         raise ValueError("MXFP8 CuTe quantizer requires BF16 or FP16 input")
     if query.value_order not in ("linear", "trellis_native_mma"):
@@ -52,7 +55,7 @@ def _validate_query(query: Mxfp8Query, device) -> None:
 # compiler parameters remain unavailable as public overrides.
 TUNING = replace(
     TUNING,
-    query_schema_version=22,
+    query_schema_version=23,
     semantic_version=3,
     validate_query=_validate_query,
 )

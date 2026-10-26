@@ -83,6 +83,7 @@ def query_from_call(
     *,
     value_order: str = "linear",
     expected_m: int | None = None,
+    min_amax: float = 0.0,
 ) -> Mxfp8Query:
     """Normalize all immutable source/output layout semantics for a declaration."""
     if source.ndim != 2 or not source.is_contiguous():
@@ -116,6 +117,7 @@ def query_from_call(
         scale_rows_storage=scale_rows_storage,
         scale_mma_layout=_scale_mma_layout(scale_mma, rows, columns),
         scale_mma_storage=scale_mma_storage,
+        min_amax=min_amax,
     )
 
 
@@ -133,6 +135,7 @@ def compile_mxfp8_rows(query_payload, ordinal, sm_count):
         subgroup_width,
         threads,
         query.value_order,
+        query.min_amax,
         device_ordinal=ordinal,
         sm_count=sm_count,
     )

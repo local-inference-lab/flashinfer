@@ -10,7 +10,7 @@ from __future__ import annotations
 import importlib
 from typing import Any
 
-_OP_MODULES = ("mxfp8", "nvfp4")
+_OP_MODULES = ("mxfp8", "nvfp4", "mla_norm_mxfp8")
 
 
 def __getattr__(name: str) -> Any:

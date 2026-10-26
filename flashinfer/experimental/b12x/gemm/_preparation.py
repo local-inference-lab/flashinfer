@@ -118,6 +118,14 @@ class _PreparedDense:
     core: object
     workspace: torch.Tensor | None = None
 
+    @property
+    def required_workspace(self):
+        return (
+            _split_k_elements(self.core.lowering) * 4
+            if self.query.workspace_form == "provided"
+            else 0
+        )
+
     def run(self, a, sfa, b, sfb, alpha, out, workspace, output_dtype, stream):
         q = self.query
         if self.core.lowering.sf_dtype == "float8_e8m0fnu":
@@ -168,6 +176,8 @@ def plan(query: DenseGemmQuery, *, invocation=FrozenMapping(), override=None):
         return lowered[key]
 
     def memory(config, device):
+        if config.backend == "cuda_streaming":
+            return MemoryRequirements()
         p = lower(config, device)
         needed = _split_k_elements(p)
         scratch = ()
@@ -213,6 +223,12 @@ def plan(query: DenseGemmQuery, *, invocation=FrozenMapping(), override=None):
         return MemoryRequirements(scratch, tuple(persistent))
 
     def materialize(selection, device):
+        if selection.config.backend == "cuda_streaming":
+            from .mxfp8_streaming._preparation import (
+                materialize as materialize_streaming,
+            )
+
+            return materialize_streaming(query, selection.config, device)
         from b12x._lib.dense_gemm.preparation import _materialize_dense
 
         p = lower(selection.config, device)
@@ -236,19 +252,31 @@ def plan(query: DenseGemmQuery, *, invocation=FrozenMapping(), override=None):
                     )
         return _PreparedDense(query, core, workspace)
 
+    def compile_jobs(config, device):
+        if config.backend == "cuda_streaming":
+            from .mxfp8_streaming._preparation import source_spec
+
+            return (
+                CompileJob.create(
+                    "b12x.gemm.mxfp8_streaming._preparation:compile_streaming",
+                    source_spec(config),
+                ),
+            )
+        return (
+            CompileJob.create(
+                "b12x._lib.dense_gemm.preparation:_compile_dense_lowering",
+                lower(config, device).to_dict(),
+                CompileJob.DEVICE_ORDINAL,
+            ),
+        )
+
     return Plan(
         contract=TUNING,
         query=query,
         invocation=invocation,
         override=override,
         shared=True,
-        _compile_jobs=lambda config, device: (
-            CompileJob.create(
-                "b12x._lib.dense_gemm.preparation:_compile_dense_lowering",
-                lower(config, device).to_dict(),
-                CompileJob.DEVICE_ORDINAL,
-            ),
-        ),
+        _compile_jobs=compile_jobs,
         _memory_requirements=memory,
         _materialize=materialize,
     )
