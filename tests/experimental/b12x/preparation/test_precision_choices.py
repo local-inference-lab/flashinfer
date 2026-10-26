@@ -453,17 +453,15 @@ def test_compact_w4a8_has_only_its_supported_dynamic_routes():
     configs = [config for _, config in TUNING.eligible_plan(query, DEVICE).candidates]
     assert configs
     assert {
-        (
-            config.backend,
-            config.dynamic_tile_m,
-            config.dynamic_route_mode,
-            config.route_planner,
-        )
+        (config.dynamic_tile_m, config.dynamic_route_mode, config.route_planner)
         for config in configs
+        if config.backend == "dynamic"
     } == {
-        ("dynamic", 16, "grouped", "internal"),
-        ("dynamic", 64, "grouped", "internal"),
+        (16, "grouped", "internal"),
+        (64, "grouped", "internal"),
     }
+    # The compact micro backend is a legal alternative to the dynamic routes.
+    assert {config.backend for config in configs} <= {"dynamic", "micro"}
 
 
 @pytest.mark.parametrize("heads", (1, 12, 16, 20, 32))

@@ -1000,22 +1000,23 @@ def _tuning_parameters(query, device):
     # a token-count guess here hid the winning inline choice on GB10 between 8
     # and 2048 tokens.
     #
-    # The one remaining backend bound is capability, not performance: the micro
-    # kernel has a hard token ceiling (`_policy_micro_supported`), and
-    # `_materialize_tuning` already rejects anything above it. Enforcing it as a
-    # correctness predicate keeps the raced space honest at every effort tier.
+    # The compact micro kernel has no token ceiling; the <=16 preference is a
+    # no-tune heuristic in `_w4a8_mx_micro_preferred`, not a capability bound.
+    # Other micro families keep their own capability checks.
     from ._impl import _policy_micro_supported
 
     micro_supported = _policy_micro_supported(launch_query)
     # Direct compact FC2 launches on grid.z = tokens * ceil(hidden / 128). With
     # no cluster cap that exceeds CUDA's 65535 limit on long launches, so the
-    # uncapped assignment is a resource violation, not a slow choice.
+    # uncapped assignment is a resource violation, not a slow choice. A cluster
+    # cap grid-strides the launch, so capped micro stays legal at any length.
     micro_z_factor = -(-launch_query.hidden_size // 128)
+    compact_micro = _compact_w4a8_query(launch_query)
 
     def micro_grid_fits(p):
-        if p["backend"] != "micro":
+        if p["backend"] != "micro" or not compact_micro:
             return True
-        if p["route_planner"] == "triton" and p["max_active_clusters"] is not None:
+        if p["max_active_clusters"] is not None:
             return True
         return launch_query.num_tokens * micro_z_factor <= 65535
 
