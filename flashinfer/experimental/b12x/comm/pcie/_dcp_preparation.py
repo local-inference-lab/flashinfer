@@ -94,7 +94,11 @@ def query_from_runtime(runtime, *, surface, call) -> PcieQuery:
     requested_threads = int(call.get("threads", 256))
     requested_blocks = int(call.get("block_limit", 16))
     effective_threads, effective_blocks = runtime._resolve_launch_config(
-        threads=requested_threads, block_limit=requested_blocks
+        threads=requested_threads,
+        block_limit=requested_blocks,
+        max_threads=1024
+        if surface.endswith("all_gather_heads") and runtime.world_size == 2
+        else 512,
     )
     metadata = {"threads": effective_threads, "block_limit": effective_blocks}
     if surface.endswith("lse_reduce_scatter"):

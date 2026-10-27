@@ -309,7 +309,7 @@ def _make_cute_state(
     )
     plain_remote_push_region_packs = (
         (world_size if sharded_eager_storage else 1) * eager_buffer_bytes // 16
-        if eager and world_size == 2 and transport_policy[2]
+        if eager and transport_policy[2]
         else 0
     )
     return _CuTeOneshotState(
@@ -738,8 +738,8 @@ def test_topology_transport_storage_policy_matches_opt_in_defaults(
     assert _uses_sharded_eager_storage(4)
     assert _uses_sharded_eager_storage(8)
     assert _eager_storage_shards(2) == 3
-    assert _eager_storage_shards(4) == 4
-    assert _eager_storage_shards(8) == 8
+    assert _eager_storage_shards(4) == 10
+    assert _eager_storage_shards(8) == 22
     assert _transport_policy_contract() == (False, False, True, True, True)
 
     monkeypatch.setenv("B12X_PCIE_TP8_OWNER_REDUCE", "0")
@@ -1266,11 +1266,13 @@ def test_failed_peer_setup_export_free_is_retained_and_retryable(monkeypatch):
             return [local_object, ()]
         if status_round == 3:  # import-open verdict
             return [local_object, ("peer open failed",)]
-        if status_round == 4:  # rollback-unmap verdict
+        if status_round == 4:  # import failure classification
+            return [local_object, (False,)]
+        if status_round == 5:  # rollback-unmap verdict
             return [local_object, ()]
-        if status_round == 5:  # rollback-export-free verdict
+        if status_round == 6:  # rollback-export-free verdict
             return [local_object, ()]
-        if status_round == 6:  # retry export-free verdict
+        if status_round == 7:  # retry export-free verdict
             return [local_object, ()]
         raise AssertionError(f"unexpected status round {status_round}")
 
@@ -1333,9 +1335,11 @@ def test_peer_setup_and_unmap_failure_retains_export_and_closes_each_import_once
             return [local_object, (), ()]
         if status_round == 3:  # import-open verdict
             return [local_object, ("peer open failed",), ()]
-        if status_round == 4:  # rollback-unmap verdict
+        if status_round == 4:  # import failure classification
+            return [local_object, (False,), ()]
+        if status_round == 5:  # rollback-unmap verdict
             return [local_object, ("peer unmap failed",), ()]
-        if status_round in (5, 6):  # retry unmap / retry export free
+        if status_round in (6, 7):  # retry unmap / retry export free
             return [local_object, (), ()]
         raise AssertionError(f"unexpected status round {status_round}")
 
@@ -2824,3 +2828,446 @@ def test_pool_rejects_channel_rollback_during_capture():
 
     with pool.capture(7), pytest.raises(RuntimeError, match="during capture"):
         pool.rollback_channels(checkpoint)
+
+
+@pytest.mark.parametrize("world_size", (2, 3, 4, 6, 8, 10))
+@pytest.mark.parametrize("tagged", (False, True))
+def test_payload_ready_storage_is_disjoint_from_tagged_records(world_size, tagged):
+    policy = (False, False, tagged, True, False)
+    without_payload = _eager_storage_shards(world_size, policy, sentinel=False)
+    with_payload = _eager_storage_shards(world_size, policy, sentinel=True)
+    base = world_size if world_size == 4 else 1
+    assert without_payload == base + (2 * (world_size - 1) if tagged else 0)
+    assert with_payload == without_payload + world_size
+
+
+@pytest.mark.parametrize("world_size", (2, 3, 4, 6, 8, 10))
+def test_tagged_registration_preserves_payload_region(world_size):
+    state = _make_cute_state(world_size)
+    state.rank_data = torch.empty(1024, dtype=torch.uint8)
+    backend = _CuTeOneshotBackend()
+    backend._states[1] = state
+    policy = (False, False, True, True, False)
+    capacity = 4096
+    backend.register_pcie_buffers(
+        1,
+        tuple(range(1000, 1000 + world_size)),
+        tuple(range(2000, 2000 + world_size)),
+        capacity,
+        policy,
+    )
+    base = world_size if world_size == 4 else 1
+    assert state.plain_remote_push_region_packs == base * capacity // 16
+    assert state.plain_payload_ready_region_packs == 0
+    assert state.eager_tables[1] - state.eager_tables[0] == 16 * 8
+    first = state.rank_data[128:256].view(torch.int64)
+    second = state.rank_data[256:384].view(torch.int64)
+    assert first[:world_size].tolist() == list(range(1000, 1000 + world_size))
+    assert second[:world_size].tolist() == list(range(2000, 2000 + world_size))
+
+
+def test_plain_graph_plan_keeps_tagged_and_payload_offsets_distinct(monkeypatch):
+    monkeypatch.setattr(_CuTeOneshotBackend, "_device_index", staticmethod(lambda _: 0))
+    state = _make_cute_state(4)
+    state.plain_remote_push_region_packs = 4 * 4096
+    state.plain_payload_ready_region_packs = 10 * 4096
+    inp = torch.empty((1, 4096), dtype=torch.bfloat16)
+    plan = _CuTeOneshotBackend._plain_graph_plan(state, inp)
+    assert plan.transport == "remote_push_full"
+    assert plan.remote_push_region_packs == 4 * 4096
+    assert plan.payload_ready_region_packs == 10 * 4096
+    assert (
+        _CuTeOneshotBackend._fused_launch_config(state, inp)[0] == "stage_bf16_sentinel"
+    )
+    state.plain_payload_ready_region_packs = 0
+    assert (
+        _CuTeOneshotBackend._fused_launch_config(state, inp)[0] != "stage_bf16_sentinel"
+    )
+
+
+def test_fused_launcher_passes_explicit_payload_region(monkeypatch):
+    from b12x.comm.pcie import _oneshot_cute as kernels
+
+    invocations = []
+    monkeypatch.setattr(
+        kernels, "b12x_compile", lambda *a, **kw: lambda *args: invocations.append(args)
+    )
+    monkeypatch.setattr(kernels, "make_ptr", lambda dtype, address, *a, **kw: address)
+    monkeypatch.setattr(kernels, "current_cuda_stream", lambda: 0)
+    monkeypatch.setattr(
+        kernels, "raise_if_kernel_resolution_frozen", lambda *a, **kw: None
+    )
+    kernels.get_fused_oneshot_launcher.cache_clear()
+    try:
+        launch = kernels.get_fused_oneshot_launcher(
+            "bfloat16",
+            4,
+            0,
+            "stage_bf16_sentinel",
+            False,
+            False,
+            True,
+            0,
+            256,
+            0,
+        )
+        launch(1, 2, 3, 4, 5, 6, 7, 512, 1, 2, 4096, 10 * 4096, 1e-6, 2)
+        assert invocations[0][10:13] == (4096, 10 * 4096, 1e-6)
+    finally:
+        kernels.get_fused_oneshot_launcher.cache_clear()
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_plain_oneshot_pointer_alignment_and_offset_views(dtype):
+    from b12x.comm.pcie.pcie_oneshot import _validate_plain_io
+
+    runtime = _make_runtime(eager=True)
+    pack = 16 // dtype.itemsize
+    storage = torch.empty(8 * pack, dtype=dtype)
+    inp = storage[pack : 3 * pack]
+    assert runtime.should_allreduce(inp)
+    assert not runtime.should_allreduce(storage[1 : 1 + 2 * pack])
+    _validate_plain_io(inp, inp.view_as(inp))
+    _validate_plain_io(inp, storage[3 * pack : 5 * pack])
+    with pytest.raises(ValueError, match="exact aliases or disjoint"):
+        _validate_plain_io(inp, storage[2 * pack : 4 * pack])
+    with pytest.raises(ValueError, match="16-byte aligned"):
+        _validate_plain_io(inp, storage[1 : 1 + 2 * pack])
+
+
+def test_plain_oneshot_physical_traversal_preserves_dense_permutations():
+    from b12x.comm.pcie.pcie_oneshot import _validate_plain_io
+
+    inp = torch.empty((8, 8), dtype=torch.bfloat16).t()
+    _validate_plain_io(inp, torch.empty_like(inp))
+    with pytest.raises(ValueError, match="physical traversal"):
+        _validate_plain_io(inp, torch.empty(inp.shape, dtype=inp.dtype))
+    inp = torch.empty((1, 8), dtype=torch.bfloat16)
+    _validate_plain_io(inp, torch.empty(8, dtype=inp.dtype).as_strided((1, 8), (99, 1)))
+    _validate_plain_io(torch.empty((0, 8)), torch.empty((0, 8)))
+    with pytest.raises(ValueError, match="weak-contiguous"):
+        _validate_plain_io(inp, torch.empty(16, dtype=inp.dtype)[::2].view(1, 8))
+
+
+@pytest.mark.parametrize("alignment", [0, 1, 2, 4, 8, 24])
+def test_oneshot_metadata_rejects_insufficient_alignment(alignment):
+    from b12x.comm.pcie._oneshot_preparation import query_from_metadata
+
+    with pytest.raises(ValueError, match="16-byte input alignment"):
+        query_from_metadata(
+            _make_runtime(eager=True),
+            surface="OneshotAllReduce.all_reduce",
+            shape=(16,),
+            dtype=torch.bfloat16,
+            alignment=alignment,
+        )
+
+
+@pytest.mark.parametrize("boundary", ["public", "query", "prepare", "run"])
+@pytest.mark.parametrize(
+    "invalid", ["input_alignment", "output_alignment", "overlap", "traversal"]
+)
+def test_plain_oneshot_boundaries_reject_unsafe_buffers(boundary, invalid):
+    from b12x.comm.pcie._oneshot_preparation import (
+        _OneshotExecutionState,
+        _prepare_plain_call,
+        query_from_runtime,
+    )
+
+    runtime = _make_runtime(eager=True, stream_affine=False)
+    storage = torch.empty(128, dtype=torch.bfloat16)
+    inp = storage[:64].view(8, 8)
+    out = torch.empty_like(inp)
+    if invalid == "input_alignment":
+        inp = storage[1:65].view(8, 8)
+    elif invalid == "output_alignment":
+        out = storage[1:65].view(8, 8)
+    elif invalid == "overlap":
+        out = storage[8:72].view(8, 8)
+    else:
+        out = out.t()
+    state = _OneshotExecutionState(SimpleNamespace(setup={"variants": ()}), runtime, {})
+    with pytest.raises(ValueError, match="align|aliases|traversal"):
+        if boundary == "public":
+            runtime.all_reduce(inp, plan=None, out=out)
+        elif boundary == "query":
+            query_from_runtime(
+                runtime,
+                surface="OneshotAllReduce.all_reduce",
+                call={"inp": inp, "out": out},
+            )
+        elif boundary == "prepare":
+            _prepare_plain_call(state, inp=inp, out=out)
+        else:
+            state.run_plain(inp, out)
+
+
+@pytest.mark.parametrize("boundary", ["bind_input", "_require_bound_input"])
+def test_oneshot_binding_rechecks_pointer_alignment(boundary, monkeypatch):
+    from b12x.comm.pcie._oneshot_preparation import _OneshotExecutionState
+
+    runtime = _make_runtime(eager=True)
+    storage = torch.empty(32, dtype=torch.bfloat16)
+    good = storage[8:24]
+    query = SimpleNamespace(
+        setup={
+            "variants": (),
+            "shape": (16,),
+            "stride": (1,),
+            "dtype": "bfloat16",
+            "device_index": None,
+        }
+    )
+    state = _OneshotExecutionState(query, runtime, {})
+    bound = []
+    monkeypatch.setattr(
+        runtime, "_prepare_prepared_surface", lambda q, inp: bound.append(inp)
+    )
+    state.bind_input(good)
+    assert bound == [good]
+    getattr(state, boundary)(good)
+    with pytest.raises(ValueError, match="16-byte aligned"):
+        getattr(state, boundary)(storage[1:17])
+
+
+@pytest.mark.parametrize(
+    "alignment, expected", [(8, False), (16, True), (24, False), (32, True)]
+)
+def test_oneshot_logical_metadata_alignment(alignment, expected):
+    from b12x.comm.pcie._oneshot_preparation import _InvocationTensor
+
+    inp = _InvocationTensor((16,), torch.bfloat16, (1,), torch.device("cpu"), alignment)
+    assert _make_runtime(eager=True).should_allreduce(inp) is expected
+
+
+def test_plain_prepared_call_accepts_aligned_disjoint_storage_offsets(monkeypatch):
+    from b12x.comm.pcie._oneshot_preparation import (
+        _OneshotExecutionState,
+        _prepare_plain_call,
+    )
+
+    runtime = _make_runtime(eager=True)
+    storage = torch.empty(48, dtype=torch.bfloat16)
+    inp, out = storage[8:24], storage[24:40]
+    query = SimpleNamespace(
+        setup={
+            "variants": (),
+            "shape": (16,),
+            "stride": (1,),
+            "dtype": "bfloat16",
+            "device_index": None,
+        }
+    )
+    state = _OneshotExecutionState(query, runtime, {})
+    calls = []
+    monkeypatch.setattr(runtime, "_prepare_prepared_surface", lambda q, x: None)
+    monkeypatch.setattr(
+        runtime,
+        "_run_prepared_plain",
+        lambda x, y, q, launchers: calls.append((x.data_ptr(), y.data_ptr())),
+    )
+    call = _prepare_plain_call(state, inp=inp, out=out)
+    call.run()
+    state.run_plain(inp, inp.view_as(inp))
+    assert calls == [(inp.data_ptr(), out.data_ptr()), (inp.data_ptr(), inp.data_ptr())]
+
+
+@pytest.mark.parametrize("world_size", (2, 3, 4, 6, 8, 10))
+@pytest.mark.parametrize(
+    "capability, expected",
+    (
+        ((12, 0, 188), True),
+        ((12, 0, 36), True),
+        ((8, 0, 108), True),
+        ((12, 0, 35), False),
+        ((7, 5, 80), False),
+    ),
+)
+def test_payload_ready_capability_requires_bf16_and_residency(
+    monkeypatch, world_size, capability, expected
+):
+    from b12x.comm.pcie import pcie_oneshot as module
+
+    monkeypatch.setattr(
+        module, "_run_collective_preallocation_setup", lambda **kwargs: capability
+    )
+    monkeypatch.setattr(
+        module, "_broadcast_gather_object", lambda value, group: [value] * world_size
+    )
+    assert (
+        module._payload_ready_supported(
+            device="cuda:0", exchange_group=object(), world_size=world_size
+        )
+        is expected
+    )
+
+
+@pytest.mark.parametrize(
+    "codes, eligible",
+    [
+        ([711], True),
+        ([217, 711], True),
+        ([711, 205], False),
+        ([711, 801], False),
+        ([711, 2], False),
+        ([711, None], False),
+    ],
+)
+@pytest.mark.parametrize("cleanup_failure", [None, "close", "free"])
+def test_direct_mapping_verdict_requires_all_peer_errors_and_clean_rollback(
+    monkeypatch, codes, eligible, cleanup_failure
+):
+    from b12x.comm.pcie._cuda_ipc import CudaRTError
+    from b12x.comm.pcie.pcie_oneshot import DirectMappingUnavailable
+
+    events = []
+    world = len(codes) + 2
+
+    class IPC:
+        def cudaMalloc(self, size):
+            return 1000
+
+        def cudaMemset(self, *args):
+            pass
+
+        def cudaIpcGetMemHandleBytes(self, ptr):
+            return b"local"
+
+        def cudaIpcOpenMemHandleBytes(self, handle):
+            if handle == 1:
+                return 2000
+            code = codes[handle - 2]
+            if code is None:
+                raise RuntimeError("unrelated failure")
+            raise CudaRTError("cudaIpcOpenMemHandle", code, "injected")
+
+        def cudaIpcCloseMemHandle(self, ptr):
+            events.append("close")
+            if cleanup_failure == "close":
+                raise RuntimeError("close failed")
+
+        def cudaFree(self, ptr):
+            events.append("free")
+            if cleanup_failure == "free":
+                raise RuntimeError("free failed")
+
+    def exchange(local, group):
+        if isinstance(local, bytes):
+            return [local, *range(1, world)]
+        if local and all(type(x) is bool for x in local):
+            events.append(("classify", local))
+        return [local, *[() for _ in range(world - 1)]]
+
+    monkeypatch.setattr("torch.distributed.get_world_size", lambda group=None: world)
+    monkeypatch.setattr("torch.distributed.get_rank", lambda group=None: 0)
+    monkeypatch.setattr(
+        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", exchange
+    )
+    with pytest.raises(RuntimeError) as caught:
+        PCIeOneshotAllReduce._allocate_shared_buffer(
+            object(), 256, zero_fill=True, ipc=IPC()
+        )
+    assert isinstance(caught.value, DirectMappingUnavailable) == (
+        eligible and cleanup_failure is None
+    )
+    assert ("classify", tuple(code in (217, 711) for code in codes)) in events
+    assert events.index("close") > 0
+    if cleanup_failure == "close":
+        assert "free" not in events
+    else:
+        assert events.index("close") < events.index("free")
+    assert hasattr(caught.value, "retryable_setup") == (cleanup_failure is not None)
+
+
+def test_cudart_exception_preserves_operation_and_numeric_code():
+    from b12x.comm.pcie._cuda_ipc import CudaRTError, CudaRTLibrary
+
+    ipc = object.__new__(CudaRTLibrary)
+    ipc.funcs = {
+        "cudaGetErrorString": lambda code: b"peer resources exhausted",
+        "cudaSetDevice": lambda device: 711,
+    }
+    with pytest.raises(CudaRTError) as caught:
+        ipc.cudaSetDevice(0)
+    assert caught.value.operation == "cudaSetDevice"
+    assert caught.value.code == 711
+
+
+@pytest.mark.parametrize(
+    "verdict", ["eligible", "mixed", "exchange_failure", "malformed"]
+)
+def test_remote_ipc_classification_coordinates_rollback(monkeypatch, verdict):
+    from b12x.comm.pcie.pcie_oneshot import DirectMappingUnavailable
+
+    events = []
+
+    class IPC:
+        def cudaMalloc(self, size):
+            return 1000
+
+        def cudaMemset(self, *args):
+            pass
+
+        def cudaIpcGetMemHandleBytes(self, ptr):
+            return b"local"
+
+        def cudaIpcOpenMemHandleBytes(self, handle):
+            return 2000
+
+        def cudaIpcCloseMemHandle(self, ptr):
+            events.append("close")
+
+        def cudaFree(self, ptr):
+            events.append("free")
+
+    status_round = 0
+
+    def exchange(local, group):
+        nonlocal status_round
+        if isinstance(local, bytes):
+            return [local, b"remote"]
+        status_round += 1
+        if status_round == 3:
+            return [local, ("peer mapping failed",)]
+        if status_round == 4:
+            if verdict == "exchange_failure":
+                raise RuntimeError("classification exchange failed")
+            return [
+                local,
+                {"eligible": (True,), "mixed": (True, False), "malformed": ("true",)}[
+                    verdict
+                ],
+            ]
+        return [local, ()]
+
+    monkeypatch.setattr("torch.distributed.get_world_size", lambda group=None: 2)
+    monkeypatch.setattr("torch.distributed.get_rank", lambda group=None: 0)
+    monkeypatch.setattr(
+        "b12x.comm.pcie.pcie_oneshot._broadcast_gather_object", exchange
+    )
+    with pytest.raises(RuntimeError) as caught:
+        PCIeOneshotAllReduce._allocate_shared_buffer(
+            object(), 256, zero_fill=True, ipc=IPC()
+        )
+    assert isinstance(caught.value, DirectMappingUnavailable) == (verdict == "eligible")
+    if verdict in ("exchange_failure", "malformed"):
+        assert events == []
+        assert caught.value.retryable_setup.remote_ptrs == [2000]
+        caught.value.retryable_setup.retry()
+    assert events == ["close", "free"]
+    assert _RETAINED_FAILED_IPC_EXPORTS == {}
+
+
+@pytest.mark.parametrize("transport", ("remote_push_full", "remote_push_rsag"))
+def test_payload_ready_launch_rejects_float16(transport):
+    with pytest.raises(ValueError, match="requires staged BF16 input"):
+        _OneshotLaunch(
+            "float16",
+            world_size=2,
+            rank=0,
+            stage_input=True,
+            device_slot_selection=True,
+            slot_bias=0,
+            transport=transport,
+            threads=128,
+        )

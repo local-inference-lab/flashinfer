@@ -23,6 +23,21 @@ SURVIVOR_ROUNDS = 3
 ELIMINATION_MARGIN = 1.10
 DEFAULT_SAMPLES = 2
 ROUND_BUDGET_US = 256.0
+# Two-sided 99% Student-t critical values, rounded upward, at five planned looks.
+COLLECTIVE_MAX_ROUNDS = 15
+_COLLECTIVE_T_CRITICAL = {3: 9.925, 6: 4.033, 9: 3.356, 12: 3.106, 15: 2.977}
+
+
+def _collective_pair_separated(values):
+    count = len(values[0])
+    critical = _COLLECTIVE_T_CRITICAL.get(count)
+    if critical is None:
+        return False
+    differences = [right - left for left, right in zip(*values, strict=True)]
+    mean = statistics.fmean(differences)
+    radius = critical * math.sqrt(statistics.variance(differences) / count)
+    median_difference = statistics.median(values[1]) - statistics.median(values[0])
+    return abs(mean) > radius and mean * median_difference > 0
 
 
 def capture_benchmark_call(call):
@@ -402,6 +417,7 @@ def measure_race_steps(
     champion=False,
     sample_observer=None,
     adaptive_repeats=True,
+    adaptive_collective_pair=False,
     sample_exchange=None,
     launch_exchange=None,
 ):
@@ -415,7 +431,14 @@ def measure_race_steps(
     """
     if type(rounds) is not int or rounds <= 0:
         raise ValueError("race rounds must be positive")
-    if eliminate:
+    if adaptive_collective_pair:
+        if len(prepared.timers) != 2 or sample_exchange is None:
+            raise ValueError(
+                "adaptive collective measurement requires a coordinated pair"
+            )
+        rounds = min(rounds, COLLECTIVE_MAX_ROUNDS)
+        eliminate = False
+    elif eliminate:
         rounds = min(rounds, SURVIVOR_ROUNDS)
     prepared.planned_rounds = rounds
     prepared.active_count = len(prepared.timers)
@@ -508,6 +531,8 @@ def measure_race_steps(
             for index, series in enumerate(values)
         )
         prepared.completed_rounds = turn + 1
+        if adaptive_collective_pair and _collective_pair_separated(values):
+            break
         if eliminate:
             best = [min(series) for series in values]
             leader = min(best[index] for index in active)

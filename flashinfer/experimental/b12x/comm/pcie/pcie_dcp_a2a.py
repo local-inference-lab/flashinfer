@@ -753,15 +753,16 @@ class PCIeDCPA2A:
         *,
         threads: int,
         block_limit: int,
+        max_threads: int = 512,
     ) -> tuple[int, int]:
         threads = int(threads)
         block_limit = int(block_limit)
         if self._threads_override > 0:
-            threads = min(512, max(64, (self._threads_override // 32) * 32))
+            threads = min(max_threads, max(64, (self._threads_override // 32) * 32))
         if self._block_limit_override > 0:
             block_limit = min(self._block_limit_override, _MAX_BLOCKS)
-        if threads < self.world_size or threads > 512 or threads % 32 != 0:
-            raise ValueError("threads must be a multiple of 32 in [32, 512]")
+        if threads < self.world_size or threads > max_threads or threads % 32 != 0:
+            raise ValueError(f"threads must be a multiple of 32 in [32, {max_threads}]")
         if block_limit <= 0 or block_limit > _MAX_BLOCKS:
             raise ValueError(f"block_limit must be in [1, {_MAX_BLOCKS}]")
         return threads, block_limit
@@ -1008,6 +1009,7 @@ class PCIeDCPA2A:
         if batch * self.total_heads * self.query_head_dim > self._output_capacity_elems:
             raise ValueError("PCIe DCP all-gather staging capacity exceeded")
         threads, block_limit = self._resolve_launch_config(
+            max_threads=1024 if self.world_size == 2 else 512,
             threads=state.query.call["threads"] if threads is None else threads,
             block_limit=state.query.call["block_limit"]
             if block_limit is None

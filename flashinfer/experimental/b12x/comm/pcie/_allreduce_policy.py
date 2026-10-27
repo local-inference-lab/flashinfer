@@ -13,10 +13,10 @@ def tp4_bf16_transport(
     """Choose among transports whose storage and alias contracts are satisfied."""
     if payload_ready:
         if nbytes <= TP4_ONESHOT_MAX_BYTES:
-            return "tp4_push_sentinel"
+            return "remote_push_full"
         if twoshot_available and nbytes > TP4_RSAG_MAX_BYTES:
             return "twoshot"
-        return "tp4_push_rsag"
+        return "remote_push_rsag"
     if twoshot_available and nbytes >= BF16_TWOSHOT_MIN_BYTES:
         return "twoshot"
     return "pull"

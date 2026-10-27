@@ -34,13 +34,36 @@ import triton
 
 
 @triton.jit(do_not_specialize=["total"], do_not_specialize_on_alignment=["total"])
-def _reduce_split_k2_bf16_kernel(partials, out, total, BLOCK: tl.constexpr) -> None:
+def _reduce_split_k2_bf16_kernel(
+    partials, out, total, BLOCK: tl.constexpr, PDL: tl.constexpr = False
+) -> None:
     pid = tl.program_id(0).to(tl.int64)
     total = total.to(tl.int64)
     offs = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offs < total
+    if PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+        tl.extra.cuda.gdc_wait()
     accum = tl.load(partials + offs, mask=mask).to(tl.float32)
     accum += tl.load(partials + total + offs, mask=mask).to(tl.float32)
+    tl.store(out + offs, accum, mask=mask)
+
+
+@triton.jit(do_not_specialize=["total"], do_not_specialize_on_alignment=["total"])
+def _reduce_split_k4_bf16_kernel(
+    partials, out, total, BLOCK: tl.constexpr, PDL: tl.constexpr = False
+) -> None:
+    pid = tl.program_id(0).to(tl.int64)
+    total = total.to(tl.int64)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < total
+    if PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+        tl.extra.cuda.gdc_wait()
+    accum = tl.load(partials + offs, mask=mask).to(tl.float32)
+    accum += tl.load(partials + total + offs, mask=mask).to(tl.float32)
+    accum += tl.load(partials + 2 * total + offs, mask=mask).to(tl.float32)
+    accum += tl.load(partials + 3 * total + offs, mask=mask).to(tl.float32)
     tl.store(out + offs, accum, mask=mask)
 
 
@@ -65,3 +88,25 @@ def _reduce_split_k2_bf16(
         _reduce_split_k2_bf16_kernel[grid](partials, out, total, BLOCK=block)
     else:
         torch.add(partials[:, :, 0], partials[:, :, 1], out=out[:, :, 0])
+
+
+def _reduce_split_k4_bf16(
+    partials: torch.Tensor, out: torch.Tensor, *, m: int, n: int
+) -> None:
+    """Sum four FP32 K partials before a single BF16 output conversion."""
+    total = int(m) * int(n)
+    if (
+        partials.shape == (m, n, 4)
+        and partials.stride() == (n, 1, total)
+        and out.shape == (m, n, 1)
+        and out.stride()[0] == n
+        and out.stride()[1] == 1
+    ):
+        block = 1024
+        grid = (triton.cdiv(total, block),)
+        _reduce_split_k4_bf16_kernel[grid](partials, out, total, BLOCK=block)
+    else:
+        accum = partials[:, :, 0].float().clone()
+        for index in range(1, 4):
+            accum.add_(partials[:, :, index].float())
+        out[:, :, 0].copy_(accum)

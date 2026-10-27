@@ -102,11 +102,15 @@ class _DenseGemmLaunch:
         mma_warps: Optional[int] = None,
         alpha_reciprocal: bool = False,
         input_k: Optional[int] = None,
+        programmatic_serialization: bool = False,
+        evict_first: bool = False,
     ):
         self._weight_only = weight_only
         self._mma_warps = mma_warps
         self._alpha_reciprocal = alpha_reciprocal
         self._input_k = k if input_k is None else input_k
+        self._programmatic_serialization = programmatic_serialization
+        self._evict_first = evict_first
         self._storage_k = k // (
             block_codec(weight_only).pack_factor
             if weight_only in BLOCK_CODECS
@@ -240,6 +244,8 @@ class _DenseGemmLaunch:
             self._direct_m1_wo_a_inputs,
             self._target_occupancy,
             self._plain_fp8,
+            self._programmatic_serialization,
+            self._evict_first,
         )
 
         return (
@@ -423,6 +429,8 @@ class _DenseGemmLaunch:
             weight_only=self._weight_only,
             mma_warps=self._mma_warps,
             alpha_reciprocal=self._alpha_reciprocal,
+            programmatic_serialization=self._programmatic_serialization,
+            evict_first=self._evict_first,
         )(
             a_tensor,
             a_tensor,
@@ -1656,6 +1664,8 @@ def _get_compiled_dense_gemm(
     mma_warps: Optional[int] = None,
     alpha_reciprocal: bool = False,
     input_k: Optional[int] = None,
+    programmatic_serialization: bool = False,
+    evict_first: bool = False,
     device_ordinal: Optional[int] = None,
 ) -> Callable:
     def _make_runtime_pointers(
@@ -1795,6 +1805,8 @@ def _get_compiled_dense_gemm(
                 b_tile_major=b_tile_major,
             )
         ),
+        programmatic_serialization=programmatic_serialization,
+        evict_first=evict_first,
     )
     if weight_only is not None and torch.cuda.is_current_stream_capturing():
         raise RuntimeError("A16 dense GEMM must be prewarmed before CUDA graph capture")

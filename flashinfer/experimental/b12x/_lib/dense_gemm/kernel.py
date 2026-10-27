@@ -47,6 +47,7 @@ from b12x._lib.quant.block_codec import block_codec
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from b12x._lib.intrinsics.memory import cp_async4_shared_global
 from b12x._lib.intrinsics.memory import cp_async_bulk_g2s_mbar
+from b12x._lib.intrinsics.memory import create_l2_evict_first_policy
 from cutlass.cute.nvgpu import cpasync
 import cuda.bindings.driver as cuda
 import cutlass.cute as cute
@@ -168,6 +169,8 @@ class DenseGemmKernel:
         plain_fp8: bool = False,
         fused_quant_bf16: Optional[bool] = None,
         block_fp8: bool = False,
+        programmatic_serialization: bool = False,
+        evict_first: bool = False,
         weight_only: Optional[str] = None,
         mma_warps: Optional[int] = None,
         alpha_reciprocal: bool = False,
@@ -321,6 +324,8 @@ class DenseGemmKernel:
         self.epi_tile = mma_tiler_mn
         self.single_work_tile_per_cta = single_work_tile_per_cta
         self.use_prefetch = use_prefetch
+        self.programmatic_serialization = programmatic_serialization
+        self.evict_first = evict_first
         self.direct_one_m_tile_scheduler = direct_one_m_tile_scheduler
         self.split_k_slices = split_k_slices
         self.split_k_atomic_bf16 = split_k_atomic_bf16
@@ -965,6 +970,7 @@ class DenseGemmKernel:
             block=[self.threads_per_cta, 1, 1],
             cluster=[1, 1, 1],
             stream=stream,
+            use_pdl=self.programmatic_serialization,
         )
         return
 
@@ -1827,6 +1833,10 @@ class DenseGemmKernel:
         # MMA warp group
         if warp_idx < self.num_mma_warps:
             cute.arch.setmaxregister_increase(self.mma_register_requirement)
+            if cutlass.const_expr(self.programmatic_serialization):
+                # Only the DMA warp may read the ready RHS before the preceding
+                # grid completes. MMA waits for its activation-side writes.
+                cute.arch.griddepcontrol_wait()
 
             num_k_blocks = cute.size(tCrA, mode=[2])
 
@@ -3252,6 +3262,53 @@ class DenseGemmKernel:
                             tBgSFB_k = tBgSFB_nkl[(None, k_tile_global)]
                             tBsSFB_pipe = tBsSFB[(None, mainloop_producer_state.index)]
 
+                        if cutlass.const_expr(self.programmatic_serialization):
+                            # RHS storage is declared ready across this grid
+                            # dependency. Issue both TMA transfers before
+                            # waiting; the barrier still includes the later
+                            # A/SFA transfers before MMA can consume the tile.
+                            if cutlass.const_expr(
+                                self.evict_first or self.occupancy > 1
+                            ):
+                                cache_policy = (
+                                    create_l2_evict_first_policy().to(Int64)
+                                    if cutlass.const_expr(self.evict_first)
+                                    else Int64(0x12F0000000000000)
+                                )
+                                cute.copy(
+                                    tma_atom_b,
+                                    tBgB_k,
+                                    tBsB_pipe,
+                                    tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
+                                        mainloop_producer_state
+                                    ),
+                                    cache_policy=cache_policy,
+                                )
+                            else:
+                                cute.copy(
+                                    tma_atom_b,
+                                    tBgB_k,
+                                    tBsB_pipe,
+                                    tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
+                                        mainloop_producer_state
+                                    ),
+                                )
+                            cute.copy(
+                                tma_atom_sfb,
+                                tBgSFB_k,
+                                tBsSFB_pipe,
+                                tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
+                                    mainloop_producer_state
+                                ),
+                            )
+                            if _k_tile == 0:
+                                cute.arch.griddepcontrol_wait()
+                                if cutlass.const_expr(self.split_k_slices > 1):
+                                    # The reducer waits for every FP32 partial
+                                    # before reading it. Release its launch while
+                                    # this CTA computes its split of K.
+                                    cute.arch.griddepcontrol_launch_dependents()
+
                         if cutlass.const_expr(self.fused_quant_a and self.b_tile_major):
                             # Start the large weight transfer before synchronous
                             # A quantization. SFB stays below as a post-fence
@@ -4195,7 +4252,9 @@ class DenseGemmKernel:
                                     )
                                 ),
                             )
-                    if cutlass.const_expr(self.load_path == "tma"):
+                    if cutlass.const_expr(
+                        self.load_path == "tma" and not self.programmatic_serialization
+                    ):
                         if cutlass.const_expr(
                             not (self.fused_quant_a and self.b_tile_major)
                         ):
@@ -4250,7 +4309,14 @@ class DenseGemmKernel:
                                     cache_policy=Int64(0x12F0000000000000),
                                 )
                             else:
-                                if cutlass.const_expr(self.occupancy > 1):
+                                if cutlass.const_expr(
+                                    self.occupancy > 1 or self.evict_first
+                                ):
+                                    cache_policy = (
+                                        create_l2_evict_first_policy().to(Int64)
+                                        if cutlass.const_expr(self.evict_first)
+                                        else Int64(0x12F0000000000000)
+                                    )
                                     cute.copy(
                                         tma_atom_b,
                                         tBgB_k,
@@ -4258,7 +4324,7 @@ class DenseGemmKernel:
                                         tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
                                             mainloop_producer_state
                                         ),
-                                        cache_policy=Int64(0x12F0000000000000),
+                                        cache_policy=cache_policy,
                                     )
                                 else:
                                     cute.copy(

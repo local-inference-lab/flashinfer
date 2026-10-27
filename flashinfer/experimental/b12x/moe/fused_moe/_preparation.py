@@ -1067,6 +1067,18 @@ def _program_carriers(
                 w4a8_n64_repacked=dynamic["w4a8_n64_repacked"],
                 nvfp4_materialize_intermediate=plan.decode_config.nvfp4_materialize_intermediate,
                 csf_inline_scales=dynamic["csf_inline_scales"],
+                separate_w13_halves=(
+                    _impl._get_activation_kernel_spec(
+                        plan.activation, quant_mode=plan.quant_mode
+                    ).is_gated
+                    and dynamic["n"] % 128 != 0
+                    and (
+                        not caps.weight_plan.csf_inline_scales
+                        or dynamic["n"] % 32 == 16
+                    )
+                    if plan.quant_mode == "nvfp4"
+                    else None
+                ),
                 direct_routing=dynamic["direct_routing"],
                 external_route_plan=dynamic["external_route_plan"],
                 share_input_across_experts=dynamic["share_input_across_experts"],

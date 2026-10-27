@@ -72,7 +72,9 @@ def select(job, obligation, selections):
         return job._selection(obligation, obligation.configuration.default, "default")
     obligation.key = digest(
         {
-            "measurement": "collective_max_stream_gated_graph_v2",
+            "measurement": "collective_max_stream_gated_graph_v3",
+            "rounds": job.session.rounds,
+            "samples": job.session.samples,
             "members": tuple((peer["device"], peer["local_key"]) for peer in peers),
         }
     )
@@ -241,6 +243,7 @@ def race(job, obligation):
             measurement = yield from job._measure(
                 trials,
                 champion=champion is not None,
+                adaptive_collective_pair=champion is not None,
                 sample_exchange=sample_exchange,
                 launch_exchange=launch_exchange,
                 sample_observer=ledger.observer(trials),

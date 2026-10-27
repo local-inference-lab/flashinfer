@@ -38,6 +38,7 @@ from .pcie_island_rs import (
 from .pcie_oneshot import (
     DEFAULT_MAX_SIZE,
     DEFAULT_RANK_DATA_BYTES,
+    DirectMappingUnavailable,
     SUPPORTED_WORLD_SIZES as ONESHOT_WORLD_SIZES,
     TP2_PLAIN_REMOTE_PUSH_AUTO_MAX_BYTES,
     PCIeOneshotAllReducePool,
@@ -136,12 +137,12 @@ def _algorithm_for_world_size(world_size: int) -> str:
 class PCIeAllReduce:
     """Select a peer-safe all-reduce implementation from the world size.
 
-    Worlds through TP8 use all-peer transports. Serialized TP4 BF16 declarations
-    also admit single-rounding two-shot when every rank has at least 64 visible
-    SMs and the output is disjoint from the input. TP9, TP10, TP12 and TP16 use
-    islands of up to four GPUs so no context maps more than
-    six peers. Other worlds fail closed instead of exceeding the CUDA peer
-    connection limit.
+    Worlds through TP8 use all-peer transports. Single-channel TP10 auto
+    preparation attempts coordinated all-peer provisioning and uses hierarchy
+    only when peer mappings are unavailable and rollback completes. Other TP10
+    declarations and TP9, TP12, and TP16 use hierarchical transports. Serialized
+    BF16 declarations also admit single-rounding two-shot when every rank has
+    at least 64 visible SMs and the output is an exact input alias or disjoint.
     """
 
     def __init__(
@@ -191,19 +192,32 @@ class PCIeAllReduce:
         world_size = dist.get_world_size(group=exchange_group)
         algorithm = _algorithm_for_world_size(world_size)
         algorithm_override = _algorithm_override()
-        if algorithm == "oneshot":
-            runtime = PCIeOneshotAllReducePool.from_exchange_group(
-                exchange_group=exchange_group,
-                device=device,
-                eager_buffer_bytes=eager_buffer_bytes,
-                max_size=max_size,
-                rank_data_bytes=rank_data_bytes,
-                ext_module=ext_module,
-                ipc=ipc,
-                single_channel=single_channel,
-                max_concurrent_channels=max_concurrent_channels,
-            )
-        else:
+        qualify_direct = (
+            world_size == 10 and single_channel and algorithm_override == "auto"
+        )
+        if algorithm == "oneshot" or qualify_direct:
+            try:
+                runtime = PCIeOneshotAllReducePool.from_exchange_group(
+                    exchange_group=exchange_group,
+                    device=device,
+                    eager_buffer_bytes=eager_buffer_bytes,
+                    max_size=max_size,
+                    rank_data_bytes=rank_data_bytes,
+                    ext_module=ext_module,
+                    ipc=ipc,
+                    single_channel=single_channel,
+                    max_concurrent_channels=max_concurrent_channels,
+                )
+            except DirectMappingUnavailable:
+                if not qualify_direct:
+                    raise
+                logger.info(
+                    "TP10 peer mappings unavailable after coordinated rollback; "
+                    "using hierarchical all-reduce"
+                )
+            else:
+                algorithm = "oneshot"
+        if algorithm == "hierarchical":
             if int(max_concurrent_channels) != 1:
                 raise ValueError(
                     "hierarchical all-reduce supports exactly one concurrent channel"
@@ -228,9 +242,9 @@ class PCIeAllReduce:
                 ipc=ipc,
             )
             if (
-                world_size == 4
+                algorithm == "oneshot"
                 and single_channel
-                and max_size >= 64
+                and max_size >= 16
                 and _bf16_twoshot_supported(
                     exchange_group=exchange_group,
                     device=runtime.device,
@@ -239,11 +253,11 @@ class PCIeAllReduce:
             ):
                 # Native rows contain one 16-byte pack; tensor dimensions need
                 # not match the transport geometry. Each rank owns complete packs.
-                capacity = min(int(max_size), BF16_TWOSHOT_MAX_BYTES)
+                capacity = int(max_size)
                 bf16_twoshot = PCIeTwoShotBF16.from_exchange_group(
                     exchange_group=exchange_group,
                     device=device,
-                    max_rows=(capacity + 63) // 64 * 4,
+                    max_rows=(capacity + 15) // 16,
                     row_elems=8,
                     ipc=ipc,
                 )
@@ -392,7 +406,8 @@ class PCIeAllReduce:
     def _use_bf16_twoshot(self, inp: torch.Tensor, out: Optional[torch.Tensor]) -> bool:
         target = self._bf16_twoshot
         if (
-            target is None
+            self.world_size != 4
+            or target is None
             or not BF16_TWOSHOT_MIN_BYTES
             <= inp.numel() * inp.element_size()
             <= min(self.max_size, BF16_TWOSHOT_MAX_BYTES)
@@ -511,7 +526,7 @@ class PCIeAllReduce:
                     operation == "all_reduce"
                     and twoshot is not None
                     and twoshot.accepts(inp)
-                    and disjoint
+                    and (inplace or disjoint)
                 ):
                     native = query_from_runtime(
                         twoshot,

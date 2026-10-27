@@ -30,6 +30,7 @@ _OP_MODULES = (
 )
 _FUNCTIONS = {
     "mm": ("._preparation", "mm"),
+    "mxfp8_mm_bases": ("._preparation", "mxfp8_mm_bases"),
     "plan": ("._preparation", "plan"),
     "DenseGemmQuery": ("._tuning", "DenseGemmQuery"),
     "DenseGemmConfig": ("._tuning", "DenseGemmConfig"),

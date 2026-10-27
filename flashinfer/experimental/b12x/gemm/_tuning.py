@@ -57,6 +57,12 @@ class DenseGemmQuery:
     sm_count: int | None = None
     workspace_form: str = "owned"
     sfb_k_replicated: bool = False
+    # The RHS values and scales are ready before a dependent launch and remain
+    # unchanged until this GEMM completes. Required for pre-wait RHS TMA loads.
+    rhs_prefetch_ready: bool = False
+    # When false, split-K accumulates FP32 partials and rounds to BF16 once.
+    # The available non-atomic reducers accept two or four slices.
+    allow_bf16_atomic_reduction: bool = True
     autotune_effort: str = field(default_factory=capture_autotune_effort)
 
     def __post_init__(self):
@@ -93,6 +99,8 @@ class DenseGemmConfig:
     split_k_slices: int | None
     large_m_unroll: bool | None
     target_occupancy: int | None
+    programmatic_serialization: bool = False
+    evict_first: bool = False
 
 
 def validate_query(query):
@@ -127,6 +135,12 @@ def validate_query(query):
         raise ValueError("SM capacity must be a positive integer or None")
     if type(query.sfb_k_replicated) is not bool:
         raise TypeError("weight-scale replication must be a boolean")
+    if type(query.rhs_prefetch_ready) is not bool:
+        raise TypeError("RHS prefetch readiness must be a boolean")
+    if type(query.allow_bf16_atomic_reduction) is not bool:
+        raise TypeError("BF16 atomic reduction policy must be a boolean")
+    if not query.allow_bf16_atomic_reduction and query.recipe != "mxfp8":
+        raise ValueError("FP32 split-K reduction is qualified for MXFP8 only")
     if query.sfb_k_replicated and query.recipe != "mxfp8":
         raise ValueError("weight-scale replication requires MXFP8")
     if query.codegen != _codegen_snapshot():
@@ -361,6 +375,8 @@ def query_from_call(lhs, rhs, out=None, *, entry_point, options):
         expected_m=expected_m,
         sm_count=options.get("sm_count"),
         sfb_k_replicated=options.get("sfb_k_replicated", False),
+        rhs_prefetch_ready=options.get("rhs_prefetch_ready", False),
+        allow_bf16_atomic_reduction=options.get("allow_bf16_atomic_reduction", True),
         workspace_nbytes=None
         if workspace is None
         else workspace.numel() * workspace.element_size(),
@@ -400,6 +416,8 @@ def launch_options(query, config):
         mma_tiler_mn=(config.tile_m, config.tile_n),
         load_path=config.load_path,
         swap_ab=config.swap_ab,
+        _programmatic_serialization=config.programmatic_serialization,
+        _evict_first=config.evict_first,
     )
     if query.recipe in ("nvfp4", "mxfp4", "mxfp8"):
         options["_tile_k_override"] = config.tile_k
@@ -414,6 +432,14 @@ def knob_values(query):
     """Recipe-specific host knob choices; validate_config applies interdependent launch constraints."""
     fp4 = query.recipe in ("nvfp4", "mxfp4")
     fp8 = query.recipe in ("mxfp8", "tensor_fp8", "block_fp8")
+    ready_small_mxfp8 = (
+        query.recipe == "mxfp8"
+        and query.rhs_prefetch_ready
+        and query.batch == 1
+        and query.max_rows <= 8
+        and query.output_mode == "provided"
+        and query.alpha_mode == "unit"
+    )
     return dict(
         backend=("cutedsl",),
         tile_m=(16, 32, 64, 128),
@@ -432,6 +458,8 @@ def knob_values(query):
         target_occupancy=(1, 2, 3, 4)
         if fp4 and query.output_mode == "provided"
         else (None,),
+        programmatic_serialization=(False, True) if ready_small_mxfp8 else (False,),
+        evict_first=(False, True) if ready_small_mxfp8 else (False,),
     )
 
 
@@ -444,6 +472,22 @@ def validate_config(query, config, device):
             type(value) is type(allowed) and value == allowed for allowed in values
         ):
             raise ValueError(f"dense GEMM {name} is outside its recipe/caller domain")
+    if config.programmatic_serialization and (
+        config.load_path != "tma"
+        or config.swap_ab
+        or (
+            config.split_k_slices != 1
+            and (
+                config.split_k_slices not in (2, 4) or query.allow_bf16_atomic_reduction
+            )
+        )
+        or config.tile_k != 128
+    ):
+        raise ValueError(
+            "programmatic MXFP8 launch requires unswapped BK128 TMA and FP32 split-K partials"
+        )
+    if config.evict_first and (config.load_path != "tma" or config.swap_ab):
+        raise ValueError("evict-first MXFP8 launch requires unswapped TMA")
     selected_options = launch_options(query, config)
     for name, value in query.overrides.items():
         if selected_options.get(name) != value:
@@ -522,6 +566,7 @@ def validate_config(query, config, device):
             )
         if (
             config.split_k_slices == 4
+            and query.allow_bf16_atomic_reduction
             and not _module__lib_dense_gemm_config._B12X_DENSE_SPLITK_TURBO
         ):
             raise ValueError(
@@ -583,6 +628,8 @@ def default_config(query, device):
         else None,
         large_m_unroll=p.policy.large_m_unroll if fp8 and query.batch == 1 else None,
         target_occupancy=occupancy,
+        programmatic_serialization=False,
+        evict_first=False,
     )
 
 
@@ -638,14 +685,31 @@ def _parameters(query, device):
         row_tile = p["tile_n"] if p["swap_ab"] else p["tile_m"]
         return query.recipe != "mxfp8" or query.max_rows <= 128 or row_tile >= 32
 
+    def dependent_loads(p):
+        return (
+            not p["programmatic_serialization"]
+            or (
+                p["load_path"] == "tma"
+                and not p["swap_ab"]
+                and (
+                    p["split_k_slices"] == 1
+                    or (
+                        p["split_k_slices"] in (2, 4)
+                        and not query.allow_bf16_atomic_reduction
+                    )
+                )
+                and p["tile_k"] == 128
+            )
+        ) and (not p["evict_first"] or (p["load_path"] == "tma" and not p["swap_ab"]))
+
     constrained = not query.overrides and query.batch == 1
     return ParameterSpace.create(
         TUNING.knobs,
         values=values,
         autotune_effort=query.autotune_effort,
-        predicates=(short_unswapped_async, bounded_prefill_k_tile)
+        predicates=(dependent_loads, short_unswapped_async, bounded_prefill_k_tile)
         if constrained
-        else (),
+        else (dependent_loads,),
         efficiency_predicates=(bounded_row_padding, narrow_output_swap, reuse_rows)
         if constrained
         else (),
@@ -660,8 +724,8 @@ def _validate_query(query, device):
 
 TUNING = TuningContract(
     component_id="gemm.mm",
-    query_schema_version=22,
-    config_schema_version=22,
+    query_schema_version=24,
+    config_schema_version=23,
     query_fields=frozenset(field.name for field in fields(DenseGemmQuery)),
     config_fields=frozenset(field.name for field in fields(DenseGemmConfig)),
     encode_query=lambda query: {
@@ -672,7 +736,7 @@ TUNING = TuningContract(
     default_config=default_config,
     validate_query=_validate_query,
     validate_config=validate_config,
-    candidate_contract_version=4,
+    candidate_contract_version=8,
     knobs=(
         Knob(name="backend", values=("cutedsl",), binding=ParameterBinding.COMPILE),
         Knob(name="tile_m", values=(16, 32, 64, 128), binding=ParameterBinding.COMPILE),
@@ -700,6 +764,14 @@ TUNING = TuningContract(
             name="target_occupancy",
             values=(None, 1, 2, 3, 4),
             binding=ParameterBinding.COMPILE,
+        ),
+        Knob(
+            name="programmatic_serialization",
+            values=(False, True),
+            binding=ParameterBinding.COMPILE,
+        ),
+        Knob(
+            name="evict_first", values=(False, True), binding=ParameterBinding.COMPILE
         ),
     ),
     parameters=_parameters,

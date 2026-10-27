@@ -21,7 +21,9 @@ from b12x._lib.compiler import compile as b12x_compile
 from b12x._lib.compile_plan import attach_programs
 from b12x._lib.program_cache import program_cache
 from b12x._lib.intrinsics.memory import (
+    ld_global_v2_u32,
     ld_global_v4_u32,
+    st_global_v2_u32,
     st_global_v4_f32,
     st_global_v4_u32,
     u32_as_f32,
@@ -30,7 +32,6 @@ from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils.device import current_cuda_stream
 from b12x._lib.utils.pointers import make_ptr
 
-from ._dcp_cute_common import _membar_sys
 from ._cute_intrinsics import (
     add_bf16x2,
     add_rn_f32,
@@ -44,6 +45,7 @@ from ._cute_intrinsics import (
     plain_graph_epoch_arrive,
     ld_global_f32,
     ld_relaxed_gpu_u32,
+    ld_acquire_sys_global_v4_u32,
     ld_relaxed_sys_global_v4_u32,
     pack_f32x2_to_bf16x2,
     pack_f32x2_to_f16x2,
@@ -52,6 +54,7 @@ from ._cute_intrinsics import (
     spin_until_changed_acquire_gpu,
     st_global_f32,
     st_global_u32,
+    st_release_sys_global_v4_u32,
     st_relaxed_sys_global_v4_u32,
     threadfence_gpu,
     unpack_bf16x2,
@@ -249,8 +252,10 @@ class _OneshotLaunch(_PackedMath):
             "tp2_remote_push",
             "tp2_remote_push_stream",
             "tp2_remote_push_simple",
-            "tp4_push_sentinel",
-            "tp4_push_rsag",
+            "remote_push_ll",
+            "remote_push_simple",
+            "remote_push_full",
+            "remote_push_rsag",
         ):
             raise ValueError(f"invalid plain oneshot transport {transport!r}")
         if transport.startswith("tp2_remote_push") and (
@@ -263,13 +268,25 @@ class _OneshotLaunch(_PackedMath):
                 "TP2 remote push requires a graph-owned staged FP16 or BF16 "
                 "input on two ranks"
             )
-        if transport in ("tp4_push_sentinel", "tp4_push_rsag") and (
-            world_size != 4
+        if transport in ("remote_push_ll", "remote_push_simple") and (
+            world_size not in (2, 3, 4, 6, 8, 10)
+            or not 0 <= rank < world_size
+            or not stage_input
+            or not device_slot_selection
+            or dtype_name not in ("float16", "bfloat16")
+        ):
+            raise ValueError(
+                "tagged peer push requires graph-owned staged FP16/BF16 input"
+            )
+        if transport in ("remote_push_full", "remote_push_rsag") and (
+            world_size not in (2, 3, 4, 6, 8, 10)
             or not stage_input
             or not device_slot_selection
             or dtype_name != "bfloat16"
         ):
-            raise ValueError("TP4 sentinel push requires graph-owned staged BF16 input")
+            raise ValueError(
+                "Payload-ready push requires staged BF16 input on a supported rank group"
+            )
         self._world_size = int(world_size)
         self._rank = int(rank)
         self._stage_input = bool(stage_input)
@@ -316,6 +333,14 @@ class _OneshotLaunch(_PackedMath):
         )
 
     @cute.jit
+    def _pack_owner(self, index: Int32, size_packs: Int32) -> Int32:
+        part = size_packs // Int32(self._world_size)
+        owner = Int32(self._world_size - 1)
+        if part > Int32(0):
+            owner = cutlass.min(index // part, Int32(self._world_size - 1))
+        return owner
+
+    @cute.jit
     def _multi_gpu_barrier(self, signal_ptrs: cute.Pointer) -> None:
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
@@ -352,6 +377,64 @@ class _OneshotLaunch(_PackedMath):
                 Int64(_PEER_SLOT_BYTES),
             )
         cute.arch.sync_threads()
+
+    @cute.jit
+    def _clear_plain_graph_slots(
+        self,
+        signal_ptrs: cute.Pointer,
+        plain_local_slot0: Int64,
+        plain_local_slot1: Int64,
+        plain_region_packs: Int64,
+        plain_capacity_packs: Int64,
+    ) -> None:
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        gdim, _, _ = cute.arch.grid_dim()
+        stride = Int32(gdim) * Int32(self._threads)
+        # These barriers join matching CTAs, so clearing must follow reader ownership.
+        self._multi_gpu_barrier(signal_ptrs)
+        for clear_slot in cutlass.range_constexpr(2):
+            clear_base = plain_local_slot0
+            if cutlass.const_expr(clear_slot == 1):
+                clear_base = plain_local_slot1
+            clear_base += plain_region_packs * Int64(16)
+            clear_index = Int64(bidx) * Int64(self._threads) + Int64(tidx)
+            if cutlass.const_expr(self._transport == "tp2_remote_push_stream"):
+                while clear_index < plain_capacity_packs:
+                    line = clear_base + clear_index * Int64(32)
+                    st_global_v4_u32(line, Uint32(0), Uint32(0), Uint32(0), Uint32(0))
+                    st_global_v4_u32(
+                        line + Int64(16), Uint32(0), Uint32(0), Uint32(0), Uint32(0)
+                    )
+                    clear_index += Int64(stride)
+            else:
+                clear_limit = plain_capacity_packs * Int64(2)
+                if cutlass.const_expr(self._transport == "tp2_remote_push_simple"):
+                    clear_limit -= Int64(_MAX_BLOCKS)
+                while clear_index < clear_limit:
+                    st_global_v4_u32(
+                        clear_base + clear_index * Int64(16),
+                        Uint32(0),
+                        Uint32(0),
+                        Uint32(0),
+                        Uint32(0),
+                    )
+                    clear_index += Int64(stride)
+                if cutlass.const_expr(self._transport == "tp2_remote_push_simple"):
+                    # Active CTA flags belong to their pollers; the rest are unused.
+                    if tidx == Int32(0):
+                        flag = Int64(bidx)
+                        while flag < Int64(_MAX_BLOCKS):
+                            st_global_v4_u32(
+                                clear_base + (clear_limit + flag) * Int64(16),
+                                Uint32(0),
+                                Uint32(0),
+                                Uint32(0),
+                                Uint32(0),
+                            )
+                            flag += Int64(gdim)
+        # Both ranks finish clearing before another kernel may reuse either slot.
+        self._multi_gpu_barrier(signal_ptrs)
 
     @cute.kernel
     def kernel(
@@ -441,15 +524,14 @@ class _OneshotLaunch(_PackedMath):
                         Uint32(gdim),
                     )
         elif cutlass.const_expr(
-            self._transport in ("tp4_push_sentinel", "tp4_push_rsag")
+            self._transport in ("remote_push_full", "remote_push_rsag")
         ):
             slot_table = peer_ptrs + Int64(slot) * Int64(_MAX_RANKS)
             local_base = Int64(slot_table[self._rank]) + plain_region_packs * Int64(16)
-            part = size_packs // Int32(self._world_size)
             publish_index = index
             while publish_index < size_packs:
                 words = ld_global_v4_u32(input_base + Int64(publish_index) * Int64(16))
-                if cutlass.const_expr(self._transport == "tp4_push_sentinel"):
+                if cutlass.const_expr(self._transport == "remote_push_full"):
                     for target in cutlass.range_constexpr(self._world_size):
                         address = (
                             Int64(slot_table[target])
@@ -462,11 +544,7 @@ class _OneshotLaunch(_PackedMath):
                         )
                         self._publish_bf16_words(address, words)
                 else:
-                    owner = Int32(self._world_size - 1)
-                    if part > Int32(0):
-                        owner = cutlass.min(
-                            publish_index // part, Int32(self._world_size - 1)
-                        )
+                    owner = self._pack_owner(publish_index, size_packs)
                     address = (
                         Int64(slot_table[owner])
                         + plain_region_packs * Int64(16)
@@ -482,12 +560,8 @@ class _OneshotLaunch(_PackedMath):
             reduce_index = index
             while reduce_index < size_packs:
                 owner = Int32(self._rank)
-                if cutlass.const_expr(self._transport == "tp4_push_rsag"):
-                    owner = Int32(self._world_size - 1)
-                    if part > Int32(0):
-                        owner = cutlass.min(
-                            reduce_index // part, Int32(self._world_size - 1)
-                        )
+                if cutlass.const_expr(self._transport == "remote_push_rsag"):
+                    owner = self._pack_owner(reduce_index, size_packs)
                 if owner == Int32(self._rank):
                     accumulator = cute.make_rmem_tensor((8,), Float32)
                     self._receive_bf16_sum(
@@ -508,7 +582,7 @@ class _OneshotLaunch(_PackedMath):
                         result[2],
                         result[3],
                     )
-                    if cutlass.const_expr(self._transport == "tp4_push_rsag"):
+                    if cutlass.const_expr(self._transport == "remote_push_rsag"):
                         for peer in cutlass.range_constexpr(self._world_size):
                             if cutlass.const_expr(peer != self._rank):
                                 destination = (
@@ -523,12 +597,10 @@ class _OneshotLaunch(_PackedMath):
                                 self._publish_bf16_words(destination, result)
                 reduce_index += stride
 
-            if cutlass.const_expr(self._transport == "tp4_push_rsag"):
+            if cutlass.const_expr(self._transport == "remote_push_rsag"):
                 # Input publication and output use identical pack ownership for aliases.
                 while index < size_packs:
-                    owner = Int32(self._world_size - 1)
-                    if part > Int32(0):
-                        owner = cutlass.min(index // part, Int32(self._world_size - 1))
+                    owner = self._pack_owner(index, size_packs)
                     if owner != Int32(self._rank):
                         address = local_base + (
                             Int64(owner) * plain_capacity_packs + Int64(index)
@@ -556,6 +628,206 @@ class _OneshotLaunch(_PackedMath):
                             address, Uint32(0), Uint32(0), Uint32(0), Uint32(0)
                         )
                     index += stride
+        elif cutlass.const_expr(
+            self._transport in ("remote_push_ll", "remote_push_simple")
+        ):
+            # The final grid-stride increment may exceed the Int32 payload size.
+            index = Int64(index)
+            stride = Int64(stride)
+            slot_table = peer_ptrs + Int64(slot) * Int64(_MAX_RANKS)
+            local_base = Int64(slot_table[self._rank]) + plain_region_packs * Int64(16)
+            source_bytes = plain_capacity_packs * Int64(32)
+            expected = generation + Uint32(2)
+            flag_offset = (
+                source_bytes - Int64(_MAX_BLOCKS * 16) + Int64(bidx) * Int64(16)
+            )
+
+            # Publish every owned pack to every receiver before an aliased output is written.
+            publish_index = index
+            while publish_index < size_packs:
+                words = ld_global_v4_u32(input_base + Int64(publish_index) * Int64(16))
+                for destination in cutlass.range_constexpr(self._world_size):
+                    if cutlass.const_expr(destination != self._rank):
+                        source_slot = self._rank - int(self._rank > destination)
+                        address = (
+                            Int64(slot_table[destination])
+                            + plain_region_packs * Int64(16)
+                            + Int64(source_slot) * source_bytes
+                        )
+                        if cutlass.const_expr(self._transport == "remote_push_simple"):
+                            st_global_v4_u32(
+                                address + Int64(publish_index) * Int64(16),
+                                words[0],
+                                words[1],
+                                words[2],
+                                words[3],
+                            )
+                        else:
+                            for half in cutlass.range_constexpr(2):
+                                st_relaxed_sys_global_v4_u32(
+                                    address
+                                    + (publish_index * Int64(2) + Int64(half))
+                                    * Int64(16),
+                                    words[half * 2],
+                                    expected,
+                                    words[half * 2 + 1],
+                                    expected,
+                                )
+                publish_index += stride
+
+            if cutlass.const_expr(self._transport == "remote_push_simple"):
+                cute.arch.sync_threads()
+                if tidx == Int32(0):
+                    for destination in cutlass.range_constexpr(self._world_size):
+                        if cutlass.const_expr(destination != self._rank):
+                            source_slot = self._rank - int(self._rank > destination)
+                            address = (
+                                Int64(slot_table[destination])
+                                + plain_region_packs * Int64(16)
+                                + Int64(source_slot) * source_bytes
+                                + flag_offset
+                            )
+                            st_release_sys_global_v4_u32(
+                                address, expected, expected, expected, expected
+                            )
+                    for source in cutlass.range_constexpr(self._world_size):
+                        if cutlass.const_expr(source != self._rank):
+                            source_slot = source - int(source > self._rank)
+                            address = (
+                                local_base
+                                + Int64(source_slot) * source_bytes
+                                + flag_offset
+                            )
+                            flag = ld_relaxed_sys_global_v4_u32(address)
+                            waiting = (
+                                (flag[0] ^ expected)
+                                | (flag[1] ^ expected)
+                                | (flag[2] ^ expected)
+                                | (flag[3] ^ expected)
+                            )
+                            while waiting != Uint32(0):
+                                flag = ld_relaxed_sys_global_v4_u32(address)
+                                waiting = (
+                                    (flag[0] ^ expected)
+                                    | (flag[1] ^ expected)
+                                    | (flag[2] ^ expected)
+                                    | (flag[3] ^ expected)
+                                )
+                            ld_acquire_sys_global_v4_u32(address)
+                cute.arch.sync_threads()
+
+            while index < size_packs:
+                accumulator = cute.make_rmem_tensor((self._pack_elems,), Float32)
+                self._load_accumulate(
+                    accumulator, input_base + Int64(index) * Int64(16), True
+                )
+                for source_index in cutlass.range_constexpr(1, self._world_size):
+                    source = (self._rank + source_index) % self._world_size
+                    source_slot = source - int(source > self._rank)
+                    address = local_base + Int64(source_slot) * source_bytes
+                    words = cute.make_rmem_tensor((4,), Uint32)
+                    if cutlass.const_expr(self._transport == "remote_push_simple"):
+                        incoming = ld_relaxed_sys_global_v4_u32(
+                            address + Int64(index) * Int64(16)
+                        )
+                        for word in cutlass.range_constexpr(4):
+                            words[word] = incoming[word]
+                        # Arbitrary dense bits must never remain as a later LL wire tag.
+                        st_global_v4_u32(
+                            address + Int64(index) * Int64(16),
+                            Uint32(0),
+                            Uint32(0),
+                            Uint32(0),
+                            Uint32(0),
+                        )
+                    else:
+                        for half in cutlass.range_constexpr(2):
+                            line_address = address + (
+                                Int64(index) * Int64(2) + Int64(half)
+                            ) * Int64(16)
+                            line = ld_relaxed_sys_global_v4_u32(line_address)
+                            waiting = (line[1] ^ expected) | (line[3] ^ expected)
+                            while waiting != Uint32(0):
+                                line = ld_relaxed_sys_global_v4_u32(line_address)
+                                waiting = (line[1] ^ expected) | (line[3] ^ expected)
+                            words[half * 2] = line[0]
+                            words[half * 2 + 1] = line[2]
+                    self._accumulate_words(
+                        accumulator, words[0], words[1], words[2], words[3], False
+                    )
+                self._store_accumulator(
+                    output_base + Int64(index) * Int64(16), accumulator
+                )
+                index += stride
+
+            if generation == Uint32(_PLAIN_GRAPH_LAST_EPOCH):
+                self._multi_gpu_barrier(signal_ptrs)
+                # The barrier pairs matching CTAs, so clearing follows live-record ownership.
+                clear_index = Int64(bidx) * Int64(self._threads) + Int64(tidx)
+                clear_count = plain_capacity_packs
+                if cutlass.const_expr(self._transport == "remote_push_simple"):
+                    clear_count = plain_capacity_packs * Int64(2) - Int64(_MAX_BLOCKS)
+                while clear_index < clear_count:
+                    for clear_slot in cutlass.range_constexpr(2):
+                        for source_slot in cutlass.range_constexpr(
+                            self._world_size - 1
+                        ):
+                            address = (
+                                Int64(peer_ptrs[clear_slot * _MAX_RANKS + self._rank])
+                                + plain_region_packs * Int64(16)
+                                + Int64(source_slot) * source_bytes
+                            )
+                            if cutlass.const_expr(
+                                self._transport == "remote_push_simple"
+                            ):
+                                st_global_v4_u32(
+                                    address + clear_index * Int64(16),
+                                    Uint32(0),
+                                    Uint32(0),
+                                    Uint32(0),
+                                    Uint32(0),
+                                )
+                            else:
+                                for half in cutlass.range_constexpr(2):
+                                    st_global_v4_u32(
+                                        address
+                                        + (clear_index * Int64(2) + Int64(half))
+                                        * Int64(16),
+                                        Uint32(0),
+                                        Uint32(0),
+                                        Uint32(0),
+                                        Uint32(0),
+                                    )
+                    clear_index += Int64(stride)
+                if cutlass.const_expr(self._transport == "remote_push_simple"):
+                    if tidx == Int32(0):
+                        flag_index = Int32(bidx)
+                        while flag_index < Int32(_MAX_BLOCKS):
+                            for clear_slot in cutlass.range_constexpr(2):
+                                for source_slot in cutlass.range_constexpr(
+                                    self._world_size - 1
+                                ):
+                                    address = (
+                                        Int64(
+                                            peer_ptrs[
+                                                clear_slot * _MAX_RANKS + self._rank
+                                            ]
+                                        )
+                                        + plain_region_packs * Int64(16)
+                                        + Int64(source_slot) * source_bytes
+                                        + source_bytes
+                                        - Int64(_MAX_BLOCKS * 16)
+                                        + Int64(flag_index) * Int64(16)
+                                    )
+                                    st_global_v4_u32(
+                                        address,
+                                        Uint32(0),
+                                        Uint32(0),
+                                        Uint32(0),
+                                        Uint32(0),
+                                    )
+                            flag_index += Int32(gdim)
+                self._multi_gpu_barrier(signal_ptrs)
         elif cutlass.const_expr(self._transport.startswith("tp2_remote_push")):
             peer_rank = self._rank ^ 1
             local_scratch_base = plain_local_slot0
@@ -569,6 +841,9 @@ class _OneshotLaunch(_PackedMath):
             # both ranks drain and clear the full incoming capacity, including
             # records not touched by this shape.
             expected_generation = generation + Uint32(2)
+            retained_words = cute.make_rmem_tensor((4,), Uint32)
+            for word in cutlass.range_constexpr(4):
+                retained_words[word] = Uint32(0)
 
             if cutlass.const_expr(self._transport == "tp2_remote_push_simple"):
                 # Match NCCL Simple publication: the payload crosses PCIe once,
@@ -587,6 +862,9 @@ class _OneshotLaunch(_PackedMath):
                     words = ld_global_v4_u32(
                         input_base + Int64(publish_index) * Int64(16)
                     )
+                    if size_packs <= stride:
+                        for word in cutlass.range_constexpr(4):
+                            retained_words[word] = words[word]
                     st_global_v4_u32(
                         peer_write_base + Int64(publish_index) * Int64(16),
                         words[0],
@@ -597,8 +875,7 @@ class _OneshotLaunch(_PackedMath):
                     publish_index += stride
                 cute.arch.sync_threads()
                 if Int32(tidx) == Int32(0):
-                    _membar_sys()
-                    st_relaxed_sys_global_v4_u32(
+                    st_release_sys_global_v4_u32(
                         peer_write_base + flag_offset,
                         expected_generation,
                         expected_generation,
@@ -622,12 +899,17 @@ class _OneshotLaunch(_PackedMath):
                             | (flag[2] ^ expected_generation)
                             | (flag[3] ^ expected_generation)
                         )
-                    _membar_sys()
+                    # The successful read and same-location acquire form one pattern.
+                    ld_acquire_sys_global_v4_u32(local_poll_base + flag_offset)
                 cute.arch.sync_threads()
                 while index < size_packs:
-                    local_words = ld_global_v4_u32(
-                        input_base + Int64(index) * Int64(16)
-                    )
+                    local_words = retained_words
+                    if size_packs > stride:
+                        loaded_words = ld_global_v4_u32(
+                            input_base + Int64(index) * Int64(16)
+                        )
+                        for word in cutlass.range_constexpr(4):
+                            local_words[word] = loaded_words[word]
                     peer_words = ld_relaxed_sys_global_v4_u32(
                         local_poll_base + Int64(index) * Int64(16)
                     )
@@ -648,20 +930,32 @@ class _OneshotLaunch(_PackedMath):
                         packed_sum[2],
                         packed_sum[3],
                     )
+                    # Dense payload bits must not become tags in a later LL epoch.
+                    st_global_v4_u32(
+                        local_poll_base + Int64(index) * Int64(16),
+                        Uint32(0),
+                        Uint32(0),
+                        Uint32(0),
+                        Uint32(0),
+                    )
                     index += stride
 
             if cutlass.const_expr(self._transport == "tp2_remote_push"):
+                line_count = size_packs * Int32(2)
                 publish_index = index
-                while publish_index < size_packs:
-                    words = ld_global_v4_u32(
-                        input_base + Int64(publish_index) * Int64(16)
+                while publish_index < line_count:
+                    words = ld_global_v2_u32(
+                        input_base + Int64(publish_index) * Int64(8)
                     )
+                    if line_count <= stride:
+                        for word in cutlass.range_constexpr(2):
+                            retained_words[word] = words[word]
                     # Match NCCL LL publication: each naturally aligned
                     # 16-byte line carries eight payload bytes and two copies
                     # of the generation. The protocol does not assume that the
                     # line is atomically visible; repeated generation lanes let
                     # the receiver reject a torn observation.
-                    line_base = peer_write_base + Int64(publish_index) * Int64(32)
+                    line_base = peer_write_base + Int64(publish_index) * Int64(16)
                     st_relaxed_sys_global_v4_u32(
                         line_base,
                         words[0],
@@ -669,36 +963,62 @@ class _OneshotLaunch(_PackedMath):
                         words[1],
                         expected_generation,
                     )
-                    st_relaxed_sys_global_v4_u32(
-                        line_base + Int64(16),
-                        words[2],
-                        expected_generation,
-                        words[3],
-                        expected_generation,
-                    )
                     publish_index += stride
+                while index < line_count:
+                    local_words = retained_words
+                    if line_count > stride:
+                        loaded_words = ld_global_v2_u32(
+                            input_base + Int64(index) * Int64(8)
+                        )
+                        for word in cutlass.range_constexpr(2):
+                            local_words[word] = loaded_words[word]
+                    line_address = local_poll_base + Int64(index) * Int64(16)
+                    line = ld_relaxed_sys_global_v4_u32(line_address)
+                    waiting = (line[1] ^ expected_generation) | (
+                        line[3] ^ expected_generation
+                    )
+                    while waiting != Uint32(0):
+                        line = ld_relaxed_sys_global_v4_u32(line_address)
+                        waiting = (line[1] ^ expected_generation) | (
+                            line[3] ^ expected_generation
+                        )
+                    packed_sum = cute.make_rmem_tensor((2,), Uint32)
+                    for word in cutlass.range_constexpr(2):
+                        if cutlass.const_expr(self._dtype_name == "float16"):
+                            packed_sum[word] = add_f16x2(
+                                local_words[word], line[word * 2]
+                            )
+                        else:
+                            packed_sum[word] = add_bf16x2(
+                                local_words[word], line[word * 2]
+                            )
+                    st_global_v2_u32(
+                        output_base + Int64(index) * Int64(8),
+                        packed_sum[0],
+                        packed_sum[1],
+                    )
+                    index += stride
 
-            if cutlass.const_expr(self._transport != "tp2_remote_push_simple"):
+            if cutlass.const_expr(self._transport == "tp2_remote_push_stream"):
                 while index < size_packs:
                     local_words = ld_global_v4_u32(
                         input_base + Int64(index) * Int64(16)
                     )
-                    if cutlass.const_expr(self._transport == "tp2_remote_push_stream"):
-                        peer_line_address = peer_write_base + Int64(index) * Int64(32)
-                        st_relaxed_sys_global_v4_u32(
-                            peer_line_address,
-                            local_words[0],
-                            expected_generation,
-                            local_words[1],
-                            expected_generation,
-                        )
-                        st_relaxed_sys_global_v4_u32(
-                            peer_line_address + Int64(16),
-                            local_words[2],
-                            expected_generation,
-                            local_words[3],
-                            expected_generation,
-                        )
+                    peer_line_address = peer_write_base + Int64(index) * Int64(32)
+                    st_relaxed_sys_global_v4_u32(
+                        peer_line_address,
+                        local_words[0],
+                        expected_generation,
+                        local_words[1],
+                        expected_generation,
+                    )
+                    st_relaxed_sys_global_v4_u32(
+                        peer_line_address + Int64(16),
+                        local_words[2],
+                        expected_generation,
+                        local_words[3],
+                        expected_generation,
+                    )
                     line_address = local_poll_base + Int64(index) * Int64(32)
                     line0 = ld_relaxed_sys_global_v4_u32(line_address)
                     line1 = ld_relaxed_sys_global_v4_u32(line_address + Int64(16))
@@ -738,29 +1058,13 @@ class _OneshotLaunch(_PackedMath):
                     index += stride
 
             if generation == Uint32(_PLAIN_GRAPH_LAST_EPOCH):
-                # Matching CTAs finish reading before either rank clears records.
-                self._multi_gpu_barrier(signal_ptrs)
-                clear_index = Int64(bidx) * Int64(self._threads) + Int64(tidx)
-                while clear_index < plain_capacity_packs:
-                    for clear_slot in cutlass.range_constexpr(2):
-                        clear_base = plain_local_slot0
-                        if cutlass.const_expr(clear_slot == 1):
-                            clear_base = plain_local_slot1
-                        line = (
-                            clear_base
-                            + plain_region_packs * Int64(16)
-                            + clear_index * Int64(32)
-                        )
-                        st_global_v4_u32(
-                            line, Uint32(0), Uint32(0), Uint32(0), Uint32(0)
-                        )
-                        st_global_v4_u32(
-                            line + Int64(16), Uint32(0), Uint32(0), Uint32(0), Uint32(0)
-                        )
-                    clear_index += Int64(stride)
-                # The peer cannot publish another epoch until its receiver's
-                # matching CTA has completed the clear with system visibility.
-                self._multi_gpu_barrier(signal_ptrs)
+                self._clear_plain_graph_slots(
+                    signal_ptrs,
+                    plain_local_slot0,
+                    plain_local_slot1,
+                    plain_region_packs,
+                    plain_capacity_packs,
+                )
 
 
 class _FusedOneshotLaunch(_PackedMath):
@@ -935,6 +1239,7 @@ class _FusedOneshotLaunch(_PackedMath):
         rows: Int32,
         ctas_per_row: Int32,
         shard_packs: Int64,
+        payload_ready_region_packs: Int64,
         epsilon: Float32,
         grid_x: Int32,
         input_addend_ptr: cute.Pointer,
@@ -954,6 +1259,7 @@ class _FusedOneshotLaunch(_PackedMath):
             rows,
             ctas_per_row,
             shard_packs,
+            payload_ready_region_packs,
             epsilon,
             input_addend_ptr,
             group_weights_ptr,
@@ -1123,6 +1429,7 @@ class _FusedOneshotLaunch(_PackedMath):
         index: Int64,
         total_packs: Int64,
         shard_packs: Int64,
+        payload_ready_region_packs: Int64,
         input_addend_base: Int64,
         group_weights_base: Int64,
         group_ids_base: Int64,
@@ -1139,7 +1446,7 @@ class _FusedOneshotLaunch(_PackedMath):
             )
             for peer in cutlass.range_constexpr(self._world_size):
                 address = Int64(peer_ptrs[peer]) + (
-                    Int64(self._world_size + self._rank) * shard_packs + index
+                    payload_ready_region_packs + Int64(self._rank) * shard_packs + index
                 ) * Int64(16)
                 self._publish_bf16_words(address, words)
         elif cutlass.const_expr(self._mode == "stage_pull"):
@@ -1367,6 +1674,7 @@ class _FusedOneshotLaunch(_PackedMath):
         index: Int64,
         total_packs: Int64,
         shard_packs: Int64,
+        payload_ready_region_packs: Int64,
         accumulator: cute.Tensor,
         input_addend_base: Int64,
         group_weights_base: Int64,
@@ -1374,9 +1682,9 @@ class _FusedOneshotLaunch(_PackedMath):
         hidden_packs: Int32,
     ) -> None:
         if cutlass.const_expr(self._mode == "stage_bf16_sentinel"):
-            local_base = Int64(peer_ptrs[self._rank]) + Int64(
-                self._world_size
-            ) * shard_packs * Int64(16)
+            local_base = Int64(
+                peer_ptrs[self._rank]
+            ) + payload_ready_region_packs * Int64(16)
             self._receive_bf16_sum(local_base, shard_packs, index, accumulator)
         elif cutlass.const_expr(self._mode == "stage_tp8_owner"):
             part = total_packs // Int64(4)
@@ -1503,6 +1811,7 @@ class _FusedOneshotLaunch(_PackedMath):
         rows: Int32,
         ctas_per_row: Int32,
         shard_packs: Int64,
+        payload_ready_region_packs: Int64,
         epsilon: Float32,
         input_addend_ptr: cute.Pointer,
         group_weights_ptr: cute.Pointer,
@@ -1579,6 +1888,7 @@ class _FusedOneshotLaunch(_PackedMath):
                         Int64(stage_row) * Int64(hidden_packs) + Int64(col),
                         total_packs,
                         shard_packs,
+                        payload_ready_region_packs,
                         input_addend_base,
                         group_weights_base,
                         group_ids_base,
@@ -1597,6 +1907,7 @@ class _FusedOneshotLaunch(_PackedMath):
                             row_offset + Int64(col),
                             total_packs,
                             shard_packs,
+                            payload_ready_region_packs,
                             input_addend_base,
                             group_weights_base,
                             group_ids_base,
@@ -1611,6 +1922,7 @@ class _FusedOneshotLaunch(_PackedMath):
                         row_offset + Int64(col),
                         total_packs,
                         shard_packs,
+                        payload_ready_region_packs,
                         input_addend_base,
                         group_weights_base,
                         group_ids_base,
@@ -1678,6 +1990,7 @@ class _FusedOneshotLaunch(_PackedMath):
                         index,
                         total_packs,
                         shard_packs,
+                        payload_ready_region_packs,
                         accumulator,
                         input_addend_base,
                         group_weights_base,
@@ -1715,6 +2028,7 @@ class _FusedOneshotLaunch(_PackedMath):
                                 index,
                                 total_packs,
                                 shard_packs,
+                                payload_ready_region_packs,
                                 accumulator,
                                 input_addend_base,
                                 group_weights_base,
@@ -1745,6 +2059,7 @@ class _FusedOneshotLaunch(_PackedMath):
                             index,
                             total_packs,
                             shard_packs,
+                            payload_ready_region_packs,
                             accumulator,
                             input_addend_base,
                             group_weights_base,
@@ -2032,6 +2347,19 @@ def get_oneshot_launcher(
         plain_peer_slot1: int,
         grid_x: int,
     ) -> None:
+        if transport in ("remote_push_ll", "remote_push_simple"):
+            if size_packs > 0x7FFFFFFF:
+                raise ValueError(
+                    "tagged peer push payload exceeds the Int32 pack-count ABI"
+                )
+            if not 0 < size_packs <= plain_capacity_packs or plain_region_packs <= 0:
+                raise ValueError(
+                    "tagged peer push requires allocated incoming capacity covering the payload"
+                )
+            if transport == "remote_push_simple" and plain_capacity_packs < _MAX_BLOCKS:
+                raise ValueError(
+                    "Simple incoming capacity must leave space for CTA flags"
+                )
         raw(
             make_ptr(
                 cutlass.Uint64,
@@ -2274,6 +2602,7 @@ def get_fused_oneshot_launcher(
         1,
         1,
         1,
+        0,
         0.0,
         1,
         _dummy(cutlass.Uint32, 16),
@@ -2297,6 +2626,7 @@ def get_fused_oneshot_launcher(
         rows: int,
         ctas_per_row: int,
         shard_packs: int,
+        payload_ready_region_packs: int,
         epsilon: float,
         grid_x: int,
         *,
@@ -2342,6 +2672,7 @@ def get_fused_oneshot_launcher(
             int(rows),
             int(ctas_per_row),
             int(shard_packs),
+            int(payload_ready_region_packs),
             float(epsilon),
             int(grid_x),
             make_ptr(

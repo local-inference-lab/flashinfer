@@ -583,8 +583,12 @@ def _run_graph(
         snapshots.append(_local_eager_words(channel, stream, offset=offset))
         if payload_ready:
             epochs.append(_payload_epoch(channel, stream))
+            payload_offset = int(plan.query.call["payload_ready_region_packs"]) * 16
+            assert payload_offset == (
+                channel._ext._state(channel._ptr).plain_payload_ready_region_packs * 16
+            )
             for source in range(world_size):
-                incoming_offset = (world_size + source) * channel.eager_buffer_bytes
+                incoming_offset = payload_offset + source * channel.eager_buffer_bytes
                 assert _local_eager_words(channel, stream, offset=incoming_offset) == (
                     0,
                     0,

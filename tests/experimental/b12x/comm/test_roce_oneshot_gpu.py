@@ -690,6 +690,8 @@ def test_all_gather_graph_replay_with_alternating_grid_sizes(runtime):
     topk = torch.zeros(8, 64, dtype=torch.float32, device=runtime.device)
     logits = torch.zeros(8, 38720, dtype=torch.bfloat16, device=runtime.device)
     h = torch.zeros(8 * 4096, dtype=torch.bfloat16, device=runtime.device)
+    small = torch.zeros(8, dtype=torch.bfloat16, device=runtime.device)
+    small_out = torch.empty_like(small)
     topk_out = torch.empty(8, 64 * world, dtype=torch.float32, device=runtime.device)
     logits_out = torch.empty(
         8, 38720 * world, dtype=torch.bfloat16, device=runtime.device
@@ -712,6 +714,7 @@ def test_all_gather_graph_replay_with_alternating_grid_sizes(runtime):
     stream = torch.cuda.Stream(device=runtime.device)
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
+        runtime.all_reduce(small, out=small_out)
         runtime.all_gather(topk, dim=-1, out=topk_out)
         runtime.all_gather(logits, dim=-1, out=logits_out)
         runtime.all_reduce(h, out=reduced)
@@ -720,10 +723,13 @@ def test_all_gather_graph_replay_with_alternating_grid_sizes(runtime):
     dist.barrier()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream), runtime.capture(stream=stream):
+        runtime.all_reduce(small, out=small_out)
         runtime.all_gather(topk, dim=-1, out=topk_out)
         runtime.all_gather(logits, dim=-1, out=logits_out)
+        runtime.all_reduce(small, out=small_out)
         runtime.all_gather(topk, dim=-1, out=topk_out)
         runtime.all_reduce(h, out=reduced)
+        runtime.all_reduce(small, out=small_out)
         runtime.all_gather(topk, dim=-1, out=topk_out)
     torch.cuda.synchronize()
     dist.barrier()
@@ -732,6 +738,7 @@ def test_all_gather_graph_replay_with_alternating_grid_sizes(runtime):
         topk.copy_(torch.randn_like(topk))
         logits.copy_(torch.randn_like(logits))
         h.copy_(torch.randn_like(h))
+        small.copy_(torch.randn_like(small))
         parts = [torch.empty_like(topk) for _ in range(world)]
         dist.all_gather(parts, topk)
         expected_topk = torch.cat(parts, dim=-1)
@@ -740,9 +747,18 @@ def test_all_gather_graph_replay_with_alternating_grid_sizes(runtime):
         expected_logits = torch.cat(parts, dim=-1)
         expected_reduce = h.clone()
         dist.all_reduce(expected_reduce)
+        expected_small = small.clone()
+        dist.all_reduce(expected_small)
+        allocated = torch.cuda.memory_allocated()
+        allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
         graph.replay()
         torch.cuda.synchronize()
+        assert torch.cuda.memory_allocated() == allocated
+        assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
         runtime.check_health()
+        torch.testing.assert_close(
+            small_out, expected_small, rtol=2e-2, atol=2e-2 * world
+        )
         assert torch.equal(topk_out, expected_topk)
         assert torch.equal(logits_out, expected_logits)
         torch.testing.assert_close(

@@ -97,7 +97,8 @@ def _default_config(
         if query.operation == "gate_mean"
         else 256,
         reduction_num_warps=8
-        if _uses_triton_reduction(query) and reduction_block_h >= 2048
+        if query.operation == "combine_norm"
+        or (_uses_triton_reduction(query) and reduction_block_h >= 2048)
         else 4,
     )
 
@@ -117,8 +118,13 @@ def _validate(
     ):
         if value <= 0 or value & (value - 1):
             raise ValueError(f"{name} must be a positive power of two")
-    if config.reduction_num_warps not in (1, 2, 4, 8):
-        raise ValueError("reduction_num_warps must be one of 1, 2, 4, or 8")
+    legal_warps = (
+        ((8, 10, 16) if query.hidden_size % 8 == 0 else (8,))
+        if query.operation == "combine_norm"
+        else (1, 2, 4, 8)
+    )
+    if config.reduction_num_warps not in legal_warps:
+        raise ValueError(f"reduction_num_warps must be one of {legal_warps}")
 
 
 def _validate_query(query, device):
@@ -283,7 +289,15 @@ def _tuning_parameters(query, device):
         if triton_reduction
         else (covering,),
         "pointwise_block": blocks if operation == "gate_mean" else (256,),
-        "reduction_num_warps": (1, 2, 4, 8) if triton_reduction else (4,),
+        "reduction_num_warps": (
+            (8, 10, 16)
+            if query.max_tokens <= 128 and query.hidden_size % 8 == 0
+            else (8,)
+        )
+        if operation == "combine_norm"
+        else (1, 2, 4, 8)
+        if triton_reduction
+        else (4,),
     }
     return ParameterSpace.create(
         TUNING.knobs,
@@ -318,7 +332,7 @@ def _materialize_tuning(
 TUNING = TuningContract(
     component_id="norm.hyperconnection",
     query_schema_version=29,
-    config_schema_version=22,
+    config_schema_version=23,
     query_fields=frozenset(HyperConnectionQuery.__dataclass_fields__),
     config_fields=frozenset(HyperConnectionConfig.__dataclass_fields__),
     encode_query=_encode,
@@ -327,13 +341,13 @@ TUNING = TuningContract(
     validate_query=_validate_query,
     validate_config=_validate,
     default_config=_default_config,
-    candidate_contract_version=8,
+    candidate_contract_version=9,
     knobs=(
         Knob(name="reduction_block_h", values=None, binding=ParameterBinding.COMPILE),
         Knob(name="pointwise_block", values=None, binding=ParameterBinding.COMPILE),
         Knob(
             name="reduction_num_warps",
-            values=(1, 2, 4, 8),
+            values=(1, 2, 4, 8, 10, 16),
             binding=ParameterBinding.COMPILE,
         ),
     ),

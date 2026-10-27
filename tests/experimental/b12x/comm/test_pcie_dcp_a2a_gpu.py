@@ -31,6 +31,7 @@ TOTAL_HEADS = 16
 HEAD_DIM = 512
 QUERY_HEAD_DIM = 576
 MAX_BATCH = 64
+GATHER_THREADS = 256
 TEST_BATCHES = (1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64)
 
 
@@ -143,6 +144,7 @@ def _prepare_channel(session, channel):
         for dtype in dtypes:
             if operation == "all_gather_heads":
                 call = dict(
+                    threads=GATHER_THREADS,
                     local_input=torch.zeros(
                         MAX_BATCH,
                         channel.heads_per_rank,
@@ -935,8 +937,10 @@ def _worker(
     port: int,
     heads_per_rank: int | None,
     query_head_dim: int,
+    gather_threads: int,
 ) -> None:
-    global TOTAL_HEADS, QUERY_HEAD_DIM
+    global TOTAL_HEADS, QUERY_HEAD_DIM, GATHER_THREADS
+    GATHER_THREADS = gather_threads
     if heads_per_rank is not None:
         TOTAL_HEADS = heads_per_rank * world_size
     QUERY_HEAD_DIM = query_head_dim
@@ -1084,7 +1088,10 @@ def _preflight_rejection_worker(rank: int, world_size: int, port: int) -> None:
 
 
 @pytest.mark.parametrize("heads_per_rank,query_head_dim", [(None, 576), (3, 64)])
-def test_pcie_dcp_a2a_eager_and_cuda_graph_correctness(heads_per_rank, query_head_dim):
+@pytest.mark.parametrize("gather_threads", [256, 1024])
+def test_pcie_dcp_a2a_eager_and_cuda_graph_correctness(
+    heads_per_rank, query_head_dim, gather_threads
+):
     if (
         os.getenv("B12X_PCIE_DCP_TEST_EXPECT_RESIDENCY_REJECTION") == "1"
         or os.getenv("B12X_PCIE_DCP_TEST_EXPECT_PREFLIGHT_REJECTION") == "1"
@@ -1093,6 +1100,8 @@ def test_pcie_dcp_a2a_eager_and_cuda_graph_correctness(heads_per_rank, query_hea
     if not torch.cuda.is_available():
         pytest.skip("CUDA is unavailable")
     world_size = int(os.getenv("B12X_PCIE_DCP_A2A_WORLD_SIZE", "2"))
+    if gather_threads == 1024 and world_size != 2:
+        pytest.skip("1024-thread gather blocks use the TP2 kernel")
     if world_size not in (2, 4, 8, 16):
         pytest.skip("PCIe DCP A2A supports world sizes 2, 4, 8, and 16")
     if torch.cuda.device_count() < world_size:
@@ -1101,7 +1110,7 @@ def test_pcie_dcp_a2a_eager_and_cuda_graph_correctness(heads_per_rank, query_hea
         )
     mp.spawn(
         _worker,
-        args=(world_size, _free_port(), heads_per_rank, query_head_dim),
+        args=(world_size, _free_port(), heads_per_rank, query_head_dim, gather_threads),
         nprocs=world_size,
         join=True,
     )

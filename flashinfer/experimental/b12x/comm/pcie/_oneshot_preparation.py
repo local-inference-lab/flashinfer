@@ -26,7 +26,13 @@ from b12x._lib.compile_pool import CompileJob
 from b12x._lib.program_cache import program_cache
 from b12x._lib.compile_plan import load_programs
 
-from .pcie_oneshot import IPC_SLAB_ALIGNMENT, _align_up, _eager_storage_shards
+from .pcie_oneshot import (
+    IPC_SLAB_ALIGNMENT,
+    _align_up,
+    _eager_storage_shards,
+    _is_weak_contiguous,
+    _validate_plain_io,
+)
 from ._tuning import PcieConfig, PcieQuery, TUNING
 
 _PLAIN_SURFACES = frozenset(
@@ -266,6 +272,7 @@ def _plain_launcher_metadata(backend, native, inp):
         "stage_input": graph.stage_input,
         "device_index": graph.device_index,
         "remote_push_region_packs": graph.remote_push_region_packs,
+        "payload_ready_region_packs": graph.payload_ready_region_packs,
     }
 
 
@@ -288,6 +295,8 @@ def query_from_metadata(
     group_ids_dtype: str = "int32",
 ) -> PcieQuery:
     """Extract a native declaration from immutable invocation metadata only."""
+    if alignment < 16 or alignment % 16:
+        raise ValueError("oneshot invocation requires 16-byte input alignment")
     tensor = _InvocationTensor(
         tuple(shape),
         dtype,
@@ -357,6 +366,7 @@ def query_from_metadata(
             "register_normalize": register_normalize,
             "threads": threads,
             "device_index": backend._device_index(runtime.device),
+            "payload_ready_region_packs": native.plain_payload_ready_region_packs,
             "hidden_packs": hidden_packs,
             "rows": rows,
             "ctas_per_row": ctas,
@@ -408,6 +418,8 @@ def query_from_runtime(runtime, *, surface, call) -> PcieQuery:
     values = dict(call)
     inp = _input_from_call(values)
     physical = inp
+    if surface in _PLAIN_SURFACES and values.get("out") is not None:
+        _validate_plain_io(inp, values["out"])
     inp, group_size, group_id_limit, group_ids_dtype = _grouped_inputs(
         physical,
         values.get("group_weights"),
@@ -470,6 +482,7 @@ def query_from_runtime(runtime, *, surface, call) -> PcieQuery:
             "register_normalize": register_normalize,
             "threads": threads,
             "device_index": backend._device_index(inp.device),
+            "payload_ready_region_packs": native.plain_payload_ready_region_packs,
             "hidden_packs": hidden_packs,
             "rows": rows,
             "ctas_per_row": ctas,
@@ -603,6 +616,10 @@ class _OneshotExecutionState:
             raise ValueError("PCIe runtime identity differs from preparation")
 
     def _check_input(self, inp):
+        if inp.data_ptr() % 16 or not _is_weak_contiguous(inp):
+            raise ValueError(
+                "oneshot input must be 16-byte aligned and weak-contiguous"
+            )
         setup = self.query.setup
         if (
             tuple(inp.shape),
@@ -634,6 +651,7 @@ class _OneshotExecutionState:
             raise RuntimeError("oneshot plan was not bound during preparation")
 
     def run_plain(self, inp, out):
+        _validate_plain_io(inp, out)
         self._require_bound_input(inp)
         return self.runtime._run_prepared_plain(inp, out, self.query, self.launchers)
 
@@ -745,6 +763,7 @@ def _prepare_plain_call(
     owners=(),
 ) -> PreparedCall:
     """Bind and prime a caller-owned plain all-reduce without a public warmup API."""
+    _validate_plain_io(inp, out)
     state.bind_input(inp)
     return PreparedCall(
         run=lambda: state.run_plain(inp, out),

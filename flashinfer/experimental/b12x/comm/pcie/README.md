@@ -11,21 +11,51 @@ tuning keys. Every caller still binds its own serving operands.
 
 | Declaration | Candidates |
 | --- | --- |
-| Staged `AllReduce.all_reduce`, TP2–8 | Native pull; qualified TP2 peer push; qualified TP4 BF16 payload-ready one-shot and fused reduce-scatter/all-gather; provisioned TP4 BF16 two-shot with disjoint output |
+| Staged `AllReduce.all_reduce`, direct peer groups | Native pull; LL and Simple peer push; BF16 payload-ready full reduction and reduce-scatter/all-gather; provisioned BF16 two-shot |
 | Staged fused residual addition and RMSNorm | Native staged transports compatible with declared input, residual, normalization, grouping, and output arithmetic |
 | DCP `all_gather_heads` and `lse_reduce_scatter`, TP2/4/8 | Thread count and block limit; equivalent effective grids are measured once |
 
-TP4 payload-ready transports require their reserved incoming slots and qualified
-SM120 hardware. Two-shot retains its native capacity and alignment constraints.
+Payload-ready transports require their reserved incoming slots, BF16 support,
+and sufficient SMs to keep their grid resident. Two-shot retains its native
+capacity and alignment constraints.
 Unsupported alternatives are absent, rather than failing over during execution.
-Tuning races the native alternatives over their launch geometry; off retains
-the static dispatch policy. Explicit
+Plain tuning admits FP16/BF16 tensors with positive 16-byte-packed payloads
+within the prepared staging capacity. LL requires two capacity shards per remote
+source; Simple additionally keeps payload bytes disjoint from its 36 CTA flag
+records. Full reduction and reduce-scatter/all-gather use separate BF16 payload
+shards. Widths, row counts, and divisibility by rank count do not restrict this
+measured candidate catalog.
+The peer-push transports require the prepared alternating graph slots. Thread counts
+32, 64, 128, 256, and 512 are measured over grids up to 36 CTAs, including the
+payload-covering grid. Pull remains a measured alternative. Optimized TP2 LL and
+Simple implementations remain separate entrants alongside generic peer push.
+Two-shot measures warp-aligned thread counts through 512 and block limits through
+64, coalescing limits that produce the same effective grid.
+
+Native peer-push kernels support rank counts 2, 3, 4, 6, 8, and 10 with fully
+mapped peers. Single-channel TP10 auto preparation provisions the actual direct
+pool and retains it on success. Only a coordinated peer-mapping rejection with
+complete rollback selects hierarchy; unrelated setup or cleanup failures remain
+fatal. Explicit hierarchical choices and multichannel TP10 declarations retain
+hierarchical routing. Pairwise reachability alone does not establish simultaneous
+full-peer mapping capacity. Inputs and outputs must be 16-byte aligned, use
+compatible physical traversal, and be either exact aliases or disjoint.
+
+Tuning races the native alternatives over their launch geometry; explicitly
+disabled tuning retains the static dispatch policy. Explicit
 `CollectiveConfig(implementation=..., threads=..., blocks=...)` pins a legal
 configuration. Native low-level plans still use `PcieConfig`.
 
-The TP9–16 hierarchy, DMA rings, FP8 sequence-parallel transports, paired gathers,
+Hierarchical collectives, DMA rings, FP8 sequence-parallel transports, paired gathers,
 and owner/top-k exchanges retain their native fixed declarations. Transport
 codecs with different arithmetic are not interchangeable tuning candidates.
+
+`PCIeTwoShotBF16.all_reduce` accepts a disjoint output or the exact input
+storage span. Reduce-scatter consumes the input into a fixed private shard
+before same-stream all-gather writes the output; peers consume IPC copies.
+Partial overlaps remain rejected. Standalone reduce-scatter and all-gather
+require disjoint outputs. All operations and graph replays sharing one runtime
+must remain serialized.
 
 ## Benchmark and synchronization contract
 

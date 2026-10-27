@@ -1021,78 +1021,135 @@ class _AllGatherHeadsLaunch(_DCPA2ABase):
         warp_stride = Int32(gdim) * Int32(self._warps_per_block)
         local_packs = local_heads * packs_per_head
         tiles_per_rank = (local_packs + Int32(31)) // Int32(32)
-        tiles_per_batch = tiles_per_rank * Int32(self._world_size)
-        tiles = batch * tiles_per_batch
-        # Every rank pushes its segments into each peer's staging and reads only
-        # its own memory after the barrier, so PCIe carries posted writes and no
-        # peer reads. Staging holds the peers' segments in rank order without the
-        # receiver's own.
-        own_stage = self._staging_words(staging[self._rank])
-        peers = Int64(self._world_size - 1)
+        if cutlass.const_expr(self._world_size == 2):
+            tiles = batch * tiles_per_rank
+            tile = warp_first
+            while tile < tiles:
+                batch_index = tile // tiles_per_rank
+                pack = (tile - batch_index * tiles_per_rank) * Int32(32) + lane
+                if pack < local_packs:
+                    source_pack = Int64(batch_index) * Int64(local_packs) + Int64(pack)
+                    output_pack = (
+                        Int64(batch_index) * Int64(2) + Int64(self._rank)
+                    ) * Int64(local_packs) + Int64(pack)
+                    values = ld_global_v4_u32(
+                        (local_input + source_pack * Int64(4)).toint()
+                    )
+                    st_global_v4_u32(
+                        (
+                            self._staging_words(staging[1 - self._rank])
+                            + source_pack * Int64(4)
+                        ).toint(),
+                        *values,
+                    )
+                    st_global_v4_u32((output + output_pack * Int64(4)).toint(), *values)
+                tile += warp_stride
+            block_pair_barrier(
+                signals,
+                self_signal=signals[self._rank],
+                rank=self._rank,
+                world_size=self._world_size,
+                max_blocks=_MAX_BLOCKS,
+            )
+            if Int32(tidx) == Int32(0):
+                _membar_sys()
+            cute.arch.sync_threads()
+            tile = warp_first
+            while tile < tiles:
+                batch_index = tile // tiles_per_rank
+                pack = (tile - batch_index * tiles_per_rank) * Int32(32) + lane
+                if pack < local_packs:
+                    source_pack = Int64(batch_index) * Int64(local_packs) + Int64(pack)
+                    output_pack = (
+                        Int64(batch_index) * Int64(2) + Int64(1 - self._rank)
+                    ) * Int64(local_packs) + Int64(pack)
+                    _copy_16b(
+                        self._staging_words(staging[self._rank])
+                        + source_pack * Int64(4),
+                        output + output_pack * Int64(4),
+                    )
+                tile += warp_stride
+        else:
+            tiles_per_batch = tiles_per_rank * Int32(self._world_size)
+            tiles = batch * tiles_per_batch
+            # Every rank pushes its segments into each peer's staging and reads only
+            # its own memory after the barrier, so PCIe carries posted writes and no
+            # peer reads. Staging holds the peers' segments in rank order without the
+            # receiver's own.
+            own_stage = self._staging_words(staging[self._rank])
+            peers = Int64(self._world_size - 1)
 
-        # Assign complete 512-byte segments to warps, independently of head
-        # boundaries. Each rank stages and reads the same CTA's segments.
-        tile = warp_first
-        while tile < tiles:
-            batch_index = tile // tiles_per_batch
-            batch_tile = tile - batch_index * tiles_per_batch
-            source_rank = batch_tile // tiles_per_rank
-            rank_tile = batch_tile - source_rank * tiles_per_rank
-            pack = rank_tile * Int32(32) + lane
-            if source_rank == Int32(self._rank) and pack < local_packs:
-                source_pack = Int64(batch_index) * Int64(local_packs) + Int64(pack)
-                for peer in cutlass.range_constexpr(self._world_size):
-                    if cutlass.const_expr(peer != self._rank):
-                        staged_pack = (
-                            Int64(batch_index) * peers
-                            + Int64(self._rank if self._rank < peer else self._rank - 1)
-                        ) * Int64(local_packs) + Int64(pack)
-                        _copy_16b(
-                            local_input + source_pack * Int64(4),
-                            self._staging_words(staging[peer]) + staged_pack * Int64(4),
-                        )
-            tile += warp_stride
-
-        block_pair_barrier(
-            signals,
-            self_signal=signals[self._rank],
-            rank=self._rank,
-            world_size=self._world_size,
-            max_blocks=_MAX_BLOCKS,
-        )
-        # Acquire the peers' pushed segments before reading them locally.
-        if Int32(tidx) == Int32(0):
-            _membar_sys()
-        cute.arch.sync_threads()
-
-        tile = warp_first
-        while tile < tiles:
-            batch_index = tile // tiles_per_batch
-            batch_tile = tile - batch_index * tiles_per_batch
-            source_rank = batch_tile // tiles_per_rank
-            rank_tile = batch_tile - source_rank * tiles_per_rank
-            pack = rank_tile * Int32(32) + lane
-            if pack < local_packs:
-                source_pack = Int64(batch_index) * Int64(local_packs) + Int64(pack)
-                output_pack = (
-                    Int64(batch_index) * Int64(self._world_size) + Int64(source_rank)
-                ) * Int64(local_packs) + Int64(pack)
-                source_address = Int64((local_input + source_pack * Int64(4)).toint())
-                for source in cutlass.range_constexpr(self._world_size):
-                    if source_rank == Int32(source):
-                        if cutlass.const_expr(source != self._rank):
+            # Assign complete 512-byte segments to warps, independently of head
+            # boundaries. Each rank stages and reads the same CTA's segments.
+            tile = warp_first
+            while tile < tiles:
+                batch_index = tile // tiles_per_batch
+                batch_tile = tile - batch_index * tiles_per_batch
+                source_rank = batch_tile // tiles_per_rank
+                rank_tile = batch_tile - source_rank * tiles_per_rank
+                pack = rank_tile * Int32(32) + lane
+                if source_rank == Int32(self._rank) and pack < local_packs:
+                    source_pack = Int64(batch_index) * Int64(local_packs) + Int64(pack)
+                    for peer in cutlass.range_constexpr(self._world_size):
+                        if cutlass.const_expr(peer != self._rank):
                             staged_pack = (
                                 Int64(batch_index) * peers
-                                + Int64(source if source < self._rank else source - 1)
+                                + Int64(
+                                    self._rank if self._rank < peer else self._rank - 1
+                                )
                             ) * Int64(local_packs) + Int64(pack)
-                            source_address = Int64(
-                                (own_stage + staged_pack * Int64(4)).toint()
+                            _copy_16b(
+                                local_input + source_pack * Int64(4),
+                                self._staging_words(staging[peer])
+                                + staged_pack * Int64(4),
                             )
-                _copy_16b_addr(
-                    source_address,
-                    Int64((output + output_pack * Int64(4)).toint()),
-                )
-            tile += warp_stride
+                tile += warp_stride
+
+            block_pair_barrier(
+                signals,
+                self_signal=signals[self._rank],
+                rank=self._rank,
+                world_size=self._world_size,
+                max_blocks=_MAX_BLOCKS,
+            )
+            # Acquire the peers' pushed segments before reading them locally.
+            if Int32(tidx) == Int32(0):
+                _membar_sys()
+            cute.arch.sync_threads()
+
+            tile = warp_first
+            while tile < tiles:
+                batch_index = tile // tiles_per_batch
+                batch_tile = tile - batch_index * tiles_per_batch
+                source_rank = batch_tile // tiles_per_rank
+                rank_tile = batch_tile - source_rank * tiles_per_rank
+                pack = rank_tile * Int32(32) + lane
+                if pack < local_packs:
+                    source_pack = Int64(batch_index) * Int64(local_packs) + Int64(pack)
+                    output_pack = (
+                        Int64(batch_index) * Int64(self._world_size)
+                        + Int64(source_rank)
+                    ) * Int64(local_packs) + Int64(pack)
+                    source_address = Int64(
+                        (local_input + source_pack * Int64(4)).toint()
+                    )
+                    for source in cutlass.range_constexpr(self._world_size):
+                        if source_rank == Int32(source):
+                            if cutlass.const_expr(source != self._rank):
+                                staged_pack = (
+                                    Int64(batch_index) * peers
+                                    + Int64(
+                                        source if source < self._rank else source - 1
+                                    )
+                                ) * Int64(local_packs) + Int64(pack)
+                                source_address = Int64(
+                                    (own_stage + staged_pack * Int64(4)).toint()
+                                )
+                    _copy_16b_addr(
+                        source_address,
+                        Int64((output + output_pack * Int64(4)).toint()),
+                    )
+                tile += warp_stride
 
         if cutlass.const_expr(self._device_slot_selection):
             if Int32(tidx) == Int32(0):

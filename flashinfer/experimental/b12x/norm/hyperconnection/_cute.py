@@ -123,19 +123,11 @@ class _GroupedRmsNorm:
             layout=cute.make_layout((1, _WARPS)),
             byte_alignment=16,
         )
-        inverse = allocator.allocate_tensor(
-            element_type=Float32,
-            layout=cute.make_layout((1,)),
-            byte_alignment=4,
-        )
         total = _block_sum(square_sum, reduction)
-        if thread_i == Int32(0):
-            inverse[0] = cute.math.rsqrt(
-                total / Float32(self.hidden_size) + eps,
-                fastmath=True,
-            )
-        cute.arch.sync_threads()
-        scale = Float32(inverse[0])
+        scale = cute.math.rsqrt(
+            total / Float32(self.hidden_size) + eps,
+            fastmath=True,
+        )
         for item in cutlass.range_constexpr(self.items):
             column = thread_i + Int32(item * _THREADS)
             if column < Int32(self.hidden_size):
@@ -617,7 +609,10 @@ class _PackedCombineNorm:
         hidden_size: int,
         zero_centered: bool = True,
         fp32_weight: bool = False,
+        threads: int = 256,
     ) -> None:
+        self._THREADS = int(threads)
+        self._WARPS = self._THREADS // 32
         self.streams = int(streams)
         self.hidden_size = int(hidden_size)
         self.zero_centered = bool(zero_centered)
@@ -674,11 +669,6 @@ class _PackedCombineNorm:
             element_type=Float32,
             layout=cute.make_layout((1, self._WARPS)),
             byte_alignment=16,
-        )
-        inverse = allocator.allocate_tensor(
-            element_type=Float32,
-            layout=cute.make_layout((1,)),
-            byte_alignment=4,
         )
 
         lane = thread_i % Int32(32)
@@ -749,13 +739,10 @@ class _PackedCombineNorm:
                 square_sum += value * value
 
         total = _block_sum(square_sum, reduction)
-        if thread_i == Int32(0):
-            inverse[0] = cute.math.rsqrt(
-                total / Float32(self.hidden_size) + eps,
-                fastmath=True,
-            )
-        cute.arch.sync_threads()
-        inv_rms = Float32(inverse[0])
+        inv_rms = cute.math.rsqrt(
+            total / Float32(self.hidden_size) + eps,
+            fastmath=True,
+        )
 
         for item in cutlass.range_constexpr(self.items):
             pack = thread_i + Int32(item * self._THREADS)

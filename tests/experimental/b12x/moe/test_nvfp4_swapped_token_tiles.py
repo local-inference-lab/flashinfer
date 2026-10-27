@@ -18,7 +18,7 @@ from ..conftest import require_b12x
 
 
 @pytest.mark.parametrize("fast_math", [False, True])
-@pytest.mark.parametrize("intermediate", [160, 192, 256, 272, 320])
+@pytest.mark.parametrize("intermediate", [160, 192, 224, 256, 272, 320])
 @pytest.mark.parametrize(
     "tile_m,planner,share_input,topk,mma_warps",
     [

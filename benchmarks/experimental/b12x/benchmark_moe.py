@@ -428,6 +428,19 @@ MODEL_PROFILES = {
         ),
         default_quant_mode="nvfp4",
     ),
+    "qwen38-flash-next-mtp": ModelProfile(
+        label="Qwen3.8 Flash Next MTP",
+        checkpoint_family="qwen_mtp",
+        default_layer_idx=0,
+        tp_size=1,
+        hf_repo_id=None,
+        default_model_path=pathlib.Path(
+            "/data/models/qwen3.8-flash-next-mixed/"
+            "qwen3.8-flash-next-180b-nvfp4-ple-mxfp8-attn-shared_vv1"
+        ),
+        default_quant_mode="w4a16",
+        default_scale_contract="per-expert",
+    ),
     "qwen38-flash-next-shape": ModelProfile(
         label="Qwen3.8 Flash Next (shape)",
         checkpoint_family="qwen38_flash_next_shape",
@@ -930,7 +943,7 @@ def build_model_spec(
             tp_size=tp,
             tp_rank=tp_rank,
         )
-    if profile.checkpoint_family in {"qwen", "qwen_iq2_xs"}:
+    if profile.checkpoint_family in {"qwen", "qwen_mtp", "qwen_iq2_xs"}:
         return ModelSpec(
             hidden_size=cfg["hidden_size"],
             intermediate_size=cfg["moe_intermediate_size"],
@@ -1253,6 +1266,7 @@ def load_expert_weights(
 
     if checkpoint_family in {
         "qwen",
+        "qwen_mtp",
         "glm",
         "glm53_flash",
         "minimax_m2",
@@ -1269,10 +1283,22 @@ def load_expert_weights(
             raise ValueError(
                 "minimax_m3 FP4 benchmark expects swigluoai_uninterleave experts"
             )
-        if checkpoint_family == "qwen":
+        if checkpoint_family in {"qwen", "qwen_mtp"}:
             cfg_num_experts = cfg["num_experts"]
             cfg_intermediate_size = cfg["moe_intermediate_size"]
             prefix = f"model.language_model.layers.{layer_idx}.mlp.experts"
+            if checkpoint_family == "qwen_mtp":
+                if layer_idx != 0 or cfg.get("mtp_num_hidden_layers") != 1:
+                    raise ValueError("Qwen MTP requires its single stored layer 0")
+                prefix = "mtp.layers.0.mlp.experts"
+                raw_config = json.loads((model_path / "config.json").read_text())
+                declaration = raw_config["quantization_config"]["quantized_layers"][
+                    prefix
+                ]
+                if declaration != {"quant_algo": "W4A16_NVFP4", "group_size": 16}:
+                    raise ValueError(
+                        "Qwen MTP benchmark requires stored W4A16 NVFP4 experts"
+                    )
             gate_proj = "gate_proj"
             up_proj = "up_proj"
             down_proj = "down_proj"
@@ -1339,7 +1365,15 @@ def load_expert_weights(
             gate_gs[eid] = loader.get_tensor(f"{ep}.{gate_proj}.weight_scale_2").to(
                 device
             )
-            gate_is[eid] = loader.get_tensor(f"{ep}.{gate_proj}.input_scale").to(device)
+            if checkpoint_family == "qwen_mtp":
+                up_gs = loader.get_tensor(f"{ep}.{up_proj}.weight_scale_2")
+                if float(up_gs.item()) != float(gate_gs[eid].item()):
+                    raise ValueError(f"{ep}: gate/up global scales differ")
+                gate_is[eid] = 1.0
+            else:
+                gate_is[eid] = loader.get_tensor(f"{ep}.{gate_proj}.input_scale").to(
+                    device
+                )
 
             up_w[eid] = (
                 loader.get_tensor(f"{ep}.{up_proj}.weight")
@@ -1365,7 +1399,12 @@ def load_expert_weights(
             down_gs[eid] = loader.get_tensor(f"{ep}.{down_proj}.weight_scale_2").to(
                 device
             )
-            down_is[eid] = loader.get_tensor(f"{ep}.{down_proj}.input_scale").to(device)
+            if checkpoint_family == "qwen_mtp":
+                down_is[eid] = 1.0
+            else:
+                down_is[eid] = loader.get_tensor(f"{ep}.{down_proj}.input_scale").to(
+                    device
+                )
         print(" done.")
 
         if checkpoint_family == "minimax_m3":
@@ -3541,7 +3580,9 @@ def bench_multilayer_graph_mode(
         topk_weights_bufs = [topk_weights.clone() for _, topk_weights in initial_case]
         graph_output_bufs = [torch.empty_like(x_buf) for _ in range(graph_num_layers)]
         eager_output_bufs = [torch.empty_like(x_buf) for _ in range(graph_num_layers)]
-        session = PreparationSession(device=device)
+        session = PreparationSession(
+            device=device, compile_workers=args.compile_workers
+        )
         layer_executions = [
             prepare_moe_execution(
                 session=session,
@@ -3703,6 +3744,7 @@ def bench_e2e() -> None:
         default=None,
         help="Assigned CUDA ordinal within the existing visibility mask",
     )
+    parser.add_argument("--compile-workers", type=int, default=None)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument(
@@ -3887,9 +3929,15 @@ def bench_e2e() -> None:
     parser.add_argument("--validate", choices=["none", "oracle"], default=None)
     parser.add_argument(
         "--oracle-quant-scale-math",
-        choices=("direct_division", "micro", "dynamic_fast", "dynamic_precise"),
+        choices=(
+            "direct_division",
+            "micro",
+            "dynamic_fast",
+            "dynamic_precise",
+            "kernel",
+        ),
         default="direct_division",
-        help="NVFP4 oracle activation-quantization evaluation order.",
+        help="NVFP4 oracle activation-quantization evaluation order; kernel follows the prepared compact or dynamic implementation.",
     )
     parser.add_argument(
         "--oracle-mode",
@@ -3909,6 +3957,11 @@ def bench_e2e() -> None:
         help="Override only the oracle cosine gate; other tolerances are unchanged.",
     )
     parser.add_argument("--include-routing", action="store_true")
+    parser.add_argument(
+        "--prepared-routing",
+        action="store_true",
+        help="Use prepared b12x top-k routing in the complete timed operation.",
+    )
     parser.set_defaults(cuda_graph=True)
     parser.add_argument(
         "--cuda-graph",
@@ -3963,6 +4016,15 @@ def bench_e2e() -> None:
         help="Bytes to touch when evicting L2; 0 uses 2x the reported L2 size.",
     )
     args = parser.parse_args()
+    if args.prepared_routing and (
+        not args.include_routing
+        or args.graph_mode != "single-op"
+        or args.tp_parallel
+        or args.routing_repeat_period
+    ):
+        parser.error(
+            "--prepared-routing requires --include-routing, single-op, one rank, and no route repetition"
+        )
 
     if args.time_graph_replay and (
         not args.graph_only
@@ -4012,6 +4074,10 @@ def bench_e2e() -> None:
         args.scale_compression = None
     if args.swiglu_clamp_after_silu is None:
         args.swiglu_clamp_after_silu = model_profile.default_swiglu_clamp_after_silu
+    if model_profile.checkpoint_family == "qwen_mtp" and args.quant_mode != "w4a16":
+        raise ValueError(
+            "Qwen MTP experts require their stored W4A16 activation contract"
+        )
     use_w4a16 = args.quant_mode == "w4a16"
     use_w4a8 = args.quant_mode in {"w4a8_mx", "w4a8_nvfp4"}
     swiglu_limit = (
@@ -4355,7 +4421,18 @@ def bench_e2e() -> None:
         w4a16_native=args.w4a16_native,
         scale_compression=args.scale_compression,
     )
-    precomputed_oracles: dict[tuple[int, int], torch.Tensor] = {}
+    if args.oracle_quant_scale_math == "kernel" and (
+        args.quant_mode != "nvfp4" or args.oracle_mode != "nvfp4"
+    ):
+        raise ValueError(
+            "kernel oracle scale math requires the NVFP4 kernel and oracle"
+        )
+    oracle_scale_modes = (
+        ("micro", "dynamic_fast" if args.fast_math else "dynamic_precise")
+        if args.oracle_quant_scale_math == "kernel"
+        else (args.oracle_quant_scale_math,)
+    )
+    precomputed_oracles: dict[tuple[int, int, str], torch.Tensor] = {}
     mutated_oracles: dict[tuple[int, int], torch.Tensor] = {}
     if args.validate == "oracle":
         print(
@@ -4367,21 +4444,24 @@ def bench_e2e() -> None:
             oracle_x, oracle_ids, oracle_topk, _ = benchmark_case(
                 batch_size, 42 + batch_size, sample_index
             )
-            oracle_output = make_oracle_reference(
-                args.oracle_mode,
-                args.quant_mode,
-                oracle_x,
-                weights,
-                params,
-                oracle_ids,
-                oracle_topk,
-                activation=args.activation,
-                activation_params=activation_params,
-                quant_scale_math=args.oracle_quant_scale_math,
-            )
-            # Outputs are the only state retained across the ownership
-            # transfer.  Keep them off-device; never retain a second model.
-            precomputed_oracles[batch_size, sample_index] = oracle_output.detach().cpu()
+            for oracle_scale_mode in oracle_scale_modes:
+                oracle_output = make_oracle_reference(
+                    args.oracle_mode,
+                    args.quant_mode,
+                    oracle_x,
+                    weights,
+                    params,
+                    oracle_ids,
+                    oracle_topk,
+                    activation=args.activation,
+                    activation_params=activation_params,
+                    quant_scale_math=oracle_scale_mode,
+                )
+                # Outputs are the only state retained across the ownership
+                # transfer.  Keep them off-device; never retain a second model.
+                precomputed_oracles[batch_size, sample_index, oracle_scale_mode] = (
+                    oracle_output.detach().cpu()
+                )
             if (
                 model_profile.checkpoint_family == "deepseek_v41_flash"
                 and args.quant_mode == "w4a8_mx"
@@ -4425,7 +4505,10 @@ def bench_e2e() -> None:
     _clear_b12x_caches()
     tuning_cache = tempfile.TemporaryDirectory(prefix="b12x-moe-tuning-")
     b12x_session = PreparationSession(
-        device=device, autotune=args.autotune, cache_dir=tuning_cache.name
+        device=device,
+        autotune=args.autotune,
+        cache_dir=tuning_cache.name,
+        compile_workers=args.compile_workers,
     )
     print("  Preparing b12x declarations...", end="", flush=True)
     x_warm, topk_ids_w, topk_weights_w = make_profile_routed_inputs(
@@ -4548,7 +4631,50 @@ def bench_e2e() -> None:
             f"{active_density:.1f} routed rows/active expert"
         )
 
+        prepared_routing_plan = None
+        if args.prepared_routing:
+            if model_profile.default_routing == "model" or routing_logits is None:
+                raise ValueError("--prepared-routing requires synthetic routing logits")
+            prepared_routing_logits = torch.empty(
+                (batch_size, spec.top_k), device=device, dtype=torch.float32
+            )
+            prepared_routing_ids = topk_ids
+            prepared_routing_weights = topk_weights
+            prepared_routing_plan = fused_moe.plan_route_topk(
+                fused_moe.RouteTopKInvocation(
+                    num_tokens=batch_size,
+                    num_experts=spec.num_experts,
+                    top_k=spec.top_k,
+                    logits_dtype=str(routing_logits.dtype).removeprefix("torch."),
+                    renormalize=True,
+                )
+            )
+            b12x_session.prepare(
+                (
+                    prepared_routing_plan.request(
+                        name=f"benchmark-routing-m{batch_size}-s{sample_index}",
+                        prepare_call=lambda state: PreparedCall(
+                            run=lambda: state.run(
+                                routing_logits,
+                                prepared_routing_logits,
+                                prepared_routing_ids,
+                                prepared_routing_weights,
+                            )
+                        ),
+                    ),
+                )
+            )
+
         def compute_timed_routing() -> tuple[torch.Tensor, torch.Tensor]:
+            if prepared_routing_plan is not None:
+                fused_moe.route_topk(
+                    prepared_routing_plan,
+                    routing_logits,
+                    prepared_routing_logits,
+                    prepared_routing_ids,
+                    prepared_routing_weights,
+                )
+                return prepared_routing_ids, prepared_routing_weights
             if model_profile.default_routing == "model":
                 timed_topk_ids, timed_topk_weights = compute_model_gate_routing(
                     weights,
@@ -4612,9 +4738,30 @@ def bench_e2e() -> None:
 
         backend_e2e = make_backend_e2e()
 
+        exact = getattr(backend_execution, "variants", {}).get(
+            batch_size, backend_execution
+        )
+        oracle_scale_mode = args.oracle_quant_scale_math
+        if oracle_scale_mode == "kernel":
+            config = exact.selection.config
+            if config.backend == "micro":
+                oracle_scale_mode = "micro"
+            elif (
+                config.backend == "dynamic"
+                and not config.nvfp4_materialize_intermediate
+            ):
+                oracle_scale_mode = (
+                    "dynamic_fast" if args.fast_math else "dynamic_precise"
+                )
+            else:
+                raise ValueError(
+                    "kernel oracle scale math requires compact or fused dynamic NVFP4"
+                )
         oracle_ref = None
         if args.validate == "oracle":
-            oracle_ref = precomputed_oracles[batch_size, sample_index].to(device=device)
+            oracle_ref = precomputed_oracles[
+                batch_size, sample_index, oracle_scale_mode
+            ].to(device=device)
             print(
                 "  oracle:".ljust(28),
                 f"norm={oracle_ref.float().norm().item():.5f}",
@@ -4664,9 +4811,6 @@ def bench_e2e() -> None:
             raise RuntimeError(
                 "Oracle failed before timing: " + "; ".join(accuracy_failures)
             )
-        exact = getattr(backend_execution, "variants", {}).get(
-            batch_size, backend_execution
-        )
         record = {
             "tokens": batch_size,
             "routing_workload": evaluation_scenarios[sample_index][0],
@@ -4690,6 +4834,7 @@ def bench_e2e() -> None:
                 "query": exact.selection.query.to_dict(),
                 "invocation": exact.invocation.to_dict(),
             },
+            "oracle_quant_scale_math": oracle_scale_mode,
             "oracle": asdict(backend_metrics) if backend_metrics is not None else None,
             "graph_samples_ms": {},
         }
