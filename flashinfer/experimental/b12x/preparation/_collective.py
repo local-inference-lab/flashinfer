@@ -59,7 +59,7 @@ def calibration_order(obligations):
         key = digest(
             (
                 obligation.request.plan.component_id,
-                obligation.request.plan.invocation,
+                obligation.request.plan.invocation.to_dict(),
                 obligation.request.collective.ranks,
                 field,
                 identity,
@@ -155,7 +155,7 @@ def select(job, obligation, selections):
         bucket_key = digest(
             (
                 contract.component_id,
-                obligation.request.plan.invocation,
+                obligation.request.plan.invocation.to_dict(),
                 identity,
                 family_field,
                 tuple(peer["device"] for peer in peers),
