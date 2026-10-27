@@ -33,6 +33,8 @@ def family_bucket(obligation):
         or space is None
         or space.autotune_effort is not AutotuneEffort.DEFAULT
         or obligation.configuration.pinned is not None
+        or request.dependencies
+        or request.benchmark_call is not request.plan._benchmark_call
     ):
         return None
     bucket = callback(request.plan.query)
@@ -57,6 +59,7 @@ def calibration_order(obligations):
         key = digest(
             (
                 obligation.request.plan.component_id,
+                obligation.request.plan.invocation,
                 obligation.request.collective.ranks,
                 field,
                 identity,
@@ -152,6 +155,7 @@ def select(job, obligation, selections):
         bucket_key = digest(
             (
                 contract.component_id,
+                obligation.request.plan.invocation,
                 identity,
                 family_field,
                 tuple(peer["device"] for peer in peers),
@@ -186,6 +190,13 @@ def select(job, obligation, selections):
     )
     if record is not None and (policy is None or record.get("finalists")):
         selection = _load(job, obligation, record)
+        if (
+            calibration is not None
+            and selection.assignment[family_field] not in calibration[1]
+        ):
+            raise ValueError(
+                "cached collective selection is outside its calibrated families"
+            )
         if bucket_key is not None and calibration is None:
             job.session._collective_family_buckets[bucket_key] = (
                 obligation.key,

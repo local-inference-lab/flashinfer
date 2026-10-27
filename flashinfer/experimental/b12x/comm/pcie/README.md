@@ -61,7 +61,8 @@ Calibration shortlists are saved with their representative selections. Exact
 selections include the calibration's program-aware cache identity and retained
 families, so a changed calibration cannot reuse an incompatible selection.
 Audit effort measures the unrestricted catalog. Explicit pins and disabled
-tuning bypass calibration. Fused arithmetic and DCP operations retain their
+tuning bypass calibration. Caller-supplied benchmark contexts and dependent
+requests do not share built-in calibration. Fused arithmetic and DCP operations retain their
 shape-specific searches. A bucket shortlist is empirical: performance within
 a bucket should be checked against audit races when changing transport kernels
 or bucket boundaries.
