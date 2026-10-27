@@ -230,10 +230,11 @@ def _collection_paused():
 
 
 class _TimedCall:
-    def __init__(self, call, eviction, samples, gate):
+    def __init__(self, call, eviction, samples, gate, *, eviction_after_produce=False):
         import torch
 
         self.call, self.eviction = call, eviction
+        self.eviction_after_produce = eviction_after_produce
         self.gate = gate
         self.producers = call.benchmark_producers or (call.produce,)
         self.events = tuple(
@@ -256,11 +257,13 @@ class _TimedCall:
                 self.producers[0]()
                 self.call.invoke()
             for index, (start, end) in enumerate(self.events):
-                if self.eviction is not None:
+                if self.eviction is not None and not self.eviction_after_produce:
                     self.eviction()
                 if self.call.reset is not None:
                     self.call.reset()
                 self.producers[index % len(self.producers)]()
+                if self.eviction is not None and self.eviction_after_produce:
+                    self.eviction()
                 with _collection_paused(), self.gate.hold(stream):
                     start.record(stream)
                     self.call.invoke()
@@ -271,6 +274,7 @@ class _TimedCall:
 
     def close(self):
         self.call = self.eviction = self.gate = None
+        self.eviction_after_produce = False
         self.events = ()
         self.producers = ()
 
@@ -333,6 +337,7 @@ def prepare_race_steps(
     primed=False,
     eviction=None,
     cache_policy="cold",
+    eviction_after_produce=False,
 ):
     """Prepare event pairs for asynchronous calls on the current CUDA stream."""
     import torch
@@ -370,7 +375,15 @@ def prepare_race_steps(
         yield
         for call in calls:
             with torch.cuda.device(device_ordinal), no_compilation():
-                timers.append(_TimedCall(call, eviction, samples, gate))
+                timers.append(
+                    _TimedCall(
+                        call,
+                        eviction,
+                        samples,
+                        gate,
+                        eviction_after_produce=eviction_after_produce,
+                    )
+                )
             yield
         completed = True
         return PreparedRace(tuple(timers), eviction, sample_count, gate=gate)
@@ -456,35 +469,56 @@ def measure_race_steps(
                     sample_count=prepared.sample_count,
                     compilation_active=compilation_active,
                 )
+                sample_groups = tuple(
+                    prepared.timers[index].samples() for index in indices
+                )
+                if sample_exchange is not None:
+                    sample_groups = yield from sample_exchange(
+                        indices, turn, repetition, sample_groups
+                    )
+                scored_batches = ((indices, sample_groups),)
             else:
                 import torch
 
+                scored_batches = []
                 with torch.cuda.device(device_ordinal), no_compilation():
                     stream = torch.cuda.current_stream(device_ordinal)
-                    # Queue the entire sample block before any peer starts it.
-                    with _collection_paused(), prepared.collective_gate.hold(stream):
-                        for index in indices:
+                    # Release each candidate's gate before submitting another
+                    # candidate's reset and input-production work. A blocked
+                    # stream cannot drain an unbounded queue of those copies.
+                    for index in indices:
+                        candidate_indices = (index,)
+                        with (
+                            _collection_paused(),
+                            prepared.collective_gate.hold(stream),
+                        ):
                             prepared.timers[index].replay(align=True)
-                        yield from launch_exchange(indices, turn, repetition)
-                    stream.synchronize()
-            sample_groups = tuple(prepared.timers[index].samples() for index in indices)
-            if sample_exchange is not None:
-                sample_groups = yield from sample_exchange(
-                    indices, turn, repetition, sample_groups
-                )
-            for index, samples in zip(indices, sample_groups, strict=True):
-                if sample_observer is not None:
-                    sample_observer(index, turn, repetition, samples)
-                latency = statistics.fmean(samples)
-                if not math.isfinite(latency) or latency <= 0:
-                    raise RuntimeError("candidate race produced an invalid latency")
-                totals[index] += latency
-                if adaptive_repeats and turn == 0 and repetition == 0:
-                    # The first scored replay also sizes the remaining work.
-                    repeats[index] = max(
-                        1,
-                        math.ceil(ROUND_BUDGET_US / (prepared.sample_count * latency)),
-                    )
+                            yield from launch_exchange(
+                                candidate_indices, turn, repetition
+                            )
+                        stream.synchronize()
+                        sample_groups = (prepared.timers[index].samples(),)
+                        if sample_exchange is not None:
+                            sample_groups = yield from sample_exchange(
+                                candidate_indices, turn, repetition, sample_groups
+                            )
+                        scored_batches.append((candidate_indices, sample_groups))
+            for scored_indices, sample_groups in scored_batches:
+                for index, samples in zip(scored_indices, sample_groups, strict=True):
+                    if sample_observer is not None:
+                        sample_observer(index, turn, repetition, samples)
+                    latency = statistics.fmean(samples)
+                    if not math.isfinite(latency) or latency <= 0:
+                        raise RuntimeError("candidate race produced an invalid latency")
+                    totals[index] += latency
+                    if adaptive_repeats and turn == 0 and repetition == 0:
+                        # The first scored replay also sizes the remaining work.
+                        repeats[index] = max(
+                            1,
+                            math.ceil(
+                                ROUND_BUDGET_US / (prepared.sample_count * latency)
+                            ),
+                        )
             repetition += 1
             yield
         for index in order:

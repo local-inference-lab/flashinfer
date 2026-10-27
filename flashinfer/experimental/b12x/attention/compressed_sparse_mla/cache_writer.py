@@ -26,6 +26,8 @@ class CacheWriterQuery:
     cache_kind: str
     cache_format: str = "deepseek_v41"
     slot_dtype: str = "int64"
+    snapshot_tokens: int = 0
+    max_requests: int = 0
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -44,6 +46,23 @@ def _validate_query(query: CacheWriterQuery, _device) -> None:
         raise ValueError("cache_format must be 'deepseek_v4' or 'deepseek_v41'")
     if query.slot_dtype not in ("int32", "int64"):
         raise ValueError("slot_dtype must be 'int32' or 'int64'")
+    if type(query.snapshot_tokens) is not int or type(query.max_requests) is not int:
+        raise TypeError("snapshot capacities must be integers")
+    if query.snapshot_tokens == 0:
+        if query.max_requests != 0:
+            raise ValueError("max_requests requires a snapshot prefix")
+    elif (
+        query.snapshot_tokens != 128
+        or query.max_requests <= 0
+        or query.cache_format != "deepseek_v41"
+        or query.cache_kind != "swa"
+        or query.page_size <= query.snapshot_tokens
+    ):
+        raise ValueError(
+            "snapshots require DSV41 SWA pages with 128 prefix records and a suffix"
+        )
+    if query.snapshot_tokens and 66 * query.max_requests + query.max_rows >= 2**31:
+        raise ValueError("snapshot launch geometry must fit in int32")
 
 
 TUNING = replace(
@@ -52,7 +71,7 @@ TUNING = replace(
         query_type=CacheWriterQuery,
         backend="cute",
     ),
-    query_schema_version=23,
+    query_schema_version=24,
     validate_query=_validate_query,
 )
 
@@ -79,13 +98,24 @@ def _representative(query: CacheWriterQuery, ordinal: int):
     size = page_nbytes(
         query.page_size, cache_kind=query.cache_kind, cache_format=query.cache_format
     )
-    return (
+    operands = (
         writer,
         torch.empty((query.max_rows, 512), dtype=torch.bfloat16, device=device),
-        torch.empty((1, size), dtype=torch.uint8, device=device),
+        torch.empty((query.max_requests or 1, size), dtype=torch.uint8, device=device),
         torch.empty(
             (query.max_rows,), dtype=_slot_dtype(query.slot_dtype), device=device
         ),
+    )
+    if not query.snapshot_tokens:
+        return (*operands, None, None)
+    return (
+        *operands,
+        torch.empty(
+            (query.max_requests + 1, query.snapshot_tokens * 528),
+            dtype=torch.uint8,
+            device=device,
+        ),
+        torch.empty((query.max_requests,), dtype=torch.int64, device=device),
     )
 
 
@@ -95,10 +125,23 @@ def compile_cache_writer(query_payload, ordinal):
     query = CacheWriterQuery(**dict(query_payload))
     _validate_query(query, None)
     with torch.cuda.device(ordinal), FakeTensorMode():
-        writer, kv, cache, slots = _representative(query, ordinal)
-        kernel, args, spec = writer._compressed_cache_writer_launch(
-            kv, cache, slots, query.page_size, query.cache_kind, query.cache_format
+        writer, kv, cache, slots, history, history_rows = _representative(
+            query, ordinal
         )
+        if query.snapshot_tokens:
+            kernel, args, spec = writer._snapshot_cache_writer_launch(
+                kv,
+                cache,
+                slots,
+                history,
+                history_rows,
+                query.page_size,
+                query.snapshot_tokens,
+            )
+        else:
+            kernel, args, spec = writer._compressed_cache_writer_launch(
+                kv, cache, slots, query.page_size, query.cache_kind, query.cache_format
+            )
         return writer.compile_cute(kernel, *args, compile_spec=spec)
 
 
@@ -112,6 +155,9 @@ class _CacheWriterState:
         kv: torch.Tensor,
         cache: torch.Tensor,
         slot_mapping: torch.Tensor,
+        *,
+        history: torch.Tensor | None = None,
+        history_rows: torch.Tensor | None = None,
     ) -> None:
         """Prime or execute this exact prepared writer specialization."""
         self.write(
@@ -121,6 +167,8 @@ class _CacheWriterState:
             page_size=None,
             cache_kind=None,
             cache_format=None,
+            history=history,
+            history_rows=history_rows,
         )
 
     def write(
@@ -132,6 +180,8 @@ class _CacheWriterState:
         page_size: int | None,
         cache_kind: str | None,
         cache_format: str | None,
+        history: torch.Tensor | None = None,
+        history_rows: torch.Tensor | None = None,
     ) -> None:
         from b12x.attention._shared.mla import kv_cache as writer
 
@@ -155,16 +205,32 @@ class _CacheWriterState:
             )
         if int(slot_mapping.shape[0]) > self.query.max_rows:
             raise ValueError("cache-writer rows exceed prepared capacity")
-        if int(slot_mapping.shape[0]) == 0:
-            return
-        args = writer._compressed_cache_writer_args(
-            kv,
-            cache,
-            slot_mapping,
-            self.query.page_size,
-            self.query.cache_kind,
-            self.query.cache_format,
-        )
+        if self.query.snapshot_tokens:
+            writer._validate_cache_snapshot(
+                history,
+                history_rows,
+                kv,
+                cache,
+                slot_mapping,
+                snapshot_tokens=self.query.snapshot_tokens,
+                max_requests=self.query.max_requests,
+            )
+            args = writer._snapshot_cache_writer_args(
+                kv, cache, slot_mapping, history, history_rows, self.query.page_size
+            )
+        else:
+            if history is not None or history_rows is not None:
+                raise ValueError("history operands require a declared snapshot writer")
+            if int(slot_mapping.shape[0]) == 0:
+                return
+            args = writer._compressed_cache_writer_args(
+                kv,
+                cache,
+                slot_mapping,
+                self.query.page_size,
+                self.query.cache_kind,
+                self.query.cache_format,
+            )
         writer.run_compiled(self.compiled, args)
 
 
@@ -217,7 +283,17 @@ def write_cache(
     page_size: int | None = None,
     cache_kind: str | None = None,
     cache_format: str | None = None,
+    history: torch.Tensor | None = None,
+    history_rows: torch.Tensor | None = None,
 ) -> None:
+    """Encode records, optionally copying an immutable 128-record history prefix.
+
+    Snapshot mode maps every destination page through an int64 history row ID,
+    including row zero. Appends targeting the reserved prefix, negative slots,
+    and slots beyond destination capacity are ignored. History and row IDs are
+    read-only and must not overlap the destination. The source history row IDs
+    must refer to backed rows; invalid IDs leave their destination prefix alone.
+    """
     state = require_prepared(
         plan, "attention.compressed_sparse_mla.cache_writer", kv.device
     )
@@ -228,6 +304,8 @@ def write_cache(
         page_size=page_size,
         cache_kind=cache_kind,
         cache_format=cache_format,
+        history=history,
+        history_rows=history_rows,
     )
 
 

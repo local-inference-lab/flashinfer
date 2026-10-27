@@ -537,6 +537,7 @@ class ConcatAndCacheGlmNextMlaKernel:
     def __init__(self, block_size: int, dsv41: bool = False):
         self.block_size = int(block_size)
         self.dsv41 = bool(dsv41)
+        self.snapshot_tokens = 0
         self.group_size = 32 if dsv41 else _GLM_NEXT_GROUP_SIZE
         self.lanes_per_group = self.group_size // 4
 
@@ -578,14 +579,41 @@ class ConcatAndCacheGlmNextMlaKernel:
         entry_stride: Int64,
         slot_capacity: Int64,
     ):
-        tidx, _, _ = cute.arch.thread_idx()
         token_idx, _, _ = cute.arch.block_idx()
+        self._write_record(
+            kv_c,
+            kv_cache,
+            slot_mapping,
+            kv_c_stride,
+            block_stride,
+            entry_stride,
+            slot_capacity,
+            Int32(token_idx),
+        )
+
+    @cute.jit
+    def _write_record(
+        self,
+        kv_c: cute.Tensor,
+        kv_cache: cute.Tensor,
+        slot_mapping: cute.Tensor,
+        kv_c_stride: Int64,
+        block_stride: Int64,
+        entry_stride: Int64,
+        slot_capacity: Int64,
+        token: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
         tid = Int32(tidx)
-        token = Int32(token_idx)
         token64 = token.to(Int64)
 
         slot = Int64(slot_mapping[token])
-        if (slot >= Int64(0)) & (slot < slot_capacity):
+        valid = (slot >= Int64(0)) & (slot < slot_capacity)
+        if cutlass.const_expr(self.snapshot_tokens > 0):
+            valid = valid & (
+                slot % Int64(self.block_size) >= Int64(self.snapshot_tokens)
+            )
+        if valid:
             dst = _glm_next_cache_record_address(
                 get_ptr_as_int64(kv_cache, 0),
                 slot,
@@ -669,6 +697,92 @@ class ConcatAndCacheGlmNextMlaKernel:
                     )
 
 
+class SnapshotAndCacheDsv41SwaKernel(ConcatAndCacheGlmNextMlaKernel):
+    """Copy immutable ring bytes and encode appended records into disjoint ranges."""
+
+    def __init__(self, block_size: int, snapshot_tokens: int):
+        super().__init__(block_size, dsv41=True)
+        self.snapshot_tokens = snapshot_tokens
+        self.copy_tiles = snapshot_tokens * 528 // 1024
+
+    @cute.jit
+    def __call__(
+        self,
+        kv_c: cute.Tensor,
+        cache: cute.Tensor,
+        slots: cute.Tensor,
+        history: cute.Tensor,
+        history_rows: cute.Tensor,
+        kv_stride: Int64,
+        cache_stride: Int64,
+        history_stride: Int64,
+        history_capacity: Int64,
+        slot_capacity: Int64,
+        num_tokens: Int32,
+        num_requests: Int32,
+        stream: cuda.CUstream,
+    ):
+        self.snapshot_append(
+            kv_c,
+            cache,
+            slots,
+            history,
+            history_rows,
+            kv_stride,
+            cache_stride,
+            history_stride,
+            history_capacity,
+            slot_capacity,
+            num_requests,
+        ).launch(
+            grid=(num_requests * Int32(self.copy_tiles) + num_tokens, 1, 1),
+            block=[_THREADS, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def snapshot_append(
+        self,
+        kv_c: cute.Tensor,
+        cache: cute.Tensor,
+        slots: cute.Tensor,
+        history: cute.Tensor,
+        history_rows: cute.Tensor,
+        kv_stride: Int64,
+        cache_stride: Int64,
+        history_stride: Int64,
+        history_capacity: Int64,
+        slot_capacity: Int64,
+        num_requests: Int32,
+    ):
+        task, _, _ = cute.arch.block_idx()
+        tid, _, _ = cute.arch.thread_idx()
+        copies = num_requests * Int32(self.copy_tiles)
+        if task < copies:
+            request = task // Int32(self.copy_tiles)
+            tile = task % Int32(self.copy_tiles)
+            state = Int64(history_rows[request])
+            if (state >= Int64(0)) & (state < history_capacity):
+                offset = Int64(tile) * Int64(1024) + Int64(tid) * Int64(8)
+                source = get_ptr_as_int64(history, 0) + state * history_stride + offset
+                destination = (
+                    get_ptr_as_int64(cache, 0) + Int64(request) * cache_stride + offset
+                )
+                st_global_u32(destination, _ld_global_u32(source))
+                st_global_u32(destination + Int64(4), _ld_global_u32(source + Int64(4)))
+        else:
+            self._write_record(
+                kv_c,
+                cache,
+                slots,
+                kv_stride,
+                cache_stride,
+                Int64(528),
+                slot_capacity,
+                Int32(task - copies),
+            )
+
+
 @lru_cache(maxsize=None)
 def _build_concat_and_cache_nvfp4_mla_fp8_rope_kernel(
     block_size: int,
@@ -684,6 +798,7 @@ def _build_concat_and_cache_nvfp4_mla_fp8_rope_kernel(
 def clear_nvfp4_mla_fp8_rope_kv_cache_kernel_cache() -> None:
     _build_concat_and_cache_nvfp4_mla_fp8_rope_kernel.cache_clear()
     _build_compressed_cache_writer.cache_clear()
+    _build_snapshot_cache_writer.cache_clear()
     with _GLM_NEXT_WRITER_LOCK:
         _NVFP4_WRITER_COMPILED.clear()
 
@@ -699,6 +814,7 @@ def clear_glm_next_mla_kv_cache_kernel_cache() -> None:
     _build_concat_and_cache_glm_next_mla_kernel.cache_clear()
     _build_concat_and_cache_nvfp4_mla_fp8_rope_kernel.cache_clear()
     _build_compressed_cache_writer.cache_clear()
+    _build_snapshot_cache_writer.cache_clear()
     with _GLM_NEXT_WRITER_LOCK:
         _GLM_NEXT_WRITER_COMPILED.clear()
         _NVFP4_WRITER_COMPILED.clear()
@@ -1441,5 +1557,110 @@ def _compressed_cache_writer_launch(
             "cache_kind",
             "cache_format",
         ),
+    )
+    return kernel, args, spec
+
+
+def _tensor_byte_span(value):
+    start = value.data_ptr()
+    end = (
+        start
+        + (
+            sum(
+                (size - 1) * stride for size, stride in zip(value.shape, value.stride())
+            )
+            + 1
+        )
+        * value.element_size()
+    )
+    return start, end
+
+
+def _validate_cache_snapshot(
+    history, history_rows, kv, cache, slots, *, snapshot_tokens, max_requests
+):
+    if not isinstance(history, torch.Tensor) or not isinstance(
+        history_rows, torch.Tensor
+    ):
+        raise ValueError("snapshot writers require history and history_rows tensors")
+    if (
+        history.ndim != 2
+        or history.dtype != torch.uint8
+        or history.shape[0] <= 0
+        or history.shape[1] < snapshot_tokens * 528
+        or history.stride(1) != 1
+        or history.stride(0) < history.shape[1]
+        or history.stride(0) % 16
+        or history.data_ptr() % 16
+    ):
+        raise ValueError(
+            "history requires aligned byte rows covering the snapshot prefix"
+        )
+    if (
+        history_rows.ndim != 1
+        or history_rows.dtype != torch.int64
+        or not history_rows.is_contiguous()
+        or not 0 < history_rows.numel() <= max_requests
+        or cache.shape[0] != history_rows.numel()
+    ):
+        raise ValueError(
+            "history_rows requires one contiguous int64 row ID per destination page"
+        )
+    if history.device != cache.device or history_rows.device != cache.device:
+        raise ValueError("snapshot operands must share the cache device")
+    if history.shape[0] * history.stride(0) >= 2**63:
+        raise ValueError("history byte offsets must fit in int64")
+    cache_first, cache_last = _tensor_byte_span(cache)
+    for value in (history, history_rows, kv, slots):
+        first, last = _tensor_byte_span(value)
+        if first < cache_last and cache_first < last:
+            raise ValueError(
+                "snapshot destination must not overlap its read-only operands"
+            )
+
+
+@lru_cache(maxsize=None)
+def _build_snapshot_cache_writer(page_size, snapshot_tokens):
+    return SnapshotAndCacheDsv41SwaKernel(page_size, snapshot_tokens)
+
+
+def _snapshot_cache_writer_args(kv, cache, slots, history, history_rows, page_size):
+    return (
+        _to_kernel_tensor(kv, assumed_align=4, leading_dim=1),
+        _to_kernel_tensor(cache, assumed_align=16, leading_dim=1),
+        _to_kernel_tensor(
+            slots, assumed_align=8 if slots.dtype == torch.int64 else 4, leading_dim=0
+        ),
+        _to_kernel_tensor(history, assumed_align=16, leading_dim=1),
+        _to_kernel_tensor(history_rows, assumed_align=8, leading_dim=0),
+        Int64(kv.stride(0)),
+        Int64(cache.stride(0)),
+        Int64(history.stride(0)),
+        Int64(history.shape[0]),
+        Int64(cache.shape[0] * page_size),
+        Int32(slots.shape[0]),
+        Int32(history_rows.shape[0]),
+        current_cuda_stream(),
+    )
+
+
+def _snapshot_cache_writer_launch(
+    kv, cache, slots, history, history_rows, page_size, snapshot_tokens
+):
+    kernel = _build_snapshot_cache_writer(page_size, snapshot_tokens)
+    args = _snapshot_cache_writer_args(
+        kv, cache, slots, history, history_rows, page_size
+    )
+    spec = KernelCompileSpec.from_facts(
+        "attention.compressed_sparse_mla.snapshot_cache",
+        1,
+        tensor_compile_fact("kv", kv, dynamic_dims=(0,), dynamic_strides=(0,)),
+        tensor_compile_fact("cache", cache, dynamic_dims=(0, 1), dynamic_strides=(0,)),
+        tensor_compile_fact("slots", slots, dynamic_dims=(0,)),
+        tensor_compile_fact(
+            "history", history, dynamic_dims=(0, 1), dynamic_strides=(0,)
+        ),
+        tensor_compile_fact("history_rows", history_rows, dynamic_dims=(0,)),
+        {"page_size": page_size, "snapshot_tokens": snapshot_tokens},
     )
     return kernel, args, spec
