@@ -83,6 +83,8 @@ def query_from_call(
     *,
     value_order: str = "linear",
     expected_m: int | None = None,
+    min_amax: float = 0.0,
+    release_dependents: bool = False,
 ) -> Mxfp8Query:
     """Normalize all immutable source/output layout semantics for a declaration."""
     if source.ndim != 2 or not source.is_contiguous():
@@ -116,6 +118,8 @@ def query_from_call(
         scale_rows_storage=scale_rows_storage,
         scale_mma_layout=_scale_mma_layout(scale_mma, rows, columns),
         scale_mma_storage=scale_mma_storage,
+        min_amax=min_amax,
+        release_dependents=release_dependents,
     )
 
 
@@ -133,6 +137,8 @@ def compile_mxfp8_rows(query_payload, ordinal, sm_count):
         subgroup_width,
         threads,
         query.value_order,
+        query.min_amax,
+        query.release_dependents,
         device_ordinal=ordinal,
         sm_count=sm_count,
     )
@@ -288,4 +294,52 @@ def quantize_rows(
     _quantize_rows_prepared(source, values, scale_rows, scale_mma, plan.handle)
 
 
-__all__ = ["Mxfp8Config", "Mxfp8Query", "plan", "query_from_call", "quantize_rows"]
+@torch.library.custom_op(
+    "b12x::mxfp8_dense_rows_prepared_bases",
+    mutates_args=("values_base", "scale_rows_base", "scale_mma_base"),
+)
+def _quantize_dense_rows_prepared_bases(
+    source: torch.Tensor,
+    values_base: torch.Tensor,
+    scale_rows_base: torch.Tensor,
+    scale_mma_base: torch.Tensor,
+    plan_handle: int,
+) -> None:
+    from .api import dense_rows_from_bases
+
+    state = require_prepared(
+        plan_from_handle(plan_handle), "quantization.mxfp8", source.device
+    )
+    rows = dense_rows_from_bases(values_base, scale_rows_base, scale_mma_base)
+    state.run(source, rows.values, rows.scale_rows, rows.scale_mma)
+
+
+@_quantize_dense_rows_prepared_bases.register_fake
+def _quantize_dense_rows_prepared_bases_fake(
+    source, values_base, scale_rows_base, scale_mma_base, plan_handle
+) -> None:
+    del source, values_base, scale_rows_base, scale_mma_base, plan_handle
+
+
+def quantize_dense_rows(
+    source: torch.Tensor,
+    values_base: torch.Tensor,
+    scale_rows_base: torch.Tensor,
+    scale_mma_base: torch.Tensor,
+    *,
+    plan: Plan,
+) -> None:
+    """Write caller-owned contiguous MXFP8 bases with a prepared CuTe plan."""
+    _quantize_dense_rows_prepared_bases(
+        source, values_base, scale_rows_base, scale_mma_base, plan.handle
+    )
+
+
+__all__ = [
+    "Mxfp8Config",
+    "Mxfp8Query",
+    "plan",
+    "query_from_call",
+    "quantize_rows",
+    "quantize_dense_rows",
+]

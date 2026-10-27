@@ -43,6 +43,7 @@ class _MXFP8RowsQuantLaunch:
         threads: int,
         trellis_native_mma_order: bool,
         min_amax: float,
+        release_dependents: bool = False,
     ) -> None:
         self._k = int(k)
         self._groups_k = self._k // 32
@@ -52,6 +53,7 @@ class _MXFP8RowsQuantLaunch:
         self._warps_per_cta = self._threads // 32
         self._trellis_native_mma_order = bool(trellis_native_mma_order)
         self._min_amax = float(min_amax)
+        self._release_dependents = bool(release_dependents)
 
     @cute.jit
     def __call__(
@@ -98,6 +100,11 @@ class _MXFP8RowsQuantLaunch:
         m: Int32,
         source_k: Int32,
     ) -> None:
+        if cutlass.const_expr(self._release_dependents):
+            # This producer retains ordinary incoming stream ordering. Only
+            # its dependent GEMM may launch early; that GEMM waits before
+            # reading the values and scales written below.
+            cute.arch.griddepcontrol_launch_dependents()
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
         gdim, _, _ = cute.arch.grid_dim()
@@ -300,6 +307,7 @@ def _get_compiled_mxfp8_rows_quant(
     threads: int,
     value_order: str,
     min_amax: float = 0.0,
+    release_dependents: bool = False,
     *,
     device_ordinal: int | None = None,
     sm_count: int | None = None,
@@ -342,6 +350,8 @@ def _get_compiled_mxfp8_rows_quant(
         raise ValueError("trellis_native_mma MXFP8 ordering requires subgroup_width=8")
     if min_amax not in (0.0, 1e-4):
         raise ValueError("MXFP8 min_amax must be 0.0 or 1e-4")
+    if type(release_dependents) is not bool:
+        raise TypeError("MXFP8 dependent release must be a boolean")
     launch = _MXFP8RowsQuantLaunch(
         k,
         source_type,
@@ -349,6 +359,7 @@ def _get_compiled_mxfp8_rows_quant(
         threads,
         value_order == "trellis_native_mma",
         min_amax,
+        release_dependents,
     )
     cache_key = (
         k,
@@ -357,6 +368,7 @@ def _get_compiled_mxfp8_rows_quant(
         int(threads),
         value_order,
         min_amax,
+        release_dependents,
     )
     raise_if_kernel_resolution_frozen(
         "cute.compile",

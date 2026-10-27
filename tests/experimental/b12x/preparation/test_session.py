@@ -16,6 +16,7 @@ from b12x.preparation import (
     CollectiveBarrierTimeout,
     CollectiveRequirement,
     DetectedDevice,
+    FinalistPolicy,
     MemoryRequirements,
     PersistentMemory,
     Plan,
@@ -766,6 +767,54 @@ def test_complete_race_cached_restart_and_disabled_precedence(tmp_path, monkeypa
         )
         assert result.selections["pin"].source == "override"
     assert calls == [6, 6, 21, 27]
+
+
+def test_finalists_survive_cache_and_shared_aliases_without_changing_winner(
+    tmp_path, monkeypatch
+):
+    _deterministic_timer(monkeypatch)
+    policy = FinalistPolicy(family_fields=("width",), max_total=4)
+
+    def make(name, *, finalists=True):
+        item = request(
+            name=name,
+            tuning=contract(values=(1, 2, 4)),
+            shared=True,
+            benchmark=lambda state: PreparedCall(
+                run=lambda: state.value, produce=lambda: None
+            ),
+        )
+        return replace(item, finalist_policy=policy) if finalists else item
+
+    with session(tmp_path, race_batch=2) as engine:
+        first = make("first")
+        result = engine.prepare((first,))
+        assert result.selections["first"].config.width == 2
+        assert {item.selection.config.width for item in result.finalists["first"]} == {
+            1,
+            2,
+            4,
+        }
+        assert first.plan.prepared.finalists
+        aliased = make("aliased")
+        again = engine.prepare((aliased,))
+        assert aliased.plan.prepared is first.plan.prepared
+        assert again.benchmarked_candidates == 0
+        assert again.finalists["aliased"] == result.finalists["first"]
+        ordinary = make("ordinary", finalists=False)
+        separate = engine.prepare((ordinary,))
+        assert ordinary.plan.prepared is not first.plan.prepared
+        assert separate.cache_hits == 0
+        assert "ordinary" not in separate.finalists
+    with session(tmp_path) as engine:
+        cached = engine.prepare((make("cached"),))
+        assert cached.selections["cached"].source == "cached"
+        assert cached.cache_hits == 1
+        assert {item.selection.config.width for item in cached.finalists["cached"]} == {
+            1,
+            2,
+            4,
+        }
 
 
 def test_race_batches_bound_residency_and_carry_the_champion(tmp_path, monkeypatch):

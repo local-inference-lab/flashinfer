@@ -67,7 +67,10 @@ from b12x._lib.dense_gemm.policy import (
     _select_mxfp8_tile_k,
     _validate_mxfp8_bk64_plan,
 )
-from b12x._lib.dense_gemm.reductions import _reduce_split_k2_bf16_kernel
+from b12x._lib.dense_gemm.reductions import (
+    _reduce_split_k2_bf16_kernel,
+    _reduce_split_k4_bf16_kernel,
+)
 
 
 @dataclass(frozen=True)
@@ -111,6 +114,8 @@ class _DenseLowering:
     target_occupancy_override: int | None
     direct_sfa_live16: bool
     direct_m1_wo_a_inputs: bool
+    programmatic_serialization: bool
+    evict_first: bool
 
     def to_dict(self):
         from dataclasses import asdict
@@ -162,6 +167,9 @@ def _lower_dense_gemm(
     _large_m_unroll_override: Optional[bool] = None,
     _target_occupancy_override: Optional[int] = None,
     _split_k_workspace: Optional[torch.Tensor] = None,
+    allow_bf16_atomic_reduction: bool = True,
+    _programmatic_serialization: bool = False,
+    _evict_first: bool = False,
 ) -> _DenseLowering:
     """Lower the existing joint host rules without allocating or launching."""
     a_torch, sfa_torch = lhs
@@ -170,6 +178,10 @@ def _lower_dense_gemm(
         raise ValueError(
             f"dense_gemm load_path must be one of {_DENSE_LOAD_PATHS}, got {load_path!r}"
         )
+    if type(_programmatic_serialization) is not bool or type(_evict_first) is not bool:
+        raise TypeError("dense MXFP8 launch policy must use booleans")
+    if type(allow_bf16_atomic_reduction) is not bool:
+        raise TypeError("BF16 atomic reduction policy must be a boolean")
     if b_packed and b_preexpanded:
         raise ValueError("b_packed and b_preexpanded are mutually exclusive")
 
@@ -279,6 +291,10 @@ def _lower_dense_gemm(
             or swap_ab not in (None, False)
             or rhs_values_tiled is not None
             or _quantized_c is not None
+            or (
+                _programmatic_serialization
+                and (_tile_k_override != 128 or _split_k_slices_override != 1)
+            )
             or sfb_k_replicated
         ):
             raise ValueError(
@@ -315,6 +331,33 @@ def _lower_dense_gemm(
             "a_preexpanded/b_preexpanded/a_fmt/b_fmt/x_bf16/w_gscale are only "
             f"supported with an MX-FP6 ab_dtype, got ab_dtype={ab_dtype!r}"
         )
+    if not allow_bf16_atomic_reduction and (
+        not is_mxfp8
+        or plain_fp8
+        or block_fp8
+        or sf_dtype != "float8_e8m0fnu"
+        or sf_vec_size != 32
+    ):
+        raise ValueError("FP32 split-K reduction is qualified for MXFP8 only")
+    if _programmatic_serialization or _evict_first:
+        if (
+            not is_mxfp8
+            or plain_fp8
+            or block_fp8
+            or sf_dtype != "float8_e8m0fnu"
+            or sf_vec_size != 32
+            or l != 1
+            or m > 8
+            or out is None
+            or alpha is not None
+            or load_path != "tma"
+            or swap_ab
+            or rhs_values_tiled is not None
+            or _quantized_c is not None
+        ):
+            raise ValueError(
+                "dependent RHS TMA policy requires provided small-row MXFP8"
+            )
     if (x_bf16 is None) != (w_gscale is None):
         raise ValueError("x_bf16 and w_gscale must be provided together")
     if x_bf16 is not None and w_gscale is not None:
@@ -487,6 +530,7 @@ def _lower_dense_gemm(
         expected_m=expected_m,
         generalize_mxfp8_split_k=(is_mxfp8 and not block_fp8 and not plain_fp8),
         generalize_block_fp8_split_k=block_fp8,
+        allow_bf16_atomic_reduction=allow_bf16_atomic_reduction,
     )
     if _split_k_slices_override is not None:
         mxfp8_autotune = (
@@ -522,7 +566,11 @@ def _lower_dense_gemm(
                     f"to divide evenly across slices; got K={k}, BK={tile_k}, "
                     f"slices={_split_k_slices_override}"
                 )
-            if _split_k_slices_override > 2 and not _B12X_DENSE_SPLITK_TURBO:
+            if (
+                _split_k_slices_override > 2
+                and allow_bf16_atomic_reduction
+                and not _B12X_DENSE_SPLITK_TURBO
+            ):
                 raise ValueError(
                     "four-way split-K requires the atomic-BF16 reduction path"
                 )
@@ -532,7 +580,9 @@ def _lower_dense_gemm(
             use_m1_non_tma=policy.use_m1_non_tma,
             split_k_slices=_split_k_slices_override,
             split_k_atomic_bf16=(
-                _split_k_slices_override > 1 and _B12X_DENSE_SPLITK_TURBO
+                _split_k_slices_override > 1
+                and _B12X_DENSE_SPLITK_TURBO
+                and allow_bf16_atomic_reduction
             ),
             large_m_unroll=policy.large_m_unroll,
         )
@@ -576,6 +626,8 @@ def _lower_dense_gemm(
         split_k_slices = 1
     split_k_output = split_k_slices > 1
     split_k_atomic_bf16 = split_k_output and policy.split_k_atomic_bf16
+    if _programmatic_serialization and split_k_atomic_bf16:
+        raise ValueError("dependent split-K MXFP8 requires FP32 partial reduction")
     if split_k_atomic_bf16:
         kernel_c_l = l
     elif split_k_output:
@@ -638,6 +690,8 @@ def _lower_dense_gemm(
         target_occupancy_override=_target_occupancy_override,
         direct_sfa_live16=_use_direct_sfa_live16(**common, alpha_is_one=alpha_is_one),
         direct_m1_wo_a_inputs=_use_direct_m1_wo_a_inputs(**common),
+        programmatic_serialization=_programmatic_serialization,
+        evict_first=_evict_first,
     )
 
 
@@ -697,17 +751,30 @@ def _compile_dense_lowering(payload, device_ordinal):
                 if p.plain_fp8 or p.quantize_c
                 else p.direct_m1_wo_a_inputs,
                 target_occupancy_override=p.target_occupancy_override,
+                programmatic_serialization=p.programmatic_serialization,
+                evict_first=p.evict_first,
             )
         programs = {"gemm": gemm}
         if split and not atomic:
-            if p.policy.split_k_slices != 2:
-                raise ValueError("non-atomic dense reduction requires two slices")
-            programs["reduce"] = _reduce_split_k2_bf16_kernel.warmup(
+            reducer = (
+                _reduce_split_k2_bf16_kernel
+                if p.policy.split_k_slices == 2
+                else _reduce_split_k4_bf16_kernel
+                if p.policy.split_k_slices == 4
+                else None
+            )
+            if reducer is None:
+                raise ValueError(
+                    "non-atomic dense reduction requires two or four slices"
+                )
+            programs["reduce"] = reducer.warmup(
                 torch.float32,
                 torch.bfloat16,
                 p.m * p.n,
                 BLOCK=1024,
+                PDL=p.programmatic_serialization,
                 grid=(triton.cdiv(p.m * p.n, 1024),),
+                launch_pdl=p.programmatic_serialization,
             )
         return programs
 
@@ -865,7 +932,7 @@ class _DenseExecutionState:
         )
         if temporary is not None:
             self.reduction[(triton.cdiv(m * p.n, 1024), 1, 1)](
-                temporary, out, m * p.n, 1024
+                temporary, out, m * p.n, 1024, p.programmatic_serialization
             )
         return out
 
