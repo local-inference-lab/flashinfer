@@ -468,6 +468,7 @@ class PreparationSession:
         self._tuning_rank = 0
         self._tuning_ranks = (0,)
         self._tuning_cache_synchronized = False
+        self._collective_family_buckets = {}
         self.session_id = uuid.uuid4().hex
         self.state = "OPEN"
 
@@ -3028,6 +3029,9 @@ class PreparationJob:
             and not any(item.name in dependencies for item in obligation.requests)
         ]
         terminal_ids = {id(item) for item in terminal_collectives}
+        from ._collective import calibration_order
+
+        terminal_collectives = calibration_order(terminal_collectives)
         obligations = [
             item for item in obligations if id(item) not in terminal_ids
         ] + terminal_collectives

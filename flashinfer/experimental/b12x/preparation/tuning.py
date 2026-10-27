@@ -256,6 +256,10 @@ class TuningContract(Generic[QueryT, ConfigT]):
         Callable[[QueryT, DeviceIdentity | None, ConfigT], object] | None
     ) = None
     collective_signature: Callable[[QueryT], Mapping[str, object]] | None = None
+    # Return the family knob, rank-independent bucket identity, and payload size.
+    collective_family_bucket: (
+        Callable[[QueryT], tuple[str, Mapping[str, object], int] | None] | None
+    ) = None
 
     def __post_init__(self):
         if not re.fullmatch(r"[a-z][a-z0-9_.-]*", self.component_id):

@@ -7,6 +7,7 @@ import time
 from dataclasses import replace
 
 from ._cache import digest
+from ._efficiency import AutotuneEffort
 from ._ledger import RaceLedger
 from ._measurement import capture_benchmark_call, no_compilation
 from .types import (
@@ -19,6 +20,55 @@ from .types import (
 
 class _Cancelled(Exception):
     pass
+
+
+def family_bucket(obligation):
+    request = obligation.request
+    callback = request.plan.contract.collective_family_bucket
+    space = obligation.configuration.space
+    if (
+        request.collective is None
+        or callback is None
+        or request.finalist_policy is not None
+        or space is None
+        or space.autotune_effort is not AutotuneEffort.DEFAULT
+        or obligation.configuration.pinned is not None
+    ):
+        return None
+    bucket = callback(request.plan.query)
+    if bucket is None:
+        return None
+    field, identity, size = bucket
+    if len({assignment[field] for assignment, _ in obligation.candidates}) <= 2:
+        return None
+    return field, identity, size
+
+
+def calibration_order(obligations):
+    """Race the largest declared payload in each bucket before its other requests."""
+    representatives = {}
+    for index, obligation in enumerate(obligations):
+        if obligation.ready or obligation.selection is not None:
+            continue
+        bucket = family_bucket(obligation)
+        if bucket is None:
+            continue
+        field, identity, size = bucket
+        key = digest(
+            (
+                obligation.request.plan.component_id,
+                obligation.request.collective.ranks,
+                field,
+                identity,
+            )
+        )
+        previous = representatives.get(key)
+        if previous is None or size > previous[0]:
+            representatives[key] = (size, index)
+    first = {index for _, index in representatives.values()}
+    return [item for index, item in enumerate(obligations) if index in first] + [
+        item for index, item in enumerate(obligations) if index not in first
+    ]
 
 
 def exchange(requirement, step, **payload):
@@ -58,6 +108,7 @@ def select(job, obligation, selections):
         raise ValueError(
             "collective tuning requires a group-consistent query signature"
         )
+    bucket = family_bucket(obligation)
     candidates = tuple(
         (assignment.to_dict(), contract.config_payload(config).to_dict())
         for assignment, config in obligation.candidates
@@ -80,6 +131,7 @@ def select(job, obligation, selections):
         rounds=job.session.rounds,
         samples=job.session.samples,
         cancel=job.session._stop.is_set(),
+        bucket=bucket,
     )
     for field in (
         "signature",
@@ -88,45 +140,97 @@ def select(job, obligation, selections):
         "rounds",
         "samples",
         "finalist_policy",
+        "bucket",
     ):
         _same(peers, field)
     if any(peer["cancel"] for peer in peers):
         return job._selection(obligation, obligation.configuration.default, "default")
-    obligation.key = digest(
-        {
-            "measurement": (
-                "collective_max_stream_gated_graph_v5_finalists"
-                if policy is not None
-                else "collective_max_stream_gated_graph_v4_token_scaled"
-            ),
-            "repetitions": {"reduction_token_target": 100, "default": 1},
-            "rounds": job.session.rounds,
-            "samples": job.session.samples,
-            "members": tuple((peer["device"], peer["local_key"]) for peer in peers),
-        }
-    )
+    bucket_key = None
+    calibration = None
+    if bucket is not None:
+        family_field, identity, _ = bucket
+        bucket_key = digest(
+            (
+                contract.component_id,
+                identity,
+                family_field,
+                tuple(peer["device"] for peer in peers),
+                requirement.ranks,
+            )
+        )
+        calibration = job.session._collective_family_buckets.get(bucket_key)
+    cache_identity = {
+        "measurement": (
+            "collective_max_stream_gated_graph_v5_finalists"
+            if policy is not None
+            else "collective_max_stream_gated_graph_v4_token_scaled"
+        ),
+        "repetitions": {"reduction_token_target": 100, "default": 1},
+        "rounds": job.session.rounds,
+        "samples": job.session.samples,
+        "members": tuple((peer["device"], peer["local_key"]) for peer in peers),
+    }
+    if bucket is not None:
+        cache_identity["family_bucket"] = (1, bucket)
+        cache_identity["family_calibration"] = None
+    obligation.key = digest(cache_identity)
+    if calibration is not None and obligation.key != calibration[0]:
+        obligation.key = digest({**cache_identity, "family_calibration": calibration})
     cache = job.session._selection_cache()
-    peers = yield from exchange(requirement, "cache", record=cache.get(obligation.key))
+    peers = yield from exchange(
+        requirement, "cache", record=cache.get(obligation.key), calibration=calibration
+    )
+    _same(peers, "calibration")
     record = next(
         (peer["record"] for peer in peers if peer["record"] is not None), None
     )
-    if record is not None and (
-        obligation.request.finalist_policy is None or record.get("finalists")
-    ):
-        return _load(job, obligation, record)
+    if record is not None and (policy is None or record.get("finalists")):
+        selection = _load(job, obligation, record)
+        if bucket_key is not None and calibration is None:
+            job.session._collective_family_buckets[bucket_key] = (
+                obligation.key,
+                tuple(obligation.coverage["bucket_families"]),
+            )
+        return selection
     if job.session.cache_only:
         raise LookupError(
             f"no completed collective selection for {obligation.request.name}"
         )
     if obligation.request.benchmark_call is None:
         raise ValueError("collective tuning requires a representative benchmark call")
+    if calibration is not None:
+        _, families = calibration
+        before = len(obligation.candidates)
+        obligation.candidates = [
+            (assignment, config)
+            for assignment, config in obligation.candidates
+            if assignment[family_field] in families
+        ]
+        if not obligation.candidates:
+            raise ValueError(
+                "collective bucket families have no eligible configurations"
+            )
+        obligation.coverage["bucket_pruned_count"] = before - len(obligation.candidates)
+        obligation.coverage["bucket_families"] = families
     try:
-        return (yield from race(job, obligation))
+        selection = yield from race(
+            job,
+            obligation,
+            family_field=bucket[0]
+            if bucket is not None and calibration is None
+            else None,
+        )
+        if bucket_key is not None and calibration is None:
+            job.session._collective_family_buckets[bucket_key] = (
+                obligation.key,
+                tuple(obligation.coverage["bucket_families"]),
+            )
+        return selection
     except _Cancelled:
         return job._selection(obligation, obligation.configuration.default, "default")
 
 
-def race(job, obligation):
+def race(job, obligation, *, family_field=None):
     from .session import _CallGuard, _Trial
 
     requirement = obligation.request.collective
@@ -378,6 +482,16 @@ def race(job, obligation):
         )
         _same(peers, "assignment")
         obligation.coverage["measured_count"] = len(measurements)
+        if family_field is not None:
+            best = {}
+            for index, latency in measurements.items():
+                family = obligation.candidates[index][0][family_field]
+                best[family] = min(best.get(family, math.inf), latency)
+            winner = champion.assignment[family_field]
+            families = sorted(
+                best, key=lambda family: (family != winner, best[family], family)
+            )
+            obligation.coverage["bucket_families"] = tuple(families[:2])
         obligation.cache_pending = True
         if obligation.key is not None:
             ledger.commit(
