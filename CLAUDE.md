@@ -541,6 +541,23 @@ toolchain require a fresh race. Unrelated kernels retain their saved selections.
 The tuning contract's schema versions and `B12X_TUNING_CACHE_VERSION` remain
 explicit controls for changes to tuning semantics and manual retuning.
 
+Experimental b12x preparation requests can opt into `FinalistPolicy` to retain
+measured configurations by tuning-parameter family, independently of the
+standalone winner. The policy has a separate selection-cache identity. Sharded
+finalist requests pass every rank's contribution, including empty shards, to
+`PreparationJob.advance(tuning=...)` in rank order; ordinary requests pass one
+consolidated winner per key. Callers
+prepare alternative plans and capture complete computations as
+`ContextCandidate` objects, then call `PreparationSession.race_contexts` before
+freezing the session. The returned contextual winner does not replace standalone
+selections. Input reset and production occur outside the timed replay; producer
+work that belongs in the measurement must be captured inside the graph. Cold
+cache eviction follows input production. Multi-rank contexts agree on candidate
+catalogs, rank membership, sample schedules, producer counts, and cache policy
+before replay, and score each sample by its slowest rank. Trial graph cleanup
+callbacks run after synchronization; callers release losing plans before final
+capture. Contextual races require an unfrozen session with preparation drained.
+
 Every completed b12x tuning race appends a self-describing record to the
 `ledger_v1` table of the race-progress database beside the selection cache:
 component, encoded query, effort, coverage, measurement protocol, and for every

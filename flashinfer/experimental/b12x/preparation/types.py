@@ -275,6 +275,66 @@ class Selection(Generic[ConfigT]):
     assignment: FrozenMapping | None = None
 
 
+@dataclass(frozen=True, kw_only=True)
+class FinalistPolicy:
+    """Retain bounded legal families from an ordinary candidate race.
+
+    Even a singleton search is measured. Tuning must be enabled; cancellation
+    prepares the default without reporting an unmeasured shortlist. Sharded
+    races require all rank contributions through ``PreparationJob.advance``.
+    """
+
+    family_fields: tuple[str, ...]
+    per_family: int = 1
+    max_total: int = 16
+
+    def __post_init__(self):
+        fields = tuple(self.family_fields)
+        if (
+            not fields
+            or len(set(fields)) != len(fields)
+            or any(
+                not isinstance(name, str) or not name.isidentifier() for name in fields
+            )
+        ):
+            raise ValueError("finalist families require distinct parameter names")
+        if type(self.per_family) is not int or self.per_family <= 0:
+            raise ValueError("finalist per-family limit must be positive")
+        if type(self.max_total) is not int or self.max_total < self.per_family:
+            raise ValueError("finalist total limit must cover one family")
+        object.__setattr__(self, "family_fields", fields)
+
+
+@dataclass(frozen=True, kw_only=True)
+class FinalistRecord:
+    """One legal candidate's fresh balanced local-race metadata."""
+
+    assignment: FrozenMapping
+    family: FrozenMapping
+    candidate_index: int
+    latency_us: float
+
+    def __post_init__(self):
+        object.__setattr__(self, "assignment", FrozenMapping(self.assignment))
+        object.__setattr__(self, "family", FrozenMapping(self.family))
+        if type(self.candidate_index) is not int or self.candidate_index < 0:
+            raise ValueError("finalist candidate index must be nonnegative")
+        if (
+            type(self.latency_us) not in (int, float)
+            or not math.isfinite(self.latency_us)
+            or self.latency_us <= 0
+        ):
+            raise ValueError("finalist latency must be finite and positive")
+
+
+@dataclass(frozen=True, kw_only=True)
+class Finalist:
+    selection: Selection
+    family: FrozenMapping
+    candidate_index: int
+    latency_us: float
+
+
 @dataclass(frozen=True)
 class CollectiveRequirement:
     key: str
@@ -331,7 +391,11 @@ class TuningCacheRequirement:
 
 @dataclass(frozen=True)
 class TuningRequirement:
-    """One rank's winner from its disjoint share of a tuning race."""
+    """One rank's winner and optional finalists from its tuning shard.
+
+    For finalist requests, submit every contribution in ``ranks`` order to
+    ``PreparationJob.advance(tuning=...)`` instead of selecting one winner.
+    """
 
     key: str
     ranks: tuple[int, ...]
@@ -340,6 +404,8 @@ class TuningRequirement:
     candidate_index: int | None
     rejected_count: int = 0
     cute_programs: tuple[str, ...] = ()
+    finalists: tuple[FinalistRecord, ...] = ()
+    finalist_policy: FinalistPolicy | None = None
 
     def __post_init__(self):
         ranks = tuple(self.ranks)
@@ -363,6 +429,18 @@ class TuningRequirement:
         ):
             raise ValueError("winner programs must be CuTe cache keys")
         object.__setattr__(self, "cute_programs", tuple(sorted(set(programs))))
+        finalists = tuple(self.finalists)
+        if any(not isinstance(item, FinalistRecord) for item in finalists):
+            raise TypeError("tuning finalists must be FinalistRecord values")
+        if self.finalist_policy is not None and not isinstance(
+            self.finalist_policy, FinalistPolicy
+        ):
+            raise TypeError("tuning finalist policy must be FinalistPolicy")
+        if finalists and self.finalist_policy is None:
+            raise ValueError("tuning finalists require their family policy")
+        if empty and finalists:
+            raise ValueError("empty tuning shards cannot report finalists")
+        object.__setattr__(self, "finalists", finalists)
         if empty != (self.latency_us is None) or empty != (
             self.candidate_index is None
         ):
@@ -519,6 +597,8 @@ class _Prepared:
     owners: tuple
     closers: tuple
     device: DetectedDevice
+    finalist_policy: FinalistPolicy | None = None
+    finalists: tuple[FinalistRecord, ...] = ()
     variants: Mapping[int, Plan] | None = None
     scratch: tuple[ScratchBufferSpec, ...] | None = None
     users: list = field(default_factory=list)
@@ -623,6 +703,23 @@ class Plan(_PreparedSlot, Generic[ConfigT]):
             raise TypeError("shared must be boolean")
         _register_handle(self)
 
+    def same_declaration_except_override(self, other: object) -> bool:
+        """Whether two plans differ only in their selected kernel configuration.
+
+        This compares public declaration semantics and device ownership; it
+        does not inspect or change either plan's prepared slot.
+        """
+        return (
+            isinstance(other, Plan)
+            and self.contract is other.contract
+            and FrozenMapping(self.contract.encode_query(self.query))
+            == FrozenMapping(other.contract.encode_query(other.query))
+            and self.invocation == other.invocation
+            and self.dependencies == other.dependencies
+            and self._device == other._device
+            and self.shared == other.shared
+        )
+
     @property
     def component_id(self):
         return self.contract.component_id
@@ -636,6 +733,7 @@ class Plan(_PreparedSlot, Generic[ConfigT]):
         dependencies=(),
         collective=None,
         retain_benchmark_call=False,
+        finalist_policy=None,
     ):
         return PreparationRequest(
             name=name,
@@ -647,6 +745,7 @@ class Plan(_PreparedSlot, Generic[ConfigT]):
             dependencies=tuple(dict.fromkeys((*self.dependencies, *dependencies))),
             collective=collective,
             retain_benchmark_call=retain_benchmark_call,
+            finalist_policy=finalist_policy,
         )
 
     def memory_requirements(self):
@@ -771,6 +870,7 @@ class PreparationRequest:
     dependencies: tuple[str, ...] = ()
     collective: CollectiveRequirement | None = None
     retain_benchmark_call: bool = False
+    finalist_policy: FinalistPolicy | None = None
 
     def __post_init__(self):
         if not isinstance(self.name, str) or not self.name:
@@ -781,6 +881,19 @@ class PreparationRequest:
             raise TypeError("retain_benchmark_call must be boolean")
         if self.retain_benchmark_call and self.benchmark_call is None:
             raise ValueError("benchmark retention requires a benchmark call factory")
+        if self.finalist_policy is not None:
+            if not isinstance(self.finalist_policy, FinalistPolicy):
+                raise TypeError("finalist policy must be FinalistPolicy")
+            if not isinstance(self.plan, Plan) or self.plan.override is not None:
+                raise ValueError("finalist policy requires an unpinned scalar Plan")
+            if self.collective is not None:
+                raise ValueError(
+                    "collective operator finalist metadata is not supported"
+                )
+            if self.benchmark_call is None:
+                raise ValueError(
+                    "finalist policy requires a representative benchmark call"
+                )
         if isinstance(self.plan, Plan):
             if not callable(self.prepare_call) or (
                 self.benchmark_call is not None and not callable(self.benchmark_call)
@@ -832,6 +945,7 @@ class PreparationResult:
         *,
         plans,
         coverage=None,
+        finalists=None,
         benchmark_calls=None,
         benchmark_closers=(),
         cache_hits=0,
@@ -858,6 +972,9 @@ class PreparationResult:
                 name: MappingProxyType(dict(value))
                 for name, value in (coverage or {}).items()
             }
+        )
+        self.finalists = MappingProxyType(
+            {name: tuple(values) for name, values in (finalists or {}).items()}
         )
         self.benchmark_calls = MappingProxyType(dict(benchmark_calls or {}))
         self.cache_hits = cache_hits
