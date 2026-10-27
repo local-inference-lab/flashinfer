@@ -19,9 +19,15 @@ META = OpMeta(
     entry_points=(
         "Mxfp8Config",
         "Mxfp8Query",
+        "MXFP8Rows",
+        "dense_rows_storage_shapes",
+        "dense_rows_from_bases",
+        "dense_scale_storage",
+        "dense_scale_view_from_storage",
         "plan",
         "query_from_call",
         "quantize_rows",
+        "quantize_dense_rows",
         "is_supported",
     ),
     dtypes=("bf16", "fp16"),
@@ -39,10 +45,16 @@ if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
     from .api import (  # noqa: F401
         Mxfp8Config,
         Mxfp8Query,
+        MXFP8Rows,
+        dense_rows_storage_shapes,
+        dense_rows_from_bases,
+        dense_scale_storage,
+        dense_scale_view_from_storage,
         is_supported,
         plan,
         query_from_call,
         quantize_rows,
+        quantize_dense_rows,
     )
 
 install_lazy_api(globals(), META)
