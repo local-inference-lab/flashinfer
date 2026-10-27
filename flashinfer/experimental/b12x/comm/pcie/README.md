@@ -46,6 +46,26 @@ disabled tuning retains the static dispatch policy. Explicit
 `CollectiveConfig(implementation=..., threads=..., blocks=...)` pins a legal
 configuration. Native low-level plans still use `PcieConfig`.
 
+Default-effort plain all-reduce tuning calibrates transfer-size buckets before
+restricting exact-shape races to two families. Bucket upper bounds are
+`1, 2, 4, 8, 16, 32, 48, 64, 96, 128` units of 8 KiB, then powers of two.
+Within a preparation batch, the largest declared payload in each bucket races
+all eligible families first. The winning family and the fastest other family
+remain eligible for every subsequent request in that bucket; each request
+still races all their eligible thread counts and block grids at its actual shape.
+Across preparation batches in one session, the first completed calibration for
+a bucket supplies its shortlist. Buckets are independent for each ordered GPU
+group, dtype, aliasing contract, transport catalog, and staging-storage geometry.
+
+Calibration shortlists are saved with their representative selections. Exact
+selections include the calibration's program-aware cache identity and retained
+families, so a changed calibration cannot reuse an incompatible selection.
+Audit effort measures the unrestricted catalog. Explicit pins and disabled
+tuning bypass calibration. Fused arithmetic and DCP operations retain their
+shape-specific searches. A bucket shortlist is empirical: performance within
+a bucket should be checked against audit races when changing transport kernels
+or bucket boundaries.
+
 Hierarchical collectives, DMA rings, FP8 sequence-parallel transports, paired gathers,
 and owner/top-k exchanges retain their native fixed declarations. Transport
 codecs with different arithmetic are not interchangeable tuning candidates.

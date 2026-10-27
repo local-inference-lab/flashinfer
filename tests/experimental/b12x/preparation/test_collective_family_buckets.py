@@ -8,6 +8,7 @@ import pytest
 from b12x.preparation import (
     CollectiveRequirement,
     FrozenMapping,
+    ParameterSpace,
     PreparedCall,
     autotune_effort,
 )
@@ -17,8 +18,13 @@ from .test_session import _deterministic_timer, request, session
 
 
 def declarations(rows):
+    from b12x.preparation._efficiency import capture_autotune_effort
+
     tuning = replace(
         contract(),
+        parameters=lambda query, device: ParameterSpace(
+            knobs=contract().knobs, autotune_effort=capture_autotune_effort()
+        ),
         collective_signature=lambda query: query.rows,
         collective_family_bucket=lambda query: (
             "width",
