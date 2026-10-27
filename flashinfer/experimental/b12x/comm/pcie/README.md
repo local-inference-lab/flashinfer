@@ -105,10 +105,10 @@ compares explicit transports and the static dispatch policy with CUDA graphs.
 
 ## Joint BF16 profiles
 
-Staged BF16 reductions with payload-ready peer storage also
-race two joint entrypoints. `joint_latency` supports `full`, `payload_rsag`, and
+Explicit joint-only plans for staged BF16 reductions with payload-ready peer
+storage race two joint entrypoints. `joint_latency` supports `full`, `payload_rsag`, and
 `pull`; `joint_bandwidth` supports `payload_rsag`, `bulk_push`, `bulk_pull`, and
-`pull`. Standalone transports remain available for comparison. Each entrypoint
+`pull`. Ordinary plans retain standalone transport competition. Each entrypoint
 uses one compiled program per thread count and maximum grid; its submode and
 active CTA count are device data and do not specialize compilation. The maximum
 grid is capped by the device SM count and 64 CTAs. The tuning
@@ -116,8 +116,10 @@ record includes both values. For example,
 `CollectiveConfig(implementation="joint_latency", threads=256, blocks=64,
 submode="full", active_blocks=16)` pins a joint configuration.
 
-Joint workspace is provisioned by `PCIeOneshotAllReduce.from_exchange_group`
-and the pool's coordinated channel factories. The public direct constructor
+Joint workspace requires `joint=True` on `PCIeAllReduce.from_exchange_group`,
+`from_process_group`, or the corresponding oneshot channel/pool factory. The
+default `joint=False` allocates only static transport storage. Ranks agree on
+this option before shared allocation. The public direct constructor
 accepting externally supplied pointers retains standalone transports; BF16
 payload-ready support alone does not admit joint candidates. Joint alternatives
 require an existing workspace and never allocate one during declaration.
@@ -137,7 +139,8 @@ from the profile; callers choose the prepared profile explicitly.
 
 ### Captured startup mode selection
 
-`AllReduce.plan(..., joint_only=True)` limits an eligible staged BF16 collective
+`AllReduce.plan(...)` excludes joint kernels by default and retains static transport
+competition. `AllReduce.plan(..., joint_only=True)` limits an eligible staged BF16 collective
 plan to the joint families. Attach `joint_finalist_policy()` to its preparation
 request to retain the best measured active CTA count for every mode and compiled
 geometry. The preparation cache restores these finalists with the selected plan.

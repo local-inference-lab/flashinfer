@@ -188,6 +188,7 @@ class PCIeAllReduce:
         ipc=None,
         single_channel: bool = False,
         max_concurrent_channels: int = 1,
+        joint: bool = False,
     ) -> "PCIeAllReduce":
         world_size = dist.get_world_size(group=exchange_group)
         algorithm = _algorithm_for_world_size(world_size)
@@ -207,6 +208,7 @@ class PCIeAllReduce:
                     ipc=ipc,
                     single_channel=single_channel,
                     max_concurrent_channels=max_concurrent_channels,
+                    joint=joint,
                 )
             except DirectMappingUnavailable:
                 if not qualify_direct:
@@ -333,6 +335,7 @@ class PCIeAllReduce:
         ext_module=None,
         single_channel: bool = False,
         max_concurrent_channels: int = 1,
+        joint: bool = False,
     ) -> "PCIeAllReduce":
         return cls.from_exchange_group(
             exchange_group=process_group,
@@ -345,6 +348,7 @@ class PCIeAllReduce:
             ext_module=ext_module,
             single_channel=single_channel,
             max_concurrent_channels=max_concurrent_channels,
+            joint=joint,
         )
 
     @property
@@ -488,7 +492,8 @@ class PCIeAllReduce:
         """Select an existing native channel once, then declare its plan.
 
         Semantic channels must already exist. This does not construct transports,
-        register inputs, allocate workspace, or compile any program.
+        register inputs, allocate workspace, or compile any program. Joint kernels
+        require explicit ``joint_only=True``; ordinary plans use static transports.
         """
         from ._preparation import plan, query_from_runtime
 
@@ -537,14 +542,14 @@ class PCIeAllReduce:
                     alternatives["twoshot"] = (native, twoshot)
                     if self._use_bf16_twoshot(inp, output):
                         default = "twoshot"
-                if joint_only:
-                    from ._joint_profile import JOINT_FAMILIES
+                from ._joint_profile import JOINT_FAMILIES
 
-                    alternatives = {
-                        name: value
-                        for name, value in alternatives.items()
-                        if name in JOINT_FAMILIES
-                    }
+                alternatives = {
+                    name: value
+                    for name, value in alternatives.items()
+                    if (name in JOINT_FAMILIES) == joint_only
+                }
+                if joint_only:
                     if not alternatives:
                         raise ValueError(
                             "joint-only planning requires a provisioned BF16 joint channel"

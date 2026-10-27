@@ -2613,6 +2613,7 @@ class PCIeOneshotAllReduce:
         rank_data_bytes: int = DEFAULT_RANK_DATA_BYTES,
         ext_module=None,
         stream_affine: bool = True,
+        joint: bool = False,
     ) -> "PCIeOneshotAllReduce":
         rank = dist.get_rank(group=exchange_group)
         world_size = dist.get_world_size(group=exchange_group)
@@ -2686,6 +2687,7 @@ class PCIeOneshotAllReduce:
                 max_size,
                 rank_data_bytes,
                 transport_policy,
+                bool(joint),
             ),
         )
 
@@ -2740,7 +2742,8 @@ class PCIeOneshotAllReduce:
             local_cleanup=abort_native_runtime,
             detach_shared_ownership=detach_shared_ownership,
         )
-        _prepare_joint_channel(runtime)
+        if joint:
+            _prepare_joint_channel(runtime)
         return runtime
 
     @classmethod
@@ -2755,6 +2758,7 @@ class PCIeOneshotAllReduce:
         rank_data_bytes: int = DEFAULT_RANK_DATA_BYTES,
         ext_module=None,
         stream_affine: bool = True,
+        joint: bool = False,
     ) -> "PCIeOneshotAllReduce":
         return cls.from_exchange_group(
             exchange_group=process_group,
@@ -2766,6 +2770,7 @@ class PCIeOneshotAllReduce:
             rank_data_bytes=rank_data_bytes,
             ext_module=ext_module,
             stream_affine=stream_affine,
+            joint=joint,
         )
 
     @staticmethod
@@ -3723,6 +3728,7 @@ class PCIeOneshotAllReducePool:
         ipc: Optional[CudaRTLibrary] = None,
         single_channel: bool = False,
         max_concurrent_channels: int = 1,
+        joint: bool = False,
         channel_factory: Optional[
             Callable[[Optional[int]], PCIeOneshotAllReduce]
         ] = None,
@@ -3807,6 +3813,7 @@ class PCIeOneshotAllReducePool:
             self.max_concurrent_channels,
             self._transport_policy,
         ) = normalized
+        self.joint = bool(joint)
         self._sharded_eager_storage = _uses_sharded_eager_storage(
             self.world_size,
             self._transport_policy,
@@ -3877,6 +3884,7 @@ class PCIeOneshotAllReducePool:
                     self.single_channel,
                     self.max_concurrent_channels,
                     self._transport_policy,
+                    self.joint,
                 ),
             )
             # A genuine single-channel pool has no independent eager/graph
@@ -3898,6 +3906,7 @@ class PCIeOneshotAllReducePool:
         ipc=None,
         single_channel: bool = False,
         max_concurrent_channels: int = 1,
+        joint: bool = False,
     ) -> "PCIeOneshotAllReducePool":
         return cls(
             rank=dist.get_rank(group=exchange_group),
@@ -3911,6 +3920,7 @@ class PCIeOneshotAllReducePool:
             ipc=ipc,
             single_channel=single_channel,
             max_concurrent_channels=max_concurrent_channels,
+            joint=joint,
         )
 
     @classmethod
@@ -3926,6 +3936,7 @@ class PCIeOneshotAllReducePool:
         ext_module=None,
         single_channel: bool = False,
         max_concurrent_channels: int = 1,
+        joint: bool = False,
     ) -> "PCIeOneshotAllReducePool":
         return cls.from_exchange_group(
             exchange_group=process_group,
@@ -3938,6 +3949,7 @@ class PCIeOneshotAllReducePool:
             ext_module=ext_module,
             single_channel=single_channel,
             max_concurrent_channels=max_concurrent_channels,
+            joint=joint,
         )
 
     def _new_channel(self, stream_key: Optional[int]) -> PCIeOneshotAllReduce:
@@ -3999,7 +4011,8 @@ class PCIeOneshotAllReducePool:
             local_cleanup=abort_native_runtime,
             detach_shared_ownership=detach_shared_ownership,
         )
-        _prepare_joint_channel(channel)
+        if self.joint:
+            _prepare_joint_channel(channel)
         channel._bind_stream_key(stream_key)
         self._all_channels.append(channel)
         return channel

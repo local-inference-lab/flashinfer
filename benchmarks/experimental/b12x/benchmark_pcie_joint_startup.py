@@ -264,6 +264,7 @@ def main():
     if capacity < max(sizes):
         raise ValueError("capacity must cover every payload")
     manager = PCIeAllReduce.from_exchange_group(
+        joint=True,
         exchange_group=dist.group.WORLD,
         device=torch.device("cuda", rank),
         single_channel=True,

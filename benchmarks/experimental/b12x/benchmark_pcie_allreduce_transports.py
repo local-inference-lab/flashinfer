@@ -121,7 +121,7 @@ def prepare(
                 call={"inp": inp, "out": out, "transport": "pull"},
             )
         else:
-            declared = manager.plan(inp, out=out)
+            declared = manager.plan(inp, out=out, joint_only=arm.startswith("joint-"))
             if family not in declared.query.alternatives:
                 raise ValueError(f"{arm} is unavailable for this prepared shape")
             native = PcieQuery(**declared.query.alternatives[family])
@@ -398,6 +398,7 @@ def main():
     ):
         raise ValueError("explicit TP2 transports require two ranks")
     manager = PCIeAllReduce.from_exchange_group(
+        joint=any(arm.startswith("joint-") for arm in arms),
         exchange_group=dist.group.WORLD,
         device=device,
         single_channel=True,

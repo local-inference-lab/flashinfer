@@ -113,6 +113,7 @@ def _exercise(rank, world, family, alias):
         else ("payload_rsag", "bulk_push", "bulk_pull", "pull")
     )
     manager = PCIeAllReduce.from_exchange_group(
+        joint=True,
         exchange_group=dist.group.WORLD,
         device=device,
         single_channel=True,
@@ -130,6 +131,7 @@ def _exercise(rank, world, family, alias):
             out = source if alias else torch.empty_like(source)
             plan = manager.plan(
                 source,
+                joint_only=True,
                 out=out,
                 override=CollectiveConfig(
                     implementation=family,
@@ -229,7 +231,10 @@ def _worker(rank, world, directory, family, alias):
         timeout=timedelta(seconds=180),
     )
     try:
-        _exercise(rank, world, family, alias)
+        if family == "provisioning":
+            _exercise_provisioning(rank)
+        else:
+            _exercise(rank, world, family, alias)
     finally:
         gc.collect()
         dist.destroy_process_group()
@@ -251,4 +256,90 @@ def test_joint_profile_graph_transitions(world, family, alias, tmp_path):
         pytest.skip("insufficient assigned GPUs")
     mp.spawn(
         _worker, args=(world, str(tmp_path), family, alias), nprocs=world, join=True
+    )
+
+
+def _exercise_provisioning(rank):
+    import torch
+    import torch.distributed as dist
+    from b12x.comm.pcie.pcie_allreduce import PCIeAllReduce
+    from b12x.comm.pcie._oneshot_preparation import _prepare_plain_call
+    from b12x.preparation import CollectiveRequirement, PreparationSession
+
+    device = torch.device("cuda", rank)
+    with pytest.raises(RuntimeError, match="contract differs across ranks"):
+        PCIeAllReduce.from_exchange_group(
+            exchange_group=dist.group.WORLD,
+            device=device,
+            single_channel=True,
+            max_size=5120,
+            eager_buffer_bytes=5120,
+            joint=bool(rank),
+        )
+    for joint in (False, True):
+        manager = PCIeAllReduce.from_exchange_group(
+            exchange_group=dist.group.WORLD,
+            device=device,
+            single_channel=True,
+            max_size=5120,
+            eager_buffer_bytes=5120,
+            joint=joint,
+        )
+        session = PreparationSession(device=device, autotune=False, compile_workers=1)
+        graph = torch.cuda.CUDAGraph()
+        try:
+            channel = manager._runtime._prepared_channel_for_stream(None, None)
+            workspace = getattr(channel, "_joint_workspace", None)
+            assert (workspace is not None) == joint
+            assert len(channel._owned_buffers) == (2 if joint else 1)
+            source = torch.full((2560,), rank + 1, device=device, dtype=torch.bfloat16)
+            out = torch.empty_like(source)
+            if not joint:
+                with pytest.raises(ValueError, match="provisioned BF16 joint channel"):
+                    manager.plan(source, out=out, joint_only=True)
+            plan = manager.plan(source, out=out, joint_only=joint)
+            session.prepare(
+                (
+                    plan.request(
+                        name="provisioning",
+                        collective=CollectiveRequirement("provisioning", (0, 1)),
+                        prepare_call=lambda state: _prepare_plain_call(
+                            state, inp=source, out=out
+                        ),
+                    ),
+                ),
+                coordinator=lambda progress: progress.ready_collectives[0].key
+                if progress.ready_collectives
+                else None,
+            )
+            state = plan.prepared.state
+            state.run_plain(source, out)
+            torch.cuda.synchronize()
+            with torch.cuda.graph(graph):
+                state.run_plain(source, out)
+            for value in (1, 3, 2):
+                source.fill_(value * (rank + 1))
+                graph.replay()
+                torch.cuda.synchronize()
+                torch.testing.assert_close(
+                    out, torch.full_like(out, value * 3), rtol=0, atol=0
+                )
+        finally:
+            graph.reset()
+            session.close()
+            manager.close()
+
+
+@pytest.mark.skipif(
+    os.environ.get("B12X_RUN_JOINT_PCIE_TEST") != "1",
+    reason="requires an assigned peer-accessible GPU group",
+)
+def test_static_and_joint_workspace_provisioning(tmp_path):
+    import torch
+    import torch.multiprocessing as mp
+
+    if torch.cuda.device_count() < 2:
+        pytest.skip("insufficient assigned GPUs")
+    mp.spawn(
+        _worker, args=(2, str(tmp_path), "provisioning", False), nprocs=2, join=True
     )
