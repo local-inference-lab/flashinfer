@@ -179,6 +179,7 @@ def main():
     parser.add_argument("--capacity-bytes", type=int, default=0)
     parser.add_argument("--tuning-cache-dir", type=Path)
     parser.add_argument("--dtype", choices=("bfloat16", "float16"), default="bfloat16")
+    parser.add_argument("--cpu-threads", type=int, default=1)
     parser.add_argument("--threads", type=int, default=256)
     parser.add_argument("--blocks", type=int, default=16)
     parser.add_argument("--samples", type=int, default=7)
@@ -219,12 +220,12 @@ def main():
         for arm in arms
     ):
         parser.error("unknown comparison arm")
-    if min(args.samples, args.replays, args.chain, args.warmup) <= 0:
-        parser.error("measurement counts must be positive")
+    if min(args.samples, args.replays, args.chain, args.warmup, args.cpu_threads) <= 0:
+        parser.error("measurement counts and CPU threads must be positive")
     rank = int(os.environ["RANK"])
     device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
     torch.cuda.set_device(device)
-    torch.set_num_threads(1)
+    torch.set_num_threads(args.cpu_threads)
     import b12x
     import flashinfer
 

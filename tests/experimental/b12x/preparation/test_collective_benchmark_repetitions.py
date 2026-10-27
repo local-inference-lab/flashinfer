@@ -39,6 +39,10 @@ def test_grouped_fused_count_uses_residual_rows(inplace):
             "input_addend": False,
             "group_size": 3,
             "group_ids_dtype": "int32",
+            "group_id_limit": 1,
+            "reduction_dtype": None,
+            "output_dtype": "bfloat16",
+            "zero_centered": False,
         },
     )
     inputs = _ReductionInputs(
