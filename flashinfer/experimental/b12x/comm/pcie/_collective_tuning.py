@@ -291,6 +291,11 @@ def _family_bucket(query):
             eager_buffer_bytes=setup.get("eager_buffer_bytes"),
             eager_storage_shards=setup.get("eager_storage_shards"),
             registered=setup.get("registered"),
+            shard_storage={
+                field: setup[field]
+                for field in ("max_rows", "pack_stride", "slot_bytes", "slots")
+                if field in setup
+            },
         )
     if len(sizes) != 1:
         raise ValueError("collective alternatives disagree on payload size")
