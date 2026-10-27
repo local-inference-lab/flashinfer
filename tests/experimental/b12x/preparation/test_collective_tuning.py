@@ -501,3 +501,114 @@ def test_cancelled_collective_progress_retains_completed_measurements(
         assert result.selections["partial"].source == "default"
         assert result.benchmarked_candidates == 1
         assert snapshots[-1].completed_candidates == snapshots[-1].total_candidates == 1
+
+
+def test_collective_catalog_rejects_rank_divergent_finalist_policy():
+    from threading import Event
+    from types import SimpleNamespace
+    from b12x.preparation import FinalistPolicy, PreparedCall
+    from b12x.preparation._collective import select
+    from .test_defaults import Config, contract
+
+    tuning = replace(
+        contract(), collective_signature=lambda query: {"rows": query.rows}
+    )
+    req = replace(
+        request(
+            name="collective",
+            tuning=tuning,
+            collective=CollectiveRequirement("reduce", (0, 1)),
+            benchmark=lambda state: PreparedCall(run=lambda: None),
+        ),
+        finalist_policy=FinalistPolicy(family_fields=("width",)),
+    )
+    job = SimpleNamespace(
+        _choice_key=lambda obligation, selections: "local-query",
+        session=SimpleNamespace(
+            device=SimpleNamespace(uuid="rank-device"),
+            cache_only=False,
+            rounds=7,
+            samples=2,
+            _stop=Event(),
+        ),
+    )
+    obligation = SimpleNamespace(
+        request=req, candidates=((FrozenMapping({"width": 1}), Config(1)),)
+    )
+    steps = select(job, obligation, {})
+    local = next(steps)
+    assert local.payload["finalist_policy"] == (("width",), 1, 16)
+    remote = replace(
+        local, payload=FrozenMapping({**local.payload, "finalist_policy": None})
+    )
+    with pytest.raises(ValueError, match="disagree on finalist_policy"):
+        steps.send((local, remote))
+
+
+def test_collective_finalist_rerace_preserves_ordinary_winner(tmp_path, monkeypatch):
+    from b12x.preparation import FinalistPolicy, PreparedCall
+    from b12x.preparation import _collective, _measurement
+    from .test_defaults import contract
+    from .test_session import _deterministic_timer, session
+
+    batches = []
+    closed = []
+    _deterministic_timer(monkeypatch, batches=batches)
+    monkeypatch.setattr(
+        _collective, "capture_benchmark_call", lambda call, **kwargs: call
+    )
+    ordinary_measure = _measurement.measure_race_steps
+
+    def measure(race, **kwargs):
+        result = yield from ordinary_measure(race, **kwargs)
+        if len(race.calls) == 3:
+            return _measurement.RaceMeasurements((1.0, 5.0, 2.0), 0)
+        return result
+
+    monkeypatch.setattr(_measurement, "measure_race_steps", measure)
+
+    def make(name):
+        return replace(
+            request(
+                name=name,
+                tuning=replace(
+                    contract(), collective_signature=lambda query: query.rows
+                ),
+                collective=CollectiveRequirement("finalists", (0, 1)),
+                benchmark=lambda state: PreparedCall(
+                    run=lambda: state.value,
+                    produce=lambda: None,
+                    close=lambda: closed.append(state.value),
+                ),
+            ),
+            finalist_policy=FinalistPolicy(family_fields=("width",)),
+        )
+
+    def coordinate(progress):
+        exchange = progress.ready_collective_tuning
+        if exchange is not None:
+            return (exchange, exchange)
+        if progress.ready_collectives:
+            return progress.ready_collectives[0].key
+        return None
+
+    with session(tmp_path) as engine:
+        result = engine.prepare((make("first"),), coordinator=coordinate)
+        assert result.selections["first"].config.width == 2
+        assert result.benchmarked_candidates == 3
+        finalists = result.finalists["first"]
+        assert {item.selection.config.width for item in finalists} == {1, 2, 4}
+        assert (
+            min(finalists, key=lambda item: item.latency_us).selection.config.width == 1
+        )
+    assert batches == [(3,), (3, 6), (6, 12), (3, 6, 12)]
+    assert sorted(closed) == [3, 3, 6, 12, 12]
+    with session(tmp_path) as engine:
+        cached = engine.prepare((make("restored"),), coordinator=coordinate)
+        assert cached.cache_hits == 1
+        assert cached.benchmarked_candidates == 0
+        assert cached.selections["restored"].config.width == 2
+        assert cached.finalists["restored"] == tuple(
+            replace(item, selection=replace(item.selection, source="cached"))
+            for item in finalists
+        )

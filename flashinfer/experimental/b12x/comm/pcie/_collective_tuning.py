@@ -271,7 +271,7 @@ def _collective_signature(query):
 
 TUNING = TuningContract(
     component_id="comm.pcie",
-    query_schema_version=4,
+    query_schema_version=5,
     config_schema_version=2,
     query_fields=frozenset(
         ("operation", "world_size", "rank", "alternatives", "default", "inplace")

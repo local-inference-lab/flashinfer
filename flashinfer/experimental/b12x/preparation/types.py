@@ -889,10 +889,8 @@ class PreparationRequest:
                 raise TypeError("finalist policy must be FinalistPolicy")
             if not isinstance(self.plan, Plan) or self.plan.override is not None:
                 raise ValueError("finalist policy requires an unpinned scalar Plan")
-            if self.collective is not None:
-                raise ValueError(
-                    "collective operator finalist metadata is not supported"
-                )
+            if self.collective is not None and self.finalist_policy.per_family != 1:
+                raise ValueError("collective finalists retain one winner per family")
             if self.benchmark_call is None:
                 raise ValueError(
                     "finalist policy requires a representative benchmark call"

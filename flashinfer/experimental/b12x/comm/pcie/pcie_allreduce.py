@@ -482,6 +482,7 @@ class PCIeAllReduce:
         channel_id: Optional[str] = None,
         invocation: FrozenMapping = FrozenMapping(),
         override: PcieConfig | CollectiveConfig | None = None,
+        joint_only: bool = False,
         **call,
     ) -> Plan:
         """Select an existing native channel once, then declare its plan.
@@ -536,6 +537,20 @@ class PCIeAllReduce:
                     alternatives["twoshot"] = (native, twoshot)
                     if self._use_bf16_twoshot(inp, output):
                         default = "twoshot"
+                if joint_only:
+                    from ._joint_profile import JOINT_FAMILIES
+
+                    alternatives = {
+                        name: value
+                        for name, value in alternatives.items()
+                        if name in JOINT_FAMILIES
+                    }
+                    if not alternatives:
+                        raise ValueError(
+                            "joint-only planning requires a provisioned BF16 joint channel"
+                        )
+                    if default not in alternatives:
+                        default = next(iter(alternatives))
                 return collective_plan(
                     alternatives,
                     default=default,
@@ -543,6 +558,10 @@ class PCIeAllReduce:
                     invocation=invocation,
                     override=override,
                 )
+        if joint_only:
+            raise ValueError(
+                "joint-only planning requires a staged all-peer BF16 collective"
+            )
         if operation == "all_reduce" and self._use_bf16_twoshot(inp, call.get("out")):
             query = query_from_runtime(
                 self._bf16_twoshot,

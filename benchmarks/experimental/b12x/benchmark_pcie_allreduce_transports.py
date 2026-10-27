@@ -359,6 +359,8 @@ def main():
             "portable-best",
             "joint-latency",
             "joint-bandwidth",
+            "joint-latency-control",
+            "joint-bandwidth-control",
             "joint-latency-tuned",
             "joint-bandwidth-tuned",
             "oneshot-tuned",
@@ -370,8 +372,11 @@ def main():
         for arm in arms
     ):
         parser.error("unknown comparison arm")
-    if any(arm.startswith("portable-") for arm in arms) and family_configs is None:
-        parser.error("portable arms require explicit family configurations")
+    if (
+        any(arm.startswith("portable-") or arm.endswith("-control") for arm in arms)
+        and family_configs is None
+    ):
+        parser.error("pinned comparison arms require explicit family configurations")
     if min(args.samples, args.replays, args.chain, args.warmup, args.cpu_threads) <= 0:
         parser.error("measurement counts and CPU threads must be positive")
     rank = int(os.environ["RANK"])
