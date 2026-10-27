@@ -3083,6 +3083,7 @@ class PreparationJob:
                     obligation.selection = self._selection(
                         obligation, configuration.default, source
                     )
+                completed_before_selection = self._benchmarked + self._restored
                 if obligation.selection is None:
                     yield from self._describe_candidates(obligation)
                     self._phase = "selecting"
@@ -3095,7 +3096,12 @@ class PreparationJob:
                     else:
                         self._lookup(obligation, selections)
                 if obligation.selection is not None and obligation.planned_candidates:
-                    self._total_candidates -= obligation.planned_candidates
+                    completed_during_selection = (
+                        self._benchmarked + self._restored - completed_before_selection
+                    )
+                    self._total_candidates -= (
+                        obligation.planned_candidates - completed_during_selection
+                    )
                     obligation.planned_candidates = 0
                 if obligation.selection is None:
                     if self.session.cache_only:

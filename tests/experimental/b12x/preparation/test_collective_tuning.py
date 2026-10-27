@@ -391,3 +391,109 @@ def test_adaptive_collective_explicit_round_limit(host_timing, rounds):
     prepared, _ = _adaptive_measure(timers, rounds=rounds)
     assert prepared.completed_rounds == min(rounds, 15)
     assert tuple(timer.replays for timer in timers) == (min(rounds, 15),) * 2
+
+
+@pytest.mark.parametrize("cached", [(), (3,), (3, 5, 7)])
+def test_preparation_progress_counts_collective_and_local_measurements(
+    tmp_path, monkeypatch, cached
+):
+    from b12x.preparation import PreparedCall
+    from b12x.preparation import _collective
+    from .test_defaults import Query, contract
+    from .test_session import _deterministic_timer, session
+
+    _deterministic_timer(monkeypatch)
+    monkeypatch.setattr(_collective, "capture_benchmark_call", lambda call: call)
+
+    def requests(rows):
+        items = []
+        for row in rows:
+            tuning = contract(values=(1, 2, 4))
+            collective = None
+            if row != 7:
+                tuning = replace(tuning, collective_signature=lambda query: query.rows)
+                collective = CollectiveRequirement(f"group/{row}", (0, 1))
+            item = request(
+                name=f"rows-{row}",
+                tuning=tuning,
+                collective=collective,
+                benchmark=lambda state: PreparedCall(
+                    run=lambda: state.value, produce=lambda: None
+                ),
+            )
+            items.append(replace(item, plan=replace(item.plan, query=Query(row))))
+        return tuple(items)
+
+    def coordinate(progress):
+        if progress.ready_collective_tuning is not None:
+            exchange = progress.ready_collective_tuning
+            return (exchange, exchange)
+        if progress.ready_collectives:
+            return progress.ready_collectives[0].key
+        return None
+
+    if cached:
+        with session(tmp_path) as engine:
+            engine.prepare(requests(cached), coordinator=coordinate)
+    snapshots = []
+    with session(tmp_path) as engine:
+        result = engine.prepare(
+            requests((3, 5, 7)), coordinator=coordinate, progress=snapshots.append
+        )
+        expected = 3 * (3 - len(cached))
+        assert result.benchmarked_candidates == expected
+        assert result.cache_hits == len(cached)
+        assert result.restored_candidates == 0
+        for row in (3, 5, 7):
+            assert result.selections[f"rows-{row}"].source == (
+                "cached" if row in cached else "tuned"
+            )
+        final = snapshots[-1]
+        assert final.completed_candidates == final.total_candidates == expected
+        assert all(
+            snapshot.completed_candidates <= snapshot.total_candidates
+            for snapshot in snapshots
+            if snapshot.total_candidates is not None
+        )
+
+
+def test_cancelled_collective_progress_retains_completed_measurements(
+    tmp_path, monkeypatch
+):
+    from b12x.preparation import PreparedCall
+    from b12x.preparation import _collective
+    from .test_defaults import contract
+    from .test_session import _deterministic_timer, session
+
+    _deterministic_timer(monkeypatch)
+    monkeypatch.setattr(_collective, "capture_benchmark_call", lambda call: call)
+    item = request(
+        name="partial",
+        tuning=replace(contract(), collective_signature=lambda query: query.rows),
+        collective=CollectiveRequirement("group/partial", (0, 1)),
+        benchmark=lambda state: PreparedCall(
+            run=lambda: state.value, produce=lambda: None
+        ),
+    )
+
+    def coordinate(progress):
+        exchange = progress.ready_collective_tuning
+        if exchange is not None:
+            if exchange.step == "bound/1":
+                exchange = replace(
+                    exchange,
+                    payload=FrozenMapping({**exchange.payload, "cancel": True}),
+                )
+            return (exchange, exchange)
+        if progress.ready_collectives:
+            return progress.ready_collectives[0].key
+        return None
+
+    snapshots = []
+    with session(tmp_path) as engine:
+        result = engine.prepare(
+            (item,), coordinator=coordinate, progress=snapshots.append
+        )
+        assert result.selections["partial"].source == "default"
+        assert result.benchmarked_candidates == 1
+        assert snapshots[-1].completed_candidates == snapshots[-1].total_candidates == 1
