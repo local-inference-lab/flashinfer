@@ -24,7 +24,8 @@ class _Cancelled(Exception):
 
 def family_bucket(obligation):
     request = obligation.request
-    callback = request.plan.contract.collective_family_bucket
+    contract = request.plan.contract
+    callback = contract.collective_family_bucket
     space = obligation.configuration.space
     if (
         request.collective is None
@@ -43,7 +44,21 @@ def family_bucket(obligation):
     field, identity, size = bucket
     if len({assignment[field] for assignment, _ in obligation.candidates}) <= 2:
         return None
-    return field, identity, size
+    return (
+        field,
+        dict(
+            contract=(
+                contract.component_id,
+                contract.query_schema_version,
+                contract.config_schema_version,
+                contract.semantic_version,
+                contract.candidate_contract_version,
+            ),
+            invocation=request.plan.invocation.to_dict(),
+            bucket=identity,
+        ),
+        size,
+    )
 
 
 def calibration_order(obligations):
@@ -58,8 +73,6 @@ def calibration_order(obligations):
         field, identity, size = bucket
         key = digest(
             (
-                obligation.request.plan.component_id,
-                obligation.request.plan.invocation.to_dict(),
                 obligation.request.collective.ranks,
                 field,
                 identity,
@@ -154,8 +167,6 @@ def select(job, obligation, selections):
         family_field, identity, _ = bucket
         bucket_key = digest(
             (
-                contract.component_id,
-                obligation.request.plan.invocation.to_dict(),
                 identity,
                 family_field,
                 tuple(peer["device"] for peer in peers),
