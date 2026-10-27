@@ -53,7 +53,7 @@ def _compile_hyperconnection(query_payload, config_payload, ordinal):
     if role == "grouped_rmsnorm" and not _uses_triton_reduction(query):
         weight_dtype = getattr(torch, query.weight_dtype)
         return native._compile(
-            ("rmsnorm", ordinal, streams, hidden, str(weight_dtype)),
+            ("rmsnorm", streams, hidden, str(weight_dtype)),
             native._GroupedRmsNorm(streams, hidden, False),
             3,
             device,
@@ -98,7 +98,7 @@ def _compile_hyperconnection(query_payload, config_payload, ordinal):
         )
     if role == "scaled_silu":
         return native._compile(
-            ("silu", ordinal, streams, query.lowrank),
+            ("silu", streams, query.lowrank),
             native._ScaledSilu(streams, query.lowrank),
             2,
             device,
@@ -107,7 +107,7 @@ def _compile_hyperconnection(query_payload, config_payload, ordinal):
         )
     if role == "combine":
         return native._compile(
-            ("combine", ordinal, streams, hidden),
+            ("combine", streams, hidden),
             native._Combine(streams, hidden),
             4,
             device,
@@ -121,7 +121,6 @@ def _compile_hyperconnection(query_payload, config_payload, ordinal):
         return native._compile(
             (
                 "combine_norm_packed" if packed else "combine_norm",
-                ordinal,
                 streams,
                 hidden,
                 str(weight_dtype),
@@ -151,7 +150,7 @@ def _compile_hyperconnection(query_payload, config_payload, ordinal):
         )
     if role == "engram_mix":
         return native._compile(
-            ("engram_mix", ordinal, streams, hidden, query.token_mask),
+            ("engram_mix", streams, hidden, query.token_mask),
             native._EngramMix(streams, hidden, query.token_mask),
             5,
             device,
@@ -173,7 +172,6 @@ def _compile_hyperconnection(query_payload, config_payload, ordinal):
         width = hidden if role in ("swiglu", "head_gate") else 1
         key = (
             role,
-            ordinal,
             *(str(dtype) for dtype in dtypes),
             width,
             None if query.limit == float("inf") else query.limit,
