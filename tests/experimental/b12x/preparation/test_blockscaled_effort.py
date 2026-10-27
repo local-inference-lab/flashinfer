@@ -120,3 +120,26 @@ def test_effort_is_captured_in_declaration_but_excluded_from_program_key(monkeyp
     assert payload == _compile_query_payload(replace(q, autotune_effort="off"))
     assert "autotune_effort" not in payload
     assert _decode_query(payload).autotune_effort == "default"
+
+
+@pytest.mark.parametrize("mode", ["auto", "quantized", "a16"])
+def test_register_rows_respect_activation_precision(mode):
+    from b12x.gemm.blockscaled._tuning import BlockscaledConfig
+
+    q = query("mxfp8", m=3, n=128, k=1280, activation_mode=mode)
+    configs = [config for _, config in TUNING.choices(q, DEVICE)]
+    assert any(config.quantized_backend == "register_rows" for config in configs) == (
+        mode != "a16"
+    )
+    assert TUNING.default_config(q, DEVICE).quantized_backend == "dense"
+    for config in configs:
+        TUNING.validate_config(q, config, DEVICE)
+    if mode != "a16":
+        config = BlockscaledConfig(mode="quantized", quantized_backend="register_rows")
+        for invalid in (
+            replace(q, num_tokens=9),
+            replace(q, source_contiguous=False),
+            replace(q, in_features=256, padded_in_features=256),
+        ):
+            with pytest.raises(ValueError, match="register rows"):
+                TUNING.validate_config(invalid, config, DEVICE)

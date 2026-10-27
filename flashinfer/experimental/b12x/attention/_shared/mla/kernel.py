@@ -1282,7 +1282,8 @@ class UnifiedDecodeKernel:
                     if tid == Int32(self.math_threads):
                         cute.arch.mbarrier_arrive(mbar_base)
                     cute.arch.mbarrier_wait(mbar_base, phase=0)
-            _exit_thread()
+            if cutlass.const_expr(not t.cluster_merge):
+                _exit_thread()
 
         # ════════════════════════════════════════════════════════════════════
         # IO WARP (PRODUCER) vs MATH WARPS (CONSUMER).
@@ -1831,6 +1832,7 @@ class UnifiedDecodeKernel:
                             else t.scale_format
                         ),
                         latent_scale_per_token=t.latent_scale_per_token,
+                        qk_accumulators=t.qk_accumulators,
                     )
                     qk = s2_qk_rope_bf16(
                         qk,
@@ -2214,6 +2216,10 @@ def _sparse_mla_decode_grid_flat_launch(
     native_dsv4_h16_override: bool | None = None,
     native_dsv41_fp8_override: bool | None = None,
     vector_q_override: bool | None = None,
+    qk_accumulators_override: int = 1,
+    cluster_merge_override: bool = False,
+    cluster_output: torch.Tensor | None = None,
+    cluster_sink: torch.Tensor | None = None,
     indexed_page_table: torch.Tensor | None = None,
     indexed_num_pages: int = 0,
     _prepared=None,
@@ -2359,6 +2365,23 @@ def _sparse_mla_decode_grid_flat_launch(
             + args[-2:]
         )
 
+    if cluster_merge_override:
+        if not fused_mapping or cluster_output is None or int(num_splits) != 8:
+            raise ValueError(
+                "cluster decode requires mapped dual-cache inputs and eight splits"
+            )
+        sink = mid_lse.as_strided((1,), (1,)) if cluster_sink is None else cluster_sink
+        args = (
+            args[:-2]
+            + (
+                _to_cute(
+                    cluster_output, cutlass.BFloat16, align=16, dynamic_layout=True
+                ),
+                _to_cute(sink, cutlass.Float32, align=4, dynamic_layout=True),
+            )
+            + args[-2:]
+        )
+
     # A published launch already owns the exact executable.  Its runtime ABI is
     # the pointer/scalar tuple above; do not rebuild traits, layouts, kernels, or
     # compile keys on serving replay.
@@ -2371,6 +2394,11 @@ def _sparse_mla_decode_grid_flat_launch(
         int(scale_format),
         fp8_rope=bool(fp8_rope),
         latent_scale_per_token=bool(latent_scale_per_token),
+    )
+    traits = replace(
+        traits,
+        qk_accumulators=int(qk_accumulators_override),
+        cluster_merge=bool(cluster_merge_override),
     )
     if native_dsv41_fp8:
         traits = replace(
@@ -2396,7 +2424,12 @@ def _sparse_mla_decode_grid_flat_launch(
     hpb = int(traits.hpb)
     d_v = int(traits.d_v)
 
-    kernel = UnifiedDecodeKernel(
+    kernel_type = UnifiedDecodeKernel
+    if cluster_merge_override:
+        from .cluster_decode import ClusterDecodeKernel
+
+        kernel_type = ClusterDecodeKernel
+    kernel = kernel_type(
         traits,
         layout,
         int(swa_page_size),
@@ -2422,6 +2455,7 @@ def _sparse_mla_decode_grid_flat_launch(
         native_dsv4_h16=native_dsv4_h16,
         native_dsv41_fp8=native_dsv41_fp8,
         vector_q=vector_q,
+        **({"has_sink": cluster_sink is not None} if cluster_merge_override else {}),
     )
     spec_fields = [
         key_field("model_type", traits.model_type),
@@ -2450,6 +2484,9 @@ def _sparse_mla_decode_grid_flat_launch(
         key_field("vector_q", int(vector_q)),
         key_field("v41_fp8_internal", int(v41_fp8_internal)),
         key_field("v41_heads_per_block", int(v41_heads_per_block)),
+        key_field("qk_accumulators", traits.qk_accumulators),
+        key_field("cluster_merge", int(traits.cluster_merge)),
+        key_field("cluster_sink", int(cluster_sink is not None)),
         tensor_key(
             "q_all",
             q_all,
@@ -2537,7 +2574,9 @@ def _sparse_mla_decode_grid_flat_launch(
         ),
         *spec_fields,
     )
-    if fused_mapping:
+    if cluster_merge_override:
+        entry = kernel.call_cluster
+    elif fused_mapping:
         entry = kernel.call_mapped_extra_pertok
     elif per_token_len:
         entry = kernel.call_extra_pertok if has_extra else kernel.call_pertok
@@ -2763,7 +2802,18 @@ def prepare_unified_decode_launch(
     topk = int(swa_indices.shape[1])
     extra_topk = int(indexed_indices.shape[1]) if has_extra else 0
     max_chunks = int(workspace.max_chunks_per_row)
-    if traits.model_type == ModelType.DSV41 and forced_num_splits is None:
+    if traits.cluster_merge:
+        if (
+            traits.model_type != ModelType.DSV41
+            or traits.fp8_internal
+            or heads % 16
+            or not has_extra
+            or return_lse
+            or max_chunks < 8
+        ):
+            raise ValueError("invalid cluster sparse-MLA arithmetic or geometry")
+        forced_num_splits = 8
+    elif traits.model_type == ModelType.DSV41 and forced_num_splits is None:
         forced_num_splits = int(workspace.num_chunks_value)
     dsv4_h16_allowed = bool(
         int(traits.model_type) == int(ModelType.DSV4)
@@ -2890,7 +2940,9 @@ def compile_unified_decode_launch(
     with compile_only_launches():
         run_unified_decode(prepared=prepared, resolved_programs=resolved, **run_kwargs)
     grid_count = int(prepared.h_blocks_full > 0) + int(prepared.rem_heads > 0)
-    expected = grid_count + 1 + int(prepared.return_lse)
+    expected = (
+        grid_count + int(not prepared.traits.cluster_merge) + int(prepared.return_lse)
+    )
     if len(resolved) != expected:
         raise RuntimeError(
             "unified decode preparation did not resolve every declared launcher: "
@@ -2901,7 +2953,7 @@ def compile_unified_decode_launch(
     launch = replace(
         prepared,
         grid_programs=tuple(resolved[:grid_count]),
-        merge_program=resolved[grid_count],
+        merge_program=None if prepared.traits.cluster_merge else resolved[grid_count],
         lse_program=resolved[-1] if prepared.return_lse else None,
     )
     return attach_programs(launch, *resolved)
@@ -3088,7 +3140,7 @@ def run_unified_decode(
                 raise RuntimeError(
                     "prepared unified decode is missing resident grid launchers"
                 )
-            if prepared.merge_program is None:
+            if prepared.merge_program is None and not prepared.traits.cluster_merge:
                 raise RuntimeError(
                     "prepared unified decode is missing its merge launcher"
                 )
@@ -3469,6 +3521,10 @@ def run_unified_decode(
                 if prepared is None
                 else prepared.native_dsv41_fp8,
                 vector_q_override=None if prepared is None else prepared.vector_q,
+                qk_accumulators_override=traits.qk_accumulators,
+                cluster_merge_override=traits.cluster_merge,
+                cluster_output=output if traits.cluster_merge else None,
+                cluster_sink=attn_sink if traits.cluster_merge else None,
                 indexed_page_table=indexed_page_table,
                 indexed_num_pages=int(indexed_k_cache.shape[0]) if has_extra else 0,
                 _prepared=prepared_program,
@@ -3488,6 +3544,9 @@ def run_unified_decode(
     if rem_heads:
         # REMAINDER tail head-block: preserve the physical tail block offset.
         _launch_grid(1, rem_heads, h_blocks_full)
+
+    if traits.cluster_merge:
+        return output
 
     from .merge import (
         build_sparse_mla_split_decode_merge_binding,
