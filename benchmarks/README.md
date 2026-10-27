@@ -47,6 +47,42 @@ cache writes, and communication. L2 eviction runs outside timed replay by
 default; `--no-flush-l2` disables it. CSV results retain actual layouts,
 selected configurations, numerical errors, cache policy, and raw timings.
 
+## Prepared BF16 router projection and top-k
+
+The experimental [router benchmark](experimental/b12x/benchmark_router_projection.py)
+compares tuned b12x projection plus top-k with a CuTe DSL single-launch prototype.
+Both round projection logits to BF16, break ties by descending expert ID, and
+return selected logits and normalized softmax weights in FP32. The fused kernel
+uses caller-owned logit scratch and completion counters; it is not selected by
+the serving runtime. Four warps cooperate on each expert by default, with eight
+warps per CTA. This SIMT kernel targets small decode batches; wider batches can
+be slower than the split path.
+
+```sh
+python -m benchmarks.experimental.b12x.benchmark_router_projection \
+  --device 10 --checkpoint /path/to/Qwen3.8-Flash-Next-FP4-Local \
+  --layers 0 23 47 mtp --rows 1 2 3 4 5 6 --output /tmp/router.json
+```
+
+Activations are synthetic. Without `--checkpoint`, weights are synthetic too.
+The default geometry is 2560 inputs, 512 experts, and top-10 routing. Correctness
+checks require exact expert IDs against BF16 projection and stable sorting,
+check selected logits and weights, and replay changed inputs and all-zero ties
+with poisoned scratch and fixed allocations. A failed check prevents timing.
+The reference disables reduced-precision BF16 partial reductions for its matmul,
+then restores the setting before executing either measured implementation.
+The preparation session remains alive and frozen through measurement.
+
+Timings cover the complete operation and counter recycling in captured graphs,
+using balanced rounds from `b12x.testing.benchmark.measure_calls`. The default
+128 MiB L2 eviction runs outside timing; `--eviction-mib 0` measures warm-cache
+replay. JSON retains per-layer/per-shape timings, raw samples, the selected split
+projection configuration, and the fused `--rows-per-tile`, `--warps`, and
+`--warps-per-expert` geometry.
+Use `--implementations split` for the control alone or `--check-only` to validate
+without timing. These component timings do not measure expert overlap or model
+throughput.
+
 ## Overview
 
 This framework provides tools to:

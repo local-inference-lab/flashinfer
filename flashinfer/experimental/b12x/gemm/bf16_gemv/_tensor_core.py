@@ -104,6 +104,22 @@ class TensorCoreGemvKernel:
         weight_stride: Int64,
         output_stride: Int64,
     ):
+        self.project_tile(
+            x, weight, output, rows, x_stride, weight_stride, output_stride, Int32(0)
+        )
+
+    @cute.jit
+    def project_tile(
+        self,
+        x: cute.Tensor,
+        weight: cute.Tensor,
+        output: cute.Tensor,
+        rows: Int32,
+        x_stride: Int64,
+        weight_stride: Int64,
+        output_stride: Int64,
+        first_row: Int32,
+    ):
         thread, _, _ = cute.arch.thread_idx()
         block, _, _ = cute.arch.block_idx()
         warp = Int32(thread) // _LANES
@@ -115,7 +131,7 @@ class TensorCoreGemvKernel:
         # stores are masked.
         row_a = cutlass.min(first + group, Int32(self.n - 1))
         row_b = cutlass.min(first + group + 8, Int32(self.n - 1))
-        token = cutlass.min(group, rows - 1)
+        token = cutlass.min(first_row + group, rows - 1)
         weight_base = get_ptr_as_int64(weight, Int64(0))
         x_base = get_ptr_as_int64(x, Int64(0))
         acc0 = Float32(0.0)
@@ -167,7 +183,7 @@ class TensorCoreGemvKernel:
                 for w in cutlass.range_constexpr(self.warps):
                     total = total + partials[Int32(w * _LANES * 4) + lane * 4 + e]
                 feature = first + group + (8 if e >= 2 else 0)
-                row = quad * 2 + (e % 2)
+                row = first_row + quad * 2 + (e % 2)
                 if feature < self.n and row < rows:
                     output[Int64(row) * output_stride + Int64(feature)] = total.to(
                         BFloat16
