@@ -2330,7 +2330,7 @@ def get_oneshot_launcher(
         1,
         1,
         current_cuda_stream(),
-        compile_spec=KernelCompileSpec.from_key("comm.pcie.oneshot", 5, cache_key),
+        compile_spec=KernelCompileSpec.from_key("comm.pcie.oneshot", 6, cache_key),
     )
 
     def run(
@@ -2610,7 +2610,7 @@ def get_fused_oneshot_launcher(
         _dummy(cutlass.Uint32, 4),
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
-            "comm.pcie.oneshot_fused_rmsnorm", 9, cache_key
+            "comm.pcie.oneshot_fused_rmsnorm", 10, cache_key
         ),
     )
 

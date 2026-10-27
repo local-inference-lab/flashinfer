@@ -458,7 +458,7 @@ def pcie_arrive_and_wait(
     loc=None,
     ip=None,
 ) -> None:
-    """One lane of the sense-alternating, system-scope PCIe barrier."""
+    """Publish prior writes and acquire peer writes through alternating flags."""
     llvm.inline_asm(
         None,
         [
@@ -483,7 +483,7 @@ def pcie_arrive_and_wait(
             add.u64 wait_addr, $2, slot_off;
             st.relaxed.sys.global.u32 [peer_addr], val;
         wait_again:
-            ld.relaxed.sys.global.u32 seen, [wait_addr];
+            ld.acquire.sys.global.u32 seen, [wait_addr];
             setp.eq.u32 done, seen, val;
             @!done bra wait_again;
         }
