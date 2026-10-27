@@ -2618,8 +2618,10 @@ def _w4a8_mx_micro_supported(
             )
         )
     if source_format == "fp4_e8m0_k32" and n % 128 == 64:
+        # The compact micro kernel grid-strides any token count; the 16-token
+        # preference is a heuristic choice, not a capability limit.
         return bool(
-            1 <= num_tokens <= _COMPACT_W4A8_MAX_TOKENS
+            1 <= num_tokens
             and k % 256 == 0
             and activation == "silu"
             and 0 < num_topk <= 32
@@ -2651,6 +2653,14 @@ def _w4a8_mx_micro_preferred(
         source_format=query.source_format,
         deterministic_output=query.deterministic_output,
     ):
+        return False
+    if (
+        query.source_format == "fp4_e8m0_k32"
+        and query.intermediate_size % 128 == 64
+        and query.num_tokens > _COMPACT_W4A8_MAX_TOKENS
+    ):
+        # No-tune heuristic: compact decode stays on the per-row micro kernel
+        # only through 16 tokens. Larger launches race it instead.
         return False
     capability = (
         device.compute_capability
@@ -3865,8 +3875,24 @@ def _plan_core_workspace(
         _TensorAllocSpec("barrier_epoch", (barrier_slots,), torch.int32, init="zeros"),
     )
     if implementation == "micro":
-        micro_rows_pad_k = align_up(max_rows, 128)
-        packed_input_shape = (state_E, max_rows, k // 2)
+        compact_micro = (
+            quant_mode == "w4a8_mx"
+            and source_format == "fp4_e8m0_k32"
+            and n % 128 == 64
+        )
+        if compact_micro:
+            # The compact launch reads `micro_intermediate` and the caller's
+            # operands; the legacy packed-input route is unused. Size those
+            # binding slots minimally instead of (routed_rows, routed_rows, k/2).
+            micro_rows_pad_k = 1
+            packed_input_shape = (1, 1, k // 2)
+            token_map_shape = (1, 1)
+            token_weights_shape = (1, 1)
+        else:
+            micro_rows_pad_k = align_up(max_rows, 128)
+            packed_input_shape = (state_E, max_rows, k // 2)
+            token_map_shape = (state_E, max_rows)
+            token_weights_shape = (state_E, max_rows)
         packed_input_dtype = torch.uint8
         micro_intermediate_elements = state_E * n
         if quant_mode == "w4a8_mx":
@@ -3932,10 +3958,10 @@ def _plan_core_workspace(
             tensor_specs=common_specs
             + (
                 _TensorAllocSpec(
-                    "token_map", (state_E, max_rows), torch.int32, init="zeros"
+                    "token_map", token_map_shape, torch.int32, init="zeros"
                 ),
                 _TensorAllocSpec(
-                    "token_weights", (state_E, max_rows), torch.float32, init="zeros"
+                    "token_weights", token_weights_shape, torch.float32, init="zeros"
                 ),
                 _TensorAllocSpec(
                     "packed_input", packed_input_shape, packed_input_dtype
