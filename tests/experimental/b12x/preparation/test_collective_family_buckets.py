@@ -1,6 +1,6 @@
 """Collective calibration selects two families before per-request launch races."""
 
-from dataclasses import replace
+from dataclasses import asdict, dataclass, replace
 from types import SimpleNamespace
 
 import pytest
@@ -8,6 +8,7 @@ import pytest
 from b12x.preparation import (
     CollectiveRequirement,
     FrozenMapping,
+    Knob,
     ParameterSpace,
     PreparedCall,
     autotune_effort,
@@ -149,6 +150,41 @@ def test_custom_benchmark_does_not_share_builtin_calibration(tmp_path, host_race
         result = engine.prepare(items, coordinator=coordinate)
         assert result.benchmarked_candidates == 6
         assert not engine._collective_family_buckets
+
+
+def test_shortlist_retains_every_launch_configuration_of_both_families(
+    tmp_path, host_races
+):
+    from b12x.preparation._efficiency import capture_autotune_effort
+
+    @dataclass(frozen=True)
+    class Config:
+        width: int
+        blocks: int
+
+    knobs = (Knob(name="width", values=(1, 2, 4)), Knob(name="blocks", values=(1, 2)))
+    items = []
+    for item in declarations((3, 5)):
+        tuning = replace(
+            item.plan.contract,
+            config_fields=frozenset(("width", "blocks")),
+            encode_config=asdict,
+            decode_config=lambda payload: Config(**payload),
+            validate_config=lambda query, config, device: None,
+            default_config=lambda query, device: Config(2, 1),
+            knobs=knobs,
+            parameters=lambda query, device: ParameterSpace(
+                knobs=knobs, autotune_effort=capture_autotune_effort()
+            ),
+            materialize=lambda query, device, assignment: Config(**assignment),
+        )
+        items.append(replace(item, plan=replace(item.plan, contract=tuning)))
+    with session(tmp_path) as engine:
+        result = engine.prepare(items, coordinator=coordinate)
+        assert result.benchmarked_candidates == 10
+        assert result.coverage["rows-5"]["measured_count"] == 6
+        assert result.coverage["rows-3"]["measured_count"] == 4
+        assert result.coverage["rows-3"]["bucket_pruned_count"] == 2
 
 
 def test_plain_buckets_follow_bytes_and_preserve_collective_semantics():
