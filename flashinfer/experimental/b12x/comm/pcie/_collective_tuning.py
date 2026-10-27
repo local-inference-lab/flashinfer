@@ -113,6 +113,31 @@ def _configs(query):
                     )
 
 
+def _efficient_plain_grid(query, value):
+    name = value["implementation"]
+    if query.operation != "all_reduce" or name not in (
+        "pull",
+        "tp2_remote_push",
+        "tp2_remote_push_simple",
+        "remote_push_ll",
+        "remote_push_simple",
+        "remote_push_full",
+        "remote_push_rsag",
+    ):
+        return True
+    call = query.alternatives[name]["call"]
+    if not call.get("stage_input") or call.get("dtype") not in ("float16", "bfloat16"):
+        return True
+    from .pcie_oneshot import _MAX_BLOCKS
+
+    # Retain maximum grids at every thread count even for arbitrarily large payloads.
+    if value["blocks"] == _MAX_BLOCKS:
+        return True
+    units = int(call["size_packs"]) * (2 if name == "tp2_remote_push" else 1)
+    # Only exclude extreme serialization; idle blocks can affect synchronization latency.
+    return units <= 1024 * value["threads"] * value["blocks"]
+
+
 def _parameters(query, device):
     configs = tuple(dict.fromkeys(_configs(query)))
     effort = capture_autotune_effort()
@@ -146,6 +171,8 @@ def _parameters(query, device):
                 or query.default.implementation == "pull"
                 or query.operation == "all_reduce"
             ),
+            lambda value: effort is AutotuneEffort.OFF
+            or _efficient_plain_grid(query, value),
         ),
         autotune_effort=effort,
     )
