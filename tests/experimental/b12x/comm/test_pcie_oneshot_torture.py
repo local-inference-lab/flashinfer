@@ -821,6 +821,134 @@ def test_tp2_concurrent_simple_graphs(monkeypatch: pytest.MonkeyPatch):
     )
 
 
+def _concurrent_tagged_graph_worker(rank, world_size, port, transports):
+    torch.cuda.set_device(rank)
+    device = torch.device("cuda", rank)
+    dist.init_process_group(
+        "nccl", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=world_size
+    )
+    pool = PCIeOneshotAllReducePool.from_process_group(
+        process_group=dist.group.WORLD,
+        device=device,
+        max_input_bytes=2048 * 16,
+        max_concurrent_channels=2,
+    )
+    prepared = ExitStack()
+    captures = []
+    try:
+        channel_ids = ("graph:tagged-a", "graph:tagged-b")
+        pool.prepare_channels(channel_ids)
+        for index, (channel_id, transport) in enumerate(zip(channel_ids, transports)):
+            source = torch.zeros(
+                (1025 if index == 0 else 37) * 8,
+                device=device,
+                dtype=torch.bfloat16 if index == 0 else torch.float16,
+            )
+            output = torch.empty_like(source)
+            stream = torch.cuda.Stream(device=device)
+            stream.wait_stream(torch.cuda.current_stream(device))
+            graph = torch.cuda.CUDAGraph()
+            with pool.capture(stream, channel_id=channel_id) as channel:
+                with torch.cuda.stream(stream):
+                    declaration = _prepare_plan(
+                        prepared, channel, source, output, plain_transport=transport
+                    )
+                with torch.cuda.graph(graph, stream=stream):
+                    channel.all_reduce(source, plan=declaration, out=output)
+            stream.synchronize()
+            epoch = _read_local_u32(
+                channel, channel.signal_ptrs[rank] + _PLAIN_GRAPH_EPOCH_OFFSET, stream
+            )
+            captures.append((stream, graph, source, output, channel, epoch))
+
+        for peer in range(world_size):
+            regions = [
+                pointer
+                for _, _, _, _, channel, _ in captures
+                for pointer in (
+                    channel.signal_ptrs[peer],
+                    channel._eager_ptrs[0][peer],
+                    channel._eager_ptrs[1][peer],
+                )
+            ]
+            assert len(set(regions)) == len(regions)
+        counts = [0, 0]
+        with kernel_resolution_guard("concurrent multi-rank tagged graph replay"):
+            for iteration in range(TORTURE_PAYLOAD_ITERS):
+                markers = [4 * (iteration % 8) + 16 * index for index in range(2)]
+                for index, (_, _, source, output, _, _) in enumerate(captures):
+                    source.fill_(markers[index] + rank + 1)
+                    output.fill_(float("nan"))
+                for stream, _, _, _, _, _ in captures:
+                    stream.wait_stream(torch.cuda.current_stream(device))
+                before = torch.cuda.memory_stats(device)
+                for index, (stream, graph, _, _, _, _) in enumerate(captures):
+                    repetitions = 2 if index == iteration % 2 else 1
+                    with torch.cuda.stream(stream):
+                        for _ in range(repetitions):
+                            graph.replay()
+                    counts[index] += repetitions
+                for stream, _, _, _, _, _ in captures:
+                    stream.synchronize()
+                after = torch.cuda.memory_stats(device)
+                for key in (
+                    "allocation.all.allocated",
+                    "allocation.all.freed",
+                    "segment.all.allocated",
+                    "segment.all.freed",
+                ):
+                    assert before[key] == after[key]
+                for index, (stream, _, source, output, channel, epoch) in enumerate(
+                    captures
+                ):
+                    assert torch.all(source == markers[index] + rank + 1).item()
+                    expected = (
+                        world_size * markers[index] + world_size * (world_size + 1) // 2
+                    )
+                    assert torch.all(output == expected).item()
+                    assert (
+                        _read_local_u32(
+                            channel,
+                            channel.signal_ptrs[rank] + _PLAIN_GRAPH_EPOCH_OFFSET,
+                            stream,
+                        )
+                        == epoch + counts[index]
+                    )
+    finally:
+        for stream, graph, _, _, _, _ in captures:
+            stream.synchronize()
+            graph.reset()
+        prepared.close()
+        pool.close()
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize(
+    "transports",
+    (
+        ("remote_push_ll", "remote_push_ll"),
+        ("remote_push_simple", "remote_push_simple"),
+        ("remote_push_ll", "remote_push_simple"),
+    ),
+)
+def test_tp4_concurrent_tagged_graphs(transports):
+    if torch.cuda.device_count() < 4:
+        pytest.skip("TP4 concurrent tagged graphs require four CUDA devices")
+    if not all(
+        torch.cuda.can_device_access_peer(a, b)
+        for a in range(4)
+        for b in range(4)
+        if a != b
+    ):
+        pytest.skip("TP4 concurrent tagged graphs require full peer access")
+    mp.spawn(
+        _concurrent_tagged_graph_worker,
+        args=(4, _free_port(), transports),
+        nprocs=4,
+        join=True,
+    )
+
+
 def _simple_to_ll_tag_collision_worker(
     rank, world_size, port, dtype_name, delayed_rank
 ):

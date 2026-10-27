@@ -26,6 +26,7 @@ class _Timer:
     def __init__(self, *latencies_us):
         self.latencies_us = latencies_us
         self.replays = 0
+        self.repetitions = 1
         self.call = SimpleNamespace(capture_safe=False)
 
     def replay(self):
@@ -187,6 +188,7 @@ class _QueuedTimer:
         self.fail = fail
         self.replays = 0
         self.completed = 0
+        self.repetitions = 1
         self.call = SimpleNamespace(capture_safe=True)
 
     def replay(self):
@@ -299,3 +301,81 @@ def test_invalid_first_measurement_is_rejected_before_sizing_replays(
     with pytest.raises(RuntimeError, match="invalid latency"):
         _measure(_race((timer,)))
     assert timer.replays == 1
+
+
+def test_reduction_chain_budget_uses_complete_graph_duration(host_timing, monkeypatch):
+    monkeypatch.setattr(_measurement, "ROUND_BUDGET_US", 256)
+    timer = _Timer(2.0)
+    timer.repetitions = 100
+    prepared = _race((timer,))
+    result = _measure(prepared, rounds=3, eliminate=False)
+    assert result.latencies_us == (2.0,)
+    assert timer.replays == 6
+
+
+def test_timer_reports_per_reduction_latency():
+    from b12x.preparation import PreparedCall
+
+    timer = object.__new__(_measurement._TimedCall)
+    timer.call = PreparedCall(run=lambda: None, benchmark_repetitions=100)
+    timer.repetitions = 100
+    timer.events = ((SimpleNamespace(elapsed_time=lambda end: 0.25), object()),)
+    assert timer.samples() == (2.5,)
+
+
+def test_capture_repeats_only_operation_and_retains_live_producer(monkeypatch):
+    from b12x.preparation import PreparedCall
+
+    operations, producers = [], []
+    stream = SimpleNamespace(wait_stream=lambda other: None, synchronize=lambda: None)
+    graph = SimpleNamespace(reset=lambda: None, replay=lambda: None)
+
+    @contextmanager
+    def scope(*args, **kwargs):
+        yield
+
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", lambda: graph)
+    monkeypatch.setattr(torch.cuda, "Stream", lambda: stream)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: stream)
+    monkeypatch.setattr(torch.cuda, "stream", scope)
+    monkeypatch.setattr(torch.cuda, "graph", scope)
+    call = PreparedCall(
+        run=lambda: operations.append(1), produce=lambda: producers.append(1)
+    )
+    captured = _measurement.capture_benchmark_call(call, repetitions=100)
+    assert len(operations) == 102
+    assert len(producers) == 2
+    assert captured.benchmark_repetitions == 100
+    assert captured.produce is call.produce
+    captured.close()
+
+
+@pytest.mark.parametrize("count", [0, -1, True, 1.5])
+def test_capture_rejects_invalid_repetition_count(count):
+    from b12x.preparation import PreparedCall
+
+    with pytest.raises(ValueError, match="positive integer"):
+        _measurement.capture_benchmark_call(
+            PreparedCall(run=lambda: None), repetitions=count
+        )
+
+
+def test_raw_timer_does_not_normalize_requested_capture_repetitions(monkeypatch):
+    from b12x.preparation import PreparedCall
+
+    class Event:
+        def __init__(self, **kwargs):
+            pass
+
+        def record(self):
+            pass
+
+        def elapsed_time(self, end):
+            return 0.25
+
+    monkeypatch.setattr(torch.cuda, "Event", Event)
+    timer = _measurement._TimedCall(
+        PreparedCall(run=lambda: None, benchmark_repetitions=100), None, 1, None
+    )
+    assert timer.repetitions == 1
+    assert timer.samples() == (250.0,)

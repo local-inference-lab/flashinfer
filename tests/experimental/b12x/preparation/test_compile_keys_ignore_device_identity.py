@@ -192,6 +192,53 @@ def _probe(ordinal, uuid, capability, sm_count, connection):
             sms=sm_count,
             max_shared_mem=101376,
         )
+        from dataclasses import replace
+        from b12x.norm.hyperconnection._tuning import HyperConnectionQuery, TUNING
+
+        for operation in (
+            "grouped_rmsnorm",
+            "scaled_silu",
+            "combine",
+            "combine_norm",
+            "engram_mix",
+            "swiglu",
+            "relu2",
+            "add",
+            "sigmoid",
+            "head_gate",
+        ):
+            query = HyperConnectionQuery(
+                dtype="bfloat16",
+                max_tokens=128,
+                hidden_size=2560,
+                streams=4,
+                lowrank=320,
+                operation=operation,
+                output_mode="provided",
+                zero_centered=False,
+                weight_dtype="float32",
+            )
+            variants = (
+                ((2560, 8), (2560, 10), (2560, 16), (2559, 8))
+                if operation == "combine_norm"
+                else ((2560, None),)
+            )
+            for hidden, warps in variants:
+                variant = replace(query, hidden_size=hidden)
+                config = TUNING.default_config(variant, None)
+                if warps is not None:
+                    config = replace(config, reduction_num_warps=warps)
+                payload = TUNING.encode_query(variant)
+                payload.pop("autotune_effort")
+                jobs[f"hyperconnection_{operation}_{hidden}_{warps}"] = (
+                    CompileJob.create(
+                        "b12x.norm.hyperconnection._preparation:_compile_hyperconnection",
+                        payload,
+                        config.to_dict(),
+                        ordinal,
+                    )
+                )
+
         results = {}
         for name, job in jobs.items():
             try:
@@ -256,7 +303,21 @@ def test_program_keys_ignore_ordinals_and_uuids_but_preserve_hardware_geometry()
             name for name in results[0] if results[0][name] != results[1][name]
         ]
         assert all(results[0][name] != results[2][name] for name in results[0])
-        assert all(results[0][name] != results[3][name] for name in results[0])
+        for name, programs in results[0].items():
+            # Triton targets encode compute capability; CuTe also keys SM count.
+            if all(dialect == "triton" for dialect, _ in programs):
+                assert programs == results[3][name], name
+            else:
+                assert programs != results[3][name], name
+        assert (
+            len(
+                {
+                    tuple(results[0][f"hyperconnection_combine_norm_2560_{warps}"])
+                    for warps in (8, 10, 16)
+                }
+            )
+            == 3
+        )
     finally:
         for process in processes:
             if process.is_alive():

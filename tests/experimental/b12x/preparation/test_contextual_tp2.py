@@ -1,6 +1,7 @@
 """Two-rank contextual races score each replay by the slower GPU rank."""
 
 import json
+import time
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -85,6 +86,31 @@ def _rank(rank, rendezvous, result_dir):
                 dist.all_gather_object(peers, dict(payload))
                 return peers
 
+            for field in ("rounds", "samples", "producer_counts"):
+                mismatched = candidates
+                options = {"rounds": 3, "samples": 2}
+                if field == "producer_counts":
+                    mismatched = [
+                        replace(
+                            candidate,
+                            call=replace(
+                                candidate.call,
+                                benchmark_producers=(candidate.call.produce,)
+                                * (rank + 1),
+                            ),
+                        )
+                        for candidate in candidates
+                    ]
+                else:
+                    options[field] += rank
+                with pytest.raises(ValueError, match=field):
+                    session.race_contexts(
+                        mismatched,
+                        collective_exchange=exchange,
+                        collective_ranks=(0, 1),
+                        **options,
+                    )
+
             result = session.race_contexts(
                 candidates,
                 collective_exchange=exchange,
@@ -109,7 +135,20 @@ def test_tp2_context_uses_max_rank_samples(tmp_path):
     if torch.cuda.device_count() < 2:
         pytest.skip("two CUDA devices are required for TP2 contextual replay")
     rendezvous = tmp_path / "rendezvous"
-    mp.spawn(_rank, args=(str(rendezvous), str(tmp_path)), nprocs=2, join=True)
+    processes = mp.spawn(
+        _rank, args=(str(rendezvous), str(tmp_path)), nprocs=2, join=False
+    )
+    try:
+        deadline = time.monotonic() + 60
+        while not processes.join(timeout=1):
+            if time.monotonic() >= deadline:
+                pytest.fail("context ranks did not finish their agreed replay schedule")
+    finally:
+        for process in processes.processes:
+            if process.is_alive():
+                process.terminate()
+        for process in processes.processes:
+            process.join(timeout=5)
     ranks = [json.loads((tmp_path / f"rank{rank}.json").read_text()) for rank in (0, 1)]
     assert ranks[0] == ranks[1]
     assert ranks[0]["winner"] == "b"

@@ -1,6 +1,7 @@
 """Private operands and arithmetic checks for prepared PCIe tuning races."""
 
 from functools import partial
+from math import prod
 
 import torch
 
@@ -15,6 +16,11 @@ _DTYPES = {
     "float16": torch.float16,
     "float32": torch.float32,
 }
+
+
+def _reduction_repetitions(shape):
+    rows = prod(shape[:-1])
+    return max(1, (100 + rows - 1) // rows)
 
 
 class _ReductionInputs:
@@ -76,6 +82,9 @@ class _ReductionInputs:
                     dtype=getattr(torch, call["group_ids_dtype"]),
                     device=device,
                 )
+        self.repetitions = _reduction_repetitions(
+            tuple(query.setup["logical_shape"]) if self.fused else shape
+        )
         self.producers = tuple(
             partial(self.produce, index) for index in range(len(self.seeds))
         )
@@ -171,6 +180,7 @@ def benchmark_call(state, *, inplace=False):
         validate=inputs.validate,
         owners=(inputs, state.runtime),
         capture_context=None if dcp else state.runtime.capture,
+        benchmark_repetitions=1 if dcp else inputs.repetitions,
     )
 
 

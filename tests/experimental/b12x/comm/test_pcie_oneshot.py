@@ -152,6 +152,105 @@ def _make_runtime(
     )
 
 
+def _cpu_prepared_backend(monkeypatch, runtime):
+    """Keep native metadata/binding real and replace only GPU execution in CPU tests."""
+    recorded = runtime._ext
+    backend = _CuTeOneshotBackend()
+    native = _CuTeOneshotState(
+        rank=runtime.rank,
+        world_size=runtime.world_size,
+        signal_ptrs=runtime.signal_ptrs,
+        rank_data=runtime.rank_data,
+        signal_table_address=runtime.rank_data.data_ptr(),
+        next_table_offset=128,
+        registered_tables={},
+    )
+    backend._states[runtime._ptr] = native
+    monkeypatch.setattr(runtime, "_ext", backend)
+    monkeypatch.setattr(backend, "_device_index", lambda device: device.index)
+    monkeypatch.setattr(
+        _CuTeOneshotBackend, "_device_index", staticmethod(lambda device: device.index)
+    )
+    monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())
+    register = backend.register_buffer
+
+    def record_registration(handle, pointers):
+        recorded.register_buffer(handle, pointers)
+        register(handle, pointers)
+
+    monkeypatch.setattr(backend, "register_buffer", record_registration)
+    if runtime._eager_ptrs is not None:
+        backend.register_pcie_buffers(
+            runtime._ptr, *runtime._eager_ptrs, runtime.eager_buffer_bytes
+        )
+    return recorded
+
+
+def _cpu_prepared_call(
+    runtime, recorded, inp, out, *, residual=None, weight=None, residual_out=None
+):
+    from b12x.comm.pcie._oneshot_preparation import (
+        _OneshotExecutionState,
+        _prepare_plain_call,
+        _prepare_fused_call,
+        query_from_runtime,
+    )
+
+    fused = residual is not None
+    surface = "OneshotAllReduce." + (
+        "all_reduce_fused_add_rms_norm" if fused else "all_reduce"
+    )
+    query = query_from_runtime(
+        runtime,
+        surface=surface,
+        call={
+            "inp": inp,
+            "out": out,
+            "residual": residual,
+            "weight": weight,
+        },
+    )
+
+    def launch(*args, **kwargs):
+        assert args[2] == inp.data_ptr()
+        if fused:
+            assert args[3:7] == tuple(
+                t.data_ptr() for t in (residual, weight, out, residual_out)
+            )
+            recorded.all_reduce_fused_add_rms_norm(
+                runtime._ptr,
+                inp,
+                residual,
+                weight,
+                out,
+                residual_out,
+                args[12],
+                0,
+                0,
+            )
+        else:
+            assert args[3] == out.data_ptr()
+            assert args[4] * 16 == inp.numel() * inp.element_size()
+            recorded.all_reduce(runtime._ptr, inp, out, 0, 0)
+
+    state = _OneshotExecutionState(
+        query, runtime, {tuple(v): launch for v in query.setup["variants"]}
+    )
+    if fused:
+        call = _prepare_fused_call(
+            state,
+            inp=inp,
+            residual=residual,
+            weight=weight,
+            out=out,
+            residual_out=residual_out,
+            epsilon=1e-6,
+        )
+    else:
+        call = _prepare_plain_call(state, inp=inp, out=out)
+    return state, call
+
+
 def test_parse_pcie_oneshot_max_size_accepts_auto_and_suffixes():
     assert parse_pcie_oneshot_max_size(None) is None
     assert parse_pcie_oneshot_max_size("auto") is None
@@ -332,7 +431,7 @@ def _make_cute_state(
 @pytest.mark.parametrize(
     ("rows", "expected"),
     (
-        (1, ("tp2_remote_push", 64, 36)),
+        (1, ("tp2_remote_push", 128, 36)),
         (2, ("tp2_remote_push_simple", 128, 8)),
         (3, ("tp2_remote_push_simple", 128, 12)),
         (4, ("tp2_remote_push_simple", 128, 16)),
@@ -786,55 +885,67 @@ def test_register_buffer_rejects_mismatched_mapping_for_same_local_ptr():
         runtime.register_buffer((111, 333))
 
 
-def test_all_reduce_registers_explicit_peer_ptrs_once():
+def test_preparation_registers_explicit_peer_ptrs_once(monkeypatch):
     runtime = _make_runtime()
-    ext = runtime._ext
+    ext = _cpu_prepared_backend(monkeypatch, runtime)
     inp = torch.arange(8, dtype=torch.bfloat16)
-
-    out0 = runtime.all_reduce(inp, peer_input_ptrs=(inp.data_ptr(), 222))
-    out1 = runtime.all_reduce(inp, peer_input_ptrs=(inp.data_ptr(), 222))
-
+    runtime._prepare_input(inp, (inp.data_ptr(), 222))
+    runtime._prepare_input(inp, (inp.data_ptr(), 222))
+    out0, out1 = torch.empty_like(inp), torch.empty_like(inp)
+    _, first = _cpu_prepared_call(runtime, ext, inp, out0)
+    _, second = _cpu_prepared_call(runtime, ext, inp, out1)
+    first.run()
+    second.run()
     assert torch.equal(out0, inp)
     assert torch.equal(out1, inp)
     assert ext.register_buffer_calls == [(12345, (inp.data_ptr(), 222))]
     assert len(ext.all_reduce_calls) == 2
+    with pytest.raises(ValueError, match="registration belongs to oneshot preparation"):
+        runtime.all_reduce(inp, plan=None, peer_input_ptrs=(inp.data_ptr(), 222))
 
 
-def test_all_reduce_requires_registration_without_eager_buffers():
+def test_preparation_requires_registration_without_eager_buffers(monkeypatch):
     runtime = _make_runtime()
+    ext = _cpu_prepared_backend(monkeypatch, runtime)
     inp = torch.arange(8, dtype=torch.bfloat16)
-
     with pytest.raises(ValueError, match="peer_input_ptrs are required"):
-        runtime.all_reduce(inp)
+        runtime._prepare_input(inp, None)
+    with pytest.raises(ValueError, match="registered graph input is absent"):
+        _cpu_prepared_call(runtime, ext, inp, torch.empty_like(inp))
+    assert ext.all_reduce_calls == []
 
 
-def test_eager_buffers_allow_all_reduce_without_peer_ptrs():
+def test_eager_buffers_allow_prepared_all_reduce_without_peer_ptrs(monkeypatch):
     runtime = _make_runtime(eager=True)
-    ext = runtime._ext
+    ext = _cpu_prepared_backend(monkeypatch, runtime)
     inp = torch.arange(8, dtype=torch.bfloat16)
-
-    out = runtime.all_reduce(inp)
-
+    out = torch.empty_like(inp)
+    _, call = _cpu_prepared_call(runtime, ext, inp, out)
+    call.run()
     assert torch.equal(out, inp)
     assert ext.register_pcie_buffers_calls == [(12345, (200, 201), (300, 301))]
     assert ext.register_buffer_calls == []
     assert len(ext.all_reduce_calls) == 1
 
 
-def test_fused_add_rms_norm_returns_norm_and_residual_outputs():
+@pytest.mark.parametrize("weight_dtype", [torch.bfloat16, torch.float32])
+def test_prepared_fused_add_rms_norm_outputs(monkeypatch, weight_dtype):
     runtime = _make_runtime(eager=True)
-    ext = runtime._ext
+    ext = _cpu_prepared_backend(monkeypatch, runtime)
     inp = torch.arange(16, dtype=torch.bfloat16).reshape(2, 8) / 8
     residual = torch.linspace(-0.5, 0.5, 16, dtype=torch.bfloat16).reshape(2, 8)
-    weight = torch.linspace(0.75, 1.25, 8, dtype=torch.bfloat16)
-
-    out, residual_out = runtime.all_reduce_fused_add_rms_norm(
+    weight = torch.linspace(0.75, 1.25, 8, dtype=weight_dtype)
+    out, residual_out = torch.empty_like(inp), torch.empty_like(residual)
+    _, call = _cpu_prepared_call(
+        runtime,
+        ext,
         inp,
-        residual,
-        weight,
-        1e-6,
+        out,
+        residual=residual,
+        weight=weight,
+        residual_out=residual_out,
     )
-
+    call.run()
     expected_residual = inp + residual
     variance = expected_residual.float().square().mean(dim=-1, keepdim=True)
     expected_out = (
@@ -845,20 +956,23 @@ def test_fused_add_rms_norm_returns_norm_and_residual_outputs():
     assert len(ext.all_reduce_fused_add_rms_norm_calls) == 1
 
 
-def test_fused_add_rms_norm_supports_inplace_residual_output():
+def test_prepared_fused_add_rms_norm_inplace_residual(monkeypatch):
     runtime = _make_runtime(eager=True)
+    ext = _cpu_prepared_backend(monkeypatch, runtime)
     inp = torch.arange(8, dtype=torch.bfloat16).reshape(1, 8)
     residual = torch.ones_like(inp)
     original_residual_ptr = residual.data_ptr()
-
-    _, residual_out = runtime.all_reduce_fused_add_rms_norm(
+    _, call = _cpu_prepared_call(
+        runtime,
+        ext,
         inp,
-        residual,
-        torch.ones(8, dtype=torch.bfloat16),
-        1e-6,
+        torch.empty_like(inp),
+        residual=residual,
+        weight=torch.ones(8, dtype=torch.bfloat16),
         residual_out=residual,
     )
-
+    _, residual_out = call.output
+    call.run()
     assert residual_out.data_ptr() == original_residual_ptr
     torch.testing.assert_close(residual_out, inp + 1)
 
@@ -866,27 +980,35 @@ def test_fused_add_rms_norm_supports_inplace_residual_output():
 def test_fused_add_rms_norm_requires_pack_aligned_rows():
     runtime = _make_runtime(eager=True)
     inp = torch.arange(8, dtype=torch.bfloat16).reshape(2, 4)
-
     with pytest.raises(ValueError, match="last input dimension"):
         runtime.all_reduce_fused_add_rms_norm(
             inp,
             torch.zeros_like(inp),
             torch.ones(4, dtype=torch.bfloat16),
             1e-6,
+            plan=None,
         )
 
 
-def test_fused_add_rms_norm_validates_weight():
+def test_prepared_fused_add_rms_norm_validates_weight(monkeypatch):
     runtime = _make_runtime(eager=True)
+    ext = _cpu_prepared_backend(monkeypatch, runtime)
     inp = torch.arange(8, dtype=torch.bfloat16).reshape(1, 8)
-
-    with pytest.raises(ValueError, match="weight tensor"):
-        runtime.all_reduce_fused_add_rms_norm(
-            inp,
-            torch.zeros_like(inp),
-            torch.ones(8, dtype=torch.float32),
-            1e-6,
+    residual, out, residual_out = (torch.empty_like(inp) for _ in range(3))
+    state, _ = _cpu_prepared_call(
+        runtime,
+        ext,
+        inp,
+        out,
+        residual=residual,
+        weight=torch.ones(8, dtype=torch.bfloat16),
+        residual_out=residual_out,
+    )
+    with pytest.raises(ValueError, match="weight metadata differs"):
+        state.run_fused(
+            inp, residual, torch.ones(8, dtype=torch.float32), out, residual_out, 1e-6
         )
+    assert ext.all_reduce_fused_add_rms_norm_calls == []
 
 
 def test_world_size_10_is_supported_by_eager_pool():
@@ -922,7 +1044,6 @@ def test_world_size_10_is_supported_by_eager_pool():
 
 def test_runtime_rejects_reuse_from_another_stream_key(monkeypatch):
     runtime = _make_runtime(eager=True)
-    inp = torch.arange(8, dtype=torch.bfloat16)
     state = {"stream_key": 11}
 
     monkeypatch.setattr(
@@ -930,16 +1051,15 @@ def test_runtime_rejects_reuse_from_another_stream_key(monkeypatch):
         lambda device, stream=None: state["stream_key"],
     )
 
-    runtime.all_reduce(inp)
+    runtime._check_stream()
     state["stream_key"] = 22
 
     with pytest.raises(RuntimeError, match="stream-affine"):
-        runtime.all_reduce(inp)
+        runtime._check_stream()
 
 
 def test_runtime_can_disable_stream_affinity(monkeypatch):
     runtime = _make_runtime(eager=True, stream_affine=False)
-    inp = torch.arange(8, dtype=torch.bfloat16)
     state = {"stream_key": 11}
 
     monkeypatch.setattr(
@@ -947,9 +1067,9 @@ def test_runtime_can_disable_stream_affinity(monkeypatch):
         lambda device, stream=None: state["stream_key"],
     )
 
-    runtime.all_reduce(inp)
+    runtime._check_stream()
     state["stream_key"] = 22
-    runtime.all_reduce(inp)
+    runtime._check_stream()
 
 
 def test_should_allreduce_checks_device_dtype_size_alignment_and_contiguity():
@@ -1104,22 +1224,26 @@ def test_process_group_max_input_sets_threshold_and_capacity(
     assert captured["max_size"] == 1 << 20
 
 
-def test_autotune_never_benchmarks_past_eager_capacity(monkeypatch):
+def test_preparation_rejects_shapes_beyond_established_capacity(monkeypatch):
+    from b12x.comm.pcie._oneshot_preparation import query_from_metadata
+
     runtime = _make_runtime(eager=True, max_size=4096)
-    runtime.device = torch.device("cuda:0")
-    observed = {}
-
-    def fake_compute(benchmark, *, ceiling_bytes, fine_step_bytes):
-        observed["ceiling_bytes"] = ceiling_bytes
-        return ceiling_bytes, []
-
-    monkeypatch.setattr(
-        "b12x.comm.pcie.pcie_oneshot._compute_crossover_size", fake_compute
+    _cpu_prepared_backend(monkeypatch, runtime)
+    query = query_from_metadata(
+        runtime,
+        surface="OneshotAllReduce.all_reduce",
+        shape=(2048,),
+        dtype=torch.bfloat16,
     )
-    monkeypatch.setattr(torch.cuda, "Stream", lambda *, device: object())
-
-    assert runtime.find_crossover_size(object(), ceiling_bytes=1 << 20) == 4096
-    assert observed["ceiling_bytes"] == 4096
+    assert query.setup["eager_buffer_bytes"] == 4096
+    assert query.call["size_packs"] * 16 == 4096
+    with pytest.raises(ValueError, match="established runtime capacity"):
+        query_from_metadata(
+            runtime,
+            surface="OneshotAllReduce.all_reduce",
+            shape=(2056,),
+            dtype=torch.bfloat16,
+        )
 
 
 def test_graph_buffer_api_exposes_explicit_registration_hooks():

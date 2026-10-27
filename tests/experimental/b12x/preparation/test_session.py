@@ -2767,3 +2767,336 @@ def test_unrelated_materialization_value_error_remains_fatal(tmp_path, monkeypat
         with pytest.raises(ValueError, match="unrelated materialization failure"):
             engine.prepare((req,))
     assert attempted == [1]
+
+
+@pytest.mark.parametrize("equivalent", (False, True))
+def test_finalist_singleton_is_measured_and_cached(tmp_path, monkeypatch, equivalent):
+    _deterministic_timer(monkeypatch)
+    tuning = contract(default=2, values=(1, 2) if equivalent else (2,))
+    if equivalent:
+        tuning = replace(
+            tuning, equivalence_key=lambda query, device, config: {"same": 1}
+        )
+
+    def make():
+        return replace(
+            request(
+                name="singleton",
+                tuning=tuning,
+                benchmark=lambda state: PreparedCall(
+                    run=lambda: state.value, produce=lambda: None
+                ),
+            ),
+            finalist_policy=FinalistPolicy(family_fields=("width",)),
+        )
+
+    with session(tmp_path) as engine:
+        item = make()
+        result = engine.prepare((item,))
+        assert result.benchmarked_candidates == 1
+        assert len(result.finalists["singleton"]) == 1
+        assert result.finalists["singleton"][0].latency_us > 0
+        expected = result.finalists["singleton"][0].selection.config
+    with session(tmp_path) as engine:
+        result = engine.prepare((make(),))
+        assert result.cache_hits == 1
+        assert result.benchmarked_candidates == 0
+        assert result.finalists["singleton"][0].selection.config == expected
+
+
+def test_coalescing_separates_finalist_policies_for_distinct_plans(
+    tmp_path, monkeypatch
+):
+    _deterministic_timer(monkeypatch)
+    tuning = contract()
+    ordinary = request(
+        name="ordinary",
+        tuning=tuning,
+        shared=True,
+        benchmark=lambda state: PreparedCall(
+            run=lambda: state.value, produce=lambda: None
+        ),
+    )
+    shortlist = replace(
+        ordinary,
+        name="shortlist",
+        plan=replace(ordinary.plan),
+        finalist_policy=FinalistPolicy(family_fields=("width",)),
+    )
+    with session(tmp_path) as engine:
+        result = engine.prepare((ordinary, shortlist))
+        assert set(result.finalists) == {"shortlist"}
+        assert len(result.finalists["shortlist"]) == 3
+        assert ordinary.plan.prepared is not shortlist.plan.prepared
+        assert ordinary.plan.prepared.finalist_policy is None
+        assert shortlist.plan.prepared.finalist_policy == shortlist.finalist_policy
+        assert result.benchmarked_candidates == 6
+
+
+def test_same_plan_rejects_conflicting_finalist_policies_before_materialization(
+    tmp_path,
+):
+    calls = []
+    ordinary = request(
+        name="ordinary",
+        calls=calls,
+        benchmark=lambda state: PreparedCall(
+            run=lambda: state.value, produce=lambda: None
+        ),
+    )
+    shortlist = replace(
+        ordinary,
+        name="shortlist",
+        finalist_policy=FinalistPolicy(family_fields=("width",)),
+    )
+    with session(tmp_path) as engine:
+        with pytest.raises(ValueError, match="same Plan must agree"):
+            engine.prepare((ordinary, shortlist))
+        assert ordinary.plan.prepared is None
+        assert calls == []
+
+
+def test_cancelled_finalist_race_prepares_default_without_shortlist(
+    tmp_path, monkeypatch
+):
+    with session(tmp_path) as engine:
+        _deterministic_timer(monkeypatch, stop=engine.cancel_tuning)
+        item = replace(
+            request(
+                name="cancelled",
+                tuning=contract(),
+                benchmark=lambda state: PreparedCall(
+                    run=lambda: state.value, produce=lambda: None
+                ),
+            ),
+            finalist_policy=FinalistPolicy(family_fields=("width",)),
+        )
+        result = engine.prepare((item,))
+        assert result.selections["cancelled"].source == "default"
+        assert not result.finalists
+        assert item.plan.prepared.finalist_policy is None
+        assert not item.plan.prepared.finalists
+        assert not engine._cache.records
+
+
+@pytest.mark.parametrize("mode", ("disabled", "off"))
+def test_finalist_request_rejects_disabled_tuning_before_materialization(
+    tmp_path, monkeypatch, mode
+):
+    if mode == "off":
+        monkeypatch.setenv("B12X_AUTOTUNE_EFFORT", "off")
+    calls = []
+    item = replace(
+        request(
+            name="shortlist",
+            tuning=contract(),
+            calls=calls,
+            benchmark=lambda state: PreparedCall(
+                run=lambda: state.value, produce=lambda: None
+            ),
+        ),
+        finalist_policy=FinalistPolicy(family_fields=("width",)),
+    )
+    with session(tmp_path, autotune=mode != "disabled") as engine:
+        with pytest.raises(ValueError, match="enabled ordinary tuning"):
+            engine.prepare((item,))
+        assert item.plan.prepared is None
+        assert calls == []
+
+
+def _finalist_shards(
+    tmp_path,
+    monkeypatch,
+    *,
+    values=(1, 2, 4, 8),
+    ranks=(0, 1),
+    ordinary=False,
+    tuning=None,
+    policy=None,
+):
+    _deterministic_timer(monkeypatch)
+    engines, jobs, progress = [], [], []
+    for rank in ranks:
+        engine = session(tmp_path / str(rank))
+        engines.append(engine)
+        engine.configure_tuning_shard(rank, ranks)
+        item = request(
+            name="families",
+            tuning=contract(values=values) if tuning is None else tuning,
+            benchmark=lambda state: PreparedCall(
+                run=lambda: state.value, produce=lambda: None
+            ),
+        )
+        requests = [
+            replace(
+                item,
+                finalist_policy=FinalistPolicy(family_fields=("width",))
+                if policy is None
+                else policy,
+            )
+        ]
+        if ordinary:
+            requests.append(
+                replace(item, name="ordinary", plan=replace(item.plan, query=Query(5)))
+            )
+        job = engine.begin(tuple(requests))
+        jobs.append(job)
+        progress.append(job.advance())
+    snapshots = tuple(state.ready_cache for state in progress)
+    assert all(snapshot is not None for snapshot in snapshots)
+    progress = [job.advance(cache=snapshots) for job in jobs]
+    for index, job in enumerate(jobs):
+        while not progress[index].ready_tuning:
+            progress[index] = job.advance()
+    return engines, jobs, progress
+
+
+@pytest.mark.parametrize("values,ranks", (((1, 2, 4, 8), (0, 1)), ((2,), (0, 1))))
+def test_sharded_finalists_merge_losing_families_and_empty_shards(
+    tmp_path, monkeypatch, values, ranks
+):
+    engines, jobs, progress = _finalist_shards(
+        tmp_path, monkeypatch, values=values, ranks=ranks
+    )
+    contributions = tuple(state.ready_tuning[0] for state in progress)
+    try:
+        for job in jobs:
+            state = job.advance(tuning=contributions)
+            while not state.done:
+                state = job.advance()
+            result = job.result()
+            assert result.selections["families"].config.width == 2
+            assert {
+                item.selection.config.width for item in result.finalists["families"]
+            } == set(values)
+            assert result.coverage["families"]["measured_count"] == len(values)
+            assert result.coverage["families"]["finalist_count"] == len(values)
+    finally:
+        for engine in engines:
+            engine.close()
+    for rank in ranks:
+        with session(tmp_path / str(rank), cache_only=True) as engine:
+            item = replace(
+                request(
+                    name="cached",
+                    tuning=contract(values=values),
+                    benchmark=lambda state: PreparedCall(
+                        run=lambda: state.value, produce=lambda: None
+                    ),
+                ),
+                finalist_policy=FinalistPolicy(family_fields=("width",)),
+            )
+            result = engine.prepare((item,))
+            assert result.cache_hits == 1
+            assert result.benchmarked_candidates == 0
+            assert result.coverage["cached"]["finalist_count"] == len(values)
+            assert {
+                item.selection.config.width for item in result.finalists["cached"]
+            } == set(values)
+
+
+@pytest.mark.parametrize("invalid", ("missing", "duplicate", "reordered"))
+def test_sharded_finalists_reject_missing_duplicate_or_reordered_shards(
+    tmp_path, monkeypatch, invalid
+):
+    engines, jobs, progress = _finalist_shards(tmp_path, monkeypatch)
+    contributions = tuple(state.ready_tuning[0] for state in progress)
+    if invalid == "missing":
+        contributions = contributions[:1]
+    elif invalid == "duplicate":
+        contributions = (contributions[0], contributions[0])
+    else:
+        contributions = contributions[::-1]
+    try:
+        with pytest.raises(ValueError, match="every tuning shard|rank order"):
+            jobs[0].advance(tuning=contributions)
+    finally:
+        for engine in engines:
+            engine.close()
+
+
+def test_sharded_batch_accepts_ordinary_winner_and_all_finalist_contributions(
+    tmp_path, monkeypatch
+):
+    engines, jobs, progress = _finalist_shards(tmp_path, monkeypatch, ordinary=True)
+    contributions = tuple(state.ready_tuning[0] for state in progress)
+    ordinary = min(
+        (state.ready_tuning[1] for state in progress),
+        key=lambda item: (item.latency_us, item.candidate_index),
+    )
+    try:
+        for job in jobs:
+            state = job.advance(tuning=(contributions[0], ordinary, contributions[1]))
+            while not state.done:
+                state = job.advance()
+            result = job.result()
+            assert set(result.finalists) == {"families"}
+            assert len(result.finalists["families"]) == 4
+            assert result.selections["ordinary"].config.width == 2
+    finally:
+        for engine in engines:
+            engine.close()
+
+
+def test_sharded_finalists_enforce_global_per_family_limit(tmp_path, monkeypatch):
+    from dataclasses import dataclass
+    from b12x.preparation import Knob
+
+    @dataclass(frozen=True)
+    class FamilyConfig:
+        family: int
+        width: int
+
+    tuning = replace(
+        contract(),
+        config_fields=frozenset(("family", "width")),
+        encode_config=lambda config: {"family": config.family, "width": config.width},
+        decode_config=lambda payload: FamilyConfig(**payload),
+        validate_config=lambda query, config, device: None,
+        default_config=lambda query, device: FamilyConfig(1, 1),
+        knobs=(Knob(name="family", values=(1, 2)), Knob(name="width", values=(1, 2))),
+    )
+    engines, jobs, progress = _finalist_shards(
+        tmp_path,
+        monkeypatch,
+        tuning=tuning,
+        policy=FinalistPolicy(family_fields=("family",), per_family=1, max_total=2),
+    )
+    contributions = tuple(state.ready_tuning[0] for state in progress)
+    assert all(len(item.finalists) == 2 for item in contributions)
+    try:
+        for job in jobs:
+            state = job.advance(tuning=contributions)
+            while not state.done:
+                state = job.advance()
+            result = job.result()
+            finalists = result.finalists["families"]
+            assert {item.selection.config for item in finalists} == {
+                FamilyConfig(1, 2),
+                FamilyConfig(2, 2),
+            }
+            assert result.selections["families"].config in {
+                item.selection.config for item in finalists
+            }
+    finally:
+        for engine in engines:
+            engine.close()
+
+
+def test_sharded_finalists_reject_global_coverage_over_total_bound(
+    tmp_path, monkeypatch
+):
+    engines, jobs, progress = _finalist_shards(
+        tmp_path,
+        monkeypatch,
+        policy=FinalistPolicy(family_fields=("width",), max_total=2),
+    )
+    contributions = tuple(state.ready_tuning[0] for state in progress)
+    try:
+        with pytest.raises(ValueError, match="bounded policy"):
+            jobs[0].advance(tuning=contributions)
+        assert not engines[0]._cache.records
+        assert all(item.plan.prepared is None for item in jobs[0].requests)
+    finally:
+        for engine in engines:
+            engine.close()

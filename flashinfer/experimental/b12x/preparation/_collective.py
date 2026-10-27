@@ -72,7 +72,8 @@ def select(job, obligation, selections):
         return job._selection(obligation, obligation.configuration.default, "default")
     obligation.key = digest(
         {
-            "measurement": "collective_max_stream_gated_graph_v3",
+            "measurement": "collective_max_stream_gated_graph_v4_token_scaled",
+            "repetitions": {"reduction_token_target": 100, "default": 1},
             "rounds": job.session.rounds,
             "samples": job.session.samples,
             "members": tuple((peer["device"], peer["local_key"]) for peer in peers),
@@ -201,8 +202,12 @@ def race(job, obligation):
                 cancel=job.session._stop.is_set(),
                 producers=len(call.benchmark_producers) or 1,
                 has_producer=call.produce is not None,
+                repetitions=call.benchmark_repetitions,
             )
             _same(peers, "producers")
+            repetitions = _same(peers, "repetitions")
+            if type(repetitions) is not int or repetitions <= 0:
+                raise ValueError("benchmark repetitions must be a positive integer")
             if not all(peer["has_producer"] for peer in peers):
                 raise ValueError(
                     "collective benchmark requires an input producer on every rank"
@@ -211,24 +216,27 @@ def race(job, obligation):
                 raise _Cancelled
             with job.session._gpu_scope(), no_compilation():
                 # Every rank has bound its operands before collective priming starts.
-                captured = capture_benchmark_call(
-                    replace(call, restore=guard.restore, close=guard.close)
-                )
-                trial.call = captured
-                trial.guard = _CallGuard(captured)
-                for producer in captured.benchmark_producers or (captured.produce,):
+                for producer in call.benchmark_producers or (call.produce,):
                     if producer is None:
                         raise ValueError(
                             "collective benchmark requires an input producer"
                         )
                     with call_scope():
-                        if captured.reset is not None:
-                            captured.reset()
+                        if call.reset is not None:
+                            call.reset()
                         producer()
-                        captured.invoke()
+                        call.invoke()
                     job.session._synchronize()
-                    if captured.validate is not None:
-                        captured.validate()
+                    if call.validate is not None:
+                        call.validate()
+                captured = capture_benchmark_call(
+                    replace(
+                        call, restore=guard.restore, close=guard.close, validate=None
+                    ),
+                    repetitions=repetitions,
+                )
+                trial.call = captured
+                trial.guard = _CallGuard(captured)
             yield from exchange(requirement, f"validated/{index}")
             job._candidates_prepared += 1
             job._batch_index += 1
@@ -238,12 +246,17 @@ def race(job, obligation):
                 batch=job._batch_index,
             )
             trials = ([] if champion is None else [champion]) + [trial]
+            if any(item.call.benchmark_repetitions != repetitions for item in trials):
+                raise ValueError(
+                    "collective candidates require the same repetition count"
+                )
             job._batch_candidates = len(trials)
             measure_started = time.perf_counter()
             measurement = yield from job._measure(
                 trials,
                 champion=champion is not None,
                 adaptive_collective_pair=champion is not None,
+                repetitions=repetitions,
                 sample_exchange=sample_exchange,
                 launch_exchange=launch_exchange,
                 sample_observer=ledger.observer(trials),

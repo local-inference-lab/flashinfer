@@ -277,7 +277,12 @@ class Selection(Generic[ConfigT]):
 
 @dataclass(frozen=True, kw_only=True)
 class FinalistPolicy:
-    """Retain bounded legal families from an ordinary candidate race."""
+    """Retain bounded legal families from an ordinary candidate race.
+
+    Even a singleton search is measured. Tuning must be enabled; cancellation
+    prepares the default without reporting an unmeasured shortlist. Sharded
+    races require all rank contributions through ``PreparationJob.advance``.
+    """
 
     family_fields: tuple[str, ...]
     per_family: int = 1
@@ -386,7 +391,11 @@ class TuningCacheRequirement:
 
 @dataclass(frozen=True)
 class TuningRequirement:
-    """One rank's winner from its disjoint share of a tuning race."""
+    """One rank's winner and optional finalists from its tuning shard.
+
+    For finalist requests, submit every contribution in ``ranks`` order to
+    ``PreparationJob.advance(tuning=...)`` instead of selecting one winner.
+    """
 
     key: str
     ranks: tuple[int, ...]
@@ -429,6 +438,8 @@ class TuningRequirement:
             raise TypeError("tuning finalist policy must be FinalistPolicy")
         if finalists and self.finalist_policy is None:
             raise ValueError("tuning finalists require their family policy")
+        if empty and finalists:
+            raise ValueError("empty tuning shards cannot report finalists")
         object.__setattr__(self, "finalists", finalists)
         if empty != (self.latency_us is None) or empty != (
             self.candidate_index is None
@@ -501,6 +512,8 @@ class PreparedCall:
     A benchmark call must return without waiting for device work or using
     unjoined side streams. Reset and activation production run before its gate.
     ``capture_safe`` describes caller capture support, not the timing method.
+    ``benchmark_repetitions`` declares invocations per timed graph. Mutations
+    repeat with each invocation; producers and resets remain outside the graph.
 
     Prepare-call factories construct bindings and resources even when the
     session disables priming. Only ``reset``, ``produce``, and ``run`` are
@@ -519,6 +532,7 @@ class PreparedCall:
     benchmark_producers: tuple[Callable[[], None], ...] = ()
     validate: Callable[[], None] | None = None
     capture_context: Callable[[], object] | None = None
+    benchmark_repetitions: int = 1
 
     def invoke(self):
         result = self.run()
