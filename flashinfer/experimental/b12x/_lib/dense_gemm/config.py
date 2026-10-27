@@ -315,6 +315,7 @@ def _dense_gemm_policy_for(
     expected_m: Optional[int] = None,
     generalize_mxfp8_split_k: bool = False,
     generalize_block_fp8_split_k: bool = False,
+    allow_bf16_atomic_reduction: bool = True,
 ) -> _DenseGemmPolicy:
     # A declared row bound owns scheduling as well as tile and unroll tuning.
     if expected_m is not None:
@@ -393,8 +394,8 @@ def _dense_gemm_policy_for(
                 if m == 8 and (n, k) == (4096, 4096) and mma_tiler_mn == (16, 128)
                 else 2
             )
-    if not _B12X_DENSE_SPLITK_TURBO:
-        # The FP32 workspace reducer consumes exactly two partials.
+    if not _B12X_DENSE_SPLITK_TURBO and allow_bf16_atomic_reduction:
+        # Preserve the existing non-atomic default when the turbo policy is off.
         split_k_slices = min(split_k_slices, 2)
     # A declared expected_m owns compile-time tuning for its regime. Without a
     # hint, keep the unroll choice stable throughout the persistent scheduler
@@ -441,7 +442,7 @@ def _dense_gemm_policy_for(
         direct_one_m_tile_scheduler=direct_one_m_tile_scheduler,
         use_m1_non_tma=use_m1_non_tma,
         split_k_slices=split_k_slices,
-        split_k_atomic_bf16=_B12X_DENSE_SPLITK_TURBO,
+        split_k_atomic_bf16=(_B12X_DENSE_SPLITK_TURBO and allow_bf16_atomic_reduction),
         large_m_unroll=(
             ab_dtype == cutlass.Float8E4M3FN and use_large_m_unroll and l == 1
         ),
