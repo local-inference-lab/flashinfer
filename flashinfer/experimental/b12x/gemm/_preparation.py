@@ -91,6 +91,7 @@ def _lower_query(query, device, constraints):
         c_dtype=query.output_dtype,
         alpha=alpha,
         expected_m=query.expected_m,
+        allow_bf16_atomic_reduction=query.allow_bf16_atomic_reduction,
         sm_count=query.sm_count if query.sm_count is not None else device.sm_count,
         **constraints,
     )

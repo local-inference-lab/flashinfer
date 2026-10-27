@@ -67,7 +67,10 @@ from b12x._lib.dense_gemm.policy import (
     _select_mxfp8_tile_k,
     _validate_mxfp8_bk64_plan,
 )
-from b12x._lib.dense_gemm.reductions import _reduce_split_k2_bf16
+from b12x._lib.dense_gemm.reductions import (
+    _reduce_split_k2_bf16,
+    _reduce_split_k4_bf16,
+)
 
 
 def dense_gemm_fused_quant_a(
@@ -296,6 +299,7 @@ def dense_gemm(
     _large_m_unroll_override: Optional[bool] = None,
     _target_occupancy_override: Optional[int] = None,
     _split_k_workspace: Optional[torch.Tensor] = None,
+    allow_bf16_atomic_reduction: bool = True,
 ) -> torch.Tensor:
     """Execute dense block-scaled GEMM for one expert-major batch stack.
 
@@ -389,6 +393,12 @@ def dense_gemm(
                 raise ValueError(f"unsupported {name}={fmt!r}")
     else:
         raise TypeError(f"dense_gemm unsupported ab_dtype: {ab_dtype}")
+    if type(allow_bf16_atomic_reduction) is not bool:
+        raise TypeError("BF16 atomic reduction policy must be a boolean")
+    if not allow_bf16_atomic_reduction and (
+        not is_mxfp8 or plain_fp8 or block_fp8 or sf_dtype != "float8_e8m0fnu"
+    ):
+        raise ValueError("FP32 split-K reduction is qualified for MXFP8 only")
     if _tile_k_override is not None:
         if ab_dtype == "float4_e2m1fn":
             valid_tile_k = (128, 256, 512)
@@ -671,6 +681,7 @@ def dense_gemm(
         expected_m=expected_m,
         generalize_mxfp8_split_k=(is_mxfp8 and not block_fp8 and not plain_fp8),
         generalize_block_fp8_split_k=block_fp8,
+        allow_bf16_atomic_reduction=allow_bf16_atomic_reduction,
     )
     if _split_k_slices_override is not None:
         mxfp8_autotune = (
@@ -706,7 +717,11 @@ def dense_gemm(
                     f"to divide evenly across slices; got K={k}, BK={tile_k}, "
                     f"slices={_split_k_slices_override}"
                 )
-            if _split_k_slices_override > 2 and not _B12X_DENSE_SPLITK_TURBO:
+            if (
+                _split_k_slices_override > 2
+                and allow_bf16_atomic_reduction
+                and not _B12X_DENSE_SPLITK_TURBO
+            ):
                 raise ValueError(
                     "four-way split-K requires atomic-BF16 or an explicit "
                     "caller-owned FP32 reduction"
@@ -717,7 +732,9 @@ def dense_gemm(
             use_m1_non_tma=policy.use_m1_non_tma,
             split_k_slices=_split_k_slices_override,
             split_k_atomic_bf16=(
-                _split_k_slices_override > 1 and _B12X_DENSE_SPLITK_TURBO
+                _split_k_slices_override > 1
+                and _B12X_DENSE_SPLITK_TURBO
+                and allow_bf16_atomic_reduction
             ),
             large_m_unroll=policy.large_m_unroll,
         )
@@ -1098,7 +1115,12 @@ def dense_gemm(
     if split_k_output and not split_k_atomic_bf16:
         assert split_scratch is not None
         assert out is not None
-        _reduce_split_k2_bf16(split_scratch, out, m=m, n=n)
+        if split_k_slices == 2:
+            _reduce_split_k2_bf16(split_scratch, out, m=m, n=n)
+        elif split_k_slices == 4:
+            _reduce_split_k4_bf16(split_scratch, out, m=m, n=n)
+        else:
+            raise ValueError("FP32 split-K reduction requires two or four slices")
         result = out
     if _B12X_TIMING:
         t_launch = time.perf_counter()

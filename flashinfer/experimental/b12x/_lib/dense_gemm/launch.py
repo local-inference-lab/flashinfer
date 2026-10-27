@@ -39,7 +39,10 @@ from b12x._lib.dense_gemm.config import (
     _use_direct_m1_wo_a_inputs,
     _use_direct_sfa_live16,
 )
-from b12x._lib.dense_gemm.reductions import _reduce_split_k2_bf16
+from b12x._lib.dense_gemm.reductions import (
+    _reduce_split_k2_bf16,
+    _reduce_split_k4_bf16,
+)
 
 
 def _dense_gemm_launch_flat(
@@ -370,7 +373,12 @@ def _dense_gemm_launch_functional_op(
         stream_int,
     )
     if split_k_output and not split_k_atomic_bf16:
-        _reduce_split_k2_bf16(c_tensor_gpu, out, m=m, n=n)
+        if split_k_slices == 2:
+            _reduce_split_k2_bf16(c_tensor_gpu, out, m=m, n=n)
+        elif split_k_slices == 4:
+            _reduce_split_k4_bf16(c_tensor_gpu, out, m=m, n=n)
+        else:
+            raise ValueError("FP32 split-K reduction requires two or four slices")
     return out
 
 

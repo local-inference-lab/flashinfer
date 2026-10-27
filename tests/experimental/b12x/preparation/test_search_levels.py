@@ -89,6 +89,8 @@ def test_audit_admits_mxfp8_geometry(m, n, k, changes):
             split_k_slices=1,
             large_m_unroll=False,
             target_occupancy=None,
+            programmatic_serialization=False,
+            evict_first=False,
         )
         | changes
     )
@@ -119,6 +121,8 @@ def test_nvfp4_dominated_variants_are_never_raced_but_can_be_pinned(m, changes):
             split_k_slices=None,
             large_m_unroll=None,
             target_occupancy=1,
+            programmatic_serialization=False,
+            evict_first=False,
         )
         | changes
     )
@@ -137,6 +141,72 @@ def test_off_uses_heuristic_default():
     cfg = TUNING.configure(query, device=DEVICE)
     choices = list(TUNING.iterate(cfg))
     assert choices == [(TUNING.config_payload(cfg.default), cfg.default)]
+
+
+def test_dependent_mxfp8_launch_requires_ready_rhs_and_single_slice():
+    from dataclasses import asdict
+
+    query = replace(
+        dense_query("mxfp8", 8, 8192, 1280, "audit"),
+        alpha_mode="unit",
+        rhs_prefetch_ready=True,
+    )
+    candidate = DenseGemmConfig(
+        backend="cutedsl",
+        tile_m=16,
+        tile_n=64,
+        tile_k=128,
+        load_path="tma",
+        swap_ab=False,
+        split_k_slices=1,
+        large_m_unroll=True,
+        target_occupancy=None,
+        programmatic_serialization=True,
+        evict_first=True,
+    )
+    TUNING.parameter_space(query, DEVICE).validate(asdict(candidate))
+    with pytest.raises(ValueError):
+        TUNING.parameter_space(
+            replace(query, rhs_prefetch_ready=False), DEVICE
+        ).validate(asdict(candidate))
+    for invalid in (
+        replace(candidate, split_k_slices=4),
+        replace(candidate, swap_ab=True),
+        replace(candidate, tile_k=64),
+    ):
+        with pytest.raises(ValueError, match="correctness"):
+            TUNING.parameter_space(query, DEVICE).validate(asdict(invalid))
+
+
+def test_full_fp32_mxfp8_reduction_keeps_single_and_split_choices():
+    from dataclasses import asdict
+    from b12x.gemm._preparation import _configured_lowering
+
+    query = replace(
+        dense_query("mxfp8", 8, 1792, 5120, "default"),
+        allow_bf16_atomic_reduction=False,
+    )
+    base = DenseGemmConfig(
+        backend="cutedsl",
+        tile_m=16,
+        tile_n=64,
+        tile_k=128,
+        load_path="tma",
+        swap_ab=False,
+        split_k_slices=1,
+        large_m_unroll=False,
+        target_occupancy=None,
+    )
+    space = TUNING.parameter_space(query, DEVICE)
+    for slices in (1, 2, 4):
+        choice = replace(base, split_k_slices=slices)
+        space.validate(asdict(choice))
+        lowered = TUNING.configure(query, device=DEVICE, override=choice)
+        assert lowered.pinned == choice
+        policy = _configured_lowering(query, choice, DEVICE).policy
+        assert policy.split_k_slices == slices
+        assert not policy.split_k_atomic_bf16
+    assert TUNING.default_config(query, DEVICE).split_k_slices in (1, 2, 4)
 
 
 def test_block32_propagates_effort():
