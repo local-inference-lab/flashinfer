@@ -340,12 +340,19 @@ def _expand_requests(requests):
 
 def _coalesce_requests(requests):
     """Group declaration-equivalent work while preserving its runtime bindings."""
-    groups, keys = {}, {}
+    groups, keys, policies = {}, {}, {}
     for request in requests:
+        if (
+            request.plan in policies
+            and policies[request.plan] != request.finalist_policy
+        ):
+            raise ValueError("requests for the same Plan must agree on finalist policy")
+        policies[request.plan] = request.finalist_policy
         key = (
             _declaration_key(request.plan),
             tuple(dict.fromkeys(keys[name] for name in request.dependencies)),
             None if request.collective is None else request.collective.ranks,
+            request.finalist_policy,
         )
         keys[request.name] = key
         groups.setdefault(key, []).append(request)
@@ -1039,7 +1046,15 @@ class PreparationJob:
     def advance(
         self, *, collective_key=None, tuning=None, cache=None, collective_tuning=None
     ):
-        """Advance preparation until work completes or reaches a readiness boundary."""
+        """Advance preparation until work completes or reaches a readiness boundary.
+
+        For each ready tuning key without a finalist policy, ``tuning`` contains
+        its consolidated winner. A key requesting finalists instead requires
+        every shard's contribution in ``ranks`` order, including empty shards.
+        Contributions may be interleaved across keys while preserving that
+        per-key rank order. The session selects the ordinary winner separately
+        from the globally bounded per-family finalists.
+        """
         started = time.perf_counter()
         if self._last_advance_end is not None:
             self._timing.add("between_advances", started - self._last_advance_end)
@@ -1139,25 +1154,51 @@ class PreparationJob:
             required = self._blocked.contributions
             if tuning is None:
                 return self._progress(False, False, (), False, required)
-            winners = (
+            contributions = (
                 (tuning,) if isinstance(tuning, TuningRequirement) else tuple(tuning)
             )
-            expected = {item.key: item.ranks for item in required}
-            if not winners and self.session._stop.is_set():
+            expected = {item.key: item for item in required}
+            grouped = {key: [] for key in expected}
+            if not contributions and self.session._stop.is_set():
                 pass
-            elif (
-                len(winners) != len(expected)
-                or any(
-                    not isinstance(item, TuningRequirement)
-                    or expected.get(item.key) != item.ranks
-                    or item.assignment is None
-                    for item in winners
-                )
-                or len({item.key for item in winners}) != len(winners)
-            ):
-                raise ValueError("tuning consolidation does not match pending races")
+            else:
+                for item in contributions:
+                    if (
+                        not isinstance(item, TuningRequirement)
+                        or item.key not in expected
+                        or item.ranks != expected[item.key].ranks
+                        or item.finalist_policy != expected[item.key].finalist_policy
+                    ):
+                        raise ValueError(
+                            "tuning consolidation does not match pending races"
+                        )
+                    grouped[item.key].append(item)
+                for key, items in grouped.items():
+                    requirement = expected[key]
+                    if requirement.finalist_policy is None:
+                        if len(items) != 1 or items[0].assignment is None:
+                            raise ValueError(
+                                "tuning consolidation does not match pending races"
+                            )
+                    else:
+                        if len(items) != len(requirement.ranks):
+                            raise ValueError(
+                                "finalist consolidation requires every tuning shard"
+                            )
+                        for rank_index, item in enumerate(items):
+                            indices = [
+                                record.candidate_index for record in item.finalists
+                            ]
+                            if item.candidate_index is not None:
+                                indices.append(item.candidate_index)
+                            if any(
+                                index % len(items) != rank_index for index in indices
+                            ):
+                                raise ValueError(
+                                    "finalist contributions must follow tuning rank order"
+                                )
             self._blocked = None
-            send_value = winners
+            send_value = contributions
         elif isinstance(self._blocked, TuningRequirement):
             if tuning is None:
                 return self._progress(False, False, (), False, (self._blocked,))
@@ -1295,6 +1336,7 @@ class PreparationJob:
         if request.finalist_policy is not None:
             policy = request.finalist_policy
             identity["finalist_policy"] = {
+                "version": 2,
                 "family_fields": policy.family_fields,
                 "per_family": policy.per_family,
                 "max_total": policy.max_total,
@@ -1508,13 +1550,17 @@ class PreparationJob:
                 override=plan.override,
                 search=not self._warmup_only,
             )
-            if request.finalist_policy is not None:
+            if request.finalist_policy is not None and not self._locally_stopped:
                 if request.collective is not None:
                     raise ValueError(
                         "collective operator finalist races require coordinated "
                         "family samples and are not supported"
                     )
-                if configuration.space is None or self._warmup_only:
+                if (
+                    configuration.space is None
+                    or self._warmup_only
+                    or configuration.space.autotune_effort is AutotuneEffort.OFF
+                ):
                     raise ValueError(
                         "finalists require an enabled ordinary tuning race"
                     )
@@ -1611,7 +1657,11 @@ class PreparationJob:
                         raise ValueError(
                             f"no eligible configurations for {plan.component_id}"
                         )
-                    if complete and len(obligation.candidates) == 1:
+                    if (
+                        complete
+                        and len(obligation.candidates) == 1
+                        and request.finalist_policy is None
+                    ):
                         assignment, config = obligation.candidates[0]
                         obligation.selection = self._selection(
                             obligation, config, "fixed", assignment
@@ -2620,7 +2670,7 @@ class PreparationJob:
             owners=() if call is None else tuple(call.owners),
             closers=() if call is None or call.close is None else (call.close,),
             device=self.session.device,
-            finalist_policy=request.finalist_policy,
+            finalist_policy=request.finalist_policy if finalists else None,
             finalists=tuple(finalists),
             variants=variants,
         )
@@ -2659,6 +2709,10 @@ class PreparationJob:
         request, plan = obligation.request, obligation.request.plan
         selection = obligation.selection
         self._active_request = request
+        if self._warmup_only:
+            obligation.finalists = ()
+        elif request.finalist_policy is not None and not obligation.finalists:
+            raise RuntimeError("requested finalist families were not measured")
         if obligation.ready:
             programs = plan.prepared.programs
         else:
@@ -2710,7 +2764,12 @@ class PreparationJob:
                     if prepared is not None
                     else self._selection(obligation, configuration.default, source)
                 )
-            if prepared is None or prepared.selection != selection:
+            if (
+                prepared is None
+                or prepared.selection != selection
+                or prepared.finalist_policy
+                != (item.finalist_policy if obligation.finalists else None)
+            ):
                 alias = _Obligation(item, obligation.configuration)
                 if not self._alias_shared(alias):
                     if item.collective is not None:
@@ -2785,9 +2844,7 @@ class PreparationJob:
             self._dependency_programs[item.name] = expected
             self._plans_by_name[item.name] = item_plan
             self._coverage[item.name] = obligation.coverage
-            if item.finalist_policy is not None:
-                if not obligation.finalists:
-                    raise RuntimeError("requested finalist families were not measured")
+            if obligation.finalists:
                 self._finalists[item.name] = self._public_finalists(
                     obligation, selection.source
                 )
@@ -2810,8 +2867,10 @@ class PreparationJob:
             return
         contributions = tuple(item[1] for item in pending)
         self._phase = "consolidating"
-        winners = yield _TuningBatch(contributions)
-        by_key = {winner.key: winner for winner in winners}
+        received = yield _TuningBatch(contributions)
+        by_key = {}
+        for contribution in received:
+            by_key.setdefault(contribution.key, []).append(contribution)
         for obligation, contribution in pending:
             configuration = obligation.configuration
             if self.session._stop.is_set():
@@ -2819,7 +2878,11 @@ class PreparationJob:
                     obligation, configuration.default, "default"
                 )
             else:
-                winner = by_key[contribution.key]
+                peers = by_key[contribution.key]
+                if obligation.request.finalist_policy is not None:
+                    winner = self._consolidate_finalists(obligation, peers)
+                else:
+                    (winner,) = peers
                 if winner.finalist_policy != obligation.request.finalist_policy:
                     raise ValueError(
                         "consolidated finalist policy differs from declaration"
@@ -2836,6 +2899,8 @@ class PreparationJob:
                 obligation.finalists = self._validate_finalists(
                     obligation, winner.finalists
                 )
+                if obligation.finalists:
+                    obligation.coverage["finalist_count"] = len(obligation.finalists)
                 if (
                     obligation.request.finalist_policy is not None
                     and winner.candidate_index
@@ -2849,6 +2914,60 @@ class PreparationJob:
             self._timing.record("request_resume", request=obligation.request.name)
             yield from self._install_obligation(obligation, selections)
         pending.clear()
+
+    def _consolidate_finalists(self, obligation, contributions):
+        policy = obligation.request.finalist_policy
+        families = {}
+        populated = []
+        for rank_index, contribution in enumerate(contributions):
+            if contribution.assignment is None:
+                shard_count = len(
+                    range(rank_index, len(obligation.candidates), len(contributions))
+                )
+                if contribution.rejected_count != shard_count:
+                    raise ValueError(
+                        "empty tuning shard did not reject all its candidates"
+                    )
+                continue
+            records = self._validate_finalists(obligation, contribution.finalists)
+            if contribution.candidate_index not in {
+                item.candidate_index for item in records
+            }:
+                raise ValueError("tuning shard finalists omit its ordinary winner")
+            if (
+                contribution.candidate_index >= len(obligation.candidates)
+                or FrozenMapping(obligation.candidates[contribution.candidate_index][0])
+                != contribution.assignment
+            ):
+                raise ValueError("tuning shard winner differs from its candidate index")
+            populated.append(contribution)
+            for item in records:
+                families.setdefault(_json(item.family), []).append(item)
+        if not populated:
+            raise RuntimeError("no launchable candidates across tuning shards")
+        winner = min(
+            populated, key=lambda item: (item.latency_us, item.candidate_index)
+        )
+        finalists = []
+        for records in families.values():
+            records.sort(key=lambda item: (item.latency_us, item.candidate_index))
+            selected = records[: policy.per_family]
+            champion = next(
+                (
+                    item
+                    for item in records
+                    if item.candidate_index == winner.candidate_index
+                ),
+                None,
+            )
+            if champion is not None and champion not in selected:
+                selected[-1] = champion
+            finalists.extend(selected)
+        return replace(
+            winner,
+            finalists=self._validate_finalists(obligation, finalists),
+            rejected_count=sum(item.rejected_count for item in contributions),
+        )
 
     def _run(self):
         if not self.requests:

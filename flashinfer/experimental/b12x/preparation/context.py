@@ -104,8 +104,10 @@ def race_contexts(
     """Measure captured complete computations with the preparation sampler.
 
     ``collective_exchange(step, payload)`` must return all ranks' payloads in
-    fixed rank order. Catalog and launch exchanges enforce identical choices;
-    sample exchanges use the maximum latency of every matching rank sample.
+    fixed rank order. Catalog exchanges require matching candidates, ranks,
+    rounds, samples, producer counts, and cache policy before any replay.
+    Launch exchanges enforce identical choices; sample exchanges use the
+    maximum latency of every matching rank sample.
     Calls restore valid inputs through ``reset`` and ``produce`` before each
     timed replay. Cold-cache eviction follows those producers and precedes the
     gated graph event interval. Trial graph ``close`` callbacks run on exit.
@@ -187,11 +189,20 @@ def race_contexts(
                 raise ValueError("context member Plan belongs to another device")
     catalog = _catalog(candidates)
     if collective_exchange is not None:
-        peers = _peers(
-            collective_exchange, "catalog", {"catalog": catalog}, expected_count
-        )
-        if any(peer.get("catalog") != catalog for peer in peers):
-            raise ValueError("context ranks declared different candidate catalogs")
+        protocol = {
+            "catalog": catalog,
+            "ranks": ranks,
+            "rounds": rounds,
+            "samples": samples,
+            "producer_counts": tuple(
+                len(candidate.call.benchmark_producers) or 1 for candidate in candidates
+            ),
+            "cache_policy": session.cache_policy,
+        }
+        peers = _peers(collective_exchange, "catalog", protocol, expected_count)
+        for field, value in protocol.items():
+            if any(peer.get(field) != value for peer in peers):
+                raise ValueError(f"context ranks declared different {field}")
 
     def launch_exchange(indices, turn, repetition):
         peers = _peers(

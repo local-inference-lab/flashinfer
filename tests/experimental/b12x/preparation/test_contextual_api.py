@@ -160,6 +160,49 @@ def test_context_result_is_immutable_and_separate_from_plan():
         result.latencies_us["paired"] = 1.0
 
 
+@pytest.mark.parametrize(
+    "field,value",
+    (
+        ("rounds", 2),
+        ("samples", 3),
+        ("producer_counts", (2,)),
+        ("cache_policy", "warm"),
+        ("ranks", (0, 2)),
+    ),
+)
+def test_context_collective_rejects_measurement_mismatch_before_replay(field, value):
+    plan = _plan()
+    calls = []
+    candidate = ContextCandidate(
+        name="one",
+        plans=(plan,),
+        call=PreparedCall(
+            run=lambda: calls.append("run"),
+            produce=lambda: calls.append("produce"),
+        ),
+    )
+
+    def exchange(step, payload):
+        assert step == "catalog"
+        peer = dict(payload)
+        peer[field] = value
+        return payload, peer
+
+    with PreparationSession(
+        device=DetectedDevice(None, None), autotune=False, cache_policy="cold"
+    ) as session:
+        session.prepare((plan.request(name="p", prepare_call=lambda state: _call()),))
+        with pytest.raises(ValueError, match=field):
+            session.race_contexts(
+                (candidate,),
+                collective_ranks=(0, 1),
+                collective_exchange=exchange,
+                rounds=1,
+                samples=1,
+            )
+    assert calls == []
+
+
 def test_context_cold_eviction_follows_state_restoration(monkeypatch):
     from b12x.preparation import _measurement
     import torch
