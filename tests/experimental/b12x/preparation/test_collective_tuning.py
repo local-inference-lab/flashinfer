@@ -77,6 +77,114 @@ def test_dcp_candidates_coalesce_effective_grids_and_preserve_overrides():
     assert values[0][1] == query.default
 
 
+@pytest.mark.parametrize("shape", [(3, 1536), (513, 2560), (8,)])
+@pytest.mark.parametrize("world", (2, 3, 4, 6, 8, 10))
+@pytest.mark.parametrize("dtype", ("bfloat16", "float16"))
+def test_plain_catalog_uses_storage_bounds_instead_of_shape_policy(shape, world, dtype):
+    from math import prod
+    from b12x.comm.pcie._collective_tuning import (
+        CollectiveConfig,
+        CollectiveQuery,
+        TUNING,
+        oneshot_alternatives,
+    )
+    from b12x.comm.pcie._tuning import PcieQuery, TUNING as NATIVE
+    from b12x.preparation import autotune_effort
+
+    packs = prod(shape) // 8
+    capacity = max(packs, 64)
+    native = PcieQuery(
+        surface="OneshotAllReduce.all_reduce",
+        world_size=world,
+        rank=0,
+        topology="pcie_ipc",
+        call=FrozenMapping(
+            dict(
+                dtype=dtype,
+                transport="pull",
+                threads=256,
+                blocks=8,
+                eager_threads=256,
+                eager_blocks=8,
+                stage_input=True,
+                size_packs=packs,
+                remote_push_region_packs=capacity,
+                payload_ready_region_packs=(1 + 2 * (world - 1)) * capacity,
+            )
+        ),
+        setup=FrozenMapping(
+            dict(
+                shape=shape,
+                variants=((False, 0), (True, 0), (True, 1)),
+                eager_buffer_bytes=capacity * 16,
+                eager_storage_shards=1 + 2 * (world - 1) + world,
+            )
+        ),
+    )
+    alternatives = oneshot_alternatives(native, object())
+    expected = {"pull", "remote_push_ll", "remote_push_simple"}
+    if world == 2:
+        expected |= {"tp2_remote_push", "tp2_remote_push_simple"}
+    if dtype == "bfloat16":
+        expected |= {"remote_push_full", "remote_push_rsag"}
+    assert set(alternatives) == expected
+    query = CollectiveQuery(
+        operation="all_reduce",
+        world_size=world,
+        rank=0,
+        alternatives=FrozenMapping(
+            {k: NATIVE.encode_query(v[0]) for k, v in alternatives.items()}
+        ),
+        default=CollectiveConfig(
+            implementation="remote_push_ll", threads=128, blocks=36
+        ),
+    )
+    with autotune_effort("default"):
+        configs = [
+            config for _, config in TUNING.iterate(TUNING.configure(query, device=None))
+        ]
+    assert {config.implementation for config in configs} == set(alternatives)
+    assert all(1 <= config.blocks <= 36 for config in configs)
+    assert (
+        CollectiveConfig(implementation="remote_push_ll", threads=128, blocks=36)
+        in configs
+    )
+    with pytest.raises(ValueError, match="parameter space"):
+        TUNING.validate_config(
+            query, CollectiveConfig(implementation="pull", threads=128, blocks=37), None
+        )
+    small = replace(
+        native,
+        call=FrozenMapping(
+            {**native.call, "size_packs": 1, "remote_push_region_packs": 1}
+        ),
+        setup=FrozenMapping({**native.setup, "shape": (8,), "eager_buffer_bytes": 16}),
+    )
+    small_expected = {"pull", "remote_push_ll"}
+    if world == 2:
+        small_expected.add("tp2_remote_push")
+    assert set(oneshot_alternatives(small, object())) == small_expected
+    absent = replace(
+        native, setup=FrozenMapping({**native.setup, "eager_storage_shards": 1})
+    )
+    assert set(oneshot_alternatives(absent, object())) == {"pull"}
+
+    for default in {config.implementation: config for config in configs}.values():
+        other = replace(query, default=default)
+        with autotune_effort("default"):
+            measured = {
+                config
+                for _, config in TUNING.iterate(TUNING.configure(other, device=None))
+            }
+        assert measured == set(configs)
+
+    for world_size, rank in ((world, -1), (world, world), (5, 0)):
+        with pytest.raises(ValueError, match="world size and rank"):
+            TUNING.validate_query(
+                replace(query, world_size=world_size, rank=rank), None
+            )
+
+
 def test_collective_signature_distinguishes_shapes_but_not_rank_ordinals():
     from b12x.comm.pcie._collective_tuning import (
         CollectiveConfig,

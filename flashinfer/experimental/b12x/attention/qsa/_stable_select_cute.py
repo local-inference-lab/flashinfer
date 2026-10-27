@@ -56,18 +56,22 @@ class StableSelectionKernel:
         score_base = row.to(Int64) * stride
         length = lengths[row].to(Int32)
         selected = cutlass.min(length, Int32(self.budget))
-        identity = Int32(0)
-        if cutlass.const_expr(self.indices_only):
-            if length <= self.budget:
-                identity = Int32(1)
-        if identity != 0:
+        if length <= self.budget:
+            carry = cutlass.min(
+                cutlass.min(eligible[row].to(Int32), group_offset), Int32(self.budget)
+            )
             for part in cutlass.range_constexpr(self.budget // 256):
                 column = tid + Int32(part * 256)
-                value = Int32(-1)
+                identifier = Int32(-1)
+                value = Float32(-float("inf"))
                 if column < length:
-                    value = column
-                ids[base + column.to(Int64)] = value
-                values[base + column.to(Int64)] = Float32(-float("inf"))
+                    identifier = group_offset + column - carry
+                    if column < carry:
+                        identifier = prior_ids[base + column.to(Int64)].to(Int32)
+                    if cutlass.const_expr(not self.indices_only):
+                        value = scores[score_base + column.to(Int64)].to(Float32)
+                ids[base + column.to(Int64)] = identifier
+                values[base + column.to(Int64)] = value
         else:
             allocator = cutlass.utils.SmemAllocator()
             minima = allocator.allocate_tensor(

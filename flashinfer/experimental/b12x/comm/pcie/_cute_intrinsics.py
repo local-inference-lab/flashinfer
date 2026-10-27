@@ -232,6 +232,61 @@ def st_relaxed_sys_global_v4_u32(
 
 
 @dsl_user_op
+def ld_acquire_sys_global_v4_u32(
+    addr: Int64, *, loc=None, ip=None
+) -> Tuple[Uint32, Uint32, Uint32, Uint32]:
+    """Load a four-word generation flag with system acquire ordering."""
+
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
+        [Int64(addr).ir_value(loc=loc, ip=ip)],
+        "ld.acquire.sys.global.v4.u32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,l,~{memory}",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return tuple(
+        Uint32(llvm.extractvalue(T.i32(), result, [index], loc=loc, ip=ip))
+        for index in range(4)
+    )
+
+
+@dsl_user_op
+def st_release_sys_global_v4_u32(
+    addr: Int64,
+    v0: Uint32,
+    v1: Uint32,
+    v2: Uint32,
+    v3: Uint32,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """Publish a four-word generation flag with system release ordering."""
+
+    llvm.inline_asm(
+        None,
+        [
+            Int64(addr).ir_value(loc=loc, ip=ip),
+            Uint32(v0).ir_value(loc=loc, ip=ip),
+            Uint32(v1).ir_value(loc=loc, ip=ip),
+            Uint32(v2).ir_value(loc=loc, ip=ip),
+            Uint32(v3).ir_value(loc=loc, ip=ip),
+        ],
+        "st.release.sys.global.v4.u32 [$0], {$1, $2, $3, $4};",
+        "l,r,r,r,r,~{memory}",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def add_f16x2(left: Uint32, right: Uint32, *, loc=None, ip=None) -> Uint32:
     """Add two packed FP16 lanes with round-to-nearest semantics."""
 

@@ -54,7 +54,7 @@ from ._twoshot_cute import (
 )
 
 _PACK_ELEMS = 8  # bf16 values per 16-byte pack
-_SUPPORTED_WORLD_SIZE = 4
+_SUPPORTED_WORLD_SIZES = (2, 3, 4, 6, 8, 10)
 
 
 class _TwoShotBf16Launch:
@@ -90,6 +90,14 @@ class _TwoShotBf16Launch:
         staging5: cute.Pointer,
         staging6: cute.Pointer,
         staging7: cute.Pointer,
+        staging8: cute.Pointer,
+        staging9: cute.Pointer,
+        staging10: cute.Pointer,
+        staging11: cute.Pointer,
+        staging12: cute.Pointer,
+        staging13: cute.Pointer,
+        staging14: cute.Pointer,
+        staging15: cute.Pointer,
         signal0: cute.Pointer,
         signal1: cute.Pointer,
         signal2: cute.Pointer,
@@ -98,11 +106,20 @@ class _TwoShotBf16Launch:
         signal5: cute.Pointer,
         signal6: cute.Pointer,
         signal7: cute.Pointer,
+        signal8: cute.Pointer,
+        signal9: cute.Pointer,
+        signal10: cute.Pointer,
+        signal11: cute.Pointer,
+        signal12: cute.Pointer,
+        signal13: cute.Pointer,
+        signal14: cute.Pointer,
+        signal15: cute.Pointer,
         output: cute.Pointer,
         rank: Int32,
         pack_stride: Int64,
         slot_bytes: Int64,
-        rows_per_rank: Int32,
+        shard_packs: Int64,
+        total_packs: Int64,
         grid_x: Int32,
         stream: cuda.CUstream,
     ) -> None:
@@ -116,6 +133,14 @@ class _TwoShotBf16Launch:
             staging5,
             staging6,
             staging7,
+            staging8,
+            staging9,
+            staging10,
+            staging11,
+            staging12,
+            staging13,
+            staging14,
+            staging15,
             signal0,
             signal1,
             signal2,
@@ -124,11 +149,20 @@ class _TwoShotBf16Launch:
             signal5,
             signal6,
             signal7,
+            signal8,
+            signal9,
+            signal10,
+            signal11,
+            signal12,
+            signal13,
+            signal14,
+            signal15,
             output,
             rank,
             pack_stride,
             slot_bytes,
-            rows_per_rank,
+            shard_packs,
+            total_packs,
         ).launch(
             grid=(grid_x, 1, 1),
             block=[self._threads, 1, 1],
@@ -147,29 +181,9 @@ class _TwoShotBf16Launch:
         """Select one scalar launch pointer without unrolling peer work."""
 
         address = Int64(pointers[0].toint())
-        if cutlass.const_expr(self._world_size == 2):
-            if index == Int32(1):
-                address = Int64(pointers[1].toint())
-            return address
-        if index < Int32(4):
-            if index < Int32(2):
-                address = Int64(pointers[0].toint())
-                if index == Int32(1):
-                    address = Int64(pointers[1].toint())
-            else:
-                address = Int64(pointers[2].toint())
-                if index == Int32(3):
-                    address = Int64(pointers[3].toint())
-        else:
-            if index < Int32(6):
-                address = Int64(pointers[4].toint())
-                if index == Int32(5):
-                    address = Int64(pointers[5].toint())
-            else:
-                address = Int64(pointers[6].toint())
-                if cutlass.const_expr(self._world_size == 8):
-                    if index == Int32(7):
-                        address = Int64(pointers[7].toint())
+        for peer in cutlass.range_constexpr(1, self._world_size):
+            if index == Int32(peer):
+                address = Int64(pointers[peer].toint())
         return address
 
     @cute.jit
@@ -273,6 +287,14 @@ class _TwoShotBf16Launch:
         staging5: cute.Pointer,
         staging6: cute.Pointer,
         staging7: cute.Pointer,
+        staging8: cute.Pointer,
+        staging9: cute.Pointer,
+        staging10: cute.Pointer,
+        staging11: cute.Pointer,
+        staging12: cute.Pointer,
+        staging13: cute.Pointer,
+        staging14: cute.Pointer,
+        staging15: cute.Pointer,
         signal0: cute.Pointer,
         signal1: cute.Pointer,
         signal2: cute.Pointer,
@@ -281,11 +303,20 @@ class _TwoShotBf16Launch:
         signal5: cute.Pointer,
         signal6: cute.Pointer,
         signal7: cute.Pointer,
+        signal8: cute.Pointer,
+        signal9: cute.Pointer,
+        signal10: cute.Pointer,
+        signal11: cute.Pointer,
+        signal12: cute.Pointer,
+        signal13: cute.Pointer,
+        signal14: cute.Pointer,
+        signal15: cute.Pointer,
         output: cute.Pointer,
         rank: Int32,
         pack_stride: Int64,
         slot_bytes: Int64,
-        rows_per_rank: Int32,
+        shard_packs: Int64,
+        total_packs: Int64,
     ) -> None:
         staging = (
             staging0,
@@ -296,6 +327,14 @@ class _TwoShotBf16Launch:
             staging5,
             staging6,
             staging7,
+            staging8,
+            staging9,
+            staging10,
+            staging11,
+            staging12,
+            staging13,
+            staging14,
+            staging15,
         )
         signals = (
             signal0,
@@ -306,6 +345,14 @@ class _TwoShotBf16Launch:
             signal5,
             signal6,
             signal7,
+            signal8,
+            signal9,
+            signal10,
+            signal11,
+            signal12,
+            signal13,
+            signal14,
+            signal15,
         )
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
@@ -315,8 +362,6 @@ class _TwoShotBf16Launch:
             local_rank = Int32(self._rank)
         else:
             local_rank = rank
-        packs_per_row = Int32(self._row_elems // _PACK_ELEMS)
-        shard_packs = Int64(rows_per_rank) * Int64(packs_per_row)
         chunk = (shard_packs + Int64(gdim) - Int64(1)) // Int64(gdim)
         begin = Int64(bidx) * chunk
         end = begin + chunk
@@ -359,16 +404,20 @@ class _TwoShotBf16Launch:
 
             index = begin + Int64(tidx)
             while index < end:
-                words = ld_global_nc_v4_u32(
-                    payload_address + (source_pack + index) * Int64(16)
-                )
-                _st_generic_v4_u32(
-                    destination_payload + index * Int64(16),
-                    words[0],
-                    words[1],
-                    words[2],
-                    words[3],
-                )
+                valid_pack = source_pack + index
+                if cutlass.const_expr(self._operation == "all_gather"):
+                    valid_pack = Int64(local_rank) * shard_packs + index
+                if valid_pack < total_packs:
+                    words = ld_global_nc_v4_u32(
+                        payload_address + (source_pack + index) * Int64(16)
+                    )
+                    _st_generic_v4_u32(
+                        destination_payload + index * Int64(16),
+                        words[0],
+                        words[1],
+                        words[2],
+                        words[3],
+                    )
                 index += Int64(block_threads)
             peer_index += Int32(1)
 
@@ -388,24 +437,27 @@ class _TwoShotBf16Launch:
                     accumulator[lane] = Float32(0.0)
 
                 local_pack = Int64(local_rank) * shard_packs + index
-                self._load_accumulate_pack_global_nc(
-                    accumulator,
-                    payload_address + local_pack * Int64(16),
-                )
-
-                for peer_index in cutlass.range(
-                    Int32(1),
-                    Int32(self._world_size),
-                    Int32(1),
-                    unroll=1,
-                ):
-                    source_rank = (local_rank + peer_index) % Int32(self._world_size)
-                    staged_pack = (
-                        self_base
-                        + Int64(source_rank) * pack_stride * Int64(16)
-                        + index * Int64(16)
+                if local_pack < total_packs:
+                    self._load_accumulate_pack_global_nc(
+                        accumulator,
+                        payload_address + local_pack * Int64(16),
                     )
-                    self._load_accumulate_pack_generic(accumulator, staged_pack)
+
+                    for peer_index in cutlass.range(
+                        Int32(1),
+                        Int32(self._world_size),
+                        Int32(1),
+                        unroll=1,
+                    ):
+                        source_rank = (local_rank + peer_index) % Int32(
+                            self._world_size
+                        )
+                        staged_pack = (
+                            self_base
+                            + Int64(source_rank) * pack_stride * Int64(16)
+                            + index * Int64(16)
+                        )
+                        self._load_accumulate_pack_generic(accumulator, staged_pack)
 
                 self._store_pack(output_address + index * Int64(16), accumulator)
                 index += Int64(self._threads)
@@ -435,16 +487,19 @@ class _TwoShotBf16Launch:
                     unroll=1,
                 ):
                     index = first_index + Int64(iteration) * Int64(self._threads)
-                    # Generic addressing serves both the local payload and the
-                    # IPC-mapped peer slabs.
-                    words = _ld_generic_v4_u32(source_payload_base + index * Int64(16))
-                    st_global_v4_u32(
-                        destination_base + index * Int64(16),
-                        words[0],
-                        words[1],
-                        words[2],
-                        words[3],
-                    )
+                    if Int64(source_rank) * shard_packs + index < total_packs:
+                        # Generic addressing serves both the local payload and the
+                        # IPC-mapped peer slabs.
+                        words = _ld_generic_v4_u32(
+                            source_payload_base + index * Int64(16)
+                        )
+                        st_global_v4_u32(
+                            destination_base + index * Int64(16),
+                            words[0],
+                            words[1],
+                            words[2],
+                            words[3],
+                        )
                 peer_index += Int32(1)
 
 
@@ -494,9 +549,9 @@ def get_twoshot_bf16_launcher(
         device_index,
     )
     del device_index  # part of the process-local cache key
-    if world_size != _SUPPORTED_WORLD_SIZE:
+    if world_size not in _SUPPORTED_WORLD_SIZES:
         raise ValueError(
-            "single-rounding BF16 two-shot launchers require world size 4, "
+            f"BF16 two-shot launchers support world sizes {_SUPPORTED_WORLD_SIZES}, "
             f"got {world_size}"
         )
     if rank < 0 or rank >= world_size:
@@ -538,7 +593,7 @@ def get_twoshot_bf16_launcher(
                 cute.AddressSpace.gmem,
                 assumed_align=16,
             )
-            for _ in range(8)
+            for _ in range(16)
         ),
         *(
             make_ptr(
@@ -547,7 +602,7 @@ def get_twoshot_bf16_launcher(
                 cute.AddressSpace.gmem,
                 assumed_align=4,
             )
-            for _ in range(8)
+            for _ in range(16)
         ),
         make_ptr(cutlass.Uint32, 16, cute.AddressSpace.gmem, assumed_align=16),
         0,
@@ -555,10 +610,11 @@ def get_twoshot_bf16_launcher(
         1,
         1,
         1,
+        1,
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             f"comm.pcie.twoshot_bf16.{operation}",
-            1,
+            2,
             cache_key,
         ),
     )
@@ -571,11 +627,12 @@ def get_twoshot_bf16_launcher(
         rank: int,
         pack_stride: int,
         slot_bytes: int,
-        rows_per_rank: int,
+        shard_packs: int,
+        total_packs: int,
         grid_x: int,
     ) -> None:
-        if len(staging_addresses) != 8 or len(signal_addresses) != 8:
-            raise ValueError("two-shot scalar pointer ABI requires eight peers")
+        if len(staging_addresses) != 16 or len(signal_addresses) != 16:
+            raise ValueError("two-shot scalar pointer ABI requires sixteen peers")
         raw_args = (
             make_ptr(
                 cutlass.Uint32,
@@ -610,7 +667,8 @@ def get_twoshot_bf16_launcher(
             rank,
             pack_stride,
             slot_bytes,
-            rows_per_rank,
+            shard_packs,
+            total_packs,
             grid_x,
             current_cuda_stream(),
         )

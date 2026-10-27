@@ -39,19 +39,72 @@ def _configs(query):
         blocks = int(call.get("blocks", call.get("block_limit", 16)))
         threads = int(call["threads"])
         yield CollectiveConfig(implementation=name, threads=threads, blocks=blocks)
-        if name in ("tp4_push_sentinel", "tp4_push_rsag"):
-            for count in (8, 16, 32):
-                yield CollectiveConfig(
-                    implementation=name, threads=threads, blocks=count
+        if (
+            query.world_size in (2, 3, 4, 6, 8, 10)
+            and query.operation == "all_reduce"
+            and call.get("stage_input")
+            and call.get("dtype") in ("float16", "bfloat16")
+            and name
+            in (
+                "pull",
+                "tp2_remote_push",
+                "tp2_remote_push_simple",
+                "remote_push_ll",
+                "remote_push_simple",
+                "remote_push_full",
+                "remote_push_rsag",
+            )
+        ):
+            from .pcie_oneshot import _MAX_BLOCKS
+
+            units = int(call["size_packs"]) * (2 if name == "tp2_remote_push" else 1)
+            for count_threads in (32, 64, 128, 256, 512):
+                grids = (
+                    1,
+                    2,
+                    4,
+                    8,
+                    16,
+                    32,
+                    _MAX_BLOCKS,
+                    min(_MAX_BLOCKS, max(1, -(-units // count_threads))),
                 )
+                for count_blocks in dict.fromkeys(grids):
+                    yield CollectiveConfig(
+                        implementation=name, threads=count_threads, blocks=count_blocks
+                    )
         elif name == "twoshot":
-            for count in (32, 64, 128):
-                yield CollectiveConfig(
-                    implementation=name, threads=threads, blocks=count
-                )
+            from math import prod
+
+            packs = prod(call["shape"]) // 8
+            shard = -(-packs // query.world_size)
+            for count_threads in (32, 64, 128, 256, 512):
+                for count in dict.fromkeys(
+                    (
+                        1,
+                        2,
+                        4,
+                        8,
+                        16,
+                        32,
+                        64,
+                        min(64, max(1, -(-shard // count_threads))),
+                    )
+                ):
+                    yield CollectiveConfig(
+                        implementation=name, threads=count_threads, blocks=count
+                    )
         elif name == "dcp":
             setup = payload["setup"]
-            thread_values = (threads,) if setup["threads_override"] else (128, 256, 512)
+            thread_values = (
+                (threads,)
+                if setup["threads_override"]
+                else (
+                    (128, 256, 512, 1024)
+                    if query.operation == "all_gather_heads" and query.world_size == 2
+                    else (128, 256, 512)
+                )
+            )
             block_values = (blocks,) if setup["blocks_override"] else (8, 16, 32, 64)
             for threads in thread_values:
                 for count in block_values:
@@ -86,12 +139,12 @@ def _parameters(query, device):
             "blocks": tuple(dict.fromkeys(c.blocks for c in configs)),
         },
         predicates=(lambda value: CollectiveConfig(**value) in configs,),
-        # The eager pull transport is raced as an alternative only by the audit;
-        # it is still raced when it is the configured transport.
+        # Plain reductions measure pull alongside the payload-ready transports.
         efficiency_predicates=(
             lambda value: (
                 value["implementation"] != "pull"
                 or query.default.implementation == "pull"
+                or query.operation == "all_reduce"
             ),
         ),
         autotune_effort=effort,
@@ -101,8 +154,11 @@ def _parameters(query, device):
 def _validate_query(query, device):
     if not isinstance(query, CollectiveQuery) or not query.alternatives:
         raise ValueError("collective query requires native alternatives")
-    if not 2 <= query.world_size <= 8 and 0 <= query.rank < query.world_size:
-        raise ValueError("collective tuning requires an established TP2–8 group")
+    if (
+        query.world_size not in (2, 3, 4, 6, 8, 9, 10, 12, 16)
+        or not 0 <= query.rank < query.world_size
+    ):
+        raise ValueError("collective tuning requires a supported world size and rank")
     for payload in query.alternatives.values():
         native = PcieQuery(**payload)
         NATIVE.validate_query(native, device)
@@ -118,6 +174,16 @@ def _validate_config(query, config, device):
 
 
 def _equivalence_key(query, device, config):
+    if config.implementation == "twoshot":
+        from math import prod
+
+        packs = prod(query.alternatives["twoshot"]["call"]["shape"]) // 8
+        shard = -(-packs // query.world_size)
+        return (
+            config.implementation,
+            config.threads,
+            min(config.blocks, max(1, -(-shard // config.threads))),
+        )
     if config.implementation != "dcp":
         return asdict(config)
     native = query.alternatives["dcp"]
@@ -151,7 +217,7 @@ def _collective_signature(query):
 
 TUNING = TuningContract(
     component_id="comm.pcie",
-    query_schema_version=1,
+    query_schema_version=3,
     config_schema_version=1,
     query_fields=frozenset(
         ("operation", "world_size", "rank", "alternatives", "default", "inplace")
@@ -247,12 +313,45 @@ def oneshot_alternatives(query, runtime):
         return alternatives
     modes = ["pull"] if field == "transport" else ["stage_pull"]
     if field == "transport":
+        capacity = int(query.setup.get("eager_buffer_bytes") or 0) // 16
+        packs = int(query.call["size_packs"])
+        graph_slots = all(
+            variant in tuple(tuple(v) for v in query.setup["variants"])
+            for variant in ((True, 0), (True, 1))
+        )
+        valid_graph = (
+            query.world_size in (2, 3, 4, 6, 8, 10)
+            and query.call["dtype"] in ("float16", "bfloat16")
+            and graph_slots
+            and 0 < packs <= min(capacity, 0x7FFFFFFF)
+        )
         if (
-            query.world_size == 4
-            and query.call["dtype"] in ("bf16", "bfloat16")
+            valid_graph
+            and query.call["remote_push_region_packs"] > 0
             and query.call["remote_push_region_packs"]
+            + 2 * (query.world_size - 1) * capacity
+            <= int(query.setup["eager_storage_shards"]) * capacity
         ):
-            modes += ["tp4_push_sentinel", "tp4_push_rsag"]
+            from .pcie_oneshot import _MAX_BLOCKS
+
+            modes.append("remote_push_ll")
+            if query.world_size == 2:
+                modes.append("tp2_remote_push")
+            if (
+                capacity >= _MAX_BLOCKS
+                and packs * 16 <= capacity * 32 - _MAX_BLOCKS * 16
+            ):
+                modes.append("remote_push_simple")
+                if query.world_size == 2:
+                    modes.append("tp2_remote_push_simple")
+        if (
+            valid_graph
+            and query.call["dtype"] == "bfloat16"
+            and query.call.get("payload_ready_region_packs", 0) > 0
+            and query.call["payload_ready_region_packs"] + query.world_size * capacity
+            <= int(query.setup["eager_storage_shards"]) * capacity
+        ):
+            modes += ["remote_push_full", "remote_push_rsag"]
     elif query.world_size == 4:
         modes += ["stage_remote_push"]
         # The payload-ready fused specialization uses an isolated incoming region.
@@ -262,7 +361,15 @@ def oneshot_alternatives(query, runtime):
         call = {**query.call, field: mode}
         if field == "transport" and mode == "pull":
             call.update(threads=call["eager_threads"], blocks=call["eager_blocks"])
-        if field == "transport" and mode.startswith("tp4_"):
+        if field == "transport" and mode in ("tp2_remote_push", "remote_push_ll"):
+            call.update(threads=128, blocks=36)
+        if field == "transport" and mode in (
+            "tp2_remote_push_simple",
+            "remote_push_simple",
+        ):
+            call.update(threads=128, blocks=min(36, -(-call["size_packs"] // 128)))
+        if field == "transport" and mode in ("remote_push_full", "remote_push_rsag"):
             call.update(threads=256, blocks=16)
-        alternatives[mode] = (replace(query, call=FrozenMapping(call)), runtime)
+        if mode not in alternatives:
+            alternatives[mode] = (replace(query, call=FrozenMapping(call)), runtime)
     return alternatives

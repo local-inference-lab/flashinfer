@@ -7,13 +7,15 @@ The timed operation is the bound ``qsa.run`` transaction: selector query
 preparation, streaming representative compression, stable top-k selection,
 position expansion, and sparse paged GQA. Each request owns disjoint main K/V
 pages plus independent selector and recurrent state, as it does in serving.
+The qwen38 fixture uses production operand layouts and rotary arithmetic with
+synthetic activations and rank-separated selector representatives.
 """
 
 from __future__ import annotations
 
 import argparse
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 import gc
 import hashlib
 import importlib.metadata
@@ -32,6 +34,7 @@ import torch
 from b12x.attention import qsa
 from b12x.preparation import PreparedCall, PreparationResult, PreparationSession
 from b12x.preparation.types import require_prepared
+from b12x.testing.benchmark import transaction_samples
 from b12x.attention.qsa.reference import (
     gemma_rmsnorm_reference,
     packed_stream_compress_reference,
@@ -40,7 +43,6 @@ from b12x.attention.qsa.reference import (
     sparse_paged_gqa_reference,
 )
 from benchmarks.experimental.b12x.common import (
-    bench_cuda_graph,
     capture_cuda_graph,
     make_l2_flush_fn,
     require_sm120,
@@ -100,13 +102,30 @@ class BenchmarkCase:
     tail_length: int = 0
     preceding_accepted_tokens: int = 1
     main_page_size: int = MAIN_PAGE_SIZE
+    planned_max_seq_len: int | None = None
+    verification_batch: int = 1
     planned_max_batch: int | None = None
     planned_max_q_rows: int | None = None
     planned_max_speculative_tokens: int | None = None
 
     def __post_init__(self) -> None:
-        if self.kind not in {"throughput", "prefill", "stream_phase", "speculative"}:
+        if self.kind not in {
+            "throughput",
+            "prefill",
+            "stream_phase",
+            "speculative",
+            "verification",
+        }:
             raise ValueError(f"unknown QSA benchmark case kind {self.kind!r}")
+        if self.verification_batch < 1 or self.rows % self.verification_batch:
+            raise ValueError("verification rows must divide into equal request widths")
+        if (
+            self.capacity_context < self.context
+            or self.capacity_context % COMPRESS_RATIO
+        ):
+            raise ValueError(
+                "planned context must cover live context and be compression aligned"
+            )
         if self.context % COMPRESS_RATIO:
             raise ValueError("QSA benchmark capacity must be compression aligned")
         if self.main_page_size <= 0 or self.main_page_size % COMPRESS_RATIO:
@@ -143,6 +162,8 @@ class BenchmarkCase:
         page_suffix = (
             "" if self.main_page_size == MAIN_PAGE_SIZE else f"-p{self.main_page_size}"
         )
+        if self.kind == "verification":
+            return f"{self.profile.name}-b{self.request_count}-w{self.rows // self.request_count}-c{self.context}{page_suffix}"
         if self.kind == "stream_phase":
             return (
                 f"{self.profile.name}-r1-cap{self.context}-tail{self.tail_length}"
@@ -161,6 +182,8 @@ class BenchmarkCase:
 
     @property
     def request_count(self) -> int:
+        if self.kind == "verification":
+            return self.verification_batch
         return 1 if self.kind in {"prefill", "speculative"} else self.rows
 
     @property
@@ -189,6 +212,8 @@ class BenchmarkCase:
 
     @property
     def max_speculative_tokens(self) -> int:
+        if self.kind == "verification":
+            return self.rows // self.request_count - 1
         return 3 if self.kind == "speculative" else 0
 
     @property
@@ -204,6 +229,9 @@ class BenchmarkCase:
             setup_start = self.context - 2 * COMPRESS_RATIO
             start = setup_start + self.preceding_accepted_tokens
             return tuple(range(start, start + self.rows))
+        if self.kind == "verification":
+            width = self.rows // self.request_count
+            return tuple(range(self.context - width, self.context)) * self.request_count
         if self.kind == "prefill":
             return tuple(range(self.context - self.rows, self.context))
         return (self.context - 1,) * self.rows
@@ -220,6 +248,14 @@ class BenchmarkCase:
         return max(self.positions) + 1
 
     @property
+    def capacity_context(self) -> int:
+        return (
+            self.context
+            if self.planned_max_seq_len is None
+            else self.planned_max_seq_len
+        )
+
+    @property
     def groups(self) -> int:
         return self.context // COMPRESS_RATIO
 
@@ -227,13 +263,15 @@ class BenchmarkCase:
     def rank_prefix_groups(self) -> int:
         if self.kind == "speculative":
             return (self.context - 2 * COMPRESS_RATIO) // COMPRESS_RATIO
+        if self.kind == "verification":
+            return (self.context - self.rows // self.request_count) // COMPRESS_RATIO
         if self.kind == "prefill":
             return (self.context - self.rows) // COMPRESS_RATIO
         return self.groups - 1
 
     @property
     def main_pages_per_request(self) -> int:
-        return (self.context + self.main_page_size - 1) // self.main_page_size
+        return (self.capacity_context + self.main_page_size - 1) // self.main_page_size
 
     @property
     def main_pages_total(self) -> int:
@@ -250,7 +288,7 @@ class BenchmarkCase:
     @property
     def compressed_pages_per_request(self) -> int:
         return (
-            self.groups + self.compressed_page_size - 1
+            self.capacity_context // COMPRESS_RATIO + self.compressed_page_size - 1
         ) // self.compressed_page_size
 
     @property
@@ -354,6 +392,7 @@ class PreparedCase:
     setup_metadata: dict[str, object]
     session: PreparationSession
     result: PreparationResult
+    fixture: str = "generic"
 
     def close(self) -> None:
         self.result.close()
@@ -425,6 +464,7 @@ def _parse_profiles(value: str) -> tuple[str, ...]:
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--fixture", choices=("generic", "qwen38"), default="generic")
     parser.add_argument(
         "--profiles",
         type=_parse_profiles,
@@ -454,11 +494,19 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "comma-separated context lengths; 'full' means 262144 (default: 2048,8192)"
         ),
     )
+    parser.add_argument("--verification-batches", type=_parse_positive_csv, default=())
+    parser.add_argument(
+        "--verification-widths", type=_parse_positive_csv, default=(1, 2, 3, 4, 5, 6)
+    )
+    parser.add_argument("--main-page-size", type=int, default=MAIN_PAGE_SIZE)
+    parser.add_argument("--planned-max-speculative-tokens", type=int)
+    parser.add_argument("--planned-max-seq-len", type=int)
+    parser.add_argument("--preparation-cache-dir", type=Path)
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
         "--main-cache-layout",
         choices=("interleaved", "separate"),
-        default="interleaved",
+        default=None,
         help=(
             "physical K/V allocation layout; interleaved matches the vLLM "
             "BLHNC per-layer cache view (default: interleaved)"
@@ -492,7 +540,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="print each complete case record as JSON after its summary",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.main_cache_layout is None:
+        args.main_cache_layout = (
+            "separate" if args.fixture == "qwen38" else "interleaved"
+        )
+    return args
 
 
 def _validate_args(args: argparse.Namespace) -> None:
@@ -520,6 +573,19 @@ def _resolve_cases(args: argparse.Namespace) -> tuple[BenchmarkCase, ...]:
         for context in args.contexts
         if rows <= context
     )
+    cases.extend(
+        BenchmarkCase(
+            PROFILES[profile],
+            batch * width,
+            context,
+            kind="verification",
+            verification_batch=batch,
+        )
+        for profile in args.profiles
+        for batch in args.verification_batches
+        for width in args.verification_widths
+        for context in args.contexts
+    )
     if args.contract_cases:
         profile = PROFILES["tp2"]
         cases.extend(
@@ -541,13 +607,22 @@ def _resolve_cases(args: argparse.Namespace) -> tuple[BenchmarkCase, ...]:
                 preceding_accepted_tokens=2,
             )
         )
-    return tuple(cases)
+    return tuple(
+        replace(
+            case,
+            planned_max_seq_len=args.planned_max_seq_len,
+            planned_max_speculative_tokens=args.planned_max_speculative_tokens,
+            main_page_size=args.main_page_size,
+        )
+        for case in cases
+    )
 
 
 def _cache_capacity_bytes(
     case: BenchmarkCase,
     *,
     kv_cache_dtype: str = "bf16",
+    fixture: str = "generic",
 ) -> dict[str, int]:
     element_bytes = torch.bfloat16.itemsize
     kv_element_bytes = (
@@ -571,10 +646,13 @@ def _cache_capacity_bytes(
         * element_bytes
     )
     raw_ring_capacity = COMPRESS_RATIO * (
-        (COMPRESS_RATIO + case.max_speculative_tokens + COMPRESS_RATIO - 1)
+        (COMPRESS_RATIO + case.planned_speculative_tokens + COMPRESS_RATIO - 1)
         // COMPRESS_RATIO
     )
-    raw = case.planned_batch * (
+    raw_slots = (
+        max(33, case.planned_batch) if fixture == "qwen38" else case.planned_batch
+    )
+    raw = raw_slots * (
         raw_ring_capacity * INDEX_HEAD_DIM * element_bytes
         + raw_ring_capacity * torch.int64.itemsize
         + raw_ring_capacity * POSITION_AXES * torch.int64.itemsize
@@ -627,6 +705,7 @@ def _rank_safe_raw_keys(
     *,
     generator: torch.Generator,
     rms_norm_eps: float,
+    nonidentity_rope: bool = False,
 ) -> torch.Tensor:
     """Build distinct keys whose compressed score is strictly negative."""
     if prepared_query.ndim != 2 or int(prepared_query.shape[1]) != INDEX_HEAD_DIM:
@@ -636,7 +715,9 @@ def _rank_safe_raw_keys(
     if count <= 0:
         raise ValueError("rank-safe raw-key count must be positive")
 
-    query = prepared_query.float()
+    query = prepared_query.float().clone()
+    if nonidentity_rope:
+        query[:, :INDEX_ROTARY_DIM] = 0
     gram = query @ query.T
     identity = torch.eye(int(query.shape[0]), dtype=torch.float32, device=query.device)
     gram = gram + identity * 1e-4
@@ -662,6 +743,8 @@ def _rank_safe_raw_keys(
         dim=-1, keepdim=True
     ).clamp_min(1e-6)
     transformed = separating[None, :] + (null_component * separating.norm() * 0.75)
+    if nonidentity_rope:
+        transformed[:, :INDEX_ROTARY_DIM] *= 0.01
     divisor = 1.0 + key_norm_weight.float()
     if bool(torch.any(divisor.abs() < 0.25)):
         raise BenchmarkFailure("index-key norm weight is unsuitable for rank-safe keys")
@@ -681,6 +764,27 @@ def _rank_safe_raw_keys(
 
 def _identity_rope(value: torch.Tensor, _positions: torch.Tensor) -> torch.Tensor:
     return value
+
+
+def _rotate_reference(value, positions, cos, sin):
+    single = positions.ndim == 1
+    if single:
+        value, positions = value[None], positions[None]
+    pairs = torch.arange(INDEX_ROTARY_DIM // 2, device=value.device)
+    axes = torch.zeros_like(pairs)
+    axes[(pairs % 3 == 1) & (pairs < 3 * MROPE_SECTIONS[1])] = 1
+    axes[(pairs % 3 == 2) & (pairs < 3 * MROPE_SECTIONS[2])] = 2
+    row_cos = cos[positions[:, axes], pairs]
+    row_sin = sin[positions[:, axes], pairs]
+    source = value.float()
+    result = source.clone()
+    first, second = source[..., :32], source[..., 32:64]
+    while row_cos.ndim < first.ndim:
+        row_cos, row_sin = row_cos.unsqueeze(1), row_sin.unsqueeze(1)
+    result[..., :32] = first * row_cos - second * row_sin
+    result[..., 32:64] = second * row_cos + first * row_sin
+    result = result.to(value.dtype)
+    return result[0] if single else result
 
 
 def _selector_rank_coefficients(
@@ -739,6 +843,7 @@ def _initialize_selector_dataset(
     group_budget: int,
     generator: torch.Generator,
     rms_norm_eps: float,
+    nonidentity_rope: bool = False,
 ) -> None:
     """Build rank-separated representatives for an exact selector oracle."""
     requests = int(prepared_query_by_request.shape[0])
@@ -753,6 +858,7 @@ def _initialize_selector_dataset(
                 int(raw_ring.shape[1]),
                 generator=generator,
                 rms_norm_eps=rms_norm_eps,
+                nonidentity_rope=nonidentity_rope,
             )
         )
     if int(raw_index_key.shape[0]) == requests:
@@ -764,18 +870,22 @@ def _initialize_selector_dataset(
                     1,
                     generator=generator,
                     rms_norm_eps=rms_norm_eps,
+                    nonidentity_rope=nonidentity_rope,
                 )[0]
             )
-    elif requests == 1:
-        raw_index_key.copy_(
-            _rank_safe_raw_keys(
-                prepared_query_by_request[0],
-                key_norm_weight,
-                int(raw_index_key.shape[0]),
-                generator=generator,
-                rms_norm_eps=rms_norm_eps,
+    elif int(raw_index_key.shape[0]) % requests == 0:
+        width = int(raw_index_key.shape[0]) // requests
+        for request in range(requests):
+            raw_index_key[request * width : (request + 1) * width].copy_(
+                _rank_safe_raw_keys(
+                    prepared_query_by_request[request],
+                    key_norm_weight,
+                    width,
+                    generator=generator,
+                    rms_norm_eps=rms_norm_eps,
+                    nonidentity_rope=nonidentity_rope,
+                )
             )
-        )
     else:
         raise BenchmarkFailure(
             "rank-safe raw-key construction requires one row per request or one "
@@ -796,9 +906,10 @@ def _initialize_selector_dataset(
         ranked_groups,
         device=prepared_query_by_request.device,
     )
-    peak_dimensions = (
-        prepared_query_by_request[:, 0].float().abs().argmax(dim=-1, keepdim=True)
-    )
+    marker_query = prepared_query_by_request[:, 0].float().abs().clone()
+    if nonidentity_rope:
+        marker_query[:, :INDEX_ROTARY_DIM] = 0
+    peak_dimensions = marker_query.argmax(dim=-1, keepdim=True)
     peak_signs = torch.gather(
         prepared_query_by_request[:, 0], 1, peak_dimensions
     ).sign()
@@ -819,13 +930,16 @@ def _make_caps(
     device: torch.device,
     *,
     kv_dtype: torch.dtype,
+    fixture: str = "generic",
 ) -> qsa.Caps:
     return qsa.Caps(
         device=device,
         max_batch=case.planned_batch,
-        max_raw_state_slots=case.planned_batch,
+        max_raw_state_slots=max(33, case.planned_batch)
+        if fixture == "qwen38"
+        else case.planned_batch,
         max_q_rows=case.planned_q_rows,
-        max_seq_len=case.context,
+        max_seq_len=case.capacity_context,
         num_main_cache_pages=case.main_pages_capacity,
         num_compressed_cache_pages=(case.compressed_pages_capacity),
         main_page_size=case.main_page_size,
@@ -854,9 +968,11 @@ def _prepare_case(
     seed: int,
     main_cache_layout: str,
     kv_cache_dtype: str,
+    preparation_cache_dir: Path | None = None,
+    fixture: str = "generic",
 ) -> PreparedCase:
     kv_dtype = torch.float8_e4m3fn if kv_cache_dtype == "fp8_e4m3" else torch.bfloat16
-    caps = _make_caps(case, device, kv_dtype=kv_dtype)
+    caps = _make_caps(case, device, kv_dtype=kv_dtype, fixture=fixture)
     generator = torch.Generator(device=device).manual_seed(seed)
 
     main_cache_shape = (
@@ -892,8 +1008,12 @@ def _prepare_case(
     k_descale = None
     v_descale = None
     if kv_dtype == torch.float8_e4m3fn:
-        k_descale = torch.tensor([0.0125], dtype=torch.float32, device=device)
-        v_descale = torch.tensor([0.01], dtype=torch.float32, device=device)
+        k_descale = torch.tensor(
+            [1.0 if fixture == "qwen38" else 0.0125], dtype=torch.float32, device=device
+        )
+        v_descale = torch.tensor(
+            [1.0 if fixture == "qwen38" else 0.01], dtype=torch.float32, device=device
+        )
         main_k.copy_((source_k.float() / k_descale).clamp(-448.0, 448.0))
         main_v.copy_((source_v.float() / v_descale).clamp(-448.0, 448.0))
     else:
@@ -926,25 +1046,28 @@ def _prepare_case(
         device=device,
     )
 
+    if fixture == "qwen38":
+        compressed_table = main_table
+
     raw_ring = _random_bf16(
-        (case.planned_batch, caps.raw_ring_capacity, INDEX_HEAD_DIM),
+        (caps.max_raw_state_slots, caps.raw_ring_capacity, INDEX_HEAD_DIM),
         generator=generator,
         device=device,
     )
     raw_tags = torch.full(
-        (case.planned_batch, caps.raw_ring_capacity),
+        (caps.max_raw_state_slots, caps.raw_ring_capacity),
         -1,
         dtype=torch.int64,
         device=device,
     )
     raw_rope = torch.full(
-        (case.planned_batch, caps.raw_ring_capacity, POSITION_AXES),
+        (caps.max_raw_state_slots, caps.raw_ring_capacity, POSITION_AXES),
         -1,
         dtype=torch.int64,
         device=device,
     )
     interval_starts = torch.full(
-        (case.planned_batch,), -1, dtype=torch.int64, device=device
+        (caps.max_raw_state_slots,), -1, dtype=torch.int64, device=device
     )
     state_slot_ids = torch.arange(case.planned_batch, dtype=torch.int64, device=device)
 
@@ -961,11 +1084,31 @@ def _prepare_case(
         * 0.05
     )
     rope_cos = torch.ones(
-        (case.context, INDEX_ROTARY_DIM // 2),
+        (case.capacity_context, INDEX_ROTARY_DIM // 2),
         dtype=torch.bfloat16,
         device=device,
     )
     rope_sin = torch.zeros_like(rope_cos)
+    if fixture == "qwen38":
+        inverse = (
+            1.0 / (10000000 ** (torch.arange(0, 64, 2, dtype=torch.float32) / 64))
+        ).to(device)
+        frequency = (
+            torch.arange(case.capacity_context, device=device, dtype=torch.float32)[
+                :, None
+            ]
+            * inverse
+        )
+        rope_cos, rope_sin = frequency.cos(), frequency.sin()
+    rotate = (
+        (
+            lambda value, positions: _rotate_reference(
+                value, positions, rope_cos, rope_sin
+            )
+        )
+        if fixture == "qwen38"
+        else _identity_rope
+    )
     output = torch.empty(
         (case.planned_q_rows, case.profile.q_heads, HEAD_DIM),
         dtype=torch.bfloat16,
@@ -1008,13 +1151,39 @@ def _prepare_case(
         generator=generator,
         device=device,
     )
+    if case.kind == "verification":
+        width = case.rows // case.request_count
+        for request in range(case.request_count):
+            first = request * width
+            index_query[first + 1 : first + width].copy_(
+                index_query[first : first + 1].expand(width - 1, -1, -1)
+            )
     if case.kind in {"prefill", "speculative"}:
         index_query[1:].copy_(index_query[:1].expand(case.rows - 1, -1, -1))
     raw_key = _random_bf16(
         (case.rows, INDEX_HEAD_DIM), generator=generator, device=device
     )
+    if fixture == "qwen38":
+        projected_index = torch.empty(
+            (case.rows, 640), dtype=torch.bfloat16, device=device
+        )
+        projected_index[:, :512].copy_(index_query.reshape(case.rows, 512))
+        projected_index[:, 512:].copy_(raw_key)
+        index_query = projected_index[:, :512].view(
+            case.rows, INDEX_HEADS, INDEX_HEAD_DIM
+        )
+        raw_key = projected_index[:, 512:]
     query_positions = torch.tensor(case.positions, dtype=torch.int64, device=device)
-    if case.kind in {"prefill", "speculative"}:
+    if case.kind == "verification":
+        width = case.rows // case.request_count
+        request_ids = torch.arange(
+            case.request_count, dtype=torch.int64, device=device
+        ).repeat_interleave(width)
+        query_start_loc = (
+            torch.arange(case.request_count + 1, dtype=torch.int32, device=device)
+            * width
+        )
+    elif case.kind in {"prefill", "speculative"}:
         request_ids = torch.zeros((case.rows,), dtype=torch.int64, device=device)
         query_start_loc = torch.tensor([0, case.rows], dtype=torch.int32, device=device)
     else:
@@ -1082,10 +1251,11 @@ def _prepare_case(
         q_weight,
         caps.rms_norm_eps,
     )
+    prepared_selector_query = rotate(prepared_selector_query, dynamic["rope_positions"])
     prepared_query_by_request = (
         prepared_selector_query
         if case.request_count == case.rows
-        else prepared_selector_query[:1]
+        else prepared_selector_query[:: case.rows // case.request_count]
     )
     _initialize_selector_dataset(
         prepared_query_by_request=prepared_query_by_request,
@@ -1093,6 +1263,7 @@ def _prepare_case(
         raw_ring=raw_ring[: case.request_count],
         raw_index_key=raw_key,
         key_norm_weight=k_weight,
+        nonidentity_rope=fixture == "qwen38",
         rank_prefix_groups=case.rank_prefix_groups,
         group_budget=caps.group_budget,
         generator=generator,
@@ -1106,7 +1277,7 @@ def _prepare_case(
     first_positions = (
         initial_positions
         if case.request_count == case.rows
-        else (initial_positions[0],)
+        else initial_positions[:: case.rows // case.request_count]
     )
     for request, first_position in enumerate(first_positions):
         interval_starts[request] = first_position - initial_acceptance
@@ -1117,20 +1288,26 @@ def _prepare_case(
             raw_tags[request, slot] = prior
             raw_rope[request, slot, :] = prior
 
+    mutable = (
+        compressed,
+        raw_ring,
+        raw_tags,
+        raw_rope,
+        interval_starts,
+        output,
+        selected,
+    )
+    initial = tuple(value.clone() for value in mutable)
+    activation_sources = {name: value.clone() for name, value in dynamic.items()}
+
     def prepare_call(state):
         (spec,) = state.scratch_specs()
         scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
         binding = state.bind_for_preparation(scratch=scratch, **binding_args)
-        mutable = (
-            compressed,
-            raw_ring,
-            raw_tags,
-            raw_rope,
-            interval_starts,
-            output,
-            selected,
-        )
-        initial = tuple(value.clone() for value in mutable)
+
+        def produce():
+            for name, source in activation_sources.items():
+                dynamic[name].copy_(source)
 
         def restore():
             for value, original in zip(mutable, initial, strict=True):
@@ -1139,16 +1316,22 @@ def _prepare_case(
         return PreparedCall(
             run=lambda: state.run_for_preparation(binding, **dynamic),
             reset=restore,
+            produce=produce,
             restore=restore,
             owners=(binding,),
         )
 
-    session = PreparationSession(device=device)
+    session = PreparationSession(
+        device=device, compile_workers=4, cache_dir=preparation_cache_dir
+    )
     request = declaration.request(
         name=case.name,
         prepare_call=prepare_call,
+        benchmark_call=prepare_call,
     )
     result = session.prepare((request,))
+    for value, original in zip(mutable, initial, strict=True):
+        value.copy_(original)
     plan = declaration
     (scratch_spec,) = require_prepared(plan, "attention.qsa").scratch_specs()
     scratch = torch.empty(
@@ -1162,6 +1345,8 @@ def _prepare_case(
         "transaction": (
             "packed_prefill_interval"
             if case.kind == "prefill"
+            else "packed_verification_interval"
+            if case.kind == "verification"
             else "single_decode_interval"
         ),
         "setup_transaction_executed": False,
@@ -1176,6 +1361,7 @@ def _prepare_case(
             case.rows,
             generator=generator,
             rms_norm_eps=caps.rms_norm_eps,
+            nonidentity_rope=fixture == "qwen38",
         )
         if torch.equal(setup_raw_index_key, raw_key):
             raise BenchmarkFailure(
@@ -1217,6 +1403,16 @@ def _prepare_case(
                 (case.planned_batch,), dtype=torch.bool, device=device
             ),
         }
+        if fixture == "qwen38":
+            setup_projected_index = torch.empty_like(projected_index)
+            setup_projected_index[:, :512].copy_(
+                setup_dynamic["index_query"].reshape(case.rows, 512)
+            )
+            setup_projected_index[:, 512:].copy_(setup_dynamic["raw_index_key"])
+            setup_dynamic["index_query"] = setup_projected_index[:, :512].view(
+                case.rows, INDEX_HEADS, INDEX_HEAD_DIM
+            )
+            setup_dynamic["raw_index_key"] = setup_projected_index[:, 512:]
         setup_oracle_compressed = compressed.clone()
         setup_oracle_raw_ring = raw_ring[0].clone()
         setup_oracle_raw_tags = raw_tags[0].clone()
@@ -1236,7 +1432,7 @@ def _prepare_case(
                 compress_ratio=COMPRESS_RATIO,
                 key_norm_weight=k_weight,
                 eps=caps.rms_norm_eps,
-                rope=_identity_rope,
+                rope=rotate,
             )
         )
         paged_store_compressed_reference(
@@ -1281,7 +1477,7 @@ def _prepare_case(
             "setup_main_kv_read_only": True,
         }
 
-    if case.kind in {"prefill", "speculative"}:
+    if case.kind in {"prefill", "speculative", "verification"}:
         compressed_rows = compressed
     else:
         completed_groups = {
@@ -1317,6 +1513,7 @@ def _prepare_case(
         setup_metadata=setup_metadata,
         session=session,
         result=result,
+        fixture=fixture,
     )
 
 
@@ -1325,6 +1522,23 @@ def _validate_correctness(
 ) -> tuple[torch.Tensor, dict[str, object], PersistentStateSnapshot]:
     case = prepared.case
     binding = prepared.binding
+    rotate = (
+        (
+            lambda value, positions: _rotate_reference(
+                value, positions, binding.rope_cos, binding.rope_sin
+            )
+        )
+        if prepared.fixture == "qwen38"
+        else _identity_rope
+    )
+    prepared_query = rotate(
+        gemma_rmsnorm_reference(
+            prepared.dynamic["index_query"],
+            binding.index_q_norm_weight,
+            binding.state.caps.rms_norm_eps,
+        ),
+        prepared.dynamic["rope_positions"],
+    )
     prepared.state_restore.restore()
     main_k_before = binding.main_k_cache.clone()
     main_v_before = binding.main_v_cache.clone()
@@ -1353,9 +1567,19 @@ def _validate_correctness(
             is_prefilling=bool(prepared.dynamic["is_prefilling"][request]),
             compress_ratio=COMPRESS_RATIO,
             key_norm_weight=binding.index_k_norm_weight,
-            eps=binding.plan.caps.rms_norm_eps,
-            rope=_identity_rope,
+            eps=binding.state.caps.rms_norm_eps,
+            rope=rotate,
         )
+        if prepared.fixture == "qwen38" and representatives.numel():
+            margins = torch.einsum(
+                "rhd,gd->rhg",
+                prepared_query[start:end].float(),
+                representatives.float(),
+            )
+            if not bool(torch.all(margins < -0.25)):
+                raise BenchmarkFailure(
+                    f"{case.name}: full rotated compression keys do not have a negative score margin"
+                )
         paged_store_compressed_reference(
             oracle_compressed,
             binding.compressed_block_table,
@@ -1380,7 +1604,7 @@ def _validate_correctness(
 
     actual = prepared.run().clone()
     selected = binding.selected_positions[: case.rows].clone()
-    torch.cuda.synchronize(binding.plan.caps.device)
+    torch.cuda.synchronize(binding.state.caps.device)
 
     if not bool(torch.all(torch.isfinite(actual))):
         raise BenchmarkFailure(f"{case.name}: eager output is non-finite")
@@ -1406,14 +1630,9 @@ def _validate_correctness(
     if not torch.equal(binding.raw_interval_start_positions, expected_anchors):
         raise BenchmarkFailure(f"{case.name}: committed interval anchor mismatch")
 
-    prepared_query = gemma_rmsnorm_reference(
-        prepared.dynamic["index_query"],
-        binding.index_q_norm_weight,
-        binding.plan.caps.rms_norm_eps,
-    )
-    final_workspace_rows = case.rows % binding.plan.workspace_q_rows
+    final_workspace_rows = case.rows % binding.state.workspace_q_rows
     if final_workspace_rows == 0:
-        final_workspace_rows = min(case.rows, binding.plan.workspace_q_rows)
+        final_workspace_rows = min(case.rows, binding.state.workspace_q_rows)
     torch.testing.assert_close(
         binding.prepared_index_query[:final_workspace_rows],
         prepared_query[-final_workspace_rows:],
@@ -1501,7 +1720,7 @@ def _validate_correctness(
             sequence_length // COMPRESS_RATIO,
             case.groups,
         )
-        expanded_count = min(eligible, binding.plan.caps.group_budget) * COMPRESS_RATIO
+        expanded_count = min(eligible, binding.state.caps.group_budget) * COMPRESS_RATIO
         tail_start = ((position + 1) // COMPRESS_RATIO) * COMPRESS_RATIO
         expected_tail = torch.arange(
             tail_start,
@@ -1527,7 +1746,7 @@ def _validate_correctness(
         main_v_cache=main_v_before,
     )
     prepared.state_restore.restore()
-    torch.cuda.synchronize(binding.plan.caps.device)
+    torch.cuda.synchronize(binding.state.caps.device)
     prepared.state_restore.assert_restored()
     return (
         actual,
@@ -1618,6 +1837,8 @@ def _run_case(
         seed=args.seed + 1009 * case_index,
         main_cache_layout=args.main_cache_layout,
         kv_cache_dtype=args.kv_cache_dtype,
+        preparation_cache_dir=args.preparation_cache_dir,
+        fixture=args.fixture,
     )
     eager_output, correctness, eager_persistent_state = _validate_correctness(prepared)
     eager_selected = prepared.binding.selected_positions[: case.rows].clone()
@@ -1687,9 +1908,9 @@ def _run_case(
         replays=args.eager_replays,
         l2_flush=l2_flush,
     )
-    graph_samples = bench_cuda_graph(
-        graph,
-        replays=args.graph_replays,
+    graph_samples = transaction_samples(
+        lambda: graph.replay(),
+        samples=args.graph_replays,
         prepare=prepared.state_restore.restore,
         l2_flush=l2_flush,
     )
@@ -1708,9 +1929,17 @@ def _run_case(
         "rows": case.rows,
         "requests": case.request_count,
         "context": case.context,
+        "planned_max_seq_len": case.capacity_context,
+        "planned_max_speculative_tokens": case.planned_speculative_tokens,
         "active_sequence_length": case.active_sequence_length,
         "case_kind": case.kind,
+        "fixture": args.fixture,
         "setup": prepared.setup_metadata,
+        "tuning_config": prepared.binding.state.config.to_dict(),
+        "preparation": {
+            "cache_hits": prepared.result.cache_hits,
+            "benchmarked_candidates": prepared.result.benchmarked_candidates,
+        },
         "geometry": {
             "main_cache_layout": args.main_cache_layout,
             "kv_cache_dtype": args.kv_cache_dtype,
@@ -1740,6 +1969,7 @@ def _run_case(
             "cache_bytes": _cache_capacity_bytes(
                 case,
                 kv_cache_dtype=args.kv_cache_dtype,
+                fixture=args.fixture,
             ),
             "allocated_binding_and_dynamic_storage_bytes": _binding_storage_bytes(
                 prepared
@@ -1753,6 +1983,7 @@ def _run_case(
                 "summary": _summary(eager_samples),
             },
             "cuda_graph": {
+                "timed_invocation": "torch.cuda.CUDAGraph.replay",
                 "replay_samples_us": graph_samples["replay_us"],
                 "restore_samples_us": graph_samples["metadata_us"],
                 "step_samples_us": graph_samples["step_us"],
@@ -1888,6 +2119,10 @@ def main(argv: list[str] | None = None) -> int:
                 "rows": list(args.rows),
                 "prefill_rows": list(args.prefill_rows),
                 "contexts": list(args.contexts),
+                "main_page_size": args.main_page_size,
+                "planned_max_seq_len": args.planned_max_seq_len,
+                "planned_max_speculative_tokens": args.planned_max_speculative_tokens,
+                "fixture": args.fixture,
                 "main_cache_layout": args.main_cache_layout,
                 "kv_cache_dtype": args.kv_cache_dtype,
                 "contract_cases": args.contract_cases,
@@ -1906,7 +2141,7 @@ def main(argv: list[str] | None = None) -> int:
 
         print(
             f"device={properties.name} sm={capability[0]}{capability[1]} "
-            f"cases={len(cases)} page={MAIN_PAGE_SIZE} "
+            f"cases={len(cases)} page={args.main_page_size} "
             f"selector={INDEX_HEADS}x{INDEX_HEAD_DIM} "
             f"compress={COMPRESS_RATIO} budget={BUDGET}"
         )

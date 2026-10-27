@@ -551,6 +551,7 @@ def test_ordinary_rmsnorm_uses_affine_weight_without_offset(
             graph.reset()
 
 
+@pytest.mark.parametrize("num_warps", (8, 10, 16))
 @pytest.mark.parametrize("tokens", (1, 7, 4096))
 @pytest.mark.parametrize(
     "weight_dtype,zero_centered",
@@ -558,7 +559,7 @@ def test_ordinary_rmsnorm_uses_affine_weight_without_offset(
 )
 @pytest.mark.parametrize("provided", (False, True))
 def test_combine_norm_preserves_affine_precision_and_replays(
-    tokens, weight_dtype, zero_centered, provided
+    tokens, weight_dtype, zero_centered, provided, num_warps
 ):
     device = require_b12x()
     generator = torch.Generator(device=device).manual_seed(5813)
@@ -581,6 +582,12 @@ def test_combine_norm_preserves_affine_precision_and_replays(
     eps = 1e-6
     plan = hc.plan(
         hc.Caps(device=device, max_tokens=tokens, hidden_size=2560),
+        override=hc.HyperConnectionConfig(
+            backend="cutedsl",
+            reduction_block_h=4096,
+            pointwise_block=256,
+            reduction_num_warps=num_warps,
+        ),
         invocation=FrozenMapping(
             {
                 "operation": "combine_norm",

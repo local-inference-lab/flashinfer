@@ -13,11 +13,11 @@ from b12x.comm.pcie.pcie_twoshot_bf16 import PCIeTwoShotBF16
 @pytest.mark.parametrize(
     "nbytes, expected",
     (
-        (16, "tp4_push_sentinel"),
-        (24576, "tp4_push_sentinel"),
-        (24592, "tp4_push_rsag"),
-        (655360, "tp4_push_rsag"),
-        (2097168, "tp4_push_rsag"),
+        (16, "remote_push_full"),
+        (24576, "remote_push_full"),
+        (24592, "remote_push_rsag"),
+        (655360, "remote_push_rsag"),
+        (2097168, "remote_push_rsag"),
     ),
 )
 def test_payload_ready_graph_plan_requires_owned_incoming_storage(nbytes, expected):
@@ -25,7 +25,7 @@ def test_payload_ready_graph_plan_requires_owned_incoming_storage(nbytes, expect
         world_size=4,
         eager_tables=(256, 512),
         eager_buffer_bytes=4 << 20,
-        plain_remote_push_region_packs=4 * (4 << 20) // 16,
+        plain_payload_ready_region_packs=4 * (4 << 20) // 16,
         transport_policy=(False, True, True, True, True),
     )
     inp = torch.empty(nbytes // 2, dtype=torch.bfloat16)
@@ -33,7 +33,7 @@ def test_payload_ready_graph_plan_requires_owned_incoming_storage(nbytes, expect
     assert config(native, inp, graph_channel=True) == (expected, 256, 16)
     assert config(native, inp, graph_channel=False)[0] == "pull"
     assert config(native, inp.to(torch.float16), graph_channel=True)[0] == "pull"
-    native.plain_remote_push_region_packs = 0
+    native.plain_payload_ready_region_packs = 0
     assert config(native, inp, graph_channel=True)[0] == "pull"
 
 
@@ -178,3 +178,124 @@ def test_capability_requires_resident_grid_on_every_rank(monkeypatch, counts, ex
         )
         == expected
     )
+
+
+@pytest.mark.parametrize("world", (2, 3, 4, 6, 8, 10))
+@pytest.mark.parametrize("capacity", (16, 65552, (2 << 20) + 16))
+def test_direct_manager_provisions_twoshot_for_full_capacity(
+    monkeypatch, world, capacity
+):
+    runtime = SimpleNamespace(rank=0, world_size=world, device=torch.device("cpu"))
+    provisioned = []
+    monkeypatch.setattr(dispatch.dist, "get_world_size", lambda group: world)
+    monkeypatch.setattr(
+        dispatch.PCIeOneshotAllReducePool,
+        "from_exchange_group",
+        lambda **kwargs: runtime,
+    )
+    monkeypatch.setattr(
+        dispatch.PCIeAllReduce, "_maybe_island_rs", lambda **kwargs: None
+    )
+    monkeypatch.setattr(dispatch, "_bf16_twoshot_supported", lambda **kwargs: True)
+
+    def construct(**kwargs):
+        provisioned.append(kwargs)
+        return object()
+
+    monkeypatch.setattr(dispatch.PCIeTwoShotBF16, "from_exchange_group", construct)
+    manager = dispatch.PCIeAllReduce.from_exchange_group(
+        exchange_group=object(),
+        device="cpu",
+        single_channel=True,
+        max_size=capacity,
+        eager_buffer_bytes=capacity,
+    )
+    assert manager.algorithm == "oneshot"
+    assert provisioned[0]["max_rows"] == (capacity + 15) // 16
+    assert provisioned[0]["row_elems"] == 8
+
+
+@pytest.mark.parametrize("world", (2, 3, 6, 8))
+def test_provisioning_preserves_disabled_tuning_default(world):
+    primary = SimpleNamespace(rank=0, world_size=world, device=torch.device("cpu"))
+    manager = dispatch.PCIeAllReduce(
+        primary, "oneshot", bf16_twoshot=object(), algorithm_override="auto"
+    )
+    assert not manager._use_bf16_twoshot(torch.empty(1, dtype=torch.bfloat16), None)
+
+
+@pytest.mark.parametrize("failure", (None, "mapping", "unrelated", "cleanup"))
+def test_tp10_auto_uses_actual_mapping_verdict(monkeypatch, failure):
+    calls = []
+    direct = SimpleNamespace(rank=0, world_size=10, device=torch.device("cpu"))
+    hierarchical = SimpleNamespace(rank=0, world_size=10, device=torch.device("cpu"))
+    error = (
+        dispatch.DirectMappingUnavailable("peer mappings unavailable")
+        if failure == "mapping"
+        else RuntimeError("retained cleanup" if failure == "cleanup" else "unrelated")
+    )
+    if failure == "cleanup":
+        error.retryable_setup = object()
+
+    def construct(**kwargs):
+        calls.append("direct")
+        if failure:
+            raise error
+        return direct
+
+    def hierarchy(**kwargs):
+        calls.append("hierarchical")
+        return hierarchical
+
+    monkeypatch.setattr(dispatch.dist, "get_world_size", lambda group: 10)
+    monkeypatch.setattr(dispatch, "_algorithm_override", lambda: "auto")
+    monkeypatch.setattr(
+        dispatch.PCIeOneshotAllReducePool, "from_exchange_group", construct
+    )
+    monkeypatch.setattr(dispatch, "PCIeHierarchicalAllReduce", hierarchy)
+    monkeypatch.setattr(
+        dispatch.PCIeAllReduce, "_maybe_island_rs", lambda **kwargs: None
+    )
+    monkeypatch.setattr(dispatch, "_bf16_twoshot_supported", lambda **kwargs: False)
+    if failure in ("unrelated", "cleanup"):
+        with pytest.raises(RuntimeError) as caught:
+            dispatch.PCIeAllReduce.from_exchange_group(
+                exchange_group=object(), device="cpu", single_channel=True
+            )
+        assert caught.value is error
+        assert calls == ["direct"]
+    else:
+        manager = dispatch.PCIeAllReduce.from_exchange_group(
+            exchange_group=object(), device="cpu", single_channel=True
+        )
+        assert manager._runtime is (hierarchical if failure else direct)
+        assert manager.algorithm == ("hierarchical" if failure else "oneshot")
+        assert calls == (["direct", "hierarchical"] if failure else ["direct"])
+
+
+@pytest.mark.parametrize(
+    "override, single_channel",
+    (("hierarchical", True), ("island_rs", True), ("auto", False)),
+)
+def test_tp10_unqualified_declarations_preserve_hierarchy(
+    monkeypatch, override, single_channel
+):
+    runtime = SimpleNamespace(rank=0, world_size=10, device=torch.device("cpu"))
+    monkeypatch.setattr(dispatch.dist, "get_world_size", lambda group: 10)
+    monkeypatch.setattr(dispatch, "_algorithm_override", lambda: override)
+    monkeypatch.setattr(dispatch, "PCIeHierarchicalAllReduce", lambda **kwargs: runtime)
+    monkeypatch.setattr(
+        dispatch.PCIeAllReduce, "_maybe_island_rs", lambda **kwargs: None
+    )
+
+    def unexpected(**kwargs):
+        pytest.fail("direct provisioning must not run")
+
+    monkeypatch.setattr(
+        dispatch.PCIeOneshotAllReducePool, "from_exchange_group", unexpected
+    )
+    manager = dispatch.PCIeAllReduce.from_exchange_group(
+        exchange_group=object(), device="cpu", single_channel=single_channel
+    )
+    assert manager._runtime is runtime
+    assert manager.algorithm == "hierarchical"

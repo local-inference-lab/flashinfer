@@ -45,11 +45,20 @@ from .pcie_twoshot import (
     TWOSHOT_REQUIRED_SMS,
     _MAX_BLOCKS,
     _SIGNAL_BYTES,
-    _pad_scalar_peer_ptrs,
 )
 
 _PACK_ELEMS = 8
-SUPPORTED_WORLD_SIZES = (4,)
+SUPPORTED_WORLD_SIZES = (2, 3, 4, 6, 8, 10)
+_SCALAR_PEERS = 16
+
+
+def _pad_scalar_peer_ptrs(
+    pointers: Sequence[int], *, rank: int, world_size: int
+) -> tuple[int, ...]:
+    live = tuple(int(pointer) for pointer in pointers)
+    if len(live) != world_size or not 0 <= rank < world_size:
+        raise ValueError("invalid BF16 two-shot scalar peer pointer set")
+    return live + (live[rank],) * (_SCALAR_PEERS - world_size)
 
 
 @dataclass(frozen=True)
@@ -63,15 +72,14 @@ class _TwoShotBf16Layout:
 def _make_layout(max_rows: int, row_elems: int, world_size: int) -> _TwoShotBf16Layout:
     if world_size not in SUPPORTED_WORLD_SIZES:
         raise ValueError(
-            f"PCIeTwoShotBF16 supports only world size 4, got {world_size}"
+            f"PCIeTwoShotBF16 supports world sizes {SUPPORTED_WORLD_SIZES}, got {world_size}"
         )
-    if max_rows <= 0 or max_rows % world_size != 0:
-        raise ValueError("max_rows must be positive and divisible by world size")
+    if max_rows <= 0:
+        raise ValueError("max_rows must be positive")
     if row_elems <= 0 or row_elems % _PACK_ELEMS != 0:
         raise ValueError("row_elems must be a positive multiple of 8")
-    max_rows_per_rank = max_rows // world_size
-    packs_per_row = row_elems // _PACK_ELEMS
-    pack_stride = _align_up(max_rows_per_rank * packs_per_row, 16)
+    total_packs = max_rows * (row_elems // _PACK_ELEMS)
+    pack_stride = _align_up((total_packs + world_size - 1) // world_size, 16)
     payload_bytes = world_size * pack_stride * 16
     slot_bytes = _align_up(payload_bytes, IPC_SLAB_ALIGNMENT)
     signal_bytes = _align_up(_SIGNAL_BYTES, IPC_SLAB_ALIGNMENT)
@@ -105,7 +113,7 @@ def _require_disjoint(
 
 
 class PCIeTwoShotBF16:
-    """Serialized single-rounding BF16 collective runtime for world size 4."""
+    """Serialized single-rounding BF16 collective runtime for CUDA IPC peers."""
 
     def __init__(self, *args, **kwargs) -> None:
         raise RuntimeError("use PCIeTwoShotBF16.from_exchange_group()")
@@ -136,11 +144,13 @@ class PCIeTwoShotBF16:
         self._staging_ptrs = tuple(
             tuple(int(pointer) for pointer in slot) for slot in staging_ptrs
         )
-        if len(self._signal_ptrs) != 8 or (
+        if len(self._signal_ptrs) != _SCALAR_PEERS or (
             len(self._staging_ptrs) != 2
-            or any(len(slot) != 8 for slot in self._staging_ptrs)
+            or any(len(slot) != _SCALAR_PEERS for slot in self._staging_ptrs)
         ):
-            raise ValueError("two-shot scalar pointer ABI requires 8 peers and 2 slots")
+            raise ValueError(
+                "two-shot scalar pointer ABI requires 16 peers and 2 slots"
+            )
         self._owned_buffers = list(owned_buffers)
         self._ipc = ipc
         self.max_rows = max_rows
@@ -149,7 +159,7 @@ class PCIeTwoShotBF16:
         self._slot_bytes = int(slot_bytes)
         # The all-reduce's reduce-scatter result; all-reduces on this serial channel reuse it.
         self._push_shard = torch.empty(
-            (max_rows // world_size, row_elems),
+            (pack_stride * _PACK_ELEMS,),
             dtype=torch.bfloat16,
             device=self.device,
         )
@@ -183,7 +193,7 @@ class PCIeTwoShotBF16:
             normalized_row_elems = int(row_elems)
             if world_size not in SUPPORTED_WORLD_SIZES:
                 raise ValueError(
-                    f"PCIeTwoShotBF16 supports only world size 4, got {world_size}"
+                    f"PCIeTwoShotBF16 supports world sizes {SUPPORTED_WORLD_SIZES}, got {world_size}"
                 )
             if device_obj.type != "cuda":
                 raise ValueError("PCIe twoshot requires a CUDA device")
@@ -191,8 +201,6 @@ class PCIeTwoShotBF16:
                 raise ValueError("max_rows must be positive")
             if normalized_row_elems <= 0 or normalized_row_elems % _PACK_ELEMS != 0:
                 raise ValueError("row_elems must be a positive multiple of 8")
-            if normalized_max_rows % world_size != 0:
-                raise ValueError("max_rows must be divisible by world size")
             return device_obj, normalized_max_rows, normalized_row_elems
 
         device_obj, max_rows, row_elems = _run_collective_preallocation_setup(
@@ -327,9 +335,9 @@ class PCIeTwoShotBF16:
         if inp.device != self.device:
             return False
         numel = inp.numel()
-        if numel == 0 or numel % (self.row_elems * self.world_size) != 0:
+        if numel == 0 or numel % _PACK_ELEMS != 0:
             return False
-        return numel // self.row_elems <= self.max_rows
+        return numel <= self.max_rows * self.row_elems
 
     # ---- graph plumbing ---------------------------------------------------
 
@@ -351,20 +359,18 @@ class PCIeTwoShotBF16:
     def _launch_prepared(self, payload, scale, out, *, state, threads, block_limit):
         del scale
         operation = state.query.call["operation"]
-        # All-reduce accepts any contiguous shape; transport rows have the
-        # fixed runtime width, independently of the producer's tensor shape.
-        rows = payload.numel() // self.row_elems
-        rows_per_rank = (
-            rows // self.world_size
-            if operation in ("reduce_scatter", "all_reduce")
-            else rows
-        )
+        payload_packs = payload.numel() // _PACK_ELEMS
+        if operation == "all_gather":
+            shard_packs = payload_packs
+            total_packs = payload_packs * self.world_size
+        else:
+            total_packs = payload_packs
+            shard_packs = (total_packs + self.world_size - 1) // self.world_size
         if (
             int(threads) != state.query.call["threads"]
             or int(block_limit) != state.query.call["block_limit"]
         ):
             raise ValueError("two-shot launch controls differ from the prepared plan")
-        shard_packs = rows_per_rank * (self.row_elems // _PACK_ELEMS)
         if shard_packs > self._pack_stride:
             raise ValueError("pcie_twoshot_bf16 staging capacity exceeded")
         blocks = max(1, min(int(block_limit), (shard_packs + threads - 1) // threads))
@@ -375,7 +381,7 @@ class PCIeTwoShotBF16:
             self._device_slot_bias = self._slot & 1
             self._device_slot_selection = True
         if operation == "all_reduce":
-            shard = self._push_shard[:rows_per_rank]
+            shard = self._push_shard[: shard_packs * _PACK_ELEMS]
             steps = (("reduce_scatter", payload, shard), ("all_gather", shard, out))
         else:
             steps = ((operation, payload, out),)
@@ -393,7 +399,8 @@ class PCIeTwoShotBF16:
                 self.rank,
                 self._pack_stride,
                 self._slot_bytes,
-                rows_per_rank,
+                shard_packs,
+                total_packs,
                 blocks,
             )
 
@@ -492,14 +499,17 @@ class PCIeTwoShotBF16:
         threads: int = 512,
         block_limit: int = 64,
     ) -> torch.Tensor:
-        """FP32-accumulating BF16 all-reduce with one BF16 rounding."""
+        """FP32-accumulating BF16 all-reduce with one BF16 rounding.
+
+        Output may share the exact input span; partial overlap is rejected.
+        The same-stream reduce-scatter consumes input before all-gather writes it.
+        """
         state = require_prepared(plan, "comm.pcie", self.device)
         state.require_runtime(self)
         if state.query.surface != "PCIeTwoShotBF16.all_reduce":
             raise ValueError("plan does not prepare BF16 all-reduce")
         if not self.accepts(inp):
             raise ValueError("input not accepted by PCIeTwoShotBF16.all_reduce")
-        rows = inp.numel() // self.row_elems
         with _device_guard(self.device):
             if out is None:
                 if _is_current_stream_capturing(self.device):
@@ -508,11 +518,12 @@ class PCIeTwoShotBF16:
                     )
                 out = torch.empty_like(inp)
             self._check_tensor(out, shape=tuple(inp.shape), name="output")
-            _require_disjoint(out, inp, source_name="input")
+            if out.data_ptr() != inp.data_ptr():
+                _require_disjoint(out, inp, source_name="input")
             self._launch_prepared(
-                inp.view(rows, self.row_elems),
+                inp,
                 None,
-                out.view(rows, self.row_elems),
+                out,
                 state=state,
                 threads=threads,
                 block_limit=block_limit,

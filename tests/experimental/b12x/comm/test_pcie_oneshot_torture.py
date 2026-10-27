@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 from contextlib import ExitStack
+from dataclasses import replace
 import os
 import socket
 
@@ -22,7 +23,7 @@ from b12x.comm.pcie._oneshot_preparation import (
     plan,
     query_from_runtime,
 )
-from b12x.preparation import CollectiveRequirement, PreparationSession
+from b12x.preparation import CollectiveRequirement, FrozenMapping, PreparationSession
 from b12x.comm.pcie._oneshot_cute import (
     _PLAIN_GRAPH_ARRIVED_OFFSET,
     _PLAIN_GRAPH_EPOCH_OFFSET,
@@ -101,13 +102,48 @@ def _read_local_u32(channel, source: int, stream: torch.cuda.Stream) -> int:
     return value.value
 
 
-def _prepare_plan(prepared: ExitStack, channel, inp, out, **fused):
+def _prepare_plan(
+    prepared: ExitStack,
+    channel,
+    inp,
+    out,
+    *,
+    plain_ll_threads=None,
+    plain_transport=None,
+    **fused,
+):
     surface = (
         "OneshotAllReduce.all_reduce_fused_add_rms_norm"
         if fused
         else "OneshotAllReduce.all_reduce"
     )
     query = query_from_runtime(channel, surface=surface, call={"inp": inp})
+    if plain_ll_threads is not None:
+        assert not fused
+        query = replace(
+            query,
+            call=FrozenMapping(
+                {
+                    **query.call,
+                    "transport": "tp2_remote_push",
+                    "threads": plain_ll_threads,
+                    "blocks": 36,
+                }
+            ),
+        )
+    if plain_transport is not None:
+        assert not fused
+        query = replace(
+            query,
+            call=FrozenMapping(
+                {
+                    **query.call,
+                    "transport": plain_transport,
+                    "threads": 64,
+                    "blocks": 2,
+                }
+            ),
+        )
     declaration = plan(query, runtime=channel)
     collective = CollectiveRequirement(
         key=surface, ranks=tuple(range(channel.world_size))
@@ -698,12 +734,211 @@ def test_tp2_graph_peer_push_preserves_payload_bits(monkeypatch: pytest.MonkeyPa
     mp.spawn(_graph_payload_worker, args=(2, _free_port()), nprocs=2, join=True)
 
 
+def _concurrent_simple_graph_worker(rank: int, world_size: int, port: int) -> None:
+    torch.cuda.set_device(rank)
+    device = torch.device("cuda", rank)
+    dist.init_process_group(
+        "nccl", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=world_size
+    )
+    pool = PCIeOneshotAllReducePool.from_process_group(
+        process_group=dist.group.WORLD,
+        device=device,
+        max_input_bytes=TP2_PLAIN_REMOTE_PUSH_MAX_BYTES,
+        max_concurrent_channels=2,
+    )
+    prepared = ExitStack()
+    captures = []
+    try:
+        channel_ids = ("graph:simple-bf16", "graph:simple-fp16")
+        pool.prepare_channels(channel_ids)
+        specs = (((8, 2560), torch.bfloat16), ((4, 4096), torch.float16))
+        for channel_id, (shape, dtype) in zip(channel_ids, specs, strict=True):
+            source = torch.zeros(shape, device=device, dtype=dtype)
+            output = torch.empty_like(source)
+            stream = torch.cuda.Stream(device=device)
+            stream.wait_stream(torch.cuda.current_stream(device))
+            graph = torch.cuda.CUDAGraph()
+            with pool.capture(stream, channel_id=channel_id) as channel:
+                query = query_from_runtime(
+                    channel, surface="OneshotAllReduce.all_reduce", call={"inp": source}
+                )
+                assert query.call["transport"] == "tp2_remote_push_simple"
+                with torch.cuda.stream(stream):
+                    declaration = _prepare_plan(prepared, channel, source, output)
+                with torch.cuda.graph(graph, stream=stream):
+                    channel.all_reduce(source, plan=declaration, out=output)
+                assert channel._ext._state(channel._ptr).device_slot_selection
+            stream.synchronize()
+            captures.append((stream, graph, source, output, channel))
+
+        for iteration in range(TORTURE_PAYLOAD_ITERS):
+            expectations = []
+            for channel_index, (_, _, source, output, _) in enumerate(captures):
+                lane = torch.arange(source.numel(), device=device, dtype=torch.float32)
+                patterns = [
+                    (
+                        (
+                            (
+                                lane * (source_rank + 3)
+                                + iteration * 11
+                                + channel_index * 7
+                            )
+                            % 127
+                            - 63
+                        )
+                        / 16
+                    )
+                    .to(source.dtype)
+                    .view_as(source)
+                    for source_rank in range(world_size)
+                ]
+                source.copy_(patterns[rank])
+                output.fill_(float("nan"))
+                expectations.append((patterns[rank], patterns[0] + patterns[1]))
+            for stream, graph, _, _, _ in captures:
+                stream.wait_stream(torch.cuda.current_stream(device))
+                with torch.cuda.stream(stream):
+                    graph.replay()
+            for stream, _, _, _, _ in captures:
+                stream.synchronize()
+            for (_, _, source, output, _), (original, expected) in zip(
+                captures, expectations, strict=True
+            ):
+                assert torch.equal(source.view(torch.int16), original.view(torch.int16))
+                assert torch.equal(output.view(torch.int16), expected.view(torch.int16))
+    finally:
+        prepared.close()
+        pool.close()
+        dist.destroy_process_group()
+
+
+def test_tp2_concurrent_simple_graphs(monkeypatch: pytest.MonkeyPatch):
+    if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+        pytest.skip("TP2 concurrent Simple graphs require two CUDA devices")
+    monkeypatch.setenv("B12X_PCIE_TP2_PLAIN_REMOTE_PUSH", "1")
+    mp.spawn(
+        _concurrent_simple_graph_worker, args=(2, _free_port()), nprocs=2, join=True
+    )
+
+
+def _simple_to_ll_tag_collision_worker(
+    rank, world_size, port, dtype_name, delayed_rank
+):
+    torch.cuda.set_device(rank)
+    device = torch.device("cuda", rank)
+    dist.init_process_group(
+        "nccl", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=world_size
+    )
+    capacity_bytes = 7 * 2560 * 2
+    pool = PCIeOneshotAllReducePool(
+        rank=rank,
+        world_size=world_size,
+        device=device,
+        exchange_group=dist.group.WORLD,
+        eager_buffer_bytes=capacity_bytes,
+        max_size=capacity_bytes,
+        rank_data_bytes=capacity_bytes,
+        single_channel=True,
+    )
+    stream = torch.cuda.Stream(device=device)
+    prepared = ExitStack()
+    graphs, inputs, outputs = [], [], []
+    try:
+        for rows, transport in ((7, "tp2_remote_push_simple"), (1, "tp2_remote_push")):
+            source = torch.full(
+                (rows, 2560), rank + 1, device=device, dtype=getattr(torch, dtype_name)
+            )
+            output = torch.empty_like(source)
+            stream.wait_stream(torch.cuda.current_stream(device))
+            with pool.capture(stream) as channel:
+                query = query_from_runtime(
+                    channel, surface="OneshotAllReduce.all_reduce", call={"inp": source}
+                )
+                assert query.call["transport"] == transport
+                with torch.cuda.stream(stream):
+                    declaration = _prepare_plan(prepared, channel, source, output)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, stream=stream):
+                    channel.all_reduce(source, plan=declaration, out=output)
+            stream.synchronize()
+            graphs.append(graph)
+            inputs.append(source)
+            outputs.append(output)
+        state = channel._ext._state(channel._ptr)
+        zeros = (ctypes.c_uint32 * (2 * capacity_bytes // 4))()
+        for slot in range(2):
+            _copy_host_to_device(
+                channel,
+                channel._eager_ptrs[slot][rank]
+                + state.plain_remote_push_region_packs * 16,
+                zeros,
+                stream,
+            )
+        control = (ctypes.c_uint32 * 2)(0, 0)
+        _copy_host_to_device(
+            channel,
+            channel.signal_ptrs[rank] + _PLAIN_GRAPH_EPOCH_OFFSET,
+            control,
+            stream,
+        )
+        pattern = torch.tensor(
+            [0x3F803F80, 4, 0x40004000, 4], device=device, dtype=torch.int32
+        )
+        stream.wait_stream(torch.cuda.current_stream(device))
+        with torch.cuda.stream(stream):
+            inputs[0].view(torch.int32).reshape(-1, 4).copy_(pattern)
+        stream.synchronize()
+        dist.barrier()
+        for graph in (graphs[0], graphs[1]):
+            with torch.cuda.stream(stream):
+                graph.replay()
+            stream.synchronize()
+            dist.barrier()
+        with torch.cuda.stream(stream):
+            outputs[1].fill_(float("nan"))
+            if rank == delayed_rank:
+                torch.cuda._sleep(20_000_000)
+            graphs[1].replay()
+        stream.synchronize()
+        mismatches = int((outputs[1] != 3).sum().item())
+        results = [None] * world_size
+        dist.all_gather_object(results, mismatches)
+        assert results == [0, 0], results
+        assert torch.equal(inputs[1], torch.full_like(inputs[1], rank + 1))
+    finally:
+        for graph in graphs:
+            graph.reset()
+        prepared.close()
+        pool.close()
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("dtype_name", ["bfloat16", "float16"])
+@pytest.mark.parametrize("delayed_rank", [0, 1])
+def test_tp2_simple_to_ll_rejects_payload_tag_collision(
+    dtype_name, delayed_rank, monkeypatch
+):
+    if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+        pytest.skip("TP2 protocol transition requires two CUDA devices")
+    monkeypatch.setenv("B12X_PCIE_TP2_PLAIN_REMOTE_PUSH", "1")
+    mp.spawn(
+        _simple_to_ll_tag_collision_worker,
+        args=(2, _free_port(), dtype_name, delayed_rank),
+        nprocs=2,
+        join=True,
+    )
+
+
 def _shape_growth_wrap_worker(
     rank: int,
     world_size: int,
     port: int,
     dtype_name: str,
     retained_tag: int,
+    hidden_size: int,
+    in_place: bool,
+    growth_rows: int = 4,
+    ll_threads: int | None = None,
 ) -> None:
     import b12x
 
@@ -717,7 +952,7 @@ def _shape_growth_wrap_worker(
         rank=rank,
         world_size=world_size,
     )
-    capacity_bytes = 4 * 4096 * 2
+    capacity_bytes = growth_rows * hidden_size * 2
     pool = PCIeOneshotAllReducePool(
         rank=rank,
         world_size=world_size,
@@ -732,18 +967,24 @@ def _shape_growth_wrap_worker(
     graphs, inputs, outputs = [], [], []
     prepared = ExitStack()
     try:
-        for rows in (1, 4):
+        for rows in (1, growth_rows):
             source = torch.full(
-                (rows, 4096),
+                (rows, hidden_size),
                 float(rank + 1),
                 device=device,
                 dtype=getattr(torch, dtype_name),
             )
-            output = torch.empty_like(source)
+            output = source if in_place else torch.empty_like(source)
             stream.wait_stream(torch.cuda.current_stream(device))
             with pool.capture(stream) as channel:
                 with torch.cuda.stream(stream):
-                    declaration = _prepare_plan(prepared, channel, source, output)
+                    declaration = _prepare_plan(
+                        prepared,
+                        channel,
+                        source,
+                        output,
+                        plain_ll_threads=ll_threads,
+                    )
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph, stream=stream):
                     channel.all_reduce(source, plan=declaration, out=output)
@@ -776,7 +1017,9 @@ def _shape_growth_wrap_worker(
         dist.barrier()
         with kernel_resolution_guard("TP2 shape growth across epoch rollover"):
             with torch.cuda.stream(stream):
+                inputs[0].fill_(rank + 1)
                 graphs[0].replay()
+                inputs[0].fill_(rank + 1)
                 graphs[0].replay()
             stream.synchronize()
             assert torch.all(outputs[0] == 3)
@@ -792,6 +1035,7 @@ def _shape_growth_wrap_worker(
             address = outputs[1].data_ptr()
             allocated = torch.cuda.memory_allocated(device)
             with torch.cuda.stream(stream):
+                inputs[1].fill_(rank + 1)
                 # Force the receiver to observe stale tail records before its
                 # peer publishes the larger shape after rollover.
                 if rank == 1:
@@ -812,14 +1056,44 @@ def _shape_growth_wrap_worker(
         dist.destroy_process_group()
 
 
+@pytest.mark.parametrize("hidden_size", [2560, 4096])
+@pytest.mark.parametrize("in_place", [False, True])
 @pytest.mark.parametrize("dtype_name", ["float16", "bfloat16"])
 @pytest.mark.parametrize("retained_tag", [0, 2])
-def test_tp2_graph_rollover_clears_unused_shape_capacity(dtype_name, retained_tag):
+def test_tp2_graph_rollover_clears_unused_shape_capacity(
+    dtype_name, retained_tag, hidden_size, in_place
+):
     if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
         pytest.skip("TP2 graph peer-push requires two CUDA devices")
     mp.spawn(
         _shape_growth_wrap_worker,
-        args=(2, _free_port(), dtype_name, retained_tag),
+        args=(2, _free_port(), dtype_name, retained_tag, hidden_size, in_place),
+        nprocs=2,
+        join=True,
+    )
+
+
+@pytest.mark.parametrize("dtype_name", ["float16", "bfloat16"])
+@pytest.mark.parametrize("retained_tag", [0, 2])
+def test_tp2_graph_in_place_multiwave_rollover(dtype_name, retained_tag):
+    if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+        pytest.skip("TP2 graph peer-push requires two CUDA devices")
+    mp.spawn(
+        _shape_growth_wrap_worker,
+        args=(2, _free_port(), dtype_name, retained_tag, 2560, True, 15),
+        nprocs=2,
+        join=True,
+    )
+
+
+@pytest.mark.parametrize("dtype_name", ["float16", "bfloat16"])
+@pytest.mark.parametrize("in_place", [False, True])
+def test_tp2_graph_ll_multiwave_rollover(dtype_name, in_place):
+    if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+        pytest.skip("TP2 graph peer-push requires two CUDA devices")
+    mp.spawn(
+        _shape_growth_wrap_worker,
+        args=(2, _free_port(), dtype_name, 2, 2560, in_place, 8, 128),
         nprocs=2,
         join=True,
     )
@@ -935,6 +1209,246 @@ def test_pcie_oneshot_prepared_plain_eager_and_graph():
     mp.spawn(
         _prepared_plain_worker,
         args=(world_size, _free_port()),
+        nprocs=world_size,
+        join=True,
+    )
+
+
+def _tagged_signed_values(inp, rank, iteration):
+    generator = torch.Generator().manual_seed(7100 + rank * 101 + iteration)
+    values = torch.randn(inp.numel(), generator=generator)
+    mode = iteration % 4
+    if mode == 1:
+        values *= torch.finfo(inp.dtype).tiny
+    elif mode == 2:
+        values.zero_()
+        values[1::2] = -0.0
+    elif mode == 3:
+        tiny = torch.finfo(inp.dtype).tiny
+        values[:8] = torch.tensor(
+            [
+                float("nan") if rank == 0 else 1.0,
+                float("inf") if rank == 0 else -1.0,
+                -float("inf") if rank == 0 else 1.0,
+                float("inf") if rank % 2 else -float("inf"),
+                torch.finfo(inp.dtype).max * (-1 if rank % 2 else 1),
+                tiny / 2,
+                -tiny / 2,
+                -0.0,
+            ]
+        )
+    return values.to(device=inp.device, dtype=inp.dtype)
+
+
+def _tagged_multirank_worker(
+    rank, world_size, port, dtype_name, in_place, compare_pull=False
+):
+    torch.cuda.set_device(rank)
+    device = torch.device("cuda", rank)
+    dist.init_process_group(
+        "nccl", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=world_size
+    )
+    capacity = 2048 * 16
+    pool = PCIeOneshotAllReducePool(
+        rank=rank,
+        world_size=world_size,
+        device=device,
+        exchange_group=dist.group.WORLD,
+        eager_buffer_bytes=capacity,
+        max_size=capacity,
+        single_channel=True,
+    )
+    stream = torch.cuda.Stream(device=device)
+    prepared = ExitStack()
+    graphs, inputs, outputs = [], [], []
+    pull_graphs, pull_inputs, pull_outputs = [], [], []
+    try:
+        # One-pack and non-world-divisible multiwave payloads exercise source addressing.
+        for transport, packs in (
+            ("remote_push_simple", 1025),
+            ("remote_push_ll", 1),
+            ("remote_push_ll", 1025),
+            ("remote_push_simple", 37),
+            ("remote_push_simple", 2048),
+        ):
+            inp = torch.full(
+                (packs * 8,), rank + 1, device=device, dtype=getattr(torch, dtype_name)
+            )
+            out = inp if in_place else torch.empty_like(inp)
+            stream.wait_stream(torch.cuda.current_stream(device))
+            with pool.capture(stream) as channel:
+                with torch.cuda.stream(stream):
+                    declaration = _prepare_plan(
+                        prepared, channel, inp, out, plain_transport=transport
+                    )
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, stream=stream):
+                    channel.all_reduce(inp, plan=declaration, out=out)
+            stream.synchronize()
+            graphs.append(graph)
+            inputs.append(inp)
+            outputs.append(out)
+            if compare_pull:
+                reference_input = inp.clone()
+                reference_output = (
+                    reference_input if in_place else torch.empty_like(inp)
+                )
+                stream.wait_stream(torch.cuda.current_stream(device))
+                with pool.capture(stream) as channel:
+                    with torch.cuda.stream(stream):
+                        reference_plan = _prepare_plan(
+                            prepared,
+                            channel,
+                            reference_input,
+                            reference_output,
+                            plain_transport="pull",
+                        )
+                    reference_graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(reference_graph, stream=stream):
+                        channel.all_reduce(
+                            reference_input, plan=reference_plan, out=reference_output
+                        )
+                stream.synchronize()
+                pull_graphs.append(reference_graph)
+                pull_inputs.append(reference_input)
+                pull_outputs.append(reference_output)
+        state = channel._ext._state(channel._ptr)
+        assert state.plain_remote_push_region_packs > 0
+        buffers = (*inputs, *outputs, *pull_inputs, *pull_outputs)
+        pointers = tuple(t.data_ptr() for t in buffers)
+        with kernel_resolution_guard("multi-rank tagged structural replay"):
+            for repeat in range(8):
+                for index in range(len(graphs)):
+                    with torch.cuda.stream(stream):
+                        if compare_pull:
+                            values = _tagged_signed_values(inputs[index], rank, repeat)
+                            inputs[index].copy_(values)
+                            pull_inputs[index].copy_(values)
+                        else:
+                            inputs[index].fill_((rank + 1) * (1 + repeat % 2))
+                        if rank == world_size - 1:
+                            torch.cuda._sleep(1_000_000)
+                        allocated = torch.cuda.memory_stats(device)[
+                            "allocation.all.allocated"
+                        ]
+                        graphs[index].replay()
+                        if compare_pull:
+                            pull_graphs[index].replay()
+                    stream.synchronize()
+                    assert (
+                        torch.cuda.memory_stats(device)["allocation.all.allocated"]
+                        == allocated
+                    )
+                    if compare_pull:
+                        # Numerical equality treats signed zeros equally and matches NaN locations.
+                        torch.testing.assert_close(
+                            outputs[index],
+                            pull_outputs[index],
+                            rtol=0,
+                            atol=0,
+                            equal_nan=True,
+                        )
+                    else:
+                        assert torch.all(
+                            outputs[index]
+                            == world_size * (world_size + 1) // 2 * (1 + repeat % 2)
+                        )
+                    assert tuple(t.data_ptr() for t in buffers) == pointers
+            for last in (0, 2):
+                # Poison unused capacity in both slots before each protocol's rollover.
+                records = (ctypes.c_uint32 * (capacity * 2 * (world_size - 1) // 4))()
+                for word in range(len(records)):
+                    records[word] = 2
+                for slot in range(2):
+                    _copy_host_to_device(
+                        channel,
+                        channel._eager_ptrs[slot][rank]
+                        + state.plain_remote_push_region_packs * 16,
+                        records,
+                        stream,
+                    )
+                control = (ctypes.c_uint32 * 2)(0xFFFFFFFD, 0)
+                _copy_host_to_device(
+                    channel,
+                    channel.signal_ptrs[rank] + _PLAIN_GRAPH_EPOCH_OFFSET,
+                    control,
+                    stream,
+                )
+                stream.synchronize()
+                dist.barrier()
+                for iteration, index in enumerate((last, 2, 0), start=8 + last):
+                    with torch.cuda.stream(stream):
+                        if compare_pull:
+                            values = _tagged_signed_values(
+                                inputs[index], rank, iteration
+                            )
+                            inputs[index].copy_(values)
+                            pull_inputs[index].copy_(values)
+                        else:
+                            inputs[index].fill_(rank + 1)
+                        if rank == world_size - 1:
+                            torch.cuda._sleep(1_000_000)
+                        graphs[index].replay()
+                        if compare_pull:
+                            pull_graphs[index].replay()
+                    stream.synchronize()
+                    if compare_pull:
+                        torch.testing.assert_close(
+                            outputs[index],
+                            pull_outputs[index],
+                            rtol=0,
+                            atol=0,
+                            equal_nan=True,
+                        )
+                    else:
+                        assert torch.all(
+                            outputs[index] == world_size * (world_size + 1) // 2
+                        )
+    finally:
+        for graph in (*graphs, *pull_graphs):
+            graph.reset()
+        prepared.close()
+        pool.close()
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("world_size", (2, 3, 4, 6, 8, 10))
+@pytest.mark.parametrize("dtype_name", ("float16", "bfloat16"))
+@pytest.mark.parametrize("in_place", (False, True))
+def test_tagged_multirank_positive_exact_graphs(world_size, dtype_name, in_place):
+    if torch.cuda.device_count() < world_size:
+        pytest.skip(f"requires {world_size} CUDA devices")
+    if not all(
+        torch.cuda.can_device_access_peer(src, dst)
+        for src in range(world_size)
+        for dst in range(world_size)
+        if src != dst
+    ):
+        pytest.skip("requires a complete directed peer-access topology")
+    mp.spawn(
+        _tagged_multirank_worker,
+        args=(world_size, _free_port(), dtype_name, in_place),
+        nprocs=world_size,
+        join=True,
+    )
+
+
+@pytest.mark.parametrize("world_size", (2, 3, 4, 6, 8, 10))
+@pytest.mark.parametrize("dtype_name", ("float16", "bfloat16"))
+@pytest.mark.parametrize("in_place", (False, True))
+def test_tagged_multirank_matches_pull_signed_inputs(world_size, dtype_name, in_place):
+    if torch.cuda.device_count() < world_size:
+        pytest.skip(f"requires {world_size} CUDA devices")
+    if not all(
+        torch.cuda.can_device_access_peer(src, dst)
+        for src in range(world_size)
+        for dst in range(world_size)
+        if src != dst
+    ):
+        pytest.skip("requires a complete directed peer-access topology")
+    mp.spawn(
+        _tagged_multirank_worker,
+        args=(world_size, _free_port(), dtype_name, in_place, True),
         nprocs=world_size,
         join=True,
     )

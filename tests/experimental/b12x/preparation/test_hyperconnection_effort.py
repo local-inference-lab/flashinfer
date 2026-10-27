@@ -164,3 +164,20 @@ def test_explicit_effort_overrides_environment(monkeypatch):
     assert plan.query.autotune_effort == "default"
     plan = hyperconnection.plan(caps, invocation={"operation": "gate_mean"})
     assert plan.query.autotune_effort == "audit"
+
+
+@pytest.mark.parametrize(
+    "rows,hidden,warps",
+    [(128, 2560, {8, 10, 16}), (129, 2560, {8}), (128, 2559, {8}), (128, 2561, {8})],
+)
+def test_combine_norm_cta_candidates_require_packed_width(rows, hidden, warps):
+    q = replace(query("combine_norm", hidden=hidden), max_tokens=rows)
+    configurations = list(_tuning.TUNING.parameter_space(q, None).configurations())
+    assert {choice["reduction_num_warps"] for choice in configurations} == warps
+    default = _tuning.TUNING.default_config(q, None)
+    if hidden % 8:
+        for larger in (10, 16):
+            with pytest.raises(ValueError, match="reduction_num_warps"):
+                _tuning.TUNING.validate_config(
+                    q, replace(default, reduction_num_warps=larger), None
+                )

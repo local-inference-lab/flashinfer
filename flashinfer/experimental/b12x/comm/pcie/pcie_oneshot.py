@@ -17,7 +17,7 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from b12x.preparation.types import Plan, require_prepared
-from ._cuda_ipc import CudaRTLibrary
+from ._cuda_ipc import CudaRTError, CudaRTLibrary
 
 
 logger = logging.getLogger(__name__)
@@ -185,9 +185,9 @@ def _eager_storage_shards(
 ) -> int:
     """Return fixed-size shards required by each eager staging slot.
 
-    Topology transports reserve one source shard per rank. TP2 plain
-    peer-push reserves isolated incoming records; TP4 plain push reserves one
-    incoming shard per source. Their readiness markers cannot alias payloads
+    Topology transports reserve one source shard per rank. Tagged plain
+    peer-push reserves two capacity shards per remote source. Payload-ready
+    push reserves one incoming shard per source. Their readiness markers cannot alias payloads
     retained by fused or pull collectives.
     """
 
@@ -199,13 +199,13 @@ def _eager_storage_shards(
     # occupy 32 bytes of incoming scratch so readiness is carried in the same
     # PCIe transactions as the payload instead of a separate peer atomic.
     # Eager channels use only the first incoming shard.
-    plain_tp2_incoming = 2 if world_size == 2 and policy[2] else 0
-    plain_tp4_incoming = 4 if world_size == 4 and policy[3] and sentinel else 0
-    return base_shards + plain_tp2_incoming + plain_tp4_incoming
+    tagged_incoming = 2 * (world_size - 1) if policy[2] else 0
+    plain_payload_incoming = world_size if policy[3] and sentinel else 0
+    return base_shards + tagged_incoming + plain_payload_incoming
 
 
-def _tp4_sentinel_supported(*, device, exchange_group, world_size):
-    if world_size != 4:
+def _payload_ready_supported(*, device, exchange_group, world_size):
+    if world_size not in SUPPORTED_WORLD_SIZES:
         return False
     capability = _run_collective_preallocation_setup(
         owner="PCIe sentinel capability",
@@ -216,7 +216,10 @@ def _tp4_sentinel_supported(*, device, exchange_group, world_size):
         ),
     )
     capabilities = _broadcast_gather_object(capability, exchange_group)
-    return all(tuple(value) == (12, 0, 188) for value in capabilities)
+    return all(
+        int(major) >= 8 and int(sms) >= ONESHOT_REQUIRED_SMS
+        for major, _minor, sms in capabilities
+    )
 
 
 def _transport_policy_contract() -> tuple[bool, bool, bool, bool, bool]:
@@ -237,11 +240,11 @@ def _tp2_plain_remote_push_rows(inp: torch.Tensor) -> Optional[int]:
     if (
         inp.dtype not in (torch.float16, torch.bfloat16)
         or inp.ndim == 0
-        or int(inp.shape[-1]) != TP2_PLAIN_REMOTE_PUSH_HIDDEN_SIZE
-        or inp.numel() % TP2_PLAIN_REMOTE_PUSH_HIDDEN_SIZE != 0
+        or int(inp.shape[-1]) not in (2560, TP2_PLAIN_REMOTE_PUSH_HIDDEN_SIZE)
+        or inp.numel() % int(inp.shape[-1]) != 0
     ):
         return None
-    rows = inp.numel() // TP2_PLAIN_REMOTE_PUSH_HIDDEN_SIZE
+    rows = inp.numel() // int(inp.shape[-1])
     if rows < 1 or rows > TP2_PLAIN_REMOTE_PUSH_MAX_ROWS:
         return None
     return rows
@@ -271,6 +274,33 @@ def _is_weak_contiguous(inp: torch.Tensor) -> bool:
         storage.nbytes() - inp.storage_offset() * inp.element_size()
         == inp.numel() * inp.element_size()
     )
+
+
+def _validate_plain_io(inp: torch.Tensor, out: torch.Tensor) -> None:
+    if out.device != inp.device:
+        raise ValueError("output tensor must be on the same device as the input")
+    if out.shape != inp.shape or out.dtype != inp.dtype:
+        raise ValueError("output tensor must match input shape and dtype")
+    if inp.data_ptr() % 16 or out.data_ptr() % 16:
+        raise ValueError("plain oneshot input and output must be 16-byte aligned")
+    if not _is_weak_contiguous(inp) or not _is_weak_contiguous(out):
+        raise ValueError("plain oneshot input and output must be weak-contiguous")
+    if inp.numel() == 0:
+        return
+    if any(
+        size > 1 and source_stride != output_stride
+        for size, source_stride, output_stride in zip(
+            inp.shape, inp.stride(), out.stride(), strict=True
+        )
+    ):
+        raise ValueError("plain oneshot output must match input physical traversal")
+    source = inp.data_ptr()
+    output = out.data_ptr()
+    nbytes = inp.numel() * inp.element_size()
+    if source != output and source < output + nbytes and output < source + nbytes:
+        raise ValueError(
+            "plain oneshot input and output must be exact aliases or disjoint"
+        )
 
 
 def _align_up(value: int, alignment: int) -> int:
@@ -655,6 +685,10 @@ def _require_no_retained_ipc_setup(exchange_group: ProcessGroup) -> None:
         ) from local_error
 
 
+class DirectMappingUnavailable(RuntimeError):
+    """Peer mappings were unavailable and collective IPC rollback completed."""
+
+
 def _format_setup_error(error: BaseException | None) -> tuple[str, ...]:
     if error is None:
         return ()
@@ -875,6 +909,7 @@ def _abort_collective_ipc_setup(
     remote_ptrs: Sequence[int],
     local_error: BaseException | None,
     local_cleanup: Optional[Callable[[], None]] = None,
+    direct_mapping_unavailable: bool = False,
 ) -> None:
     """Undo a failed collective IPC setup without freeing a mapped export.
 
@@ -1063,7 +1098,10 @@ def _abort_collective_ipc_setup(
             local_error or free_error
         )
 
-    error = RuntimeError(
+    error_type = (
+        DirectMappingUnavailable if direct_mapping_unavailable else RuntimeError
+    )
+    error = error_type(
         _setup_failure_message(
             owner,
             setup_phase,
@@ -1337,6 +1375,7 @@ class _PlainGraphLaunchPlan:
     eager_buffer_bytes: Optional[int]
     transport_policy: tuple[bool, bool, bool, bool, bool]
     remote_push_region_packs: int
+    payload_ready_region_packs: int
     remote_push_slot_ptrs: tuple[int, int, int, int]
 
 
@@ -1392,6 +1431,7 @@ class _CuTeOneshotState:
     )
     sharded_eager_storage: bool = False
     plain_remote_push_region_packs: int = 0
+    plain_payload_ready_region_packs: int = 0
     eager_slot: int = 0
     device_slot_selection: bool = False
     slot_bias: int = 0
@@ -1524,11 +1564,12 @@ class _CuTeOneshotBackend:
             if transport_policy is None
             else tuple(bool(value) for value in transport_policy)
         )
+        state.plain_payload_ready_region_packs = 0
         state.sharded_eager_storage = _uses_sharded_eager_storage(
             state.world_size,
             state.transport_policy,
         )
-        if state.world_size == 2 and state.transport_policy[2]:
+        if state.transport_policy[2]:
             base_shards = state.world_size if state.sharded_eager_storage else 1
             state.plain_remote_push_region_packs = (
                 base_shards * int(state.eager_buffer_bytes or 0) // 16
@@ -1582,12 +1623,15 @@ class _CuTeOneshotBackend:
         rows = _tp2_plain_remote_push_rows(inp)
         if rows is None or inp.numel() * inp.element_size() > state.eager_buffer_bytes:
             return None
-        # LL records double the bytes on PCIe, which only one-row latency repays.
+        # LL avoids a separate publication fence for small payloads.
         # Larger reductions publish Simple payloads with one flag per CTA.
-        if rows == 1:
-            return 64, 36, "ll"
+        if rows == 1 or (int(inp.shape[-1]) == 2560 and rows <= 6):
+            return 128, 36, "ll"
         packs = inp.numel() * inp.element_size() // 16
-        return _TP2_SIMPLE_THREADS, min(36, -(-packs // _TP2_SIMPLE_THREADS)), "simple"
+        threads = (
+            256 if int(inp.shape[-1]) == 2560 and rows >= 16 else _TP2_SIMPLE_THREADS
+        )
+        return threads, min(36, -(-packs // threads)), "simple"
 
     @classmethod
     def _plain_launch_config(
@@ -1617,7 +1661,7 @@ class _CuTeOneshotBackend:
         if (
             graph_channel
             and state.world_size == 4
-            and state.plain_remote_push_region_packs > 0
+            and state.plain_payload_ready_region_packs > 0
             and state.eager_tables is not None
             and state.eager_buffer_bytes is not None
             and inp.dtype == torch.bfloat16
@@ -1645,7 +1689,7 @@ class _CuTeOneshotBackend:
             graph_channel=True,
         )
         slot_ptrs = (0, 0, 0, 0)
-        if transport.startswith("tp2_remote_push"):
+        if state.world_size == 2 and state.plain_remote_push_region_packs > 0:
             if state.eager_ptrs is None:
                 raise RuntimeError("TP2 peer-push requires eager staging pointers")
             peer_rank = state.rank ^ 1
@@ -1665,6 +1709,7 @@ class _CuTeOneshotBackend:
             eager_buffer_bytes=state.eager_buffer_bytes,
             transport_policy=state.transport_policy,
             remote_push_region_packs=state.plain_remote_push_region_packs,
+            payload_ready_region_packs=state.plain_payload_ready_region_packs,
             remote_push_slot_ptrs=slot_ptrs,
         )
 
@@ -1772,7 +1817,7 @@ class _CuTeOneshotBackend:
             mode = "stage_pull"
         if (
             state.world_size == 4
-            and state.plain_remote_push_region_packs > 0
+            and state.plain_payload_ready_region_packs > 0
             and state.eager_tables is not None
             and inp.dtype == torch.bfloat16
             and int(inp.shape[-1]) in (4096, 5120, 6144)
@@ -1914,7 +1959,11 @@ class _CuTeOneshotBackend:
             blocks = plan.blocks
             size_packs = plan.size_packs
             device_index = plan.device_index
-            plain_region_packs = plan.remote_push_region_packs
+            plain_region_packs = (
+                plan.payload_ready_region_packs
+                if transport in ("remote_push_full", "remote_push_rsag")
+                else plan.remote_push_region_packs
+            )
             plain_capacity_packs = int(plan.eager_buffer_bytes or 0) // 16
             plain_slot_ptrs = plan.remote_push_slot_ptrs
         prospective_device_selection = state.device_slot_selection or (
@@ -2084,6 +2133,7 @@ class _CuTeOneshotBackend:
                 rows,
                 ctas_per_row,
                 int(state.eager_buffer_bytes or inp.numel() * inp.element_size()) // 16,
+                state.plain_payload_ready_region_packs,
                 float(epsilon),
                 blocks,
             )
@@ -2317,7 +2367,7 @@ class PCIeOneshotAllReduce:
                 exchange_group=self.exchange_group,
             )
 
-            self._sentinel_supported = _tp4_sentinel_supported(
+            self._sentinel_supported = _payload_ready_supported(
                 device=self.device,
                 exchange_group=self.exchange_group,
                 world_size=self.world_size,
@@ -2457,7 +2507,20 @@ class PCIeOneshotAllReduce:
                     )
                     if self._sentinel_supported and self._transport_policy[3]:
                         capacity = int(self.eager_buffer_bytes or 0)
-                        required = 8 * capacity
+                        base_shards = (
+                            self.world_size
+                            if _uses_sharded_eager_storage(
+                                self.world_size, self._transport_policy
+                            )
+                            else 1
+                        )
+                        tagged_shards = (
+                            2 * (self.world_size - 1)
+                            if self._transport_policy[2]
+                            else 0
+                        )
+                        payload_offset = base_shards + tagged_shards
+                        required = (payload_offset + self.world_size) * capacity
                         if all(
                             any(
                                 buffer.local_ptr <= pointers[self.rank]
@@ -2467,9 +2530,10 @@ class PCIeOneshotAllReduce:
                             )
                             for pointers in self._eager_ptrs
                         ):
-                            self._ext._state(
-                                self._ptr
-                            ).plain_remote_push_region_packs = 4 * capacity // 16
+                            native = self._ext._state(self._ptr)
+                            native.plain_payload_ready_region_packs = (
+                                payload_offset * capacity // 16
+                            )
                 else:
                     self._ext.register_pcie_buffers(
                         self._ptr,
@@ -2586,7 +2650,7 @@ class PCIeOneshotAllReduce:
             exchange_group=exchange_group,
         )
 
-        sentinel_supported = _tp4_sentinel_supported(
+        sentinel_supported = _payload_ready_supported(
             device=device_obj, exchange_group=exchange_group, world_size=world_size
         )
 
@@ -2834,6 +2898,7 @@ class PCIeOneshotAllReduce:
             raise _attach_retryable_setup(error, retained) from exchange_error
 
         open_error: BaseException | None = None
+        open_failures: list[BaseException] = []
         for idx, handle in enumerate(handles):
             if idx == rank:
                 peer_ptrs.append(local_ptr)
@@ -2844,6 +2909,7 @@ class PCIeOneshotAllReduce:
             try:
                 remote_ptr = ipc.cudaIpcOpenMemHandleBytes(handle)
             except Exception as exc:
+                open_failures.append(exc)
                 if open_error is None:
                     open_error = RuntimeError(
                         f"failed to open CUDA IPC handle for peer group rank {idx}"
@@ -2857,6 +2923,7 @@ class PCIeOneshotAllReduce:
                 remote_ptrs.append(remote_ptr)
 
         if len(handles) != world_size or len(peer_ptrs) != world_size:
+            open_failures.append(ValueError("invalid CUDA IPC handle count"))
             open_error = open_error or RuntimeError(
                 "failed to gather CUDA IPC handles for every group rank"
             )
@@ -2884,6 +2951,47 @@ class PCIeOneshotAllReduce:
                 open_error or exchange_error
             )
         if any(open_statuses):
+            mapping_unavailable = False
+            try:
+                classifications = _broadcast_gather_object(
+                    tuple(
+                        isinstance(error, CudaRTError)
+                        and error.operation == "cudaIpcOpenMemHandle"
+                        # CUDA peer access unsupported / peer resources exhausted.
+                        and error.code in (217, 711)
+                        for error in open_failures
+                    ),
+                    exchange_group,
+                )
+                if (
+                    len(open_statuses) != world_size
+                    or len(classifications) != world_size
+                    or any(
+                        not isinstance(values, (tuple, list))
+                        or any(type(value) is not bool for value in values)
+                        or bool(values) != bool(status)
+                        for values, status in zip(classifications, open_statuses)
+                    )
+                ):
+                    raise RuntimeError("invalid CUDA IPC import failure classification")
+                mapping_unavailable = all(
+                    value for values in classifications for value in values
+                )
+            except Exception as classification_error:
+                retained = _retain_failed_ipc_setup(
+                    ipc=ipc,
+                    local_ptr=local_ptr,
+                    exchange_group=exchange_group,
+                    owner="PCIe shared buffer",
+                    phase="CUDA IPC import classification",
+                    remote_ptrs=remote_ptrs,
+                    state="unmap",
+                )
+                error = RuntimeError(
+                    "failed to exchange CUDA IPC import classification; "
+                    "CUDA IPC ownership was retained"
+                )
+                raise _attach_retryable_setup(error, retained) from classification_error
             _abort_collective_ipc_setup(
                 owner="PCIe shared buffer",
                 setup_phase="CUDA IPC import open",
@@ -2893,6 +3001,7 @@ class PCIeOneshotAllReduce:
                 local_ptr=local_ptr,
                 remote_ptrs=remote_ptrs,
                 local_error=open_error,
+                direct_mapping_unavailable=mapping_unavailable,
             )
 
         return _OwnedSharedBuffer(
@@ -2982,7 +3091,11 @@ class PCIeOneshotAllReduce:
         inp_bytes = inp.numel() * inp.element_size()
         if inp_bytes > self.max_size:
             return False
-        if inp_bytes % 16 != 0:
+        if isinstance(inp, torch.Tensor):
+            aligned = inp.data_ptr() % 16 == 0
+        else:
+            aligned = inp.alignment >= 16 and inp.alignment % 16 == 0
+        if not aligned or inp_bytes % 16 != 0:
             return False
         return _is_weak_contiguous(inp)
 
@@ -2998,7 +3111,7 @@ class PCIeOneshotAllReduce:
         ``should_allreduce`` defines functional support. This method adds the
         latency policy used by callers with an NCCL fallback. Prepared TP2 CUDA
         graph channels extend the caller's generic band through 64 storage-dense
-        FP16/BF16 rows of width 4096. Every other shape and execution mode uses
+        FP16/BF16 rows of width 2560 or 4096. Every other shape and execution mode uses
         the caller-supplied size policy.
         """
 
@@ -3139,7 +3252,11 @@ class PCIeOneshotAllReduce:
                 inp.data_ptr(),
                 out.data_ptr(),
                 call["size_packs"],
-                call["remote_push_region_packs"],
+                (
+                    call["payload_ready_region_packs"]
+                    if call["transport"] in ("remote_push_full", "remote_push_rsag")
+                    else call["remote_push_region_packs"]
+                ),
                 int(state.eager_buffer_bytes or 0) // 16,
                 *plan.remote_push_slot_ptrs,
                 call["blocks"] if state.device_slot_selection else call["eager_blocks"],
@@ -3175,6 +3292,7 @@ class PCIeOneshotAllReduce:
                 call["rows"],
                 call["ctas_per_row"],
                 int(state.eager_buffer_bytes or inp.numel() * inp.element_size()) // 16,
+                call["payload_ready_region_packs"],
                 float(epsilon),
                 call["blocks"],
                 input_addend_address=0
@@ -3268,12 +3386,7 @@ class PCIeOneshotAllReduce:
             raise ValueError("peer input registration belongs to oneshot preparation")
         if out is None:
             out = torch.empty_like(inp)
-        if out.device != inp.device:
-            raise ValueError("output tensor must be on the same device as the input")
-        if out.shape != inp.shape or out.dtype != inp.dtype:
-            raise ValueError("output tensor must match input shape and dtype")
-        if not _is_weak_contiguous(out):
-            raise ValueError("output tensor must be weak-contiguous")
+        _validate_plain_io(inp, out)
         state = require_prepared(plan, "comm.pcie", self.device)
         state.require_runtime(self)
         state.run_plain(inp, out)
@@ -3712,7 +3825,7 @@ class PCIeOneshotAllReducePool:
                 exchange_group=self.exchange_group,
             )
 
-            self._sentinel_supported = _tp4_sentinel_supported(
+            self._sentinel_supported = _payload_ready_supported(
                 device=self.device,
                 exchange_group=self.exchange_group,
                 world_size=self.world_size,

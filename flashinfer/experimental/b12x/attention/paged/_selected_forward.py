@@ -802,22 +802,49 @@ class _SelectedPositionPagedForwardKernel:
             byte_alignment=16,
         )
 
-        query_element = thread
         first_query_head = kv_head * Int32(self.heads_per_kv)
-        while query_element < Int32(self.tile_m * _HEAD_DIM):
-            local_head = query_element // Int32(_HEAD_DIM)
-            dimension = query_element - local_head * Int32(_HEAD_DIM)
-            query_value = Float32(0.0)
-            if (local_head < Int32(self.heads_per_kv)) & (
-                dimension < Int32(self.head_dim)
+        if (_pointer_as_int64(query, Int64(0)) & Int64(15)) == Int64(0):
+            for vector_iter in cutlass.range_constexpr(
+                self.tile_m * _HEAD_DIM // (8 * self.threads)
             ):
-                query_head = first_query_head + local_head
+                vector = thread + Int32(vector_iter * self.threads)
+                local_head = vector // Int32(_HEAD_DIM // 8)
+                dimension = (vector % Int32(_HEAD_DIM // 8)) * Int32(8)
+                valid = (local_head < Int32(self.heads_per_kv)) & (
+                    dimension < Int32(self.head_dim)
+                )
                 query_offset = (
-                    row.to(Int64) * Int64(self.q_heads) + query_head.to(Int64)
+                    row.to(Int64) * Int64(self.q_heads)
+                    + (first_query_head + local_head).to(Int64)
                 ) * Int64(self.head_dim) + dimension.to(Int64)
-                query_value = Float32(query[query_offset])
-            shared_query[local_head, dimension] = BFloat16(query_value)
-            query_element += Int32(self.threads)
+                query_offset = cutlass.select_(valid, query_offset, Int64(0))
+                destination = shared_ptr_to_u32(
+                    shared_query.iterator
+                    + cute.crd2idx((local_head, dimension), shared_query.layout)
+                )
+                _cp_async_load_128b_zfill(
+                    destination,
+                    _pointer_as_int64(query, query_offset),
+                    cutlass.select_(valid, Int32(16), Int32(0)),
+                )
+            cute.arch.cp_async_commit_group()
+            cute.arch.cp_async_wait_group(0)
+        else:
+            query_element = thread
+            while query_element < Int32(self.tile_m * _HEAD_DIM):
+                local_head = query_element // Int32(_HEAD_DIM)
+                dimension = query_element - local_head * Int32(_HEAD_DIM)
+                query_value = Float32(0.0)
+                if (local_head < Int32(self.heads_per_kv)) & (
+                    dimension < Int32(self.head_dim)
+                ):
+                    query_head = first_query_head + local_head
+                    query_offset = (
+                        row.to(Int64) * Int64(self.q_heads) + query_head.to(Int64)
+                    ) * Int64(self.head_dim) + dimension.to(Int64)
+                    query_value = Float32(query[query_offset])
+                shared_query[local_head, dimension] = BFloat16(query_value)
+                query_element += Int32(self.threads)
         cute.arch.sync_threads()
 
         qk_thread = thread % Int32(self.qk_warps * 32)

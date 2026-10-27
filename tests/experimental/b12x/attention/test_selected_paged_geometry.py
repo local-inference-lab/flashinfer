@@ -15,10 +15,14 @@ from b12x.attention.paged._selected_forward import (
 @pytest.mark.parametrize("selection_groups", [1, 2])
 @pytest.mark.parametrize("rows", [3, 17])
 @pytest.mark.parametrize("fp8", [False, True])
-def test_selected_geometry(head_dim, direct, selection_groups, rows, fp8):
+@pytest.mark.parametrize("query_offset", [0, 1])
+def test_selected_geometry(head_dim, direct, selection_groups, rows, fp8, query_offset):
     torch.manual_seed(843)
     heads, kv_heads, tokens, width, splits = 8, 2, 640, 4104, 8
-    q = torch.randn(rows, heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    q_storage = torch.randn(
+        rows * heads * head_dim + query_offset, device="cuda", dtype=torch.bfloat16
+    )
+    q = q_storage[query_offset:].view(rows, heads, head_dim)
     k = torch.randn(6, 128, kv_heads, head_dim, device="cuda", dtype=torch.bfloat16)
     v = torch.randn_like(k)
     k_scale = torch.tensor([0.5], device="cuda") if fp8 else None

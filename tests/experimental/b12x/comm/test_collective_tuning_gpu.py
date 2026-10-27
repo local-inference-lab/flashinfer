@@ -1,6 +1,6 @@
 """Whole-group tuning, cancellation, cache reuse, and graph replay on PCIe.
 
-Run with B12X_RUN_COLLECTIVE_TUNING_TEST=1 and two or four visible SM120 GPUs.
+Run with B12X_RUN_COLLECTIVE_TUNING_TEST=1 and 2, 4, or 10 visible SM120 GPUs.
 """
 
 import os
@@ -54,6 +54,7 @@ def _drive(session, requests, *, cancel_step=None):
 
 
 def _worker(rank, world, directory):
+    import gc
     import torch
     import torch.distributed as dist
     from b12x.comm.pcie import AllReduce
@@ -80,20 +81,24 @@ def _worker(rank, world, directory):
         max_size=2 << 20,
         eager_buffer_bytes=2 << 20,
     )
+    assert manager.algorithm == "oneshot"
+    assert manager._bf16_twoshot is not None
     manager.prepare_channels(("tuning",))
     members = tuple(range(world))
 
-    def declarations(*, dtype=torch.bfloat16, mismatch=False, width=None):
+    def declarations(
+        *, dtype=torch.bfloat16, mismatch=False, width=None, shape=None, override=None
+    ):
         plans, requests, operands = [], [], []
         for index in range(2):
             rows = 16 if mismatch and rank else 8
             source = torch.ones(
-                (rows, width or (4096 if world == 2 else 5120)),
+                shape or (rows, width or (4096 if world == 2 else 5120)),
                 dtype=dtype,
                 device=device,
             )
             out = torch.empty_like(source)
-            plan = manager.plan(source, out=out)
+            plan = manager.plan(source, out=out, override=override)
 
             def bind(state, source=source, out=out):
                 if state.query.surface.startswith("PCIeTwoShotBF16."):
@@ -128,6 +133,9 @@ def _worker(rank, world, directory):
             plans, requests, operands = declarations()
             result = _drive(owner, requests)
             assert plans[0].selection.config == plans[1].selection.config
+            selections = [None] * world
+            dist.all_gather_object(selections, plans[0].selection.config)
+            assert all(config == selections[0] for config in selections)
             assert all(
                 plan.selection.source == ("tuned" if iteration == 0 else "cached")
                 for plan in plans
@@ -144,12 +152,28 @@ def _worker(rank, world, directory):
                     manager.all_reduce(source, out=out, plan=plan)
                 graphs.append(graph)
             owner.freeze()
-            for index in (0, 1, 1, 0):
+            for step, index in enumerate((0, 1, 1, 0)):
+                source, out = operands[index]
+                source.fill_(rank + step + 1)
+                out.fill_(float("nan"))
+                original = source.clone()
+                gc.collect()
+                torch.cuda.synchronize()
+                before = torch.cuda.memory_stats()
                 graphs[index].replay()
                 torch.cuda.synchronize()
+                after = torch.cuda.memory_stats()
+                for counter in (
+                    "allocation.all.allocated",
+                    "allocation.all.freed",
+                    "segment.all.allocated",
+                    "segment.all.freed",
+                ):
+                    assert before[counter] == after[counter]
+                torch.testing.assert_close(source, original, rtol=0, atol=0)
                 torch.testing.assert_close(
-                    operands[index][1],
-                    torch.full_like(operands[index][1], world),
+                    out,
+                    torch.full_like(out, world * (step + 1) + world * (world - 1) // 2),
                     rtol=0,
                     atol=0,
                 )
@@ -196,12 +220,85 @@ def _worker(rank, world, directory):
                 _drive(owner, requests)
             owner.close()
         if world == 2:
-            owner = session("fixed-width")
-            plans, requests, _ = declarations(width=5120)
-            result = _drive(owner, requests)
-            assert all(plan.selection.source == "fixed" for plan in plans)
-            assert result.benchmarked_candidates == 0
-            result.close()
+            for shape in ((8, 5120), (513, 1536)):
+                owner = session(f"noncanonical-{shape}")
+                plans, requests, operands = declarations(shape=shape)
+                result = _drive(owner, requests)
+                assert all(plan.selection.source == "tuned" for plan in plans)
+                assert result.benchmarked_candidates > 0
+                graph = torch.cuda.CUDAGraph()
+                with owner.capture(), manager.capture(), torch.cuda.graph(graph):
+                    manager.all_reduce(
+                        operands[0][0], out=operands[0][1], plan=plans[0]
+                    )
+                owner.freeze()
+                for step in range(3):
+                    operands[0][0].fill_(rank + step + 1)
+                    graph.replay()
+                    torch.cuda.synchronize()
+                    torch.testing.assert_close(
+                        operands[0][1],
+                        torch.full_like(operands[0][1], 2 * step + 3),
+                        rtol=0,
+                        atol=0,
+                    )
+                graph.reset()
+                result.close()
+                owner.close()
+
+            from b12x.comm.pcie import CollectiveConfig
+
+            owner = session("pinned-transitions")
+            retained, calls = [], []
+            for shape, config in (
+                (
+                    (3, 1536),
+                    CollectiveConfig(
+                        implementation="tp2_remote_push", threads=64, blocks=8
+                    ),
+                ),
+                (
+                    (513, 1536),
+                    CollectiveConfig(
+                        implementation="tp2_remote_push_simple", threads=256, blocks=16
+                    ),
+                ),
+                (
+                    (3, 1536),
+                    CollectiveConfig(
+                        implementation="tp2_remote_push", threads=128, blocks=36
+                    ),
+                ),
+                (
+                    (513, 1536),
+                    CollectiveConfig(implementation="pull", threads=256, blocks=8),
+                ),
+            ):
+                plans, requests, operands = declarations(shape=shape, override=config)
+                retained.append(_drive(owner, requests))
+                assert all(plan.selection.config == config for plan in plans)
+                calls.append((plans[0], *operands[0]))
+            graph = torch.cuda.CUDAGraph()
+            with owner.capture(), manager.capture(), torch.cuda.graph(graph):
+                for plan, source, out in calls:
+                    manager.all_reduce(source, out=out, plan=plan)
+            owner.freeze()
+            for step in range(4):
+                for _, source, out in calls:
+                    source.fill_(rank + step + 1)
+                    out.fill_(float("nan"))
+                graph.replay()
+                torch.cuda.synchronize()
+                for _, source, out in calls:
+                    torch.testing.assert_close(
+                        out, torch.full_like(out, 2 * step + 3), rtol=0, atol=0
+                    )
+                    torch.testing.assert_close(
+                        source, torch.full_like(source, rank + step + 1), rtol=0, atol=0
+                    )
+            graph.reset()
+            for result in retained:
+                result.close()
             owner.close()
         owner = session("missing-cache", cache_only=True)
         _, requests, _ = declarations()
@@ -216,7 +313,7 @@ def _worker(rank, world, directory):
     os.environ.get("B12X_RUN_COLLECTIVE_TUNING_TEST") != "1",
     reason="requires peer-accessible SM120 GPUs",
 )
-@pytest.mark.parametrize("world", (2, 4))
+@pytest.mark.parametrize("world", (2, 4, 10))
 def test_collective_tuning(world, tmp_path):
     import torch
     import torch.multiprocessing as mp

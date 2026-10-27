@@ -65,6 +65,53 @@ def _tensor(values: Mapping[str, object], name: str) -> torch.Tensor:
     return value
 
 
+def _validate_geometry(runtime, operation, payload, scale, output=None):
+    if not payload.is_contiguous() or _alignment(payload) < 16:
+        raise ValueError("two-shot payload must be contiguous and 16-byte aligned")
+    count = payload.numel()
+    if operation == "all_reduce":
+        if count <= 0 or count % 8:
+            raise ValueError("two-shot all-reduce requires complete 16-byte packs")
+        if count > int(runtime.max_rows) * int(runtime.row_elems):
+            raise ValueError("two-shot payload exceeds runtime capacity")
+        shard_packs = (count // 8 + runtime.world_size - 1) // runtime.world_size
+        output_shape = tuple(payload.shape)
+    else:
+        if payload.ndim != 2 or payload.shape[1] != runtime.row_elems:
+            raise ValueError("two-shot payload must have the native row shape")
+        rows = payload.shape[0]
+        if rows > runtime.max_rows:
+            raise ValueError("two-shot payload exceeds runtime row capacity")
+        if operation == "reduce_scatter":
+            if rows % runtime.world_size:
+                raise ValueError("two-shot reduce-scatter rows must divide world size")
+            shard_rows = rows // runtime.world_size
+            output_shape = (shard_rows, runtime.row_elems)
+        else:
+            shard_rows = rows
+            output_shape = (rows * runtime.world_size, runtime.row_elems)
+        pack_elements = 16 if scale is not None else 8
+        shard_packs = shard_rows * (runtime.row_elems // pack_elements)
+        if scale is not None:
+            if (
+                scale.numel() != rows
+                or not scale.is_contiguous()
+                or _alignment(scale) < 4
+            ):
+                raise ValueError(
+                    "two-shot scale requires one contiguous aligned scalar per row"
+                )
+            if shard_rows > runtime._scale_stride:
+                raise ValueError("two-shot scale staging capacity exceeded")
+    if shard_packs > runtime._pack_stride:
+        raise ValueError("two-shot payload staging capacity exceeded")
+    if output is not None:
+        if tuple(output.shape) != output_shape:
+            raise ValueError(f"two-shot output shape must be {output_shape}")
+        if not output.is_contiguous() or _alignment(output) < 16:
+            raise ValueError("two-shot output must be contiguous and 16-byte aligned")
+
+
 def query_from_runtime(runtime, *, surface: str, call) -> PcieQuery:
     """Normalize exact tensor/launch ABI without retaining tensors or groups."""
     if surface not in _SURFACES:
@@ -75,10 +122,15 @@ def query_from_runtime(runtime, *, surface: str, call) -> PcieQuery:
     )
     if payload.device != runtime.device:
         raise ValueError("two-shot payload device differs from runtime")
-    if payload.ndim == 0 or payload.numel() % int(runtime.row_elems):
-        raise ValueError("two-shot payload must contain complete native rows")
-    rows = payload.numel() // int(runtime.row_elems)
     operation = _operation(surface)
+    width = 8 if operation == "all_reduce" else int(runtime.row_elems)
+    if (
+        payload.ndim == 0
+        or payload.numel() % width
+        or (operation == "all_reduce" and payload.numel() == 0)
+    ):
+        raise ValueError("two-shot payload must contain complete transport packs/rows")
+    rows = (payload.numel() + int(runtime.row_elems) - 1) // int(runtime.row_elems)
     if operation == "reduce_scatter" and rows % int(runtime.world_size):
         raise ValueError("two-shot reduce-scatter rows must divide world size")
     if surface in _FP8_SURFACES:
@@ -100,6 +152,7 @@ def query_from_runtime(runtime, *, surface: str, call) -> PcieQuery:
             _alignment(scale),
         )
     else:
+        scale = None
         if payload.dtype is not torch.bfloat16:
             raise TypeError("BF16 two-shot payload must be bfloat16")
         dtype, scale_dtype = "bfloat16", None
@@ -113,6 +166,12 @@ def query_from_runtime(runtime, *, surface: str, call) -> PcieQuery:
     output = values.get("out")
     if output is not None and not isinstance(output, torch.Tensor):
         raise TypeError("two-shot output must be a tensor when supplied")
+    if output is not None:
+        if output.dtype is not torch.bfloat16:
+            raise TypeError("two-shot output must be bfloat16")
+        if output.device != runtime.device:
+            raise ValueError("two-shot output device differs from runtime")
+    _validate_geometry(runtime, operation, payload, scale, output)
     call_metadata = FrozenMapping(
         {
             "operation": operation,
@@ -145,12 +204,7 @@ def query_from_runtime(runtime, *, surface: str, call) -> PcieQuery:
             "pack_stride": int(runtime._pack_stride),
             "slot_bytes": int(runtime._slot_bytes),
             "push_shard_nbytes": (
-                int(runtime.max_rows)
-                // int(runtime.world_size)
-                * int(runtime.row_elems)
-                * torch.bfloat16.itemsize
-                if surface in _BF16_SURFACES
-                else 0
+                int(runtime._pack_stride) * 16 if surface in _BF16_SURFACES else 0
             ),
             "slots": 2,
             "signal_ptr_count": len(runtime._signal_ptrs),
@@ -191,8 +245,8 @@ def query_from_metadata(
     count = 1
     for extent in shape:
         count *= extent
-    if count % int(runtime.row_elems):
-        raise ValueError("two-shot metadata must contain complete native rows")
+    if count % 8:
+        raise ValueError("two-shot metadata must contain complete 16-byte packs")
     contiguous = []
     stride = 1
     for extent in reversed(shape):
@@ -205,7 +259,7 @@ def query_from_metadata(
         raise ValueError("two-shot metadata requires contiguous payload layout")
     if alignment < 16 or alignment & (alignment - 1):
         raise ValueError("two-shot metadata alignment must be a power of two >= 16")
-    rows = count // int(runtime.row_elems)
+    rows = (count + int(runtime.row_elems) - 1) // int(runtime.row_elems)
     call_metadata = FrozenMapping(
         {
             "operation": "all_reduce",
@@ -234,12 +288,7 @@ def query_from_metadata(
             "pack_stride": int(runtime._pack_stride),
             "slot_bytes": int(runtime._slot_bytes),
             "push_shard_nbytes": (
-                int(runtime.max_rows)
-                // int(runtime.world_size)
-                * int(runtime.row_elems)
-                * torch.bfloat16.itemsize
-                if surface in _BF16_SURFACES
-                else 0
+                int(runtime._pack_stride) * 16 if surface in _BF16_SURFACES else 0
             ),
             "slots": 2,
             "signal_ptr_count": len(runtime._signal_ptrs),
@@ -353,6 +402,19 @@ class _TwoShotExecutionState:
     def run(self, payload, scale, out, *, threads: int, block_limit: int):
         self.require_runtime(self.runtime)
         call = self.query.call
+        bindings = [
+            ("payload", payload, call["dtype"]),
+            ("output", out, call["output_dtype"] or "bfloat16"),
+        ]
+        if call["scale_shape"] is not None:
+            bindings.append(("scale", scale, call["scale_dtype"]))
+        for name, tensor, dtype in bindings:
+            if not isinstance(tensor, torch.Tensor):
+                raise TypeError(f"two-shot {name} must be a tensor")
+            if tensor.dtype != getattr(torch, dtype):
+                raise TypeError(f"two-shot {name} dtype differs from preparation")
+            if tensor.device != self.runtime.device:
+                raise ValueError(f"two-shot {name} device differs from runtime")
         if (tuple(payload.shape), tuple(payload.stride()), _alignment(payload)) != (
             tuple(call["shape"]),
             tuple(call["stride"]),
@@ -379,6 +441,26 @@ class _TwoShotExecutionState:
             call["output_alignment"],
         ):
             raise ValueError("two-shot output metadata differs from preparation")
+        _validate_geometry(self.runtime, call["operation"], payload, scale, out)
+        if self.query.surface in _BF16_SURFACES:
+            from .pcie_twoshot_bf16 import _require_disjoint
+
+            operation = call["operation"]
+            exact_alias = (
+                operation == "all_reduce"
+                and out.data_ptr() == payload.data_ptr()
+                and out.shape == payload.shape
+                and out.dtype == payload.dtype
+                and out.device == payload.device
+                and out.is_contiguous()
+                and payload.is_contiguous()
+            )
+            if not exact_alias:
+                _require_disjoint(
+                    out,
+                    payload,
+                    source_name="input" if operation == "all_reduce" else "payload",
+                )
         return self.runtime._launch_prepared(
             payload,
             scale,

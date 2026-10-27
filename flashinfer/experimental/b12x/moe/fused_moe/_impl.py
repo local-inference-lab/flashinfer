@@ -1388,10 +1388,8 @@ class _WeightViews:
     sfb_down_mx: torch.Tensor | None = None
     w13_residual: torch.Tensor | None = None
     down_residual: torch.Tensor | None = None
-    # A gated NVFP4 FC1 whose half boundary lands inside a 32-row MMA scale
-    # slice uses separately swizzled scale views for the zero-copy up/gate
-    # weight descriptors. The original concatenated view remains authoritative
-    # for micro and every naturally aligned dynamic geometry.
+    # Immutable unaligned gated FC1 halves use atom-aligned scale views.
+    # Micro kernels and mutable scale scratch retain the concatenated layout.
     w13_up_sf: torch.Tensor | None = None
     w13_gate_sf: torch.Tensor | None = None
     dynamic_down_fp4: torch.Tensor | None = None
@@ -6278,8 +6276,9 @@ def _ensure_dynamic_nvfp4_tail_views(
     k: int,
     *,
     activation_spec: _ActivationKernelSpec,
+    immutable_scales: bool,
 ) -> None:
-    if n % 32 != 16:
+    if n % 128 == 0 or (not immutable_scales and n % 32 != 16):
         return
     if activation_spec.is_gated and views.w13_up_sf is None:
         views.w13_up_sf, views.w13_gate_sf = _split_gated_nvfp4_scale_views(
@@ -6287,7 +6286,7 @@ def _ensure_dynamic_nvfp4_tail_views(
             n,
             k,
         )
-    if views.dynamic_down_fp4 is None:
+    if n % 32 == 16 and views.dynamic_down_fp4 is None:
         views.dynamic_down_fp4, views.dynamic_down_sf = _pad_nvfp4_down_for_tma(
             views.w2_storage,
             views.w2_scale_storage,
@@ -11249,6 +11248,7 @@ def _get_dynamic_kernel(
     w4a8_n64_repacked: bool = False,
     nvfp4_materialize_intermediate: bool = False,
     csf_inline_scales: bool = False,
+    separate_w13_halves: bool | None = None,
     mma_warps: int | None = None,
     materialized_fc1_cta_budget: int = 2,
     direct_routing: bool = False,
@@ -11334,18 +11334,18 @@ def _get_dynamic_kernel(
     if w4a8_n64_repacked:
         materialize_intermediate = True
         share_input_across_experts = True
-    # Independent zero-copy up/gate descriptors: NVFP4 at the 16-mod-32
-    # boundary, and MXFP8 whenever the gate half starts inside a 128-row
-    # tile/scale atom (the halves' tail tiles are TMA zero-filled).
-    separate_w13_halves = bool(
-        activation_spec.is_gated
-        and (
-            (quant_mode == "nvfp4" and int(n) % 32 == 16)
-            or (is_w8a8 and int(n) % _LEVEL_TILE_N != 0)
+    # Independently aligned 32-row NVFP4 halves require immutable scales.
+    # Default selection preserves the 16-mod-32 NVFP4 and MXFP8 layouts.
+    if separate_w13_halves is None:
+        separate_w13_halves = bool(
+            activation_spec.is_gated
+            and (
+                (quant_mode == "nvfp4" and int(n) % 32 == 16)
+                or (is_w8a8 and int(n) % _LEVEL_TILE_N != 0)
+            )
         )
-    )
-    # Gated FC1 swap_ab handles 32-aligned, non-128 shards. The 16-mod-32
-    # boundary uses independent zero-copy up/gate descriptors instead.
+    # Swapped FC1 handles 32-aligned shards using combined scale storage.
+    # Independently aligned half descriptors override this orientation below.
     swap_ab = bool(
         quant_mode == "nvfp4"
         and activation_spec.is_gated
@@ -12000,6 +12000,7 @@ def _launch_dynamic_flat(
         )
     # Do not enlarge this grid beyond the measured resident count: the fused
     # kernel has a resident-grid barrier, so over-launching would deadlock.
+    # Native gate scales are E4M3 views; absent storage uses int32 routing scratch.
     compiled, mac = _get_dynamic_kernel(
         E,
         m,
@@ -12016,6 +12017,9 @@ def _launch_dynamic_flat(
         w4a8_n64_repacked=w4a8_n64_repacked,
         nvfp4_materialize_intermediate=nvfp4_materialize_intermediate,
         csf_inline_scales=csf_inline_scales,
+        separate_w13_halves=(
+            sfb_w13_mx.dtype == torch.float8_e4m3fn if quant_mode == "nvfp4" else None
+        ),
         mma_warps=mma_warps,
         materialized_fc1_cta_budget=materialized_fc1_cta_budget,
         direct_routing=direct_routing,
@@ -13856,6 +13860,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
                     n,
                     k,
                     activation_spec=activation_spec,
+                    immutable_scales=experts.nvfp4_csf is None,
                 )
         input_gs = s.input_gs
         down_input_scale = s.down_input_scale
