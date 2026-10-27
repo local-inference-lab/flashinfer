@@ -1,6 +1,7 @@
 """Quantization ops for b12x.
 
 - ``mxfp8``: BF16/FP16 rows -> dense-GEMM MXFP8 layout (one-shot CuTe kernel).
+- ``mla_norm_mxfp8``: split query/KV RMS normalization and BF16-seam MXFP8 rows.
 - ``nvfp4``: BF16 -> packed NVFP4 + e4m3 MMA-layout scales (TMA tile kernel;
   revived by the CUTLASS DSL 4.6 migration).
 """
@@ -10,7 +11,7 @@ from __future__ import annotations
 import importlib
 from typing import Any
 
-_OP_MODULES = ("mxfp8", "nvfp4")
+_OP_MODULES = ("mxfp8", "mla_norm_mxfp8", "nvfp4")
 
 
 def __getattr__(name: str) -> Any:

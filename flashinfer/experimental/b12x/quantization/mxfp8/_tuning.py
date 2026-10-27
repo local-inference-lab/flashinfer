@@ -17,6 +17,10 @@ class Mxfp8Query:
     scale_rows_storage: str
     scale_mma_layout: str
     scale_mma_storage: str
+    min_amax: float = 0.0
+    # A normally ordered producer may release dependent PDL launches before
+    # writing its outputs. Consumers must wait before reading those outputs.
+    release_dependents: bool = False
 
 
 Mxfp8Config = BackendConfig
@@ -46,14 +50,18 @@ def _validate_query(query: Mxfp8Query, device) -> None:
         raise ValueError("unsupported MXFP8 MMA-scale layout")
     if query.scale_mma_storage not in ("uint8", "float8_e8m0fnu"):
         raise ValueError("unsupported MXFP8 MMA-scale storage")
+    if type(query.min_amax) is not float or query.min_amax not in (0.0, 1e-4):
+        raise ValueError("MXFP8 min_amax must be 0.0 or 1e-4")
+    if type(query.release_dependents) is not bool:
+        raise TypeError("MXFP8 dependent release must be a boolean")
 
 
 # Lane layout and threads are derived once from declaration metadata; private
 # compiler parameters remain unavailable as public overrides.
 TUNING = replace(
     TUNING,
-    query_schema_version=22,
-    semantic_version=3,
+    query_schema_version=24,
+    semantic_version=5,
     validate_query=_validate_query,
 )
 

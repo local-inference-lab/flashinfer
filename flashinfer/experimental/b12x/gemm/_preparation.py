@@ -91,6 +91,7 @@ def _lower_query(query, device, constraints):
         c_dtype=query.output_dtype,
         alpha=alpha,
         expected_m=query.expected_m,
+        allow_bf16_atomic_reduction=query.allow_bf16_atomic_reduction,
         sm_count=query.sm_count if query.sm_count is not None else device.sm_count,
         **constraints,
     )
@@ -466,3 +467,112 @@ def mm(
             handle,
         )
     return out
+
+
+@torch.library.custom_op(
+    "b12x::dense_mxfp8_prepared_bases",
+    mutates_args=("out_base", "workspace_base"),
+)
+def _mxfp8_mm_bases_prepared(
+    a_values_base: torch.Tensor,
+    a_scale_mma_base: torch.Tensor,
+    b_values_base: torch.Tensor,
+    b_scale_mma_base: torch.Tensor,
+    out_base: torch.Tensor,
+    workspace_base: torch.Tensor,
+    plan_handle: int,
+) -> None:
+    from b12x.quantization.mxfp8 import dense_scale_view_from_storage
+
+    state = require_prepared(
+        plan_from_handle(plan_handle), "gemm.mm", a_values_base.device
+    )
+    query = state.query
+    if (
+        query.recipe != "mxfp8"
+        or query.output_mode != "provided"
+        or query.alpha_mode != "unit"
+        or query.workspace_form != "provided"
+    ):
+        raise ValueError(
+            "MXFP8 physical-base launch requires a prepared unit-alpha output plan"
+        )
+    if (
+        a_values_base.ndim != 2
+        or b_values_base.ndim != 2
+        or a_values_base.dtype != torch.float8_e4m3fn
+        or b_values_base.dtype != torch.float8_e4m3fn
+        or not a_values_base.is_contiguous()
+        or not b_values_base.is_contiguous()
+        or out_base.shape != (a_values_base.shape[0], b_values_base.shape[0])
+        or out_base.dtype != torch.bfloat16
+        or not out_base.is_contiguous()
+        or workspace_base.dtype != torch.uint8
+        or workspace_base.ndim != 1
+        or not workspace_base.is_contiguous()
+        or workspace_base.numel() % 4
+    ):
+        raise ValueError(
+            "MXFP8 physical-base operands differ from the prepared dense layout"
+        )
+    m, k = (int(size) for size in a_values_base.shape)
+    n = int(b_values_base.shape[0])
+    if b_values_base.shape[1] != k:
+        raise ValueError("MXFP8 physical-base operands require matching K")
+    sfa = dense_scale_view_from_storage(a_scale_mma_base, m, k)
+    sfb = dense_scale_view_from_storage(b_scale_mma_base, n, k)
+    state.run(
+        a_values_base.view(m, k, 1),
+        sfa,
+        b_values_base.view(n, k, 1),
+        sfb,
+        None,
+        out_base.view(m, n, 1),
+        workspace_base.view(torch.float32),
+        torch.bfloat16,
+        None,
+    )
+
+
+@_mxfp8_mm_bases_prepared.register_fake
+def _mxfp8_mm_bases_prepared_fake(
+    a_values_base,
+    a_scale_mma_base,
+    b_values_base,
+    b_scale_mma_base,
+    out_base,
+    workspace_base,
+    plan_handle,
+) -> None:
+    del (
+        a_values_base,
+        a_scale_mma_base,
+        b_values_base,
+        b_scale_mma_base,
+        out_base,
+        workspace_base,
+        plan_handle,
+    )
+
+
+def mxfp8_mm_bases(
+    a_values_base: torch.Tensor,
+    a_scale_mma_base: torch.Tensor,
+    b_values_base: torch.Tensor,
+    b_scale_mma_base: torch.Tensor,
+    out_base: torch.Tensor,
+    workspace_base: torch.Tensor,
+    *,
+    plan: Plan,
+) -> torch.Tensor:
+    """Execute a prepared CuTe MXFP8 GEMM from caller-owned physical bases."""
+    _mxfp8_mm_bases_prepared(
+        a_values_base,
+        a_scale_mma_base,
+        b_values_base,
+        b_scale_mma_base,
+        out_base,
+        workspace_base,
+        plan.handle,
+    )
+    return out_base
