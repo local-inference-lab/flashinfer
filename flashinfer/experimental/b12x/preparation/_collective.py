@@ -95,9 +95,9 @@ def select(job, obligation, selections):
     obligation.key = digest(
         {
             "measurement": (
-                "collective_max_stream_gated_graph_v5_finalists"
+                "collective_max_stream_gated_graph_v6_screened_finalists"
                 if policy is not None
-                else "collective_max_stream_gated_graph_v4_token_scaled"
+                else "collective_max_stream_gated_graph_v5_screened"
             ),
             "repetitions": {"reduction_token_target": 100, "default": 1},
             "rounds": job.session.rounds,
