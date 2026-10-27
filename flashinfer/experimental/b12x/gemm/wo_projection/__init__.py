@@ -29,6 +29,7 @@ META = OpMeta(
         "bind",
         "bind_inv_rope",
         "run",
+        "run_out",
         "run_inv_rope",
         "pack_weights",
         "quantize_input",
@@ -71,6 +72,7 @@ if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
         quantize_input_b,
         quantize_input_inv_rope,
         run,
+        run_out,
         run_inv_rope,
     )
 

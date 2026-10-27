@@ -207,12 +207,13 @@ class _WOProjectionState:
         scratch: torch.Tensor | Mapping[str, torch.Tensor] | Sequence[torch.Tensor],
         source_tgd: torch.Tensor,
         weights: WOProjectionMXFP8Weights,
+        out: torch.Tensor | None = None,
         return_3d: bool = False,
         expected_m: int | None = None,
     ) -> WOProjectionBinding:
         tokens = _validate_wo_projection_inputs(source_tgd, weights)
         self._check_live_capacity(tokens=tokens, weights=weights)
-        views = self._views_from_scratch(scratch=scratch, tokens=tokens)
+        views = self._views_from_scratch(scratch=scratch, tokens=tokens, out=out)
         return _build_wo_projection_binding_from_views(
             x_q=views.x_q,
             tmp=views.tmp,
@@ -233,6 +234,7 @@ class _WOProjectionState:
         cos_sin_cache: torch.Tensor,
         weights: WOProjectionMXFP8Weights,
         heads_per_group: int,
+        out: torch.Tensor | None = None,
         nope_dim: int = 448,
         rope_dim: int = 64,
         return_3d: bool = False,
@@ -246,7 +248,7 @@ class _WOProjectionState:
             rope_dim=rope_dim,
         )
         self._check_live_capacity(tokens=tokens, weights=weights)
-        views = self._views_from_scratch(scratch=scratch, tokens=tokens)
+        views = self._views_from_scratch(scratch=scratch, tokens=tokens, out=out)
         return _build_wo_projection_inv_rope_binding_from_views(
             x_q=views.x_q,
             tmp=views.tmp,
@@ -268,6 +270,7 @@ class _WOProjectionState:
         *,
         scratch: torch.Tensor | Mapping[str, torch.Tensor] | Sequence[torch.Tensor],
         tokens: int | None = None,
+        out: torch.Tensor | None = None,
     ) -> _WOProjectionScratchViews:
         max_tokens = int(self.caps.max_tokens)
         tokens = max_tokens if tokens is None else int(tokens)
@@ -377,12 +380,17 @@ class _WOProjectionState:
             k=rank * groups,
             num_groups=1,
         )
-        output, _ = _materialize_arena_view(
-            scratch_storage,
-            offset_bytes=layout.output_offset_bytes,
-            shape=(tokens, hidden, 1),
-            dtype=torch.bfloat16,
-        )
+        if out is None:
+            out = torch.empty(
+                (tokens, hidden), dtype=torch.bfloat16, device=scratch_storage.device
+            )
+        if out.device != scratch_storage.device or not out.is_contiguous():
+            raise ValueError("WO output must be contiguous on the scratch device")
+        if out.shape not in ((tokens, hidden), (tokens, hidden, 1)):
+            raise ValueError(
+                "WO output must have shape [tokens, hidden] or [tokens, hidden, 1]"
+            )
+        output = out.as_strided((tokens, hidden, 1), (hidden, 1, tokens * hidden))
         return _WOProjectionScratchViews(
             x_q=x_q,
             tmp=tmp,
@@ -2645,7 +2653,7 @@ def _materialize_wo_projection_scratch(
         _scratch_specs=(
             scratch_buffer_spec(
                 "wo_projection.scratch",
-                nbytes=layout.nbytes,
+                nbytes=layout.output_offset_bytes,
                 device=caps.device,
             ),
         ),

@@ -487,6 +487,7 @@ def run_combine_impl(
     injection_logits: torch.Tensor,
     *,
     plan: _HyperConnectionState,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     _require_cuda(plan)
     plan.require_operation("combine")
@@ -498,7 +499,18 @@ def run_combine_impl(
         plan=plan,
         tokens=tokens,
     )
-    combined = torch.empty_like(state)
+    if plan.query.output_mode != ("functional" if out is None else "provided"):
+        raise ValueError("output form differs from preparation")
+    combined = torch.empty_like(state) if out is None else out
+    _validate_input(combined, shape=tuple(state.shape), caps=plan.caps, name="out")
+    _validate_output_disjoint(
+        "out",
+        combined,
+        (("block_output", block_output), ("injection_logits", injection_logits)),
+    )
+    if not torch.compiler.is_compiling() and _overlaps(combined, state):
+        if _byte_interval(combined) != _byte_interval(state):
+            raise ValueError("out may only overlap state through an exact alias")
     if tokens:
         plan.launch(state, block_output, injection_logits, combined)
     return combined

@@ -154,7 +154,10 @@ def _validate_query(query, device):
     expected_mode = (
         "functional" if query.operation in ("combine", "combine_norm") else "provided"
     )
-    if query.operation != "combine_norm" and query.output_mode != expected_mode:
+    if (
+        query.operation not in ("combine", "combine_norm")
+        and query.output_mode != expected_mode
+    ):
         raise ValueError("output form is not supported by this operation")
     if query.dtype != "bfloat16" and not (
         query.operation == "grouped_rmsnorm" and query.dtype == "float32"

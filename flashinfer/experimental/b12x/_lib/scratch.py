@@ -77,8 +77,30 @@ def scratch_tensor(
     return tensor.reshape(-1)
 
 
+def require_disjoint(output: torch.Tensor, inputs, *, owner: str) -> None:
+    """Reject overlapping byte ranges while allowing disjoint views of one pool."""
+    if not output.numel():
+        return
+
+    def interval(value):
+        begin = value.data_ptr()
+        span = 1 + sum(
+            (size - 1) * stride for size, stride in zip(value.shape, value.stride())
+        )
+        return begin, begin + span * value.element_size()
+
+    begin, end = interval(output)
+    for value in inputs:
+        if value is None or not value.numel() or value.device != output.device:
+            continue
+        other_begin, other_end = interval(value)
+        if begin < other_end and other_begin < end:
+            raise ValueError(f"{owner} must not overlap input or workspace storage")
+
+
 __all__ = [
     "ScratchBufferSpec",
     "scratch_buffer_spec",
     "scratch_tensor",
+    "require_disjoint",
 ]

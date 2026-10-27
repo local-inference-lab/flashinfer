@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 from dataclasses import replace
+
+import torch
 from ..._lib.gating import default_is_supported
+from ..._lib.scratch import require_disjoint
 from ...preparation import Plan
-from ...preparation.types import require_prepared
+from ...preparation.types import plan_from_handle, require_prepared
 from .._shared.wo_mxfp8 import MXFP8Rows
 from .._shared.wo_mxfp8 import WOProjectionBinding as Binding
 from .._shared.wo_mxfp8 import WOProjectionInvRopeBinding as InvRopeBinding
@@ -17,6 +20,78 @@ from .._shared import wo_mxfp8 as _shared
 from ._preparation import plan
 from ._tuning import WoProjectionConfig, WoProjectionQuery
 from . import META
+
+
+@torch.library.custom_op("b12x::wo_projection_out", mutates_args=("out", "scratch"))
+def _run_out(
+    source: torch.Tensor,
+    weights: list[torch.Tensor],
+    tiled_a: torch.Tensor | None,
+    tiled_b: torch.Tensor | None,
+    out: torch.Tensor,
+    scratch: torch.Tensor,
+    handle: int,
+) -> None:
+    require_disjoint(
+        out, (source, scratch, *weights, tiled_a, tiled_b), owner="WO output"
+    )
+    plan = plan_from_handle(handle)
+    state = require_prepared(plan, "gemm.wo_projection", source.device)
+    q = plan.query
+
+    def matrix(parts, tiled):
+        return MXFP8Rows(
+            parts[0],
+            parts[1].view(torch.float8_e8m0fnu),
+            parts[2].view(torch.float8_e8m0fnu),
+            tiled,
+        )
+
+    packed = Weights(
+        matrix(weights[:3], tiled_a),
+        matrix(weights[3:], tiled_b),
+        q.groups,
+        q.group_width,
+        q.rank,
+        q.hidden,
+        q.sfb_k_replicated,
+    )
+    binding = state.bind(
+        source_tgd=source,
+        weights=packed,
+        out=out,
+        scratch=scratch,
+        return_3d=q.return_3d,
+    )
+    state.run(binding)
+
+
+@_run_out.register_fake
+def _run_out_fake(source, weights, tiled_a, tiled_b, out, scratch, handle) -> None:
+    pass
+
+
+def run_out(source, weights: Weights, *, out, scratch, plan: Plan):
+    """Write a prepared projection into output with caller-owned private scratch."""
+    operands = [
+        tensor
+        for packed in (weights.wo_a, weights.wo_b)
+        for tensor in (
+            packed.values,
+            packed.scale_rows.view(torch.uint8),
+            packed.scale_mma.view(torch.uint8),
+        )
+    ]
+    _run_out(
+        source,
+        operands,
+        weights.wo_a.values_tiled,
+        weights.wo_b.values_tiled,
+        out,
+        scratch,
+        plan.handle,
+    )
+    return out
 
 
 def bind(plan: Plan, **kwargs) -> Binding:
@@ -107,6 +182,7 @@ __all__ = [
     "bind",
     "bind_inv_rope",
     "run",
+    "run_out",
     "run_inv_rope",
     "pack_weights",
     "quantize_input",

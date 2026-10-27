@@ -81,7 +81,13 @@ def run_gate_mean(normalized, gate_logits, *, binding: Binding):
     return binding.block_input
 
 
-def run_combine(state, block_output, injection_logits, *, plan: Plan):
+def run_combine(state, block_output, injection_logits, *, plan: Plan, out=None):
+    """Inject into BF16 output; provided output may alias state exactly."""
+    if out is not None:
+        torch.ops.b12x.hyperconnection_combine_out(
+            state, block_output, injection_logits, out, plan.handle
+        )
+        return out
     return torch.ops.b12x.hyperconnection_combine(
         state, block_output, injection_logits, plan.handle
     )

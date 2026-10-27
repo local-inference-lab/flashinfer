@@ -231,7 +231,7 @@ def run(*, binding: Binding):
         from torch.fx.experimental.proxy_tensor import get_proxy_mode
 
         if torch.compiler.is_compiling() or get_proxy_mode() is not None:
-            from ._binding_ops import prepared_moe_out
+            from ._binding_ops import prepared_moe_out, scale_buffers
 
             output = (
                 binding.output_cast_target
@@ -249,6 +249,7 @@ def run(*, binding: Binding):
                     binding.topk_ids,
                     output,
                     binding.compiler_scratch,
+                    *scale_buffers(binding),
                     plan._handle,
                     binding.correction_bias,
                     binding.image_correction_bias,
@@ -263,6 +264,7 @@ def run(*, binding: Binding):
                 binding.topk_ids,
                 output,
                 binding.compiler_scratch,
+                *scale_buffers(binding),
                 plan._handle,
                 binding.input_scales_static,
                 binding.fast_math,

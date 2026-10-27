@@ -21,6 +21,7 @@ META = OpMeta(
         "plan",
         "plan_batched",
         "run",
+        "run_out",
         "run_batched",
         "is_supported",
     ),

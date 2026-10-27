@@ -1,13 +1,125 @@
 """Compiler-visible prepared MoE execution over caller-owned storage."""
 
+from copy import copy
+from dataclasses import replace
+
 import torch
 
 from b12x.preparation.types import plan_from_handle, require_prepared
 
 
+def scale_buffers(binding):
+    """Expose CSF planes as reads or mutations according to the invocation."""
+    if hasattr(binding, "experts"):
+        experts = binding.experts
+        decoder = experts.nvfp4_csf
+        if decoder is None or binding.execution_plan.decode_config.csf_inline_scales:
+            return [], []
+        writes = not binding.scales_expanded or binding.implementation == "micro"
+    else:
+        experts = binding.state.experts._impl
+        decoder = binding.state.scale_decoder
+        if decoder is None:
+            return [], []
+        writes = not binding.scales_expanded
+    buffers = [
+        experts.w1_blockscale.view(torch.uint8),
+        experts.w2_blockscale.view(torch.uint8),
+        decoder.active,
+    ]
+    return ([], buffers) if writes else (buffers, [])
+
+
+def _scale_view(experts, buffers, decoder=None):
+    buffers = [
+        buffers[0].view(experts.w1_blockscale.dtype),
+        buffers[1].view(experts.w2_blockscale.dtype),
+        buffers[2],
+    ]
+    for source, target in zip(
+        (experts.w1_blockscale, experts.w2_blockscale), buffers[:2]
+    ):
+        if (
+            target.shape != source.shape
+            or target.stride() != source.stride()
+            or target.dtype != source.dtype
+            or target.device != source.device
+        ):
+            raise ValueError("CSF scale buffers must preserve prepared tensor metadata")
+    # Weight values were validated at preparation; only mutable storage is rebound.
+    result = copy(experts)
+    object.__setattr__(result, "w1_blockscale", buffers[0])
+    object.__setattr__(result, "w2_blockscale", buffers[1])
+    representation = experts.representation
+    if representation is not None:
+        payload = representation.value
+        updates = {}
+        for names, before, after in zip(
+            (("w13_scale", "w13_sfb"), ("w2_scale", "w2_sfb")),
+            (experts.w1_blockscale, experts.w2_blockscale),
+            buffers[:2],
+        ):
+            for name in names:
+                value = getattr(payload, name, None)
+                if (
+                    isinstance(value, torch.Tensor)
+                    and value.untyped_storage().data_ptr()
+                    == before.untyped_storage().data_ptr()
+                ):
+                    offset = (
+                        value.storage_offset() * value.element_size()
+                        - before.storage_offset() * before.element_size()
+                        + after.storage_offset() * after.element_size()
+                    ) // value.element_size()
+                    updates[name] = after.view(value.dtype).as_strided(
+                        value.shape, value.stride(), offset
+                    )
+        if updates:
+            object.__setattr__(
+                result,
+                "representation",
+                replace(representation, value=replace(payload, **updates)),
+            )
+    if decoder is not None:
+        object.__setattr__(result, "nvfp4_csf", decoder)
+    return result
+
+
+def _bind_scale_buffers(binding, buffers):
+    if not buffers:
+        return binding
+    if len(buffers) != 3:
+        raise ValueError("CSF execution requires two scale planes and routing storage")
+    decoder = (
+        binding.experts.nvfp4_csf
+        if hasattr(binding, "experts")
+        else binding.state.scale_decoder
+    )
+    active = decoder.active
+    if (
+        buffers[2].shape != active.shape
+        or buffers[2].stride() != active.stride()
+        or buffers[2].dtype != active.dtype
+        or buffers[2].device != active.device
+    ):
+        raise ValueError("CSF routing storage must preserve prepared tensor metadata")
+    if hasattr(binding, "experts"):
+        experts = binding.experts
+        decoder = replace(experts.nvfp4_csf, active=buffers[2])
+        return replace(binding, experts=_scale_view(experts, buffers, decoder))
+    state = binding.state
+    experts = _scale_view(state.experts._impl, buffers)
+    state = replace(
+        state,
+        experts=replace(state.experts, _impl=experts),
+        scale_decoder=replace(state.scale_decoder, active=buffers[2]),
+    )
+    return replace(binding, state=state)
+
+
 @torch.library.custom_op(
     "b12x::prepared_moe_out",
-    mutates_args=("output", "scratch", "activation_amax"),
+    mutates_args=("output", "scratch", "activation_amax", "scale_storage"),
 )
 def prepared_moe_out(
     a: torch.Tensor,
@@ -15,6 +127,8 @@ def prepared_moe_out(
     topk_ids: torch.Tensor,
     output: torch.Tensor,
     scratch: torch.Tensor,
+    scale_inputs: list[torch.Tensor],
+    scale_storage: list[torch.Tensor],
     plan_handle: int,
     input_scales_static: bool,
     fast_math: bool | None,
@@ -41,7 +155,7 @@ def prepared_moe_out(
         scales_expanded=scales_expanded,
         a4_prefill=a4_prefill,
     )
-    state.run(binding)
+    state.run(_bind_scale_buffers(binding, scale_storage or scale_inputs))
 
 
 @prepared_moe_out.register_fake
@@ -51,6 +165,8 @@ def _fake(
     topk_ids,
     output,
     scratch,
+    scale_inputs,
+    scale_storage,
     plan_handle,
     input_scales_static,
     fast_math,
@@ -66,7 +182,14 @@ def _fake(
 
 @torch.library.custom_op(
     "b12x::prepared_routed_moe_out",
-    mutates_args=("topk_weights", "topk_ids", "selected_logits", "output", "scratch"),
+    mutates_args=(
+        "topk_weights",
+        "topk_ids",
+        "selected_logits",
+        "output",
+        "scratch",
+        "scale_storage",
+    ),
 )
 def prepared_routed_moe_out(
     a: torch.Tensor,
@@ -76,6 +199,8 @@ def prepared_routed_moe_out(
     topk_ids: torch.Tensor,
     output: torch.Tensor,
     scratch: torch.Tensor,
+    scale_inputs: list[torch.Tensor],
+    scale_storage: list[torch.Tensor],
     plan_handle: int,
     correction_bias: torch.Tensor | None,
     image_correction_bias: torch.Tensor | None,
@@ -98,7 +223,7 @@ def prepared_routed_moe_out(
         num_valid_tokens=num_valid_tokens,
         scales_expanded=scales_expanded,
     )
-    state.run(binding)
+    state.run(_bind_scale_buffers(binding, scale_storage or scale_inputs))
 
 
 @prepared_routed_moe_out.register_fake
@@ -110,6 +235,8 @@ def _fake_routed(
     topk_ids,
     output,
     scratch,
+    scale_inputs,
+    scale_storage,
     plan_handle,
     correction_bias,
     image_correction_bias,

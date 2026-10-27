@@ -148,6 +148,7 @@ class BatchedBinding:
     binding: object
     sink_source: torch.Tensor | None = None
     sink_storage: torch.Tensor | None = None
+    return_lse: bool = True
 
 
 @dataclass(frozen=True)
@@ -158,6 +159,7 @@ class VarlenBinding:
     sink_storage: torch.Tensor | None = None
     block_indices: torch.Tensor | None = None
     block_offsets: torch.Tensor | None = None
+    return_lse: bool = True
 
 
 @dataclass(frozen=True)
@@ -185,7 +187,6 @@ class _BatchedState:
                 "attention_sink_bias is not enabled for this prepared plan"
             )
         if self.sink_storage is not None:
-            self.sink_storage.copy_(sink)
             return self.sink_storage
         if sink.dtype != torch.float32 or not sink.is_contiguous():
             raise ValueError("prepared attention sink requires conversion storage")
@@ -196,6 +197,8 @@ class _BatchedState:
         *,
         plan: Plan | None = None,
         scratch,
+        out=None,
+        lse=None,
         q,
         k,
         v,
@@ -205,6 +208,8 @@ class _BatchedState:
         sink = self._sink(attention_sink_bias)
         binding = self.scratch_plan.bind(
             scratch=scratch,
+            out=out,
+            lse=lse,
             q=q,
             k=k,
             v=v,
@@ -220,6 +225,7 @@ class _BatchedState:
             if self.sink_storage is not None and attention_sink_bias is not None
             else None,
             self.sink_storage if attention_sink_bias is not None else None,
+            return_lse=lse is not None or out is None,
         )
 
     def run(self, binding):
@@ -255,7 +261,6 @@ class _VarlenState:
                 "attention_sink_bias is not enabled for this prepared plan"
             )
         if self.sink_storage is not None:
-            self.sink_storage.copy_(sink)
             return self.sink_storage
         if sink.dtype != torch.float32 or not sink.is_contiguous():
             raise ValueError("prepared attention sink requires conversion storage")
@@ -266,6 +271,8 @@ class _VarlenState:
         *,
         plan: Plan | None = None,
         scratch,
+        out=None,
+        lse=None,
         q,
         k,
         v,
@@ -300,6 +307,8 @@ class _VarlenState:
         sink = self._sink(attention_sink_bias)
         binding = self.scratch_plan.bind(
             scratch=scratch,
+            out=out,
+            lse=lse,
             q=q,
             k=k,
             v=v,
@@ -323,6 +332,7 @@ class _VarlenState:
             self.sink_storage if attention_sink_bias is not None else None,
             block_indices,
             block_offsets,
+            return_lse=lse is not None or out is None,
         )
 
     def run(self, binding):
@@ -806,14 +816,16 @@ def bind(plan, **kwargs):
 def run_batched(binding):
     if not isinstance(binding, BatchedBinding):
         raise TypeError("run_batched requires a prepared BatchedBinding")
-    return require_prepared(
+    output, lse = require_prepared(
         binding.plan, "attention.varlen", binding.binding.q.device
     ).run(binding)
+    return output, lse if binding.return_lse else None
 
 
 def run(binding):
     if not isinstance(binding, VarlenBinding):
         raise TypeError("run requires a prepared VarlenBinding")
-    return require_prepared(
+    output, lse = require_prepared(
         binding.plan, "attention.varlen", binding.binding.q.device
     ).run(binding)
+    return output, lse if binding.return_lse else None

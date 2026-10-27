@@ -60,6 +60,7 @@ def test_native_expert_output_and_shared_scratch_poisoned_replay(
     inline_scales=False,
     mma_warps=None,
     execution_override=None,
+    compiled=False,
 ):
     device = require_b12x()
     e, h, topk = 8, 256, 2
@@ -237,13 +238,55 @@ def test_native_expert_output_and_shared_scratch_poisoned_replay(
             owners.append(scratch)
             outputs.append(output)
             bindings.append(binding)
+        if compiled:
+            from b12x.moe.fused_moe._binding_ops import scale_buffers
+
+            for prefetched in (False, True):
+                if prefetched:
+                    assert moe.expand_scales(experts[1])
+                binding = replace(bindings[1], scales_expanded=prefetched)
+                args = (
+                    binding.a,
+                    binding.topk_weights,
+                    binding.topk_ids,
+                    binding.output,
+                    binding.compiler_scratch,
+                    *scale_buffers(binding),
+                    binding.plan.handle,
+                    binding.input_scales_static,
+                    binding.fast_math,
+                    binding.activation_amax,
+                    binding.layer_idx,
+                    binding.route_expert_map,
+                    binding.output_expert_map,
+                    binding.scales_expanded,
+                    binding.compiler_a4_prefill,
+                )
+                torch.library.opcheck(
+                    torch.ops.b12x.prepared_moe_out.default,
+                    args,
+                    test_utils=(
+                        "test_schema",
+                        "test_faketensor",
+                        "test_aot_dispatch_dynamic",
+                    ),
+                )
+        selected_inline = not moe.uses_expanded_nvfp4_scales(
+            plans[1], num_tokens=tokens
+        )
         if inline_scales:
-            assert not moe.uses_expanded_nvfp4_scales(plans[1], num_tokens=tokens)
+            assert selected_inline
         session.freeze()
         for binding in bindings:
+
+            def run(binding=binding):
+                return moe.run(binding=binding)
+
+            forward = torch.compile(run, fullgraph=True) if compiled else run
+            forward()
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
-                moe.run(binding=binding)
+                forward()
             graphs.append(graph)
         for _ in range(3):
             source.neg_()
@@ -265,7 +308,7 @@ def test_native_expert_output_and_shared_scratch_poisoned_replay(
             )
             assert torch.isfinite(outputs[0]).all() and torch.count_nonzero(outputs[0])
             torch.testing.assert_close(outputs[0], outputs[1], rtol=0, atol=0)
-            if inline_scales:
+            if selected_inline:
                 assert all(torch.all(b.view(torch.uint8) == 0x7F) for b in buffers)
             else:
                 assert not torch.all(buffers[0].view(torch.uint8) == 0x7F)
@@ -552,9 +595,12 @@ def test_prefetched_scales_replace_the_per_call_expansion(
         poison = lambda: [b.view(torch.uint8).fill_(0x7F) for b in buffers]  # noqa: E731
         poison()
         stale = call(1, scales_expanded=True)
-        if plans[1].selection.config.backend == "micro":
-            # Small FP4-activation calls run the micro kernel, whose barrier
-            # reset is fused into the expansion: they expand regardless.
+        if plans[
+            1
+        ].selection.config.backend == "micro" or not moe.uses_expanded_nvfp4_scales(
+            plans[1], num_tokens=tokens
+        ):
+            # Micro resets barriers through expansion; inline kernels ignore expanded planes.
             torch.testing.assert_close(stale, reference, rtol=0, atol=0)
         else:
             assert not torch.equal(stale, reference)
@@ -677,4 +723,28 @@ def test_w4a16_wide_inline_poisoned_graph(monkeypatch):
     monkeypatch.setattr(w4a16_fused_launch, "compile_w4a16_fused_moe", compile_wide)
     test_native_expert_output_and_shared_scratch_poisoned_replay(
         32, "a16", "blocks", 256, inline_scales=True
+    )
+
+
+@pytest.mark.parametrize("tokens", [1, 33])
+@pytest.mark.parametrize("activation_mode", ["a4", "a16"])
+def test_compiled_csf_mutations_preserve_scale_expansion(tokens, activation_mode):
+    from b12x.moe.fused_moe._tuning import MoeDecodeConfig
+
+    override = MoeDecodeConfig(
+        backend="w4a16" if activation_mode == "a16" else "dynamic",
+        route_planner="internal",
+        max_active_clusters=None,
+        csf_inline_scales=False,
+        dynamic_tile_m=16 if activation_mode == "a4" else None,
+        dynamic_route_mode="grouped" if activation_mode == "a4" else None,
+        w4a16_route_mode="packed" if activation_mode == "a16" else None,
+    )
+    test_native_expert_output_and_shared_scratch_poisoned_replay(
+        tokens,
+        activation_mode,
+        "blocks",
+        128,
+        compiled=True,
+        execution_override=override,
     )

@@ -26,13 +26,10 @@ def _align(value):
 
 def _layout(invocation):
     rows, heads, _ = invocation["q_shape"]
-    width = invocation["v_shape"][-1]
-    output_bytes = rows * heads * width * 2
     row_bytes = rows * heads * 4
-    lse = _align(output_bytes)
-    maximum = _align(lse + row_bytes)
+    maximum = _align(row_bytes)
     inverse = _align(maximum + row_bytes)
-    return (0, lse, maximum, inverse), max(1, inverse + row_bytes)
+    return (0, maximum, inverse), max(1, inverse + row_bytes)
 
 
 def scratch_spec(invocation, ordinal):
@@ -239,6 +236,8 @@ class _State:
         self,
         *,
         scratch,
+        out=None,
+        lse=None,
         q,
         k,
         v,
@@ -319,20 +318,43 @@ class _State:
                 raise ValueError("eager_bf16 scratch must not overlap attention inputs")
         offsets, _ = _layout(invocation)
         rows, heads, _ = invocation["q_shape"]
-        shapes = ((rows, heads, invocation["v_shape"][-1]),) + ((heads, rows),) * 3
-        dtypes = (torch.bfloat16,) + (torch.float32,) * 3
-        output, lse, maximum, inverse = (
-            arena.narrow(0, offset, math.prod(shape) * dtype.itemsize)
-            .view(dtype)
+        shape = (heads, rows)
+        private_lse, maximum, inverse = (
+            arena.narrow(0, offset, math.prod(shape) * 4)
+            .view(torch.float32)
             .reshape(shape)
-            for offset, shape, dtype in zip(offsets, shapes, dtypes)
+            for offset in offsets
         )
+        return_lse = lse is not None or out is None
+        if out is None:
+            out = torch.empty(
+                (qshape[0], heads, vshape[-1]), device=device, dtype=dtype
+            )
+        if lse is None:
+            lse = (
+                torch.empty((heads, rows), device=device, dtype=torch.float32)
+                if return_lse
+                else private_lse
+            )[:, : qshape[0]]
+        if (
+            out.shape != (qshape[0], heads, vshape[-1])
+            or out.dtype != dtype
+            or out.device != device
+            or not out.is_contiguous()
+            or lse.shape != (heads, qshape[0])
+            or lse.dtype != torch.float32
+            or lse.device != device
+            or lse.stride() != (rows, 1)
+        ):
+            raise ValueError(
+                "attention output and lse must match the live query geometry"
+            )
         binding = _Binding(
             q,
             k,
             v,
-            output[: qshape[0]],
-            lse[:, : qshape[0]],
+            out,
+            lse,
             maximum,
             inverse,
             cu_seqlens_q,
@@ -340,7 +362,7 @@ class _State:
             scale,
             self.plan,
         )
-        return VarlenBinding(plan, binding)
+        return VarlenBinding(plan, binding, return_lse=return_lse)
 
     def run(self, binding):
         active = binding.binding

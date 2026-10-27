@@ -431,6 +431,27 @@ def _combine_fake(
     return torch.empty_like(state)
 
 
+@torch.library.custom_op("b12x::hyperconnection_combine_out", mutates_args=("out",))
+def _combine_out_op(
+    state: torch.Tensor,
+    block_output: torch.Tensor,
+    injection_logits: torch.Tensor,
+    out: torch.Tensor,
+    plan_handle: int,
+) -> None:
+    from ._impl import run_combine_impl
+
+    prepared = require_prepared(
+        plan_from_handle(plan_handle), "norm.hyperconnection", state.device
+    )
+    run_combine_impl(state, block_output, injection_logits, plan=prepared, out=out)
+
+
+@_combine_out_op.register_fake
+def _combine_out_fake(state, block_output, injection_logits, out, plan_handle) -> None:
+    pass
+
+
 @torch.library.custom_op("b12x::hyperconnection_combine_norm", mutates_args=())
 def _combine_norm_op(
     state: torch.Tensor,

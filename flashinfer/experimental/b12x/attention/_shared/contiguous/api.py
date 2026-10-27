@@ -655,8 +655,6 @@ class VarlenAttentionBinding:
 @dataclass(frozen=True, kw_only=True)
 class _AttentionScratchLayout:
     nbytes: int
-    output_offset_bytes: int
-    lse_offset_bytes: int
 
 
 @dataclass(frozen=True)
@@ -681,6 +679,8 @@ class AttentionScratchPlan:
         self,
         *,
         scratch: torch.Tensor | Mapping[str, torch.Tensor] | Sequence[torch.Tensor],
+        out: torch.Tensor | None = None,
+        lse: torch.Tensor | None = None,
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
@@ -690,6 +690,8 @@ class AttentionScratchPlan:
         views = _attention_scratch_views_from_scratch_plan(
             self,
             scratch=scratch,
+            out=out,
+            lse=lse,
         )
         return _build_attention_binding_from_views(
             output=views.output,
@@ -719,6 +721,8 @@ class VarlenAttentionScratchPlan:
         self,
         *,
         scratch: torch.Tensor | Mapping[str, torch.Tensor] | Sequence[torch.Tensor],
+        out: torch.Tensor | None = None,
+        lse: torch.Tensor | None = None,
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
@@ -734,6 +738,8 @@ class VarlenAttentionScratchPlan:
         views = _varlen_attention_scratch_views_from_scratch_plan(
             self,
             scratch=scratch,
+            out=out,
+            lse=lse,
         )
         return _build_varlen_attention_binding_from_views(
             output=views.output,
@@ -1504,6 +1510,8 @@ def _validate_attention_output_lse(
     lse: torch.Tensor,
     plan: AttentionPlan | VarlenAttentionPlan,
 ) -> None:
+    if not output.is_contiguous() or not lse.is_contiguous():
+        raise ValueError("attention output and lse must be contiguous")
     expected_output_shape = _output_shape(plan.q_shape, plan.v_shape)
     if output.shape != expected_output_shape:
         raise ValueError(
@@ -1539,18 +1547,7 @@ def _attention_scratch_layout(
     v_shape: tuple[int, ...],
     dtype: torch.dtype,
 ) -> _AttentionScratchLayout:
-    cursor = 0
-    cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
-    output_offset_bytes = cursor
-    cursor += _shape_numel(_output_shape(q_shape, v_shape)) * _dtype_nbytes(dtype)
-    cursor = _align_up(cursor, _ARENA_ALIGN_BYTES)
-    lse_offset_bytes = cursor
-    cursor += _shape_numel(_lse_shape(q_shape)) * _dtype_nbytes(torch.float32)
-    return _AttentionScratchLayout(
-        nbytes=max(int(cursor), 1),
-        output_offset_bytes=output_offset_bytes,
-        lse_offset_bytes=lse_offset_bytes,
-    )
+    return _AttentionScratchLayout(nbytes=max(1, _shape_numel(_lse_shape(q_shape)) * 4))
 
 
 def _arena_view(
@@ -1593,24 +1590,34 @@ def _attention_workspace_from_arena(
 
 
 def _attention_scratch_views_from_arena(
-    plan: AttentionPlan,
+    plan: AttentionPlan | VarlenAttentionPlan,
     *,
     layout: _AttentionScratchLayout,
     arena: torch.Tensor,
+    out: torch.Tensor | None = None,
+    lse: torch.Tensor | None = None,
 ) -> _AttentionScratchViews:
-    output = _arena_view(
-        arena,
-        offset_bytes=layout.output_offset_bytes,
-        shape=_output_shape(plan.q_shape, plan.v_shape),
-        dtype=plan.dtype,
-    )
-    lse = _arena_view(
-        arena,
-        offset_bytes=layout.lse_offset_bytes,
-        shape=_lse_shape(plan.q_shape),
-        dtype=torch.float32,
-    )
-    return _AttentionScratchViews(output=output, lse=lse)
+    functional_output = out is None
+    if out is None:
+        out = torch.empty(
+            _output_shape(plan.q_shape, plan.v_shape),
+            dtype=plan.dtype,
+            device=plan.device,
+        )
+    if lse is None:
+        lse = (
+            torch.empty(
+                _lse_shape(plan.q_shape), dtype=torch.float32, device=plan.device
+            )
+            if functional_output
+            else _arena_view(
+                arena,
+                offset_bytes=0,
+                shape=_lse_shape(plan.q_shape),
+                dtype=torch.float32,
+            )
+        )
+    return _AttentionScratchViews(output=out, lse=lse)
 
 
 def _varlen_attention_workspace_from_arena(
@@ -1647,24 +1654,34 @@ def _varlen_attention_workspace_from_arena(
 
 
 def _varlen_attention_scratch_views_from_arena(
-    plan: VarlenAttentionPlan,
+    plan: AttentionPlan | VarlenAttentionPlan,
     *,
     layout: _AttentionScratchLayout,
     arena: torch.Tensor,
+    out: torch.Tensor | None = None,
+    lse: torch.Tensor | None = None,
 ) -> _AttentionScratchViews:
-    output = _arena_view(
-        arena,
-        offset_bytes=layout.output_offset_bytes,
-        shape=_output_shape(plan.q_shape, plan.v_shape),
-        dtype=plan.dtype,
-    )
-    lse = _arena_view(
-        arena,
-        offset_bytes=layout.lse_offset_bytes,
-        shape=_lse_shape(plan.q_shape),
-        dtype=torch.float32,
-    )
-    return _AttentionScratchViews(output=output, lse=lse)
+    functional_output = out is None
+    if out is None:
+        out = torch.empty(
+            _output_shape(plan.q_shape, plan.v_shape),
+            dtype=plan.dtype,
+            device=plan.device,
+        )
+    if lse is None:
+        lse = (
+            torch.empty(
+                _lse_shape(plan.q_shape), dtype=torch.float32, device=plan.device
+            )
+            if functional_output
+            else _arena_view(
+                arena,
+                offset_bytes=0,
+                shape=_lse_shape(plan.q_shape),
+                dtype=torch.float32,
+            )
+        )
+    return _AttentionScratchViews(output=out, lse=lse)
 
 
 def _attention_workspace_from_scratch_plan(
@@ -1688,6 +1705,8 @@ def _attention_scratch_views_from_scratch_plan(
     scratch_plan: AttentionScratchPlan,
     *,
     scratch: torch.Tensor | Mapping[str, torch.Tensor] | Sequence[torch.Tensor],
+    out: torch.Tensor | None = None,
+    lse: torch.Tensor | None = None,
 ) -> _AttentionScratchViews:
     arena = scratch_tensor(
         scratch,
@@ -1698,6 +1717,8 @@ def _attention_scratch_views_from_scratch_plan(
         scratch_plan.plan,
         layout=scratch_plan._layout,
         arena=arena,
+        out=out,
+        lse=lse,
     )
 
 
@@ -1722,6 +1743,8 @@ def _varlen_attention_scratch_views_from_scratch_plan(
     scratch_plan: VarlenAttentionScratchPlan,
     *,
     scratch: torch.Tensor | Mapping[str, torch.Tensor] | Sequence[torch.Tensor],
+    out: torch.Tensor | None = None,
+    lse: torch.Tensor | None = None,
 ) -> _AttentionScratchViews:
     arena = scratch_tensor(
         scratch,
@@ -1732,6 +1755,8 @@ def _varlen_attention_scratch_views_from_scratch_plan(
         scratch_plan.plan,
         layout=scratch_plan._layout,
         arena=arena,
+        out=out,
+        lse=lse,
     )
 
 
