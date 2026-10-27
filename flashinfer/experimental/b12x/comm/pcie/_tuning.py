@@ -72,6 +72,25 @@ def _validate_query(query: PcieQuery, device) -> None:
         raise ValueError(f"{query.surface} supports world sizes {worlds}")
     if not 0 <= query.rank < query.world_size:
         raise ValueError("rank must belong to the caller's process group")
+    if query.surface.endswith(".all_gather_heads"):
+        transport = query.call.get("gather_transport", "barrier")
+        if transport not in ("barrier", "tagged_words"):
+            raise ValueError("unknown DCP gather transport")
+        if transport == "tagged_words":
+            from math import prod
+
+            element_bytes = 1 if query.call["dtype"] == "torch.float8_e4m3fn" else 2
+            words = prod(query.call["shape"]) * element_bytes // 4
+            if (
+                query.world_size != 4
+                or not 0 < words <= min(4096, query.setup.get("tagged_words", 0))
+                or query.call.get("output_alias", True)
+                or not query.call.get("word_aligned", False)
+                or query.call["block_limit"] != 1
+            ):
+                raise ValueError(
+                    "tagged DCP gather requires disjoint TP4 inputs within owned word capacity"
+                )
     if query.surface == "kimi_topk16":
         if query.topology != "local":
             raise ValueError("stateless kimi_topk16 uses one local device")
@@ -81,6 +100,6 @@ def _validate_query(query: PcieQuery, device) -> None:
         )
 
 
-TUNING = replace(TUNING, query_schema_version=30, validate_query=_validate_query)
+TUNING = replace(TUNING, query_schema_version=31, validate_query=_validate_query)
 
 __all__ = ["PcieQuery", "PcieConfig", "SURFACES", "TUNING"]

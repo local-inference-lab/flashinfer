@@ -164,7 +164,17 @@ class _StagingLayout:
     lse_offset: int
     lse_capacity: int
     slot_bytes: int
+    tagged_offset: int
+    tagged_words: int
     slab_bytes: int
+
+
+def _tagged_capacity(world_size, max_batch_size, local_heads, query_head_dim):
+    # Even the one-byte gather dtype must fit a complete row in 4096 words.
+    # Owners whose smallest row cannot fit do not reserve tagged receive space.
+    if world_size != 4 or local_heads * query_head_dim > 4096 * 4:
+        return 0
+    return min(4096, max_batch_size * local_heads * query_head_dim // 2)
 
 
 def _staging_layout(
@@ -201,6 +211,11 @@ def _staging_layout(
         lse_offset + lse_capacity * 4,
         IPC_SLAB_ALIGNMENT,
     )
+    tagged_offset = slot_bytes
+    tagged_words = _tagged_capacity(
+        world_size, max_batch_size, total_heads // world_size, query_head_dim
+    )
+    slot_bytes += _align_up(world_size * tagged_words * 8, IPC_SLAB_ALIGNMENT)
     staging0_offset = _align_up(signal_bytes, IPC_SLAB_ALIGNMENT)
     staging1_offset = staging0_offset + slot_bytes
     return _StagingLayout(
@@ -211,6 +226,8 @@ def _staging_layout(
         lse_offset=lse_offset,
         lse_capacity=lse_capacity,
         slot_bytes=slot_bytes,
+        tagged_offset=tagged_offset,
+        tagged_words=tagged_words,
         slab_bytes=staging1_offset + slot_bytes,
     )
 
@@ -515,6 +532,20 @@ class PCIeDCPA2A:
                 "staging slot pointers must have one shared positive stride"
             )
         self._slot_bytes = next(iter(slot_deltas))
+        self._tagged_offset = _align_up(
+            self.lse_offset + self.lse_capacity * 4, IPC_SLAB_ALIGNMENT
+        )
+        self._tagged_words = _tagged_capacity(
+            self.world_size,
+            self.max_batch_size,
+            self.heads_per_rank,
+            self.query_head_dim,
+        )
+        if (
+            self._tagged_offset + self.world_size * self._tagged_words * 8
+            > self._slot_bytes
+        ):
+            self._tagged_words = 0
         self._output_capacity_elems = int(output_capacity_elems)
         self._lse_offset = int(lse_offset)
         self._lse_capacity = int(lse_capacity)
@@ -1023,6 +1054,29 @@ class PCIeDCPA2A:
             1,
             min(block_limit, (rows + warps_per_block - 1) // warps_per_block),
         )
+        if state.query.call.get("gather_transport", "barrier") == "tagged_words":
+            nbytes = local_input.numel() * local_input.element_size()
+            if nbytes // 4 > self._tagged_words or nbytes % 4:
+                raise ValueError("tagged gather exceeds its owned word capacity")
+            if (
+                local_input.data_ptr()
+                < out.data_ptr() + out.numel() * out.element_size()
+                and out.data_ptr() < local_input.data_ptr() + nbytes
+            ):
+                raise ValueError(
+                    "tagged gather requires disjoint input and output storage"
+                )
+            state.launcher(False)(
+                local_input.data_ptr(),
+                out.data_ptr(),
+                self._staging0_ptrs,
+                self._signal_ptrs,
+                self._slot_bytes,
+                self._tagged_offset,
+                int(batch),
+                int(local_heads * head_dim * local_input.element_size() // 4),
+            )
+            return out
         capturing = _is_current_stream_capturing(self.device)
         if capturing:
             from ._dcp_a2a_cute import is_all_gather_heads_prepared

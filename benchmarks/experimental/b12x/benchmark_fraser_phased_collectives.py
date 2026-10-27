@@ -205,9 +205,9 @@ def main():
     parser.add_argument("--hidden-size", type=int, default=5120)
     parser.add_argument("--gather-columns", type=int, default=1280)
     parser.add_argument("--summary-widths", default="3,5")
-    parser.add_argument(
-        "--summary-layout", choices=("rows32", "flat512"), default="rows32"
-    )
+    parser.add_argument("--carrier-words", type=int, default=32)
+    parser.add_argument("--capacity-rows", type=int, default=0)
+    parser.add_argument("--summary-layout", choices=("rows", "flat512"), default="rows")
     parser.add_argument("--tuning-cache-dir", type=Path)
     parser.add_argument("--samples", type=int, default=5)
     parser.add_argument("--replays", type=int, default=30)
@@ -230,6 +230,15 @@ def main():
         parser.error(
             "positive rows, hidden alignment 8, and gather alignment 64 required"
         )
+    capacity_rows = args.capacity_rows or max(rows)
+    if (
+        capacity_rows < max(rows)
+        or args.carrier_words < max(summary_widths)
+        or args.carrier_words % 32
+    ):
+        parser.error(
+            "carrier capacity must cover rows and contain complete32-word blocks"
+        )
     if max(rows) * max(summary_widths) > 4096:
         parser.error("source tagged gather supports at most 4096 words")
     device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
@@ -239,7 +248,7 @@ def main():
     rank, world = dist.get_rank(), dist.get_world_size()
     if world != 4 or ext.RANKS != 4:
         raise ValueError("Fraser source transport requires exactly four ranks")
-    capacity = max(rows) * max(args.hidden_size, args.gather_columns) * 2
+    capacity = capacity_rows * max(args.hidden_size, args.gather_columns) * 2
     original = SourceExchange(ext, capacity)
     manager = pcie.AllReduce.from_exchange_group(
         exchange_group=dist.group.WORLD,
@@ -323,12 +332,16 @@ def main():
                     columns = (
                         width
                         if operation == "gather"
-                        else (64 if args.summary_layout == "rows32" else 256)
+                        else (
+                            args.carrier_words * 2
+                            if args.summary_layout == "rows"
+                            else 256
+                        )
                     )
                     runtime = pcie.DcpAllToAll.from_exchange_group(
                         exchange_group=dist.group.WORLD,
                         device=device,
-                        max_batch_size=max(rows),
+                        max_batch_size=capacity_rows,
                         total_heads=columns * world // 64,
                         head_dim=64,
                         stream_affine=False,
@@ -392,10 +405,14 @@ def main():
                         words = count * width
                         tiles = (
                             count
-                            if args.summary_layout == "rows32"
+                            if args.summary_layout == "rows"
                             else (words + 127) // 128
                         )
-                        carrier_columns = 64 if args.summary_layout == "rows32" else 256
+                        carrier_columns = (
+                            args.carrier_words * 2
+                            if args.summary_layout == "rows"
+                            else 256
+                        )
                         inp = torch.empty((words,), device=device, dtype=torch.int32)
                         inp.fill_(rank + 1)
                         packed = torch.zeros(
@@ -420,7 +437,7 @@ def main():
                         )
 
                         def ordinary():
-                            if args.summary_layout == "rows32":
+                            if args.summary_layout == "rows":
                                 packed.view(torch.int32)[:, :width].copy_(
                                     inp.view(count, width)
                                 )
@@ -452,9 +469,10 @@ def main():
                             if step == 1:
                                 data.zero_()
                             inp.copy_(data[rank].to(device))
-                            if args.summary_layout == "rows32":
+                            if args.summary_layout == "rows":
                                 rank_padding = torch.zeros(
-                                    (world, count, 32), dtype=torch.int32
+                                    (world, count, args.carrier_words),
+                                    dtype=torch.int32,
                                 )
                                 rank_padding[:, :, :width].copy_(
                                     data.view(world, count, width)

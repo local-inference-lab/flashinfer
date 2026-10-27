@@ -87,6 +87,8 @@ def query_from_runtime(runtime, *, surface, call) -> PcieQuery:
             "query_head_dim": int(runtime.query_head_dim),
             "slot_bytes": int(runtime._slot_bytes),
             "signal_words": len(runtime._signal_ptrs),
+            "tagged_offset": getattr(runtime, "_tagged_offset", 0),
+            "tagged_words": getattr(runtime, "_tagged_words", 0),
             "threads_override": int(runtime._threads_override),
             "blocks_override": int(runtime._block_limit_override),
         }
@@ -114,6 +116,18 @@ def query_from_runtime(runtime, *, surface, call) -> PcieQuery:
         )
     elif surface.endswith("all_gather_heads"):
         value = _call_value(call, "local_input")
+        out = call.get("out")
+        alias = (
+            out is not None
+            and value.data_ptr() < out.data_ptr() + out.numel() * out.element_size()
+            and out.data_ptr() < value.data_ptr() + value.numel() * value.element_size()
+        )
+        metadata.update(
+            gather_transport="barrier",
+            output_alias=alias,
+            word_aligned=value.data_ptr() % 4 == 0
+            and (out is None or out.data_ptr() % 4 == 0),
+        )
         metadata.update(
             dtype=str(value.dtype),
             shape=tuple(value.shape),
@@ -164,6 +178,7 @@ def compile_dcp_surface(query_payload, ordinal):
     from . import _dcp_a2a_cute as cute
 
     query = PcieQuery(**dict(query_payload))
+    TUNING.validate_query(query, None)
     call = query.call
     surface = query.surface
     with torch.cuda.device(ordinal):
@@ -181,6 +196,13 @@ def compile_dcp_surface(query_payload, ordinal):
                 for slot in (False, True)
             }
         if surface.endswith("all_gather_heads"):
+            if call.get("gather_transport", "barrier") == "tagged_words":
+                from ._tagged_gather import compile_tagged
+
+                program = compile_tagged(
+                    query.rank, int(call["threads"]), int(query.setup["tagged_words"])
+                )
+                return {False: program, True: program}
             return {
                 slot: cute._get_compiled_all_gather_heads(
                     query.world_size, query.rank, int(call["threads"]), slot
@@ -204,6 +226,13 @@ def compile_dcp_surface(query_payload, ordinal):
     raise ValueError(f"unsupported DCP preparation surface {surface!r}")
 
 
+def _require_tagged_layout(query, runtime):
+    if query.call.get("gather_transport", "barrier") == "tagged_words":
+        for field in ("tagged_words", "tagged_offset", "slot_bytes"):
+            if query.setup[field] != getattr(runtime, "_" + field):
+                raise ValueError("tagged gather plan differs from its owned IPC layout")
+
+
 @dataclass(frozen=True)
 class _DcpExecutionState:
     query: PcieQuery
@@ -218,6 +247,7 @@ class _DcpExecutionState:
             self.query.world_size,
         ):
             raise ValueError("DCP runtime identity differs from preparation")
+        _require_tagged_layout(self.query, runtime)
 
     def launcher(self, device_slot_selection: bool):
         try:
@@ -316,6 +346,7 @@ def plan(
         runtime = _runtime(runtime)
         if (runtime.rank, runtime.world_size) != (query.rank, query.world_size):
             raise ValueError("DCP query does not match its runtime owner")
+    _require_tagged_layout(query, runtime)
     if invocation:
         raise ValueError("DCP invocation semantics belong in PcieQuery")
 

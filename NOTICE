@@ -18,11 +18,9 @@ Copyright (c) 2026 KDA Team, under the MIT License (licenses/LICENSE.kda-for-kda
 The split kernel also retains its original Apache-2.0 TIRx-author attribution.
 Source: https://github.com/NVlabs/kda/tree/260927-kda-for-kda
 
-Persistent decoder CUDA kernels derive from DeepSeek-4.1-Flash-1017-BRRR.
-Copyright 2026 Fraser Price. Licensed under Apache-2.0.
-https://huggingface.co/fraserprice/DeepSeek-4.1-Flash-1017-BRRR
-The register-resident MXFP8 projection, alternating BF16 QK accumulators,
-and eight-CTA sparse-attention merge mechanisms are adapted from DeepSeek-4.1-Flash-1017-BRRR,
+The persistent decoder, register-resident MXFP8 projection, alternating BF16 QK
+accumulators, eight-CTA sparse-attention merge, and exact-word PCIe gather
+mechanisms are adapted from DeepSeek-4.1-Flash-1017-BRRR,
 Copyright 2026 Fraser Price, under the Apache License, Version 2.0.
 Source: https://huggingface.co/fraserprice/DeepSeek-4.1-Flash-1017-BRRR
 
