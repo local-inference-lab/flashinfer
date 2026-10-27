@@ -255,9 +255,12 @@ class _RoceOneshotLaunch:
 
             # 2. the last block to finish staging rings the proxy doorbell
             if Int32(tidx) == Int32(0):
-                fence_sc_sys()
-                prior = atomic_add_relaxed_gpu_u32(stage_counter_ptr, Uint32(1))
-                if (prior + Uint32(1)) % Uint32(gdim) == Uint32(0):
+                last_stager = Int32(gdim) == Int32(1)
+                if Int32(gdim) != Int32(1):
+                    fence_sc_sys()
+                    prior = atomic_add_relaxed_gpu_u32(stage_counter_ptr, Uint32(1))
+                    last_stager = (prior + Uint32(1)) % Uint32(gdim) == Uint32(0)
+                if last_stager:
                     st_relaxed_sys_u32(ctrl_base + Int64(4), Uint32(nbytes))
                     st_relaxed_sys_u32(
                         ctrl_base + Int64(16) + slot * Int64(4), Uint32(nbytes)
@@ -266,6 +269,8 @@ class _RoceOneshotLaunch:
                     st_relaxed_sys_u32(
                         ctrl_base + Int64(32) + slot * Int64(4), Uint32(0)
                     )
+                    # A single block publishes its staged payload and metadata
+                    # together; multiple blocks already fenced before arrival.
                     fence_sc_sys()
                     st_relaxed_sys_u32(ctrl_base, seq)
 
@@ -315,8 +320,11 @@ class _RoceOneshotLaunch:
             fence_sc_gpu()
             cute.arch.sync_threads()
             if Int32(tidx) == Int32(0):
-                prior = atomic_add_relaxed_gpu_u32(tail_counter_ptr, Uint32(1))
-                if (prior + Uint32(1)) % Uint32(gdim) == Uint32(0):
+                last_finisher = Int32(gdim) == Int32(1)
+                if Int32(gdim) != Int32(1):
+                    prior = atomic_add_relaxed_gpu_u32(tail_counter_ptr, Uint32(1))
+                    last_finisher = (prior + Uint32(1)) % Uint32(gdim) == Uint32(0)
+                if last_finisher:
                     fence_sc_gpu()
                     # Every block's timeout store precedes its tail arrival, so the
                     # error word is final here.  A failed sequence keeps the epoch,
@@ -422,7 +430,7 @@ def get_launcher(
         1,
         1,
         current_cuda_stream(),
-        compile_spec=KernelCompileSpec.from_key("comm.roce.oneshot", 6, cache_key),
+        compile_spec=KernelCompileSpec.from_key("comm.roce.oneshot", 7, cache_key),
     )
 
     def run(
