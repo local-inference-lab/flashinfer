@@ -187,3 +187,50 @@ def test_bf16_constraint_requires_mixed_v41_cache_format():
             cache_format="deepseek_v4",
             compute_mode="bf16",
         )
+
+
+def test_bf16_qk_accumulator_candidates_preserve_arithmetic_constraint():
+    declaration_plan = declaration(arithmetic="bf16", indexed=True)
+    configs = [
+        config
+        for _, config in declaration_plan.contract.eligible_plan(
+            declaration_plan.query, DEVICE
+        ).candidates
+    ]
+    assert {config.v41_qk_accumulators for config in configs} == {1, 2}
+    assert all(config.v41_compute_mode == "bf16" for config in configs)
+    default = declaration_plan.contract.configure(
+        declaration_plan.query, device=DEVICE
+    ).default
+    assert default.v41_qk_accumulators == 1
+    assert (
+        declaration_plan.contract.decode_config(FrozenMapping(asdict(default)))
+        == default
+    )
+    fp8_plan = declaration()
+    fp8_default = fp8_plan.contract.configure(fp8_plan.query, device=DEVICE).default
+    with pytest.raises(ValueError, match="parallel QK accumulation"):
+        fp8_plan.contract.validate_config(
+            fp8_plan.query, replace(fp8_default, v41_qk_accumulators=2), DEVICE
+        )
+
+
+def test_cluster_candidates_preserve_bf16_and_output_constraints():
+    base = declaration(arithmetic="bf16", indexed=True)
+    q = replace(base.query, indexed_width=512)
+    configuration = base.contract.configure(q, device=DEVICE)
+    assert configuration.default.v41_merge == "separate"
+    configs = [
+        config for _, config in base.contract.eligible_plan(q, DEVICE).candidates
+    ]
+    clustered = [config for config in configs if config.v41_merge == "cluster8"]
+    assert {config.v41_qk_accumulators for config in clustered} == {1, 2}
+    assert all(config.v41_compute_mode == "bf16" for config in clustered)
+    for unsupported in (
+        replace(q, return_lse=True),
+        replace(q, num_q_heads=24),
+        replace(q, indexed_cache_present=False),
+        replace(q, mode="extend"),
+    ):
+        with pytest.raises(ValueError, match="cluster merge|config path"):
+            base.contract.validate_config(unsupported, clustered[0], DEVICE)

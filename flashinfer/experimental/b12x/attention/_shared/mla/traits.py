@@ -89,6 +89,9 @@ class UnifiedMLATraits:
     # This is not a cache ABI change: it exists only after the gathered row is
     # owned by the math CTA.
     fp8_internal: bool = False
+    # Independent FP32 accumulation chains for BF16 QK reduction.
+    qk_accumulators: int = 1
+    cluster_merge: bool = False
 
 
 def make_unified_traits(

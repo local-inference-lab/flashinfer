@@ -174,11 +174,16 @@ def compile_packed(
                     enable_fp_fusion=False,
                 )
             return programs
-        programs = dict(
-            _module__lib_dense_gemm_preparation._compile_dense_lowering(
-                dense_payload, ordinal
+        if config.quantized_backend == "register_rows":
+            from ._register_mxfp8 import compile_register
+
+            programs = {"gemm": compile_register(query.in_features, query.out_features)}
+        else:
+            programs = dict(
+                _module__lib_dense_gemm_preparation._compile_dense_lowering(
+                    dense_payload, ordinal
+                )
             )
-        )
         if short_dense_payload is not None:
             programs.update(
                 {
@@ -262,6 +267,8 @@ def _workspace_bytes(query, config):
             return max(partials, query.out_features * query.padded_in_features * 2)
         return partials
     if functional_mxfp8_quantization(query, config):
+        if config.quantized_backend == "register_rows":
+            return 0
         if config.dense_config is not None and not query.codegen["split_k_atomic"]:
             slices = config.dense_config["split_k_slices"]
             if slices > 1:
@@ -327,6 +334,23 @@ class _PackedExecutionState:
             m,
             self.query.padded_in_features,
             num_groups=1,
+        )
+
+    def _run_register(self, x, xs, weights, scales, out, m):
+        import cutlass
+        import cutlass.cute as cute
+
+        tensors = (x, xs, weights, scales, out)
+        types = (cutlass.Uint8,) * 4 + (cutlass.BFloat16,)
+        self.programs["gemm"](
+            *(
+                make_ptr(
+                    dtype, value.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
+                )
+                for value, dtype in zip(tensors, types, strict=True)
+            ),
+            cutlass.Int32(m),
+            current_cuda_stream(),
         )
 
     def run(
@@ -436,6 +460,12 @@ class _PackedExecutionState:
                 self.programs["quantize"](
                     contiguous, packed.values, packed.scale_rows, packed.scale_mma
                 )
+                if config.quantized_backend == "register_rows":
+                    result = _validate_output(source, out, q.out_features)
+                    self._run_register(
+                        packed.values, packed.scale_mma, values, scales, result, m
+                    )
+                    return result
                 result = core.run(
                     (packed.values.view(m, stored_k, 1), packed.scale_mma),
                     (
@@ -575,6 +605,9 @@ class _PackedExecutionState:
             scale_view = (as_grouped_scale_view if nvfp4 else as_grouped_scale_view_mx)(
                 packed_scales.view(1, -1), m, q.padded_in_features
             )
+            if config.quantized_backend == "register_rows":
+                self._run_register(packed_values, packed_scales, values, scales, out, m)
+                return out
             core.run(
                 (packed_values.view(m, stored_k, 1), scale_view),
                 (values.view(q.out_features, stored_k, 1), scales),
@@ -599,7 +632,7 @@ def _plan_bf16(query: BlockscaledQuery, *, invocation=FrozenMapping(), override=
         if key not in lowerings:
             lowerings[key] = (
                 (None, None)
-                if config.mode == "a16"
+                if config.mode == "a16" or config.quantized_backend == "register_rows"
                 else (
                     _dense_lowering(query, config, device),
                     _short_dense_lowering(query, config, device),
