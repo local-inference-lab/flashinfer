@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 from statistics import median
 import sys
+import time
 
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT))
@@ -176,6 +177,7 @@ def main():
     parser.add_argument("--arms", default="pull,oneshot,rsag,twoshot")
     parser.add_argument("--hidden-size", type=int, default=0)
     parser.add_argument("--capacity-bytes", type=int, default=0)
+    parser.add_argument("--tuning-cache-dir", type=Path)
     parser.add_argument("--dtype", choices=("bfloat16", "float16"), default="bfloat16")
     parser.add_argument("--threads", type=int, default=256)
     parser.add_argument("--blocks", type=int, default=16)
@@ -250,6 +252,7 @@ def main():
         PreparationSession(
             device=device,
             autotune=True,
+            cache_dir=args.tuning_cache_dir,
             compile_workers=1,
             collective_barrier=lambda key, ranks: dist.barrier(),
         )
@@ -270,13 +273,16 @@ def main():
             out = torch.empty_like(inp)
             inp.fill_(rank + 1)
             calls, plans, graphs = {}, {}, {}
+            preparation_seconds = {}
             for arm in arms:
                 if rank == 0:
                     print(f"preparing bytes={size} arm={arm}", flush=True)
                 owner = tuned_session if arm == "tuned" else session
+                preparation_started = time.perf_counter()
                 plans[arm], calls[arm] = prepare(
                     owner, manager, inp, out, arm, args.threads, args.blocks
                 )
+                preparation_seconds[arm] = time.perf_counter() - preparation_started
                 graph = torch.cuda.CUDAGraph()
                 dist.barrier()
                 with owner.capture(), manager.capture(), torch.cuda.graph(graph):
@@ -351,6 +357,8 @@ def main():
                     )
             rank_samples = [None] * world
             dist.all_gather_object(rank_samples, samples)
+            rank_preparation_seconds = [None] * world
+            dist.all_gather_object(rank_preparation_seconds, preparation_seconds)
             record = {
                 "bytes": size,
                 "world_size": world,
@@ -363,6 +371,11 @@ def main():
                     for arm in arms
                 },
                 "rank_samples_us": rank_samples,
+                "rank_preparation_seconds": rank_preparation_seconds,
+                "max_rank_preparation_seconds": {
+                    arm: max(values[arm] for values in rank_preparation_seconds)
+                    for arm in arms
+                },
                 "max_rank_median_us": {
                     arm: max(median(values[arm]) for values in rank_samples)
                     for arm in arms
@@ -374,7 +387,13 @@ def main():
                 args.output.write_text(
                     json.dumps(
                         {
-                            "arguments": {**vars(args), "output": str(args.output)},
+                            "arguments": {
+                                **vars(args),
+                                "output": str(args.output),
+                                "tuning_cache_dir": str(args.tuning_cache_dir)
+                                if args.tuning_cache_dir is not None
+                                else None,
+                            },
                             "results": records,
                         },
                         indent=2,

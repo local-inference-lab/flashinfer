@@ -244,3 +244,150 @@ def test_collective_samples_control_repetitions_and_elimination(
         counts.append(tuple(timer.replays for timer in timers))
     assert schedules[0] == schedules[1]
     assert counts[0] == counts[1] == (8, 48)
+
+
+def _adaptive_measure(timers, sample_exchange=None, *, rounds=15):
+    def identity(indices, turn, repetition, samples):
+        yield
+        return samples
+
+    prepared = _race(timers)
+    steps = measure_race_steps(
+        prepared,
+        device_ordinal=0,
+        rounds=rounds,
+        eliminate=True,
+        adaptive_collective_pair=True,
+        adaptive_repeats=False,
+        sample_exchange=sample_exchange or identity,
+    )
+    while True:
+        try:
+            next(steps)
+        except StopIteration as result:
+            return prepared, result.value
+
+
+@pytest.mark.parametrize("difference", (-2.0, 2.0))
+def test_adaptive_collective_clear_pair_stops_after_three_rounds(
+    host_timing, difference
+):
+    timers = (_Timer(10.0), _Timer(10.0 + difference))
+    prepared, result = _adaptive_measure(timers)
+    assert prepared.completed_rounds == 3
+    assert tuple(timer.replays for timer in timers) == (3, 3)
+    assert result.latencies_us == (10.0, 10.0 + difference)
+
+
+def test_adaptive_collective_noisy_pair_collects_more_rounds(host_timing):
+    timers = (_Timer(10.0), _Timer(9.0, 11.0, 10.0, *([11.0] * 12)))
+    prepared, result = _adaptive_measure(timers)
+    assert 3 < prepared.completed_rounds <= 15
+    assert timers[0].replays == timers[1].replays == prepared.completed_rounds
+    assert result.latencies_us == (10.0, 11.0)
+
+
+def test_adaptive_collective_exact_tie_reaches_bound(host_timing):
+    timers = (_Timer(10.0), _Timer(10.0))
+    prepared, result = _adaptive_measure(timers)
+    assert prepared.completed_rounds == prepared.planned_rounds == 15
+    assert tuple(timer.replays for timer in timers) == (15, 15)
+    assert result.latencies_us == (10.0, 10.0)
+
+
+def test_adaptive_collective_mean_cannot_override_opposite_median():
+    from b12x.preparation._measurement import _collective_pair_separated
+
+    first = [100.0 * (index + 1) for index in range(15)]
+    second = [value + 10 for value in first]
+    second[7] = first[7] - 20
+    assert sum(second) > sum(first)
+    assert sorted(second)[7] < sorted(first)[7]
+    assert not _collective_pair_separated((first, second))
+
+
+def test_adaptive_collective_rank_reduction_controls_shared_stopping(host_timing):
+    schedules = []
+    for rank in range(2):
+        schedule = []
+
+        def reduce(indices, turn, repetition, samples):
+            schedule.append((indices, turn, repetition))
+            yield
+            return tuple(
+                (10.0 if index == 0 else (9.0, 11.0, 10.0)[turn % 3],)
+                for index in indices
+            )
+
+        prepared, _ = _adaptive_measure(
+            (_Timer(1.0 + rank * 50), _Timer(20.0 - rank * 10)), reduce
+        )
+        assert prepared.completed_rounds == 15
+        schedules.append(schedule)
+    assert schedules[0] == schedules[1]
+
+
+@pytest.mark.parametrize("failure", ("cancel", "close"))
+def test_adaptive_collective_extended_race_closes_resources(
+    host_timing, monkeypatch, failure
+):
+    from contextlib import nullcontext
+    from threading import Event
+    from types import SimpleNamespace
+    from b12x.preparation import _measurement
+    from b12x.preparation._collective import _Cancelled
+    from b12x.preparation.session import PreparationJob
+
+    closed = []
+    timers = (_Timer(10.0), _Timer(10.0))
+    for index, timer in enumerate(timers):
+        timer.close = lambda index=index: closed.append(index)
+    prepared = _race(timers)
+
+    def prepare(*args, **kwargs):
+        return prepared
+        yield
+
+    monkeypatch.setattr(_measurement, "prepare_race_steps", prepare)
+    job = PreparationJob.__new__(PreparationJob)
+    job.session = SimpleNamespace(
+        device=SimpleNamespace(ordinal=0),
+        samples=2,
+        rounds=15,
+        cache_policy="cold",
+        _stop=Event(),
+        _pool=None,
+    )
+    job._race_eviction = object()
+    job._timing = SimpleNamespace(span=lambda name: nullcontext())
+
+    def exchange(indices, turn, repetition, samples):
+        if failure == "cancel" and turn == 3:
+            raise _Cancelled
+        yield
+        return samples
+
+    steps = job._measure(
+        [SimpleNamespace(call=timer.call) for timer in timers],
+        champion=True,
+        adaptive_collective_pair=True,
+        sample_exchange=exchange,
+    )
+    if failure == "cancel":
+        with pytest.raises(_Cancelled):
+            while True:
+                next(steps)
+    else:
+        while prepared.completed_rounds < 3:
+            next(steps)
+        steps.close()
+    assert prepared._closed
+    assert sorted(closed) == [0, 1]
+
+
+@pytest.mark.parametrize("rounds", (1, 2, 4, 7, 20))
+def test_adaptive_collective_explicit_round_limit(host_timing, rounds):
+    timers = (_Timer(10.0), _Timer(10.0))
+    prepared, _ = _adaptive_measure(timers, rounds=rounds)
+    assert prepared.completed_rounds == min(rounds, 15)
+    assert tuple(timer.replays for timer in timers) == (min(rounds, 15),) * 2

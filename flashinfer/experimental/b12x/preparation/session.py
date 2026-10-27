@@ -42,7 +42,7 @@ from b12x._lib.runtime_control import (
 from ._cache import SelectionCache, _json, cache_identity, digest
 from ._efficiency import AutotuneEffort, capture_autotune_effort
 from ._discovery import discovery_key, discovery_record, restore_discovery
-from ._measurement import DEFAULT_SAMPLES, SURVIVOR_ROUNDS
+from ._measurement import DEFAULT_SAMPLES, COLLECTIVE_MAX_ROUNDS
 from ._ledger import RaceLedger
 from ._race_cache import RaceCache, RaceCheckpoint
 from ._timing import PreparationTiming
@@ -376,7 +376,7 @@ class PreparationSession:
         cache_dir=None,
         namespace=None,
         compile_workers=None,
-        rounds=SURVIVOR_ROUNDS,
+        rounds=COLLECTIVE_MAX_ROUNDS,
         samples=DEFAULT_SAMPLES,
         cache_only=False,
         race_batch=32,
@@ -2056,6 +2056,7 @@ class PreparationJob:
         sample_exchange=None,
         launch_exchange=None,
         sample_observer=None,
+        adaptive_collective_pair=False,
     ):
         from ._measurement import _l2_flush_fn, prepare_race_steps, measure_race_steps
 
@@ -2099,6 +2100,7 @@ class PreparationJob:
                     and self.session._pool.active_compilations
                 ),
                 eliminate=True,
+                adaptive_collective_pair=adaptive_collective_pair,
                 champion=champion,
                 sample_exchange=sample_exchange,
                 launch_exchange=launch_exchange,

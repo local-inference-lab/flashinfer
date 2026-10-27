@@ -73,7 +73,7 @@ def test_complete_race_appends_one_record_and_cached_restart_adds_none(
     assert all(c["local"] and not c["restored"] for c in record["candidates"])
     assert all(c["batch"] is not None for c in record["candidates"])
     assert record["batches"] and record["batches"][-1]["winner"] == 1
-    assert record["protocol"]["rounds"] == 3 and record["protocol"]["samples"] == 2
+    assert record["protocol"]["rounds"] == 15 and record["protocol"]["samples"] == 2
     assert set(record["phase_seconds"]) >= {"compile", "prepare", "measure"}
     assert record["seconds"] >= 0
     assert row["key"] == record["key"]

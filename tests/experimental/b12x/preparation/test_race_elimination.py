@@ -90,11 +90,14 @@ def test_scenario_score_minimizes_total_time_despite_geometric_speedup(host_timi
     assert measurement.latencies_us == (550.0, 590.0)
 
 
-def test_trailing_candidates_stop_after_one_round_and_keep_their_median(host_timing):
+@pytest.mark.parametrize("rounds", (7, 15))
+def test_trailing_candidates_stop_after_one_round_and_keep_their_median(
+    host_timing, rounds
+):
     leader, near, behind, far = _Timer(10.0), _Timer(10.9), _Timer(12.0), _Timer(40.0)
     prepared = _race((leader, near, behind, far))
 
-    measurement = _measure(prepared, rounds=7)
+    measurement = _measure(prepared, rounds=rounds)
 
     assert [_rounds(timer) for timer in (leader, near, behind, far)] == [3, 3, 1, 1]
     assert measurement.latencies_us == (10.0, 10.9, 12.0, 40.0)
