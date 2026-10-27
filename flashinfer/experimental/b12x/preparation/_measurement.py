@@ -476,7 +476,6 @@ def measure_race_steps(
         offset = (turn // 2) % len(order)
         order = order[offset:] + order[:offset]
         totals = [0.0] * len(prepared.timers)
-        round_samples = [[] for _ in prepared.timers]
         repetition = 0
         while repetition < max(repeats[index] for index in order):
             indices = tuple(
@@ -527,7 +526,6 @@ def measure_race_steps(
                         scored_batches.append((candidate_indices, sample_groups))
             for scored_indices, sample_groups in scored_batches:
                 for index, samples in zip(scored_indices, sample_groups, strict=True):
-                    round_samples[index].extend(samples)
                     if sample_observer is not None:
                         sample_observer(index, turn, repetition, samples)
                     latency = statistics.fmean(samples)
@@ -559,12 +557,6 @@ def measure_race_steps(
             for index, series in enumerate(values)
         )
         prepared.completed_rounds = turn + 1
-        if (
-            adaptive_collective_pair
-            and turn == 0
-            and min(round_samples[1]) > 2 * max(round_samples[0])
-        ):
-            break
         if adaptive_collective_pair and _collective_pair_separated(values):
             break
         if eliminate:

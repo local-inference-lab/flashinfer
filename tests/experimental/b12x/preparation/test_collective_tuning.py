@@ -295,24 +295,6 @@ def test_adaptive_collective_exact_tie_reaches_bound(host_timing):
     assert result.latencies_us == (10.0, 10.0)
 
 
-@pytest.mark.parametrize("challenger,rounds", ((21.0, 1), (20.0, 3), (4.0, 3)))
-def test_collective_screen_only_rejects_clearly_slower_challengers(
-    host_timing, challenger, rounds
-):
-    prepared, result = _adaptive_measure((_Timer(10.0), _Timer(challenger)))
-    assert prepared.completed_rounds == rounds
-    assert result.latencies_us == (10.0, challenger)
-
-
-def test_collective_screen_requires_every_sample_to_be_separated(host_timing):
-    def exchange(indices, turn, repetition, samples):
-        yield
-        return tuple((10.0, 11.0) if index == 0 else (21.0, 100.0) for index in indices)
-
-    prepared, _ = _adaptive_measure((_Timer(10.0), _Timer(50.0)), exchange)
-    assert prepared.completed_rounds == 3
-
-
 def test_adaptive_collective_mean_cannot_override_opposite_median():
     from b12x.preparation._measurement import _collective_pair_separated
 
