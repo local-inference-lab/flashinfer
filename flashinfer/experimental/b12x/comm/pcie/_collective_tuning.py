@@ -14,6 +14,7 @@ from b12x.preparation import (
 from b12x.preparation._efficiency import capture_autotune_effort
 
 from ._tuning import PcieQuery, TUNING as NATIVE
+from ._joint_profile import JOINT_FAMILIES
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -21,6 +22,8 @@ class CollectiveConfig:
     implementation: str
     threads: int
     blocks: int
+    submode: str = ""
+    active_blocks: int = 0
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -38,6 +41,25 @@ def _configs(query):
         call = payload["call"]
         blocks = int(call.get("blocks", call.get("block_limit", 16)))
         threads = int(call["threads"])
+        if name in JOINT_FAMILIES:
+            for count_threads in (32, 64, 128, 256, 512):
+                for mode in JOINT_FAMILIES[name]:
+                    units = int(call["size_packs"])
+                    if mode in ("bulk_push", "bulk_pull"):
+                        units = -(-units // query.world_size)
+                    covering = max(1, -(-units // count_threads))
+                    for active in dict.fromkeys(
+                        min(count, blocks)
+                        for count in (1, 2, 4, 8, 16, 32, 36, blocks, covering)
+                    ):
+                        yield CollectiveConfig(
+                            implementation=name,
+                            threads=count_threads,
+                            blocks=blocks,
+                            submode=mode,
+                            active_blocks=active,
+                        )
+            continue
         yield CollectiveConfig(implementation=name, threads=threads, blocks=blocks)
         if (
             query.world_size in (2, 3, 4, 6, 8, 10)
@@ -147,6 +169,8 @@ def _parameters(query, device):
                 CollectiveConfig(
                     implementation=name,
                     threads=int(payload["call"]["threads"]),
+                    submode=payload["call"].get("submode", ""),
+                    active_blocks=int(payload["call"].get("active_blocks", 0)),
                     blocks=int(
                         payload["call"].get(
                             "blocks", payload["call"].get("block_limit", 16)
@@ -156,14 +180,17 @@ def _parameters(query, device):
                 for name, payload in query.alternatives.items()
             )
         )
+    legal_configs = frozenset(configs)
     return ParameterSpace.create(
         TUNING.knobs,
         values={
             "implementation": tuple(dict.fromkeys(c.implementation for c in configs)),
             "threads": tuple(dict.fromkeys(c.threads for c in configs)),
             "blocks": tuple(dict.fromkeys(c.blocks for c in configs)),
+            "submode": tuple(dict.fromkeys(c.submode for c in configs)),
+            "active_blocks": tuple(dict.fromkeys(c.active_blocks for c in configs)),
         },
-        predicates=(lambda value: CollectiveConfig(**value) in configs,),
+        predicates=(lambda value: CollectiveConfig(**value) in legal_configs,),
         # Plain reductions measure pull alongside the payload-ready transports.
         efficiency_predicates=(
             lambda value: (
@@ -244,12 +271,14 @@ def _collective_signature(query):
 
 TUNING = TuningContract(
     component_id="comm.pcie",
-    query_schema_version=3,
-    config_schema_version=1,
+    query_schema_version=4,
+    config_schema_version=2,
     query_fields=frozenset(
         ("operation", "world_size", "rank", "alternatives", "default", "inplace")
     ),
-    config_fields=frozenset(("implementation", "threads", "blocks")),
+    config_fields=frozenset(
+        ("implementation", "threads", "blocks", "submode", "active_blocks")
+    ),
     encode_query=lambda q: dict(
         operation=q.operation,
         world_size=q.world_size,
@@ -267,6 +296,8 @@ TUNING = TuningContract(
         Knob(name="implementation", values=None),
         Knob(name="threads", values=None),
         Knob(name="blocks", values=None, binding=ParameterBinding.RUNTIME),
+        Knob(name="submode", values=None, binding=ParameterBinding.RUNTIME),
+        Knob(name="active_blocks", values=None, binding=ParameterBinding.RUNTIME),
     ),
     parameters=_parameters,
     collective_signature=_collective_signature,
@@ -294,6 +325,8 @@ def plan(
         ),
         default=CollectiveConfig(
             implementation=default,
+            submode=default_call.get("submode", ""),
+            active_blocks=int(default_call.get("active_blocks", 0)),
             threads=int(default_call["threads"]),
             blocks=int(default_call.get("blocks", default_call.get("block_limit", 16))),
         ),
@@ -308,6 +341,8 @@ def plan(
             call = dict(q.call)
             call["threads"] = config.threads
             call["blocks" if "blocks" in call else "block_limit"] = config.blocks
+            if config.implementation in JOINT_FAMILIES:
+                call.update(submode=config.submode, active_blocks=config.active_blocks)
             q = replace(q, call=FrozenMapping(call))
             native_plans[config] = _provider(q.surface).plan(q, runtime=runtime)
         return native_plans[config]
@@ -379,6 +414,8 @@ def oneshot_alternatives(query, runtime):
             <= int(query.setup["eager_storage_shards"]) * capacity
         ):
             modes += ["remote_push_full", "remote_push_rsag"]
+            if query.setup.get("joint_max_blocks", 0) > 0:
+                modes += list(JOINT_FAMILIES)
     elif query.world_size == 4:
         modes += ["stage_remote_push"]
         # The payload-ready fused specialization uses an isolated incoming region.
@@ -397,6 +434,13 @@ def oneshot_alternatives(query, runtime):
             call.update(threads=128, blocks=min(36, -(-call["size_packs"] // 128)))
         if field == "transport" and mode in ("remote_push_full", "remote_push_rsag"):
             call.update(threads=256, blocks=16)
+        if mode in JOINT_FAMILIES:
+            call.update(
+                threads=256,
+                blocks=query.setup["joint_max_blocks"],
+                submode=JOINT_FAMILIES[mode][0],
+                active_blocks=min(16, query.setup["joint_max_blocks"]),
+            )
         if mode not in alternatives:
             alternatives[mode] = (replace(query, call=FrozenMapping(call)), runtime)
     return alternatives

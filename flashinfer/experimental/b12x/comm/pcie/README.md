@@ -102,3 +102,35 @@ The test exercises duplicate declarations, cache reuse with a missing member
 cache, one-rank cancellation, inconsistent shapes, cache-only misses, and graph
 replay. `benchmarks/experimental/b12x/benchmark_pcie_allreduce_transports.py`
 compares explicit transports and the static dispatch policy with CUDA graphs.
+
+## Joint BF16 profiles
+
+Staged BF16 reductions with payload-ready peer storage also
+race two joint entrypoints. `joint_latency` supports `full`, `payload_rsag`, and
+`pull`; `joint_bandwidth` supports `payload_rsag`, `bulk_push`, `bulk_pull`, and
+`pull`. Standalone transports remain available for comparison. Each entrypoint
+uses one compiled program per thread count and maximum grid; its submode and
+active CTA count are device data and do not specialize compilation. The maximum
+grid is capped by the device SM count and 64 CTAs. The tuning
+record includes both values. For example,
+`CollectiveConfig(implementation="joint_latency", threads=256, blocks=64,
+submode="full", active_blocks=16)` pins a joint configuration.
+
+Joint workspace is provisioned by `PCIeOneshotAllReduce.from_exchange_group`
+and the pool's coordinated channel factories. The public direct constructor
+accepting externally supplied pointers retains standalone transports; BF16
+payload-ready support alone does not admit joint candidates. Joint alternatives
+require an existing workspace and never allocate one during declaration.
+
+Coordinated channel setup allocates every admitted submode's IPC storage before
+asynchronous compilation and tuning begin. Materialization reuses that storage
+and allocates a device selector without entering communicator collectives.
+Immutable host records enumerate admitted `(mode, active CTA count)` profiles;
+the selector encodes the selected record in one uint32. These resources remain
+owned by the established channel and execution state. The captured launch
+retains fixed addresses, thread count, and maximum grid. The state method
+`select_profile(submode, active_blocks)` collectively drains pending CUDA work,
+checks rank agreement, and updates that selector. Every rank must stop submitting
+work before entering this method with identical arguments. A profile change
+cannot occur during capture or overlap graph replay. No topology is inferred
+from the profile; callers choose the prepared profile explicitly.

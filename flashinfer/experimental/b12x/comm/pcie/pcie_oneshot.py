@@ -303,6 +303,18 @@ def _validate_plain_io(inp: torch.Tensor, out: torch.Tensor) -> None:
         )
 
 
+def _prepare_joint_channel(runtime) -> None:
+    if not runtime._sentinel_supported:
+        return
+    from ._joint_preparation import prepare_workspace
+
+    try:
+        prepare_workspace(runtime)
+    except BaseException:
+        runtime.close()
+        raise
+
+
 def _align_up(value: int, alignment: int) -> int:
     return ((int(value) + int(alignment) - 1) // int(alignment)) * int(alignment)
 
@@ -2728,6 +2740,7 @@ class PCIeOneshotAllReduce:
             local_cleanup=abort_native_runtime,
             detach_shared_ownership=detach_shared_ownership,
         )
+        _prepare_joint_channel(runtime)
         return runtime
 
     @classmethod
@@ -3986,6 +3999,7 @@ class PCIeOneshotAllReducePool:
             local_cleanup=abort_native_runtime,
             detach_shared_ownership=detach_shared_ownership,
         )
+        _prepare_joint_channel(channel)
         channel._bind_stream_key(stream_key)
         self._all_channels.append(channel)
         return channel

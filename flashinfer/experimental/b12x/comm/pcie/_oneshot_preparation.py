@@ -250,7 +250,28 @@ def _owned_resident_layout(runtime, native) -> tuple[int, int, int]:
     signal_nbytes = _align_up(int(runtime._ext.meta_size()), IPC_SLAB_ALIGNMENT)
     eager_nbytes = _align_up(int(eager_bytes) * shards, IPC_SLAB_ALIGNMENT)
     slab_nbytes = signal_nbytes + 2 * eager_nbytes
-    return rank_data_nbytes, slab_nbytes, len(runtime._owned_buffers)
+    joint = getattr(runtime, "_joint_workspace", None)
+    joint_buffer = None if joint is None else joint.shared
+    native_count = sum(buffer is not joint_buffer for buffer in runtime._owned_buffers)
+    return rank_data_nbytes, slab_nbytes, native_count
+
+
+def _joint_max_blocks(runtime):
+    if getattr(runtime, "_joint_workspace", None) is None:
+        return 0
+    return min(
+        64, torch.cuda.get_device_properties(runtime.device).multi_processor_count
+    )
+
+
+def _joint_workspace_nbytes(runtime):
+    workspace = getattr(runtime, "_joint_workspace", None)
+    if workspace is None:
+        return 0
+    return int(workspace.shared.nbytes) + sum(
+        table.numel() * table.element_size()
+        for table in (workspace.peer_table, workspace.signal_table)
+    )
 
 
 def _plain_launcher_metadata(backend, native, inp):
@@ -390,9 +411,11 @@ def query_from_metadata(
         "rank_data_nbytes": rank_data_nbytes,
         "owned_slab_nbytes": slab_nbytes,
         "owned_slab_count": owned_slab_count,
+        "joint_workspace_nbytes": _joint_workspace_nbytes(runtime),
         "eager_buffer_bytes": None
         if native.eager_buffer_bytes is None
         else int(native.eager_buffer_bytes),
+        "joint_max_blocks": _joint_max_blocks(runtime),
         "eager_storage_shards": _eager_storage_shards(
             int(runtime.world_size),
             tuple(bool(value) for value in native.transport_policy),
@@ -505,9 +528,11 @@ def query_from_runtime(runtime, *, surface, call) -> PcieQuery:
         "rank_data_nbytes": rank_data_nbytes,
         "owned_slab_nbytes": slab_nbytes,
         "owned_slab_count": owned_slab_count,
+        "joint_workspace_nbytes": _joint_workspace_nbytes(runtime),
         "eager_buffer_bytes": None
         if native.eager_buffer_bytes is None
         else int(native.eager_buffer_bytes),
+        "joint_max_blocks": _joint_max_blocks(runtime),
         "eager_storage_shards": _eager_storage_shards(
             int(runtime.world_size),
             tuple(bool(value) for value in native.transport_policy),
@@ -834,6 +859,11 @@ def plan(
     if invocation:
         raise ValueError("oneshot invocation semantics belong in PcieQuery")
 
+    if query.call.get("transport") in ("joint_latency", "joint_bandwidth"):
+        from ._joint_preparation import plan as joint_plan
+
+        return joint_plan(query, runtime=runtime, override=override)
+
     def materialize(selection, device):
         launchers = load_programs(
             compile_oneshot_surface(TUNING.encode_query(query), device.ordinal)
@@ -844,7 +874,11 @@ def plan(
     rank_data_nbytes, slab_nbytes, owned_slab_count = _owned_resident_layout(
         runtime, native
     )
-    resident = rank_data_nbytes + slab_nbytes * owned_slab_count
+    resident = (
+        rank_data_nbytes
+        + slab_nbytes * owned_slab_count
+        + _joint_workspace_nbytes(runtime)
+    )
 
     return Plan(
         contract=TUNING,
