@@ -2239,6 +2239,7 @@ class PreparationJob:
         eliminate=True,
         adaptive_repeats=True,
         adaptive_collective_pair=False,
+        repetitions=1,
     ):
         from ._measurement import _l2_flush_fn, prepare_race_steps, measure_race_steps
 
@@ -2262,6 +2263,7 @@ class PreparationJob:
                 primed=True,
                 eviction=self._race_eviction,
                 cache_policy=self.session.cache_policy,
+                repetitions=repetitions,
             )
             while sample_exchange is not None or not self.session._stop.is_set():
                 try:

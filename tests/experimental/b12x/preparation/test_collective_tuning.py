@@ -403,7 +403,9 @@ def test_preparation_progress_counts_collective_and_local_measurements(
     from .test_session import _deterministic_timer, session
 
     _deterministic_timer(monkeypatch)
-    monkeypatch.setattr(_collective, "capture_benchmark_call", lambda call: call)
+    monkeypatch.setattr(
+        _collective, "capture_benchmark_call", lambda call, **kwargs: call
+    )
 
     def requests(rows):
         items = []
@@ -466,7 +468,9 @@ def test_cancelled_collective_progress_retains_completed_measurements(
     from .test_session import _deterministic_timer, session
 
     _deterministic_timer(monkeypatch)
-    monkeypatch.setattr(_collective, "capture_benchmark_call", lambda call: call)
+    monkeypatch.setattr(
+        _collective, "capture_benchmark_call", lambda call, **kwargs: call
+    )
     item = request(
         name="partial",
         tuning=replace(contract(), collective_signature=lambda query: query.rows),

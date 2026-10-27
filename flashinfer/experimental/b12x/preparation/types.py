@@ -512,6 +512,8 @@ class PreparedCall:
     A benchmark call must return without waiting for device work or using
     unjoined side streams. Reset and activation production run before its gate.
     ``capture_safe`` describes caller capture support, not the timing method.
+    ``benchmark_repetitions`` declares invocations per timed graph. Mutations
+    repeat with each invocation; producers and resets remain outside the graph.
 
     Prepare-call factories construct bindings and resources even when the
     session disables priming. Only ``reset``, ``produce``, and ``run`` are
@@ -530,6 +532,7 @@ class PreparedCall:
     benchmark_producers: tuple[Callable[[], None], ...] = ()
     validate: Callable[[], None] | None = None
     capture_context: Callable[[], object] | None = None
+    benchmark_repetitions: int = 1
 
     def invoke(self):
         result = self.run()

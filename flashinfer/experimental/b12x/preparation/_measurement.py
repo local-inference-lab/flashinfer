@@ -40,10 +40,12 @@ def _collective_pair_separated(values):
     return abs(mean) > radius and mean * median_difference > 0
 
 
-def capture_benchmark_call(call):
+def capture_benchmark_call(call, *, repetitions=1):
     """Explicitly capture the timed operation, retaining live sample producers."""
     import torch
 
+    if type(repetitions) is not int or repetitions <= 0:
+        raise ValueError("benchmark repetitions must be a positive integer")
     graph = torch.cuda.CUDAGraph()
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -56,7 +58,8 @@ def capture_benchmark_call(call):
             nullcontext() if call.capture_context is None else call.capture_context()
         )
         with context, call_scope(), torch.cuda.graph(graph, stream=stream):
-            call.invoke()
+            for _ in range(repetitions):
+                call.invoke()
     except BaseException:
         try:
             graph.reset()
@@ -81,6 +84,7 @@ def capture_benchmark_call(call):
         owners=(call, graph, stream),
         close=close,
         capture_safe=True,
+        benchmark_repetitions=repetitions,
     )
 
 
@@ -230,9 +234,19 @@ def _collection_paused():
 
 
 class _TimedCall:
-    def __init__(self, call, eviction, samples, gate, *, eviction_after_produce=False):
+    def __init__(
+        self,
+        call,
+        eviction,
+        samples,
+        gate,
+        *,
+        eviction_after_produce=False,
+        repetitions=1,
+    ):
         import torch
 
+        self.repetitions = repetitions
         self.call, self.eviction = call, eviction
         self.eviction_after_produce = eviction_after_produce
         self.gate = gate
@@ -270,7 +284,10 @@ class _TimedCall:
                     end.record(stream)
 
     def samples(self):
-        return tuple(start.elapsed_time(end) * 1000.0 for start, end in self.events)
+        return tuple(
+            start.elapsed_time(end) * 1000.0 / self.repetitions
+            for start, end in self.events
+        )
 
     def close(self):
         self.call = self.eviction = self.gate = None
@@ -338,6 +355,7 @@ def prepare_race_steps(
     eviction=None,
     cache_policy="cold",
     eviction_after_produce=False,
+    repetitions=1,
 ):
     """Prepare event pairs for asynchronous calls on the current CUDA stream."""
     import torch
@@ -348,6 +366,8 @@ def prepare_race_steps(
         raise ValueError("a race requires candidates and positive samples")
     if any(call.produce is None for call in calls):
         raise ValueError("candidate races require an activation-producing context")
+    if type(repetitions) is not int or repetitions <= 0:
+        raise ValueError("benchmark repetitions must be a positive integer")
     workload_counts = {len(call.benchmark_producers) or 1 for call in calls}
     if len(workload_counts) != 1:
         raise ValueError(
@@ -382,6 +402,7 @@ def prepare_race_steps(
                         samples,
                         gate,
                         eviction_after_produce=eviction_after_produce,
+                        repetitions=repetitions,
                     )
                 )
             yield
@@ -516,7 +537,12 @@ def measure_race_steps(
                         repeats[index] = max(
                             1,
                             math.ceil(
-                                ROUND_BUDGET_US / (prepared.sample_count * latency)
+                                ROUND_BUDGET_US
+                                / (
+                                    prepared.sample_count
+                                    * latency
+                                    * prepared.timers[index].repetitions
+                                )
                             ),
                         )
             repetition += 1
