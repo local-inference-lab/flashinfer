@@ -2501,9 +2501,9 @@ class DenseGemmKernel:
                             ) and n_coord < Int32(directC_mnl.shape[1]):
                                 directC_mnl[
                                     (
-                                        m_coord,
-                                        n_coord,
-                                        tile_coord_mnl[2],
+                                        Int64(m_coord),
+                                        Int64(n_coord),
+                                        Int64(tile_coord_mnl[2]),
                                     )
                                 ] = epilogue_op(
                                     (alpha_value * swap_ab_acc_mn[acc_m, acc_n]).to(
@@ -2709,9 +2709,9 @@ class DenseGemmKernel:
                                             ):
                                                 c_offset = cute.crd2idx(
                                                     (
-                                                        m_coord0,
-                                                        n_coord0,
-                                                        Int32(0),
+                                                        Int64(m_coord0),
+                                                        Int64(n_coord0),
+                                                        Int64(0),
                                                     ),
                                                     directC_mnl.layout,
                                                 )
@@ -2747,9 +2747,9 @@ class DenseGemmKernel:
                                             ) and n_coord < Int32(directC_mnl.shape[1]):
                                                 c_offset = cute.crd2idx(
                                                     (
-                                                        m_coord,
-                                                        n_coord,
-                                                        Int32(0),
+                                                        Int64(m_coord),
+                                                        Int64(n_coord),
+                                                        Int64(0),
                                                     ),
                                                     directC_mnl.layout,
                                                 )
@@ -2784,7 +2784,11 @@ class DenseGemmKernel:
                                                 directC_mnl.shape[0]
                                             ) and n_coord < Int32(directC_mnl.shape[1]):
                                                 directC_mnl[
-                                                    (m_coord, n_coord, split_idx)
+                                                    (
+                                                        Int64(m_coord),
+                                                        Int64(n_coord),
+                                                        Int64(split_idx),
+                                                    )
                                                 ] = (
                                                     alpha_value
                                                     * split_k_acc_mn[acc_m, acc_n]
@@ -3108,9 +3112,9 @@ class DenseGemmKernel:
                                         ) and n_coord < Int32(directC_mnl.shape[1]):
                                             directC_mnl[
                                                 (
-                                                    Int32(0),
-                                                    n_coord,
-                                                    tile_coord_mnl[2],
+                                                    Int64(0),
+                                                    Int64(n_coord),
+                                                    Int64(tile_coord_mnl[2]),
                                                 )
                                             ] = sC[(Int32(0), n_local, epi_buffer)]
                                 elif cutlass.const_expr(not self.quantize_c):

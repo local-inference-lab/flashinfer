@@ -1085,3 +1085,43 @@ def test_a16_rejects_tma_misalignment():
     with pytest.raises(ValueError):
         with prepared_execution(source, weight, activation_mode="a16"):
             pytest.fail("misaligned A16 geometry was admitted")
+
+
+def test_nvfp4_split_partials_exceed_int32_elements():
+    require_b12x()
+    m, n, k = 4096, 34816, 1024
+    source = torch.ones((m, k), device="cuda", dtype=torch.bfloat16)
+    packed = torch.full((n, k // 2), 0x22, device="cuda", dtype=torch.uint8)
+    scales = torch.ones((n, k // 16), device="cuda", dtype=torch.float8_e4m3fn)
+    weight = blockscaled.pack_weight(
+        packed,
+        swizzle_block_scale(scales),
+        recipe="nvfp4",
+        global_scale=torch.ones(1, device="cuda", dtype=torch.float32),
+    )
+    out = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
+    config = BlockscaledConfig(mode="a16", tile_m=16, tile_n=64, tile_k=64, split_k=16)
+    workspace = make_workspace(
+        source, weight, activation_mode="a16", out=out, config=config
+    )
+    assert workspace.numel() > 2**31 * 4
+    with prepared_execution(
+        source,
+        weight,
+        activation_mode="a16",
+        out=out,
+        workspace=workspace,
+        config=config,
+    ) as (_, plan):
+
+        def run():
+            blockscaled.mm(source, weight, plan=plan, out=out, workspace=workspace)
+
+        run()
+        torch.testing.assert_close(out, torch.full_like(out, k), rtol=0, atol=0)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+        source.fill_(0.5)
+        graph.replay()
+        torch.testing.assert_close(out, torch.full_like(out, k / 2), rtol=0, atol=0)

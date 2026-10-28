@@ -319,7 +319,7 @@ class _DenseGemmLaunch:
         c_tensor = cute.make_tensor(
             c_ptr,
             layout=cute.make_ordered_layout(
-                (m, self._n, self._c_l),
+                (cutlass.Int64(m), self._n, self._c_l),
                 order=(0, 1, 2) if self._c_major == "m" else (1, 0, 2),
             ),
         )
@@ -541,7 +541,7 @@ class _DenseGemmMxfp6Launch(_DenseGemmLaunch):
         c_tensor = cute.make_tensor(
             c_ptr,
             layout=cute.make_ordered_layout(
-                (m, self._n, self._c_l),
+                (cutlass.Int64(m), self._n, self._c_l),
                 order=(0, 1, 2) if self._c_major == "m" else (1, 0, 2),
             ),
         )
@@ -905,7 +905,9 @@ class _DenseGemmFusedQuantALaunch(_DenseGemmLaunch):
         b_tensor = cute.make_tensor(b_ptr, layout=b_layout)
         c_tensor = cute.make_tensor(
             c_ptr,
-            layout=cute.make_ordered_layout((m, self._n, self._c_l), order=(1, 0, 2)),
+            layout=cute.make_ordered_layout(
+                (cutlass.Int64(m), self._n, self._c_l), order=(1, 0, 2)
+            ),
         )
         alpha_tensor = cute.make_tensor(
             alpha_ptr,
@@ -1179,7 +1181,9 @@ class _DenseGemmFusedQuantAGroupedLaunch(_DenseGemmLaunch):
         )
         c_tensor = cute.make_tensor(
             c_ptr,
-            layout=cute.make_ordered_layout((m, self._n, self._c_l), order=(1, 0, 2)),
+            layout=cute.make_ordered_layout(
+                (cutlass.Int64(m), self._n, self._c_l), order=(1, 0, 2)
+            ),
         )
         alpha_tensor = cute.make_tensor(
             alpha_ptr,
