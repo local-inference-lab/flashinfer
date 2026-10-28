@@ -74,13 +74,20 @@ class SparseMlaQuery:
 
 @dataclass(frozen=True, kw_only=True)
 class SparseMlaConfig:
-    """Prepared split/merge capacity selected for this immutable query."""
+    """Prepared split geometry and arithmetic-preserving kernel schedules.
+
+    ``v41_qk_accumulators=2`` alternates BF16 QK MMA steps between independent
+    FP32 accumulators. ``v41_merge="cluster8"`` merges eight normalized BF16
+    partials within one CTA cluster, retaining the shared softmax/PV rounding.
+    """
 
     max_chunks_per_row: int
     split_chunk_size: int
     single_pass: bool
     v41_compute_mode: str = "fp8"
     v41_heads_per_block: int = 16
+    v41_qk_accumulators: int = 1
+    v41_merge: str = "separate"
 
     @classmethod
     def from_config(cls, payload: FrozenMapping) -> "SparseMlaConfig":
@@ -90,6 +97,8 @@ class SparseMlaConfig:
             "single_pass",
             "v41_compute_mode",
             "v41_heads_per_block",
+            "v41_qk_accumulators",
+            "v41_merge",
         }
         if set(payload) != expected:
             raise ValueError(
@@ -100,12 +109,16 @@ class SparseMlaConfig:
         single_pass = payload["single_pass"]
         compute_mode = payload["v41_compute_mode"]
         heads_per_block = payload["v41_heads_per_block"]
+        qk_accumulators = payload["v41_qk_accumulators"]
+        merge = payload["v41_merge"]
         if (
             type(chunks) is not int
             or type(chunk_size) is not int
             or type(single_pass) is not bool
             or type(compute_mode) is not str
             or type(heads_per_block) is not int
+            or type(qk_accumulators) is not int
+            or type(merge) is not str
         ):
             raise TypeError("compressed MLA config fields have invalid types")
         return cls(
@@ -114,6 +127,8 @@ class SparseMlaConfig:
             single_pass=single_pass,
             v41_compute_mode=compute_mode,
             v41_heads_per_block=heads_per_block,
+            v41_qk_accumulators=qk_accumulators,
+            v41_merge=merge,
         )
 
 
@@ -235,6 +250,24 @@ def _validate_config(
         raise ValueError(
             "compressed MLA configuration violates its arithmetic constraint"
         )
+    if config.v41_merge not in ("separate", "cluster8"):
+        raise ValueError("v41_merge must be separate or cluster8")
+    if config.v41_merge == "cluster8" and not (
+        _cluster_eligible(query)
+        and config.v41_compute_mode == "bf16"
+        and config.max_chunks_per_row >= 8
+    ):
+        raise ValueError(
+            "cluster merge requires V4.1 BF16 mapped decode with eight split slots"
+        )
+    if config.v41_qk_accumulators not in (1, 2):
+        raise ValueError("v41_qk_accumulators must be 1 or 2")
+    if config.v41_qk_accumulators != 1 and (
+        query.cache_format != "deepseek_v41"
+        or config.v41_compute_mode != "bf16"
+        or config.single_pass
+    ):
+        raise ValueError("parallel QK accumulation requires V4.1 BF16 decode")
     if config.v41_heads_per_block not in (8, 16):
         raise ValueError("v41_heads_per_block must be 8 or 16")
     fp8_decode = (
@@ -260,6 +293,17 @@ def _validate_config(
         raise ValueError(
             "compressed MLA config is inconsistent with the declared split contract"
         )
+
+
+def _cluster_eligible(query):
+    return (
+        query.cache_format == "deepseek_v41"
+        and query.mode == "decode"
+        and query.indexed_cache_present
+        and query.num_q_heads % 16 == 0
+        and not query.return_lse
+        and (query.swa_width + 63) // 64 + (query.indexed_width + 63) // 64 >= 8
+    )
 
 
 def _parameters(query: SparseMlaQuery, device: DeviceIdentity | None) -> ParameterSpace:
@@ -296,8 +340,29 @@ def _parameters(query: SparseMlaQuery, device: DeviceIdentity | None) -> Paramet
             "single_pass": (default.single_pass,),
             "v41_compute_mode": modes,
             "v41_heads_per_block": head_blocks,
+            "v41_merge": ("separate", "cluster8")
+            if _cluster_eligible(query)
+            else ("separate",),
+            "v41_qk_accumulators": (1, 2)
+            if query.cache_format == "deepseek_v41" and not default.single_pass
+            else (1,),
         },
-        predicates=(lambda choice: pair(choice) in legal,),
+        predicates=(
+            lambda choice: pair(choice) in legal,
+            lambda choice: (
+                choice["v41_merge"] == "separate"
+                or (
+                    choice["v41_compute_mode"] == "bf16"
+                    and pair(choice)
+                    == (default.max_chunks_per_row, default.split_chunk_size)
+                    and choice["max_chunks_per_row"] >= 8
+                )
+            ),
+            lambda choice: (
+                choice["v41_qk_accumulators"] == 1
+                or choice["v41_compute_mode"] == "bf16"
+            ),
+        ),
         efficiency_predicates=(lambda choice: pair(choice) in raced,),
         autotune_effort=query.autotune_effort,
     )
@@ -314,7 +379,7 @@ def _materialize(
 TUNING = TuningContract(
     component_id="attention.compressed_sparse_mla",
     query_schema_version=25,
-    config_schema_version=22,
+    config_schema_version=24,
     query_fields=frozenset(SparseMlaQuery.__dataclass_fields__) - {"compute_mode"},
     config_fields=frozenset(SparseMlaConfig.__dataclass_fields__),
     encode_query=SparseMlaQuery.to_dict,
@@ -329,14 +394,18 @@ TUNING = TuningContract(
         Knob(name="single_pass", values=None, binding=ParameterBinding.COMPILE),
         Knob(name="v41_compute_mode", values=None, binding=ParameterBinding.COMPILE),
         Knob(name="v41_heads_per_block", values=None, binding=ParameterBinding.COMPILE),
+        Knob(name="v41_qk_accumulators", values=None, binding=ParameterBinding.COMPILE),
+        Knob(name="v41_merge", values=None, binding=ParameterBinding.COMPILE),
     ),
-    candidate_contract_version=6,
+    candidate_contract_version=8,
     parameters=_parameters,
     materialize=_materialize,
     equivalence_key=lambda query, _device, config: (
         config.max_chunks_per_row,
         config.split_chunk_size,
         config.single_pass,
+        config.v41_qk_accumulators,
+        config.v41_merge,
         (config.v41_compute_mode, config.v41_heads_per_block)
         if query.cache_format == "deepseek_v41"
         else None,

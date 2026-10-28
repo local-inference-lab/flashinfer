@@ -346,6 +346,8 @@ def _lower_launch(
                 fp8_rope=False,
             ),
             fp8_internal=config.v41_compute_mode == "fp8",
+            qk_accumulators=config.v41_qk_accumulators,
+            cluster_merge=config.v41_merge == "cluster8",
         )
         if query.cache_format == "deepseek_v41"
         else None

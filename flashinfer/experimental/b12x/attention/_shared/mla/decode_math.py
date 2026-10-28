@@ -1,3 +1,6 @@
+# Alternating BF16 QK accumulation adapted from Fraser BRRR.
+# Copyright 2026 Fraser Price; Apache-2.0. See NOTICE for attribution.
+
 """DSV4 sparse-MLA decode MATH stages (P5) -- the QK path (S0-S3).
 
 100%-CuTeDSL single-CTA DSV4 decode for ONE query token over HPB=16 heads with
@@ -725,6 +728,7 @@ def s1_qk_nope_block_scaled(
     scale_format: cutlass.Constexpr = 0,  # ScaleFormat.UE8M0_BYTE (0) / ARBITRARY_FP32 (1)
     valid_hpb: cutlass.Constexpr = 16,
     latent_scale_per_token: cutlass.Constexpr = False,  # NVFP4_E4M3 only
+    qk_accumulators: cutlass.Constexpr = 1,
 ):
     """S1: accumulate Q_nope . K_nope into qk[0..3] via NUM_SCALES*(QUANT_TILE/32)
     block-scaled MMAs (14 DSV4 / 16 GLM).
@@ -773,6 +777,7 @@ def s1_qk_nope_block_scaled(
             kv_smem_stride=kv_smem_stride,
             latent_scale_per_token=latent_scale_per_token,
             kv_sc_base_addr=kv_sc_base_addr,
+            qk_accumulators=qk_accumulators,
         )
 
     gid = lane >> Int32(2)
@@ -897,6 +902,7 @@ def _s1_qk_dsv41_source(
     quant_tile: cutlass.Constexpr,
     q_nope_bf16_stride: cutlass.Constexpr,
     swa: cutlass.Constexpr,
+    qk_accumulators: cutlass.Constexpr = 1,
 ):
     """Run the QK K-loop for one invariant packed source format."""
     gid = lane >> Int32(2)
@@ -904,6 +910,9 @@ def _s1_qk_dsv41_source(
     a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
     a_col = (lane >> Int32(4)) * Int32(8)
     kv_gid_row = warp_first_cand + gid
+    # Alternate independent MMA chains to shorten the 512-coordinate dependency.
+    # The operands stay BF16; only the order of FP32 additions changes.
+    odd = [Float32(0), Float32(0), Float32(0), Float32(0)]
     for blk in cutlass.range_constexpr(num_scales):
         swa_scales = []
         if cutlass.const_expr(swa and quant_tile % 32 == 0):
@@ -935,18 +944,17 @@ def _s1_qk_dsv41_source(
             a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(
                 _smem_byte(q_nope_bf16_base_addr, a_byte)
             )
-            qk[0], qk[1], qk[2], qk[3] = mma_m16n8k16_f32_bf16(
-                qk[0],
-                qk[1],
-                qk[2],
-                qk[3],
-                a0,
-                a1,
-                a2,
-                a3,
-                b0,
-                b1,
-            )
+            if cutlass.const_expr(qk_accumulators == 2 and ks % 2):
+                odd[0], odd[1], odd[2], odd[3] = mma_m16n8k16_f32_bf16(
+                    odd[0], odd[1], odd[2], odd[3], a0, a1, a2, a3, b0, b1
+                )
+            else:
+                qk[0], qk[1], qk[2], qk[3] = mma_m16n8k16_f32_bf16(
+                    qk[0], qk[1], qk[2], qk[3], a0, a1, a2, a3, b0, b1
+                )
+    if cutlass.const_expr(qk_accumulators == 2):
+        for i in cutlass.range_constexpr(4):
+            qk[i] = qk[i] + odd[i]
     return qk[0], qk[1], qk[2], qk[3]
 
 
@@ -965,6 +973,7 @@ def s1_qk_nope_nvfp4_bf16(
     kv_smem_stride: cutlass.Constexpr,  # 288 bytes
     latent_scale_per_token: cutlass.Constexpr = False,
     kv_sc_base_addr: Int32 = Int32(0),
+    qk_accumulators: cutlass.Constexpr = 1,
 ):
     """S1 (NVFP4): BF16 QK-NoPE over in-register dequantized E2M1 K.
 
@@ -1003,6 +1012,7 @@ def s1_qk_nope_nvfp4_bf16(
                 quant_tile=quant_tile,
                 q_nope_bf16_stride=q_nope_bf16_stride,
                 swa=True,
+                qk_accumulators=qk_accumulators,
             )
         elif indexed_warp:
             q0, q1, q2, q3 = _s1_qk_dsv41_source(
@@ -1016,6 +1026,7 @@ def s1_qk_nope_nvfp4_bf16(
                 quant_tile=quant_tile,
                 q_nope_bf16_stride=q_nope_bf16_stride,
                 swa=False,
+                qk_accumulators=qk_accumulators,
             )
         else:
             for blk in cutlass.range_constexpr(num_scales):

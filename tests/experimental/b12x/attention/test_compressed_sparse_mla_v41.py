@@ -115,6 +115,7 @@ def test_v41_heterogeneous_attention_replay_and_live_rows(
     mla_session,
     arithmetic="auto",
     rows=19,
+    qk_accumulators=1,
 ) -> None:
     from b12x.attention._shared.mla.compressed_reference import (
         pack_deepseek_v41_cache_reference,
@@ -197,6 +198,7 @@ def test_v41_heterogeneous_attention_replay_and_live_rows(
         execution = replace(
             TUNING.configure(plan.query, device=mla_session.device.identity).default,
             v41_compute_mode="fp8" if fp8 else "bf16",
+            v41_qk_accumulators=qk_accumulators,
             v41_heads_per_block=8 if fp8 and mode == "decode" and heads % 16 else 16,
         )
         plan = compressed_sparse_mla.plan(
@@ -685,3 +687,16 @@ def test_v41_mapped_decode_replay_rejects_invalid_slots(
         graph.reset()
     assert torch.equal(indexed, indexed_snapshot)
     assert torch.equal(swa, swa_snapshot)
+
+
+@pytest.mark.parametrize("heads", [8, 16, 24, 32])
+def test_v41_parallel_bf16_qk_replay(heads, monkeypatch, mla_session):
+    test_v41_heterogeneous_attention_replay_and_live_rows(
+        heads=heads,
+        mode="decode",
+        large_pool=False,
+        fp8=False,
+        monkeypatch=monkeypatch,
+        mla_session=mla_session,
+        qk_accumulators=2,
+    )
