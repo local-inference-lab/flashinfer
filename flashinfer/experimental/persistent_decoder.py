@@ -61,11 +61,16 @@ class PersistentDecoderTP4(PCIeOneshotAllReduce):
         ordinal = self.device.index
         if ordinal is None:
             ordinal = torch.cuda.current_device()
-        self.peers = [
+        rank_peers = [
             torch.from_dlpack(self.module.view(ptr, self.nbytes, ordinal))
             for ptr in shared.peer_ptrs
         ]
-        local = self.peers[self.rank]
+        # Every rank exposes the same storage-alias graph to forward compilation.
+        self.peers = [
+            rank_peers[self.rank],
+            *(peer for rank, peer in enumerate(rank_peers) if rank != self.rank),
+        ]
+        local = self.peers[0]
         self.scratch = [local[offset : offset + nbytes] for offset, nbytes in offsets]
         self.owners = (shared, local, *self.peers, *self.scratch)
 

@@ -57,7 +57,7 @@ int64_t persistent_decoder_scratch_bytes(int64_t index) {
     case 23:
       return (long(ROUTES) * HQ_LD) * sizeof(uint8_t);
     case 24:
-      return (long(MAXM) * HID) * sizeof(float);
+      return (long(ROUTES) * HID) * sizeof(__nv_bfloat16);
     case 25:
       return (long(MAXM) * HID) * sizeof(uint8_t);
     case 26:
@@ -98,12 +98,19 @@ int64_t persistent_decoder_ctas(int64_t device, int64_t blocks_per_sm) {
 
 void persistent_decoder_run(Array<Tensor> io, Array<Tensor> weights, Array<Tensor> scratch,
                             Array<Tensor> peers, int64_t rank, int64_t ctas, int64_t shared_a16) {
-  TVM_FFI_ICHECK_EQ(io.size(), 13);
+  TVM_FFI_ICHECK_EQ(io.size(), 20);
   TVM_FFI_ICHECK_EQ(weights.size(), 19);
   TVM_FFI_ICHECK_EQ(scratch.size(), 34);
   TVM_FFI_ICHECK_EQ(peers.size(), RANKS);
   TVM_FFI_ICHECK(rank >= 0 && rank < RANKS);
   Params p{};
+  p.router_logits = static_cast<float*>(io[13].data_ptr());
+  p.router_ids = static_cast<int*>(io[14].data_ptr());
+  p.router_weights = static_cast<float*>(io[15].data_ptr());
+  p.routed_out = static_cast<__nv_bfloat16*>(io[16].data_ptr());
+  p.shared_out = static_cast<__nv_bfloat16*>(io[17].data_ptr());
+  p.shared_gate_up = static_cast<__nv_bfloat16*>(io[18].data_ptr());
+  p.shared_intermediate = static_cast<__nv_bfloat16*>(io[19].data_ptr());
   p.rank = rank;
   p.shared_a16 = shared_a16;
   TVM_FFI_ICHECK(shared_a16 >= 0 && shared_a16 <= 3);
@@ -209,7 +216,7 @@ void persistent_decoder_run(Array<Tensor> io, Array<Tensor> weights, Array<Tenso
   TVM_FFI_ICHECK_GE(scratch[23].numel(), persistent_decoder_scratch_bytes(23));
   p.s.hqe = reinterpret_cast<uint8_t*>(scratch[23].data_ptr());
   TVM_FFI_ICHECK_GE(scratch[24].numel(), persistent_decoder_scratch_bytes(24));
-  p.s.yracc = reinterpret_cast<float*>(scratch[24].data_ptr());
+  p.s.yracc = reinterpret_cast<__nv_bfloat16*>(scratch[24].data_ptr());
   TVM_FFI_ICHECK_GE(scratch[25].numel(), persistent_decoder_scratch_bytes(25));
   p.s.aq = reinterpret_cast<uint8_t*>(scratch[25].data_ptr());
   TVM_FFI_ICHECK_GE(scratch[26].numel(), persistent_decoder_scratch_bytes(26));
@@ -229,8 +236,10 @@ void persistent_decoder_run(Array<Tensor> io, Array<Tensor> weights, Array<Tenso
   TVM_FFI_ICHECK_GE(scratch[33].numel(), persistent_decoder_scratch_bytes(33));
   p.s.ose = reinterpret_cast<uint8_t*>(scratch[33].data_ptr());
   for (int r = 0; r < RANKS; ++r) {
-    TVM_FFI_ICHECK_GE(peers[r].numel(), FLAG_BYTES + 8L * PUB_SLOT * sizeof(__nv_bfloat16));
-    auto* base = static_cast<uint8_t*>(peers[r].data_ptr());
+    const int peer_index = r == rank ? 0 : r < rank ? r + 1 : r;
+    TVM_FFI_ICHECK_GE(peers[peer_index].numel(),
+                      FLAG_BYTES + 8L * PUB_SLOT * sizeof(__nv_bfloat16));
+    auto* base = static_cast<uint8_t*>(peers[peer_index].data_ptr());
     p.peers.flags[r] = reinterpret_cast<unsigned*>(base);
     p.peers.pub[r] = reinterpret_cast<__nv_bfloat16*>(base + FLAG_BYTES);
   }
@@ -276,8 +285,10 @@ Tensor persistent_decoder_view(int64_t address, int64_t nbytes, int64_t device) 
   return Tensor::FromDLPack(&view->managed);
 }
 
-void persistent_decoder_quantize(TensorView source, TensorView values, TensorView scales) {
+void persistent_decoder_quantize(TensorView source, TensorView values, TensorView scales,
+                                 bool zero_scale) {
   Params p{};
+  p.zero_scale = zero_scale;
   p.m = source.size(0);
   TVM_FFI_ICHECK(p.m > 0 && p.m <= MAXM);
   p.o = static_cast<const __nv_bfloat16*>(source.data_ptr());

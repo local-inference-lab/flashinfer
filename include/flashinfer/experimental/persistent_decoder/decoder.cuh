@@ -295,7 +295,7 @@ struct Scratch {
   float* hacc;
   uint8_t* hq;
   uint8_t* hqe;
-  float* yracc;
+  __nv_bfloat16* yracc;
   uint8_t* aq;
   uint8_t* as;
   float* qkp;
@@ -332,6 +332,14 @@ struct Weights {
 };
 
 struct Params {
+  int zero_scale;
+  float* router_logits;
+  int* router_ids;
+  float* router_weights;
+  __nv_bfloat16* routed_out;
+  __nv_bfloat16* shared_out;
+  __nv_bfloat16* shared_gate_up;
+  __nv_bfloat16* shared_intermediate;
   int shared_a16;
   Peers peers;
   Scratch s;
@@ -988,6 +996,7 @@ __device__ void job_route(Ctx& c, int tok) {
     expert[i] = c.warp * EW + c.lane + 32 * i;
     long long* a = p.s.gacc + tok * EXPERTS + expert[i];
     const float v = __ll2float_rn(__ldcg(a)) / FIXED;
+    p.router_logits[tok * EXPERTS + expert[i]] = v;
     __stcg(a, 0LL);
     score[i] = sqrtf(v > 20.0f ? v : logf(1.0f + expf(v)));
     key[i] = score[i] + __ldg(bias + expert[i]);
@@ -1015,7 +1024,9 @@ __device__ void job_route(Ctx& c, int tok) {
     for (int k = 0; k < TOPK; ++k) total += __shfl_sync(0xffffffffu, s2, k);
     if (c.lane < TOPK) {
       const int r = tok * TOPK + c.lane;
+      p.router_ids[r] = e2;
       p.s.topk_w[r] = s2 * (ROUTE_SCALE / (total > 0.0f ? total : 1.0f));
+      p.router_weights[r] = p.s.topk_w[r];
       Table* tb = p.s.table;
       const int pos = int(atomicAdd(p.s.counters + C_ECOUNT + e2, 1u));
       tb->routes[e2 * MAXM + pos] = r;
@@ -1046,7 +1057,7 @@ __device__ void finish_woa(Ctx& c, int rb, int tg) {
 #pragma unroll
   for (int u = 0; u < PER; ++u) {
     const int i = c.tid + u * GT, tok = sp.first + i / 8, col = rb * 64 + i % 8 * 8;
-    const int e = block_exp(z[u], AMAX_FLOOR);
+    const int e = block_exp(z[u], 0.0f);
     if (i / 8 >= sp.count) continue;
     clear8(p.s.zacc + long(tok) * OA + col);
     *reinterpret_cast<uint2*>(p.s.zq + long(tok) * OA + col) = quant8(z[u], e);
@@ -1217,7 +1228,7 @@ __device__ void job_xnorm(Ctx& c, int kp, int t8) {
     const float r = row < sp.count ? rs[row] : 0.0f;
 #pragma unroll
     for (int e = 0; e < 8; ++e) x8[e] = bf(nw[e] * (xc[e] * r));
-    const int ex = block_exp(x8, AMAX_FLOOR);
+    const int ex = block_exp(x8, 0.0f);
     if (row < sp.count) {
       *reinterpret_cast<uint2*>(p.s.xq + tok * HID + k0) = quant8(x8, ex);
       *reinterpret_cast<uint4*>(p.s.xbf + tok * HID + k0) = pack8(x8);
@@ -1271,7 +1282,7 @@ __device__ void gate_group(Ctx& c, int rb, int kp, int tg) {
         float amax = 0.0f;
 #pragma unroll
         for (int e = 0; e < 32; ++e) amax = fmaxf(amax, fabsf(v[e]));
-        const int ex = quant_exp(amax, AMAX_FLOOR);
+        const int ex = dense_quant_exp(amax);
         uint2* q = reinterpret_cast<uint2*>(p.s.xq + t * HID + k);
 #pragma unroll
         for (int u = 0; u < 4; ++u)
@@ -1323,8 +1334,11 @@ __device__ void finish_sh1(Ctx& c, int b, int tg) {
     float* h = p.s.sacc + long(tok) * 2 * INTER + col;
     __stcg(h, 0.0f);
     __stcg(h + INTER, 0.0f);
+    p.shared_gate_up[long(tok) * 2 * INTER + col] = __float2bfloat16(g[i]);
+    p.shared_gate_up[long(tok) * 2 * INTER + INTER + col] = __float2bfloat16(u[i]);
     const float a = bf(swiglu(bf(g[i]), bf(u[i])));
-    const int e = quant_exp(warp_max(fabsf(a)), AMAX_FLOOR);
+    p.shared_intermediate[long(tok) * INTER + col] = __float2bfloat16(a);
+    const int e = dense_quant_exp(warp_max(fabsf(a)));
     if (p.shared_a16 & 2)
       reinterpret_cast<__nv_bfloat16*>(p.s.hsq)[tok * INTER + col] = __float2bfloat16(a);
     else
@@ -1465,9 +1479,16 @@ __device__ void finish_r1(Ctx& c, int ei, int bb, const Span& en) {
     const float g = __ldcg(h), u = __ldcg(h + INTER);
     __stcg(h, 0.0f);
     __stcg(h + INTER, 0.0f);
-    // Routed activations round through BF16 before MXFP8, matching the prepared MoE contract.
+    // The prologue has completed before this tail. Its split-K byte range
+    // retains the declared BF16 projection and activation boundaries until the
+    // following prologue reuses the storage.
+    static_assert(ROUTES * 3L * INTER * sizeof(__nv_bfloat16) <= 5L * MAXM * 1792 * sizeof(float));
+    auto* projected = reinterpret_cast<__nv_bfloat16*>(p.s.qkp);
+    projected[long(route) * 2 * INTER + col] = __float2bfloat16(g);
+    projected[long(route) * 2 * INTER + INTER + col] = __float2bfloat16(u);
     const float a = bf(swiglu(bf(g), bf(u)));
-    const int e = quant_exp(warp_max(fabsf(a)), AMAX_FLOOR);
+    projected[ROUTES * 2L * INTER + long(route) * INTER + col] = __float2bfloat16(a);
+    const int e = quant_exp(warp_max(fabsf(a)), 0.0f);
     p.s.hq[long(route) * INTER + col] = quant_byte(a, e);
     if (c.lane == 0) p.s.hqe[route * HQ_LD + col / 32] = uint8_t(e + 127);
   }
@@ -1498,8 +1519,9 @@ __device__ void job_r2(Ctx& c, const Job& job) {
       [&](int i) { return p.s.hqe + c.sm.routes[i] * HQ_LD; });
   routed(c, en, KS_INTER, KW_INTER, [&](int route, int r, float4 v) {
     const float w = __ldcg(p.s.topk_w + route);
-    red4(p.s.yracc + long(route / TOPK) * HID + rb * 128 + r,
-         make_float4(w * v.x, w * v.y, w * v.z, w * v.w));
+    auto* out = reinterpret_cast<__nv_bfloat162*>(p.s.yracc + long(route) * HID + rb * 128 + r);
+    out[0] = __floats2bfloat162_rn(w * v.x, w * v.y);
+    out[1] = __floats2bfloat162_rn(w * v.z, w * v.w);
   });
   c.signal(C_SF + rb);
 }
@@ -1510,29 +1532,30 @@ __device__ void job_xf(Ctx& c, int k) {
   __nv_bfloat16* mine = inbox(p, p.rank, 1, 0, c.epoch);
   constexpr int XU = 2;
   for (int base = 0; base < p.m * CHUNK_VECS; base += GT * XU) {
-    Acc8 rv[XU], sv[XU];
+    Acc8 sv[XU];
 #pragma unroll
     for (int u = 0; u < XU; ++u) {
       const int i = base + c.tid + u * GT;
       const bool live = i < p.m * CHUNK_VECS;
-      const long off = chunk_off(live ? i : 0, k);
-      rv[u] = load8(p.s.yracc + off, live);
-      sv[u] = load8(p.s.shacc + off, live);
+      sv[u] = load8(p.s.shacc + chunk_off(live ? i : 0, k), live);
     }
 #pragma unroll
     for (int u = 0; u < XU; ++u) {
       const int i = base + c.tid + u * GT;
       if (i >= p.m * CHUNK_VECS) break;
-      const long off = chunk_off(i, k);
-      clear8(p.s.yracc + off);
+      const long off = chunk_off(i, k), tok = off / HID, col = off % HID;
       clear8(p.s.shacc + off);
-      float routed[8], shared[8], y[8];
-      unpack8(rv[u], routed);
+      float routed[8] = {}, shared[8], y[8];
+      // Each route is BF16 before the fixed top-k-order FP32 reduction.
+#pragma unroll
+      for (int route = 0; route < TOPK; ++route)
+        add8(routed,
+             __ldcg(reinterpret_cast<const uint4*>(p.s.yracc + (tok * TOPK + route) * HID + col)));
       unpack8(sv[u], shared);
 #pragma unroll
-      for (int e = 0; e < 8; ++e) shared[e] = bf(shared[e]);
-#pragma unroll
-      for (int e = 0; e < 8; ++e) y[e] = bf(routed[e]) + shared[e];
+      for (int e = 0; e < 8; ++e) y[e] = bf(routed[e]) + bf(shared[e]);
+      *reinterpret_cast<uint4*>(p.routed_out + off) = pack8(routed);
+      *reinterpret_cast<uint4*>(p.shared_out + off) = pack8(shared);
       *reinterpret_cast<uint4*>(mine + off) = pack8(y);
     }
   }
@@ -1847,36 +1870,8 @@ struct Prologue {
   const long* positions;
   const float* cos_sin;
   __nv_bfloat16* q;
-  uint8_t* swa;
-  long swa_stride;
-  long swa_capacity;
-  const long* swa_slots;
-  int swa_page;
   Scratch s;
 };
-
-constexpr int SWA_RECORD = 528;
-
-__device__ __forceinline__ void write_swa(const Prologue& a, int tok, int col, float y, int lane) {
-  const long pos = __ldg(a.positions + tok);
-  const float partner = __shfl_xor_sync(0xffffffffu, y, 1);
-  float r = y;
-  if (col >= KVW - ROPE) {
-    const int local = col - (KVW - ROPE);
-    const float2 cs = make_float2(a.cos_sin[tok * ROPE + local], a.cos_sin[tok * ROPE + local + 1]);
-    r = local % 2 ? rot_add(r, partner, cs) : rot_sub(r, partner, cs);
-  }
-  if (pos < 0) r = 0.0f;
-  r = bf(r);
-  const int e = quant_exp(warp_max(fabsf(r)), AMAX_FLOOR);
-  float inv;
-  asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(inv) : "f"(pow2(e)));
-  const long slot = __ldg(a.swa_slots + tok);
-  if (slot < 0 || slot >= a.swa_capacity) return;
-  uint8_t* rec = a.swa + (slot / a.swa_page) * a.swa_stride + (slot % a.swa_page) * SWA_RECORD;
-  rec[col] = uint8_t(e4m3x2(r * inv, 0.0f) & 0xffu);
-  if (lane == 0) rec[KVW + col / 32] = uint8_t(e + 127);
-}
 
 template <int PERW>
 __device__ __forceinline__ void attn_slice(const AttnIn& a, const Scratch& sc, float* fn, int s,
@@ -2035,7 +2030,6 @@ __device__ __forceinline__ void norm_batch(const Prologue& a, int col, float nw,
       }
       if (__ldg(a.positions + tok) < 0) rotated = 0.0f;
       a.kv[long(tok) * KVW + col] = __float2bfloat16(rotated);
-      if (a.swa) write_swa(a, tok, col, __bfloat162float(y), lane);
     }
     if (!KV) {
       const float f = __bfloat162float(y);
@@ -2196,7 +2190,8 @@ __global__ void quantize_woa_input(Params p) {
   if (block >= p.m * 2 * OAK / 32) return;
   const int row = block / (2 * OAK / 32), col = block % (2 * OAK / 32) * 32 + lane;
   const float x = __bfloat162float(p.o[long(row) * p.o_stride + col]);
-  const int exponent = quant_exp(warp_max(fabsf(x)), AMAX_FLOOR);
+  const float amax = warp_max(fabsf(x));
+  const int exponent = p.zero_scale ? quant_exp(amax, 0.0f) : dense_quant_exp(amax);
   p.s.oq[long(row) * 2 * OAK + col] = quant_byte(x, exponent);
   if (lane == 0) p.s.ose[block] = uint8_t(exponent + 127);
 }

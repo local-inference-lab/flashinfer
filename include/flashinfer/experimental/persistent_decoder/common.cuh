@@ -14,7 +14,6 @@
 #include <cstdint>
 
 constexpr int RANKS = 4;
-constexpr float AMAX_FLOOR = 1e-4f;
 constexpr float MX_AMAX_FLOOR = 1e-4f;
 
 __host__ __device__ __forceinline__ constexpr int cdiv(int a, int b) { return (a + b - 1) / b; }
@@ -144,13 +143,21 @@ __device__ __forceinline__ void add8(float (&acc)[8], uint4 v) {
   }
 }
 
-__device__ __forceinline__ float pow2(int e) { return __uint_as_float(unsigned(e + 127) << 23); }
+__device__ __forceinline__ float pow2(int e) {
+  return e == -127 ? __uint_as_float(0x00400000u) : __uint_as_float(unsigned(e + 127) << 23);
+}
 
-__device__ __forceinline__ float e8m0(unsigned e) { return __uint_as_float(e << 23); }
+__device__ __forceinline__ float e8m0(unsigned e) {
+  return __uint_as_float(e == 0 ? 0x00400000u : e << 23);
+}
 
 __device__ __forceinline__ int quant_exp(float amax, float floor) {
   const unsigned bits = __float_as_uint(fmaxf(amax, floor) * (1.0f / 448.0f));
   return int((bits >> 23) & 0xff) - 127 + ((bits & 0x7fffffu) != 0);
+}
+
+__device__ __forceinline__ int dense_quant_exp(float amax) {
+  return amax == 0.0f ? 0 : quant_exp(amax, 0.0f);
 }
 
 __device__ __forceinline__ unsigned e4m3x2(float lo, float hi) {
@@ -172,7 +179,8 @@ __device__ __forceinline__ int block_exp(const float (&x)[8], float floor) {
   float amax = 0.0f;
 #pragma unroll
   for (int e = 0; e < 8; ++e) amax = fmaxf(amax, fabsf(x[e]));
-  return quant_exp(quad_max(amax), floor);
+  const float reduced = quad_max(amax);
+  return floor == 0.0f ? dense_quant_exp(reduced) : quant_exp(reduced, floor);
 }
 
 __device__ __forceinline__ uint2 quant8(const float (&x)[8], int e) {
