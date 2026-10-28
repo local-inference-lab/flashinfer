@@ -566,3 +566,59 @@ def _mhc_pre_big_fuse_with_prenorm_impl_fake(
     block_size: int,
 ) -> None:
     pass
+
+
+@register_custom_op(
+    "flashinfer::mhc_pre_big_fuse_with_norm",
+    mutates_args=("post_mix", "comb_mix", "normalized"),
+)
+def _mhc_pre_big_fuse_with_norm_impl(
+    post_mix: torch.Tensor,
+    comb_mix: torch.Tensor,
+    normalized: torch.Tensor,
+    dot_mix: torch.Tensor,
+    sqrsum: torch.Tensor,
+    residual: torch.Tensor,
+    mhc_scale: torch.Tensor,
+    mhc_base: torch.Tensor,
+    norm_weight: torch.Tensor,
+    rms_eps: float,
+    mhc_pre_eps: float,
+    mhc_sinkhorn_eps: float,
+    mhc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    norm_eps: float,
+    num_splits: int,
+    block_size: int,
+    tokens_per_cta: int = 1,
+) -> None:
+    """Finalize into caller storage, retaining BF16 collapse and BF16/FP32 norm weights."""
+    get_mhc_module().mhc_pre_big_fuse_with_norm(
+        post_mix, comb_mix, normalized, dot_mix, sqrsum, residual, mhc_scale, mhc_base,
+        norm_weight, rms_eps, mhc_pre_eps, mhc_sinkhorn_eps, mhc_post_mult_value,
+        sinkhorn_repeat, norm_eps, num_splits, block_size, tokens_per_cta,
+    )
+
+
+@register_fake_op("flashinfer::mhc_pre_big_fuse_with_norm")
+def _mhc_pre_big_fuse_with_norm_impl_fake(
+    post_mix: torch.Tensor,
+    comb_mix: torch.Tensor,
+    normalized: torch.Tensor,
+    dot_mix: torch.Tensor,
+    sqrsum: torch.Tensor,
+    residual: torch.Tensor,
+    mhc_scale: torch.Tensor,
+    mhc_base: torch.Tensor,
+    norm_weight: torch.Tensor,
+    rms_eps: float,
+    mhc_pre_eps: float,
+    mhc_sinkhorn_eps: float,
+    mhc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    norm_eps: float,
+    num_splits: int,
+    block_size: int,
+    tokens_per_cta: int = 1,
+) -> None:
+    pass
