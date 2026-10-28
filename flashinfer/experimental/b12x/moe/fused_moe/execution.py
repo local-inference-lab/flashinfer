@@ -15,8 +15,10 @@ class ExecutionCapacity:
 
     ``token`` outputs hold weighted [tokens, hidden] values. ``routes`` exposes
     unweighted [tokens, top_k, hidden] GEMM outputs in activation precision for
-    token outer scaling. Invalid route entries are unspecified and consumers
-    must mask them with the route IDs before applying their weights.
+    token or expert outer scaling. Invalid route entries are unspecified;
+    consumers must mask them with the route IDs before applying their weights.
+    Expert-outer NVFP4 routes reduce FC2 slices in a fixed FP32 order before
+    the final BF16 conversion.
     """
 
     max_tokens: int
@@ -73,13 +75,25 @@ def plan_execution(
     if experts.plan.activation.outer_scale == "token":
         from ._token_outer import plan
     else:
-        if capacity.output_layout != "token":
-            raise ValueError("route output storage requires token outer scaling")
+        if (
+            capacity.output_layout == "routes"
+            and experts.plan._impl.quant_modes != frozenset({"nvfp4"})
+        ):
+            raise ValueError("expert-scale route outputs require NVFP4 A4 preparation")
         if routing is not None and routing.has_valid_tokens:
             raise ValueError(
                 "valid-token integrated routing requires token outer scaling"
             )
         from ._preparation import plan
+
+    if (
+        capacity.output_layout == "routes"
+        and routing is not None
+        and routing.apply_router_weight_on_input
+    ):
+        raise ValueError(
+            "unweighted route outputs cannot apply router weights on input"
+        )
 
     return plan(
         experts,

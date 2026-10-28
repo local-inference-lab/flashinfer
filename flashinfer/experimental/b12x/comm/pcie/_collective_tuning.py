@@ -291,6 +291,56 @@ def _collective_signature(query):
     )
 
 
+def _family_bucket(query):
+    if query.operation != "all_reduce":
+        return None
+    from math import prod
+
+    alternatives = {}
+    sizes = set()
+    for name, payload in query.alternatives.items():
+        call, setup = payload["call"], payload["setup"]
+        if call["dtype"] not in ("float16", "bfloat16"):
+            return None
+        sizes.add(prod(call["shape"] if name == "twoshot" else setup["shape"]) * 2)
+        alternatives[name] = dict(
+            surface=payload["surface"],
+            topology=payload["topology"],
+            dtype=call["dtype"],
+            stage_input=call.get("stage_input"),
+            remote_push_region_packs=call.get("remote_push_region_packs"),
+            payload_ready_region_packs=call.get("payload_ready_region_packs"),
+            eager_buffer_bytes=setup.get("eager_buffer_bytes"),
+            eager_storage_shards=setup.get("eager_storage_shards"),
+            registered=setup.get("registered"),
+            shard_storage={
+                field: setup[field]
+                for field in ("max_rows", "pack_stride", "slot_bytes", "slots")
+                if field in setup
+            },
+        )
+    if len(sizes) != 1:
+        raise ValueError("collective alternatives disagree on payload size")
+    size = sizes.pop()
+    units = -(-size // 8192)
+    ladder = (1, 2, 4, 8, 16, 32, 48, 64, 96, 128)
+    upper = next((value for value in ladder if value >= units), None)
+    if upper is None:
+        upper = 1 << (units - 1).bit_length()
+    return (
+        "implementation",
+        dict(
+            version=1,
+            operation=query.operation,
+            world_size=query.world_size,
+            inplace=query.inplace,
+            upper_bytes=upper * 8192,
+            alternatives=alternatives,
+        ),
+        size,
+    )
+
+
 TUNING = TuningContract(
     component_id="comm.pcie",
     query_schema_version=7,
@@ -324,6 +374,7 @@ TUNING = TuningContract(
     ),
     parameters=_parameters,
     collective_signature=_collective_signature,
+    collective_family_bucket=_family_bucket,
     equivalence_key=_equivalence_key,
 )
 

@@ -50,6 +50,8 @@ class MoeDecodeQuery:
     fast_math: bool
     numerical_recipe: str | None
     controls: FrozenMapping
+    output_layout: str = "token"
+    split_fc1_scales: bool = False
     shared_input_scales: bool = False
     csf_inline_scales: bool = False
     swiglu_clamp_after_silu: bool = False
@@ -58,6 +60,8 @@ class MoeDecodeQuery:
 
     def to_dict(self) -> dict[str, object]:
         return {
+            "output_layout": self.output_layout,
+            "split_fc1_scales": self.split_fc1_scales,
             "a4_prefill": self.a4_prefill,
             "autotune_effort": self.autotune_effort,
             "activation": self.activation,
@@ -320,6 +324,10 @@ def _validate_w4a16_launch(query, config):
 def _validate_query(query: MoeDecodeQuery, _device: DeviceIdentity | None) -> None:
     if not isinstance(query, MoeDecodeQuery):
         raise TypeError("query must be MoeDecodeQuery")
+    if query.output_layout not in {"token", "routes"}:
+        raise ValueError("MoE output layout must be token or routes")
+    if type(query.split_fc1_scales) is not bool:
+        raise TypeError("split_fc1_scales must be boolean")
     AutotuneEffort(query.autotune_effort)
     if not isinstance(query.controls, FrozenMapping):
         raise TypeError("MoE controls must be frozen declaration metadata")
@@ -458,6 +466,12 @@ def validate_moe_decode_config(
     _device: DeviceIdentity | None,
 ) -> None:
     """Reject a decode config the query's recipe cannot execute."""
+    if (query.output_layout == "routes" or query.split_fc1_scales) and (
+        config.backend != "dynamic" or config.nvfp4_materialize_intermediate
+    ):
+        raise ValueError(
+            "route outputs and split FC1 gains require the monolithic dynamic backend"
+        )
     _validate_w4a16_launch(query, config)
     if type(config.micro_fc1_tile_n) is not int:
         raise TypeError("micro_fc1_tile_n must be an integer")
@@ -790,7 +804,9 @@ def _default_config(
     config = replace(
         config,
         nvfp4_materialize_intermediate=bool(
-            _nvfp4_materialization_eligible(query, config)
+            query.output_layout != "routes"
+            and not query.split_fc1_scales
+            and _nvfp4_materialization_eligible(query, config)
             and query.controls.get("dynamic_nvfp4_materialized") is not False
         ),
     )

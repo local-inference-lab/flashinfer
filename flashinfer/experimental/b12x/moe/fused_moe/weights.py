@@ -157,6 +157,9 @@ IQ2XSWeights = BlockQuantWeights
 class PackedWeights:
     """Ordinary packed MoE checkpoint tensors, without runtime policy fields.
 
+    ``w13_global_scales`` accepts a scalar, [E], or [E,2] gains in the
+    physical half order declared by ``w13_layout``. Paired gains require
+    NVFP4 A4 dynamic execution and remain distinct through FC1 activation.
     Activation scales are optional source metadata. A16 preparation uses unit
     scales; ModelOpt NVFP4 A4/A8 preparation requires both scale tensors.
     ``immutable_input_scales`` promises that input scale values remain unchanged

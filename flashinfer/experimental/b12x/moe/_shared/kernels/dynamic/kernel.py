@@ -141,6 +141,8 @@ class MoEDynamicKernelBackend:
         dynamic_down_scale: bool = False,
         share_input_across_experts: bool = False,
         deterministic_output: bool = False,
+        raw_routes: bool = False,
+        split_fc1_scales: bool = False,
         num_topk: int = 1,
         swap_ab: bool = False,
         separate_w13_halves: bool = False,
@@ -604,6 +606,8 @@ class MoEDynamicKernelBackend:
             )
         self.dynamic_down_scale = dynamic_down_scale
         self.share_input_across_experts = share_input_across_experts
+        self.raw_routes = bool(raw_routes)
+        self.split_fc1_scales = bool(split_fc1_scales)
         self.deterministic_output = bool(deterministic_output)
         # swap_ab runs the gated FC1 with the intermediate (logical N) on the
         # MMA M-role (mirrors dense.py), so a sub-64 tile_n that divides a
@@ -2819,7 +2823,7 @@ class MoEDynamicKernelBackend:
         else:
             output_bytes_per_row = cols // Int32(2)
             mx_blocks_per_row = sf_blocks_per_row  # unused placeholder
-        cols_u32 = cols // Int32(2)
+        cols_u32 = cols if cutlass.const_expr(self.raw_routes) else cols // Int32(2)
         scatter_output_u32 = cute.recast_tensor(scatter_output, cutlass.Uint32)
         total_pairs = Int32(topk_ids.shape[0])
         num_topk = total_pairs // num_tokens
@@ -2866,8 +2870,11 @@ class MoEDynamicKernelBackend:
         # top-k kernel overwrites every caller-output location afterward.  Its
         # routed scratch therefore needs no 4x-output clear; poison/replay
         # coverage verifies that phase 2 really overwrites the full domain.
+        # Raw tasks overwrite every valid (slice, route, column). The reducer
+        # masks invalid IDs without reading their uninitialized partials.
         if cutlass.const_expr(
-            not (self.deterministic_output and self.external_materialized_fc2)
+            not self.raw_routes
+            and not (self.deterministic_output and self.external_materialized_fc2)
         ):
             scatter_rows = Int32(scatter_output.shape[0])
             scatter_total_u32 = scatter_rows * cols_u32
@@ -2968,7 +2975,9 @@ class MoEDynamicKernelBackend:
                 m1_slot_expert_id = local_expert_id(topk_ids[flat_tid], num_experts)
                 if m1_slot_expert_id >= Int32(0) and m1_slot_expert_id < num_experts:
                     m1_physical_row = flat_tid * Int32(self.tile_shape_mnk[0])
-                    token_map[m1_physical_row] = Int32(0)
+                    token_map[m1_physical_row] = (
+                        flat_tid if cutlass.const_expr(self.raw_routes) else Int32(0)
+                    )
                     token_weights[m1_physical_row] = topk_weights[flat_tid].to(
                         cutlass.Float32
                     )
@@ -3140,7 +3149,9 @@ class MoEDynamicKernelBackend:
                                         self.tile_shape_mnk[0]
                                     ) + row % Int32(self.tile_shape_mnk[0])
                                     map_value = token_idx
-                                    if cutlass.const_expr(self.deterministic_output):
+                                    if cutlass.const_expr(
+                                        self.deterministic_output or self.raw_routes
+                                    ):
                                         map_value = pair_idx
                                     st_global_i32(
                                         get_ptr_as_int64(token_map, phys_row), map_value
@@ -3604,7 +3615,9 @@ class MoEDynamicKernelBackend:
                                     self.tile_shape_mnk[0]
                                 ) + row % Int32(self.tile_shape_mnk[0])
                                 map_value = token_idx
-                                if cutlass.const_expr(self.deterministic_output):
+                                if cutlass.const_expr(
+                                    self.deterministic_output or self.raw_routes
+                                ):
                                     map_value = pair_idx
                                 st_global_i32(
                                     get_ptr_as_int64(token_map, phys_row), map_value
@@ -4234,6 +4247,10 @@ class MoEDynamicKernelBackend:
         epi_m_scale = self.tile_shape_mnk[0] // self.epi_tile[0]
         sub_shape = tCsC_for_shape.shape[:3]
         acc_shape = (sub_shape[0], sub_shape[1] * epi_m_scale, sub_shape[2])
+        if cutlass.const_expr(self.raw_routes):
+            raw_coords = thr_mma.partition_C(
+                cute.make_identity_tensor(self.tile_shape_mnk[:2])
+            )
         gate_acc = cute.make_rmem_tensor(acc_shape, self.acc_dtype)
         up_acc = cute.make_rmem_tensor(acc_shape, self.acc_dtype)
 
@@ -4757,7 +4774,10 @@ class MoEDynamicKernelBackend:
                     if cache_row < task_valid_rows_cache:
                         global_row_cache = tile_m_base_cache + cache_row
                         tok = token_map[global_row_cache].to(Int32)
-                        wv = token_weights[global_row_cache].to(cutlass.Float32)
+                        if cutlass.const_expr(self.raw_routes):
+                            wv = cutlass.Float32(1.0)
+                        else:
+                            wv = token_weights[global_row_cache].to(cutlass.Float32)
                     _st_shared_i32(scatter_tok_base_addr + cache_row * Int32(4), tok)
                     st_shared_f32(scatter_weight_base_addr + cache_row * Int32(4), wv)
                     cache_row += Int32(self.threads_per_cta)
@@ -4777,7 +4797,16 @@ class MoEDynamicKernelBackend:
                 task_slice_count_val = work_item[_WORK_SLICE_COUNT]
                 task_valid_rows_val = work_item[_WORK_VALID_ROWS]
 
-                alpha_value = alpha[task_expert_idx].to(cutlass.Float32)
+                if cutlass.const_expr(self.split_fc1_scales):
+                    up_alpha_value = alpha[task_expert_idx * Int32(2)].to(
+                        cutlass.Float32
+                    )
+                    alpha_value = alpha[task_expert_idx * Int32(2) + Int32(1)].to(
+                        cutlass.Float32
+                    )
+                else:
+                    alpha_value = alpha[task_expert_idx].to(cutlass.Float32)
+                    up_alpha_value = alpha_value
                 if cutlass.const_expr(self.is_w4a8):
                     # w4a8 activations are self-ranging: the calibrated input
                     # global scale is NOT applied at quantize time, so fold it
@@ -4786,6 +4815,7 @@ class MoEDynamicKernelBackend:
                     alpha_value = alpha_value * input_global_scale[task_expert_idx].to(
                         cutlass.Float32
                     )
+                    up_alpha_value = alpha_value
                 valid_rows = task_valid_rows_val
 
                 # In-loop SFA partition for sub-128 tiles. FC1 reads the
@@ -5193,7 +5223,7 @@ class MoEDynamicKernelBackend:
                                     _ir = _c[0]
                                     _tk = _c[1]
                                     _g = alpha_value * _g_mn[_am, _an]
-                                    _u = alpha_value * _u_mn[_am, _an]
+                                    _u = up_alpha_value * _u_mn[_am, _an]
                                     _int_col = _s * self._fc1_int_tile + _ir
                                     _val = self._gated_activation_value(_g, _u).to(
                                         cutlass.BFloat16
@@ -5888,7 +5918,7 @@ class MoEDynamicKernelBackend:
                                                 cute.size(tRS_rD_slice)
                                             ):
                                                 g = alpha_value * gate_slice[elem_idx]
-                                                u = alpha_value * up_slice[elem_idx]
+                                                u = up_alpha_value * up_slice[elem_idx]
                                                 tRS_rD_slice[elem_idx] = (
                                                     self._gated_activation_value(g, u)
                                                 )
@@ -5992,7 +6022,7 @@ class MoEDynamicKernelBackend:
                                                 cute.size(tRS_rD_slice)
                                             ):
                                                 tRS_rD_slice[elem_idx] = (
-                                                    alpha_value * up_slice[elem_idx]
+                                                    up_alpha_value * up_slice[elem_idx]
                                                 )
                                     acc_vec = tRS_rD.load()
                                     acc_vec = acc_vec.to(cutlass.BFloat16)
@@ -6139,7 +6169,7 @@ class MoEDynamicKernelBackend:
                                                 cute.size(tRS_rD_slice)
                                             ):
                                                 tRS_rD_slice[elem_idx] = (
-                                                    alpha_value * up_slice[elem_idx]
+                                                    up_alpha_value * up_slice[elem_idx]
                                                 )
                                     acc_vec = tRS_rD.load()
                                     acc_vec = acc_vec.to(cutlass.BFloat16)
@@ -7027,7 +7057,7 @@ class MoEDynamicKernelBackend:
                                                 cute.size(tRS_rD_slice)
                                             ):
                                                 g = alpha_value * gate_slice[elem_idx]
-                                                u = alpha_value * up_slice[elem_idx]
+                                                u = up_alpha_value * up_slice[elem_idx]
                                                 tRS_rD_slice[elem_idx] = (
                                                     self._gated_activation_value(g, u)
                                                 )
@@ -7832,181 +7862,234 @@ class MoEDynamicKernelBackend:
                             tile_n_base_cur = output_tile_idx_cur * Int32(
                                 self.tile_shape_mnk[1]
                             )
-                            for epi_m in cutlass.range_constexpr(epi_rest_m):
-                                for mma_n_in_epi in cutlass.range_constexpr(
-                                    MmaNPerEpiN
+                            if cutlass.const_expr(self.raw_routes):
+                                for elem in cutlass.range(
+                                    cute.size(down_acc), unroll_full=True
                                 ):
-                                    for mma_m_in_epi in cutlass.range_constexpr(
-                                        MmaMPerEpiM
+                                    row, col = raw_coords[elem]
+                                    if row < valid_rows:
+                                        route = ld_shared_i32_relaxed(
+                                            scatter_tok_base_addr
+                                            + Int32(row) * Int32(4)
+                                        )
+                                        if cutlass.const_expr(self.dynamic_down_scale):
+                                            value = (
+                                                fc2_down_alpha_value * down_acc[elem]
+                                            )
+                                        else:
+                                            value = down_alpha_value * down_acc[elem]
+                                        plane = task_slice_begin_idx + slice_idx
+                                        offset = (
+                                            Int64(plane)
+                                            * Int64(total_pairs)
+                                            * Int64(scatter_N)
+                                            + Int64(route) * Int64(scatter_N)
+                                            + Int64(tile_n_base_cur)
+                                            + Int64(col)
+                                        )
+                                        scatter_output[
+                                            offset // Int64(scatter_N),
+                                            offset % Int64(scatter_N),
+                                        ] = value
+                            else:
+                                for epi_m in cutlass.range_constexpr(epi_rest_m):
+                                    for mma_n_in_epi in cutlass.range_constexpr(
+                                        MmaNPerEpiN
                                     ):
-                                        mma_n = mma_n_in_epi
-                                        mma_m = epi_m * MmaMPerEpiM + mma_m_in_epi
-                                        tRS_rD_slice = tRS_rD[
-                                            (None, mma_m_in_epi, mma_n_in_epi)
-                                        ]
-                                        down_epi_acc_slice = down_acc[
-                                            (None, mma_m, mma_n)
-                                        ]
-                                        for elem_idx in cutlass.range_constexpr(
-                                            cute.size(tRS_rD_slice)
+                                        for mma_m_in_epi in cutlass.range_constexpr(
+                                            MmaMPerEpiM
                                         ):
-                                            if cutlass.const_expr(
-                                                self.dynamic_down_scale
+                                            mma_n = mma_n_in_epi
+                                            mma_m = epi_m * MmaMPerEpiM + mma_m_in_epi
+                                            tRS_rD_slice = tRS_rD[
+                                                (None, mma_m_in_epi, mma_n_in_epi)
+                                            ]
+                                            down_epi_acc_slice = down_acc[
+                                                (None, mma_m, mma_n)
+                                            ]
+                                            for elem_idx in cutlass.range_constexpr(
+                                                cute.size(tRS_rD_slice)
                                             ):
-                                                tRS_rD_slice[elem_idx] = (
-                                                    fc2_down_alpha_value
-                                                    * down_epi_acc_slice[elem_idx]
-                                                )
-                                            else:
-                                                tRS_rD_slice[elem_idx] = (
-                                                    down_alpha_value
-                                                    * down_epi_acc_slice[elem_idx]
-                                                )
+                                                if cutlass.const_expr(
+                                                    self.dynamic_down_scale
+                                                ):
+                                                    tRS_rD_slice[elem_idx] = (
+                                                        fc2_down_alpha_value
+                                                        * down_epi_acc_slice[elem_idx]
+                                                    )
+                                                else:
+                                                    tRS_rD_slice[elem_idx] = (
+                                                        down_alpha_value
+                                                        * down_epi_acc_slice[elem_idx]
+                                                    )
 
-                                acc_vec = tRS_rD.load()
-                                acc_vec = acc_vec.to(cutlass.BFloat16)
-                                tRS_rD_out.store(acc_vec)
-                                epi_buffer = Int32(epi_m) % cute.size(tRS_sD, mode=[3])
-                                cute.copy(
-                                    tiled_copy_r2s,
-                                    tRS_rD_out,
-                                    tRS_sD[(None, None, None, epi_buffer)],
-                                )
-                                cute.arch.fence_proxy("async.shared", space="cta")
-                                # Vector scatter reads wider spans from sC than
-                                # the scalar path, so wait for all MMA warps.
-                                self.epilog_sync_barrier.arrive_and_wait()
-                                rows_offset = Int32(epi_m) * Int32(self.epi_tile[0])
+                                    acc_vec = tRS_rD.load()
+                                    acc_vec = acc_vec.to(cutlass.BFloat16)
+                                    tRS_rD_out.store(acc_vec)
+                                    epi_buffer = Int32(epi_m) % cute.size(
+                                        tRS_sD, mode=[3]
+                                    )
+                                    cute.copy(
+                                        tiled_copy_r2s,
+                                        tRS_rD_out,
+                                        tRS_sD[(None, None, None, epi_buffer)],
+                                    )
+                                    cute.arch.fence_proxy("async.shared", space="cta")
+                                    # Vector scatter reads wider spans from sC than
+                                    # the scalar path, so wait for all MMA warps.
+                                    self.epilog_sync_barrier.arrive_and_wait()
+                                    rows_offset = Int32(epi_m) * Int32(self.epi_tile[0])
 
-                                # Per-warp scatter: each warp scatters its own
-                                # quadrant of sC (64 M-rows × 64 N-cols).
-                                warp_epi_rows = valid_rows - rows_offset - warp_m_base
-                                if warp_epi_rows > Int32(64):
-                                    warp_epi_rows = Int32(64)
-                                if warp_epi_rows < Int32(0):
-                                    warp_epi_rows = Int32(0)
-                                tile_vec_cols = Int32(64) // Int32(8)
-                                vec_idx = lane_id
-                                while vec_idx < warp_epi_rows * tile_vec_cols:
-                                    local_row = vec_idx // tile_vec_cols
-                                    local_vec_col = vec_idx - local_row * tile_vec_cols
-                                    local_col = warp_n_base + local_vec_col * Int32(8)
-                                    global_col = tile_n_base_cur + local_col
-                                    cached_row = rows_offset + warp_m_base + local_row
-                                    tok = ld_shared_i32_relaxed(
-                                        scatter_tok_base_addr + cached_row * Int32(4)
+                                    # Per-warp scatter: each warp scatters its own
+                                    # quadrant of sC (64 M-rows × 64 N-cols).
+                                    warp_epi_rows = (
+                                        valid_rows - rows_offset - warp_m_base
                                     )
-                                    wv = ld_shared_f32(
-                                        scatter_weight_base_addr + cached_row * Int32(4)
-                                    )
-                                    if cutlass.const_expr(self.w4a8_repacked):
-                                        sc_logical = Int32(
-                                            cute.crd2idx(
+                                    if warp_epi_rows > Int32(64):
+                                        warp_epi_rows = Int32(64)
+                                    if warp_epi_rows < Int32(0):
+                                        warp_epi_rows = Int32(0)
+                                    tile_vec_cols = Int32(64) // Int32(8)
+                                    vec_idx = lane_id
+                                    while vec_idx < warp_epi_rows * tile_vec_cols:
+                                        local_row = vec_idx // tile_vec_cols
+                                        local_vec_col = (
+                                            vec_idx - local_row * tile_vec_cols
+                                        )
+                                        local_col = warp_n_base + local_vec_col * Int32(
+                                            8
+                                        )
+                                        global_col = tile_n_base_cur + local_col
+                                        cached_row = (
+                                            rows_offset + warp_m_base + local_row
+                                        )
+                                        tok = ld_shared_i32_relaxed(
+                                            scatter_tok_base_addr
+                                            + cached_row * Int32(4)
+                                        )
+                                        wv = ld_shared_f32(
+                                            scatter_weight_base_addr
+                                            + cached_row * Int32(4)
+                                        )
+                                        if cutlass.const_expr(self.w4a8_repacked):
+                                            sc_logical = Int32(
+                                                cute.crd2idx(
+                                                    (
+                                                        warp_m_base + local_row,
+                                                        local_col,
+                                                        epi_buffer,
+                                                    ),
+                                                    epi_smem_staged.outer,
+                                                )
+                                            )
+                                            sc_yyy_mask = Int32(
                                                 (
+                                                    (
+                                                        1
+                                                        << epi_smem_staged.inner.num_bits
+                                                    )
+                                                    - 1
+                                                )
+                                                << (
+                                                    epi_smem_staged.inner.num_base
+                                                    + epi_smem_staged.inner.num_shift
+                                                )
+                                            )
+                                            sc_logical_bytes = sc_logical << Int32(1)
+                                            sc_physical_bytes = sc_logical_bytes ^ (
+                                                (sc_logical_bytes & sc_yyy_mask)
+                                                >> Int32(
+                                                    epi_smem_staged.inner.num_shift
+                                                )
+                                            )
+                                            sc_addr = sC_base_addr + sc_physical_bytes
+                                        if cutlass.const_expr(self.w4a8_repacked):
+                                            _sc0, _sc1, _sc2, _sc3 = ld_shared_v4_u32(
+                                                sc_addr
+                                            )
+                                            sc_v0, sc_v1 = bfloat2_to_float2_scaled(
+                                                _sc0, wv
+                                            )
+                                            sc_v2, sc_v3 = bfloat2_to_float2_scaled(
+                                                _sc1, wv
+                                            )
+                                            sc_v4, sc_v5 = bfloat2_to_float2_scaled(
+                                                _sc2, wv
+                                            )
+                                            sc_v6, sc_v7 = bfloat2_to_float2_scaled(
+                                                _sc3, wv
+                                            )
+                                        else:
+                                            sc_v0 = wv * cutlass.Float32(
+                                                sC[
                                                     warp_m_base + local_row,
                                                     local_col,
                                                     epi_buffer,
-                                                ),
-                                                epi_smem_staged.outer,
+                                                ]
                                             )
-                                        )
-                                        sc_yyy_mask = Int32(
-                                            ((1 << epi_smem_staged.inner.num_bits) - 1)
-                                            << (
-                                                epi_smem_staged.inner.num_base
-                                                + epi_smem_staged.inner.num_shift
+                                            sc_v1 = wv * cutlass.Float32(
+                                                sC[
+                                                    warp_m_base + local_row,
+                                                    local_col + Int32(1),
+                                                    epi_buffer,
+                                                ]
                                             )
-                                        )
-                                        sc_logical_bytes = sc_logical << Int32(1)
-                                        sc_physical_bytes = sc_logical_bytes ^ (
-                                            (sc_logical_bytes & sc_yyy_mask)
-                                            >> Int32(epi_smem_staged.inner.num_shift)
-                                        )
-                                        sc_addr = sC_base_addr + sc_physical_bytes
-                                    if cutlass.const_expr(self.w4a8_repacked):
-                                        _sc0, _sc1, _sc2, _sc3 = ld_shared_v4_u32(
-                                            sc_addr
-                                        )
-                                        sc_v0, sc_v1 = bfloat2_to_float2_scaled(
-                                            _sc0, wv
-                                        )
-                                        sc_v2, sc_v3 = bfloat2_to_float2_scaled(
-                                            _sc1, wv
-                                        )
-                                        sc_v4, sc_v5 = bfloat2_to_float2_scaled(
-                                            _sc2, wv
-                                        )
-                                        sc_v6, sc_v7 = bfloat2_to_float2_scaled(
-                                            _sc3, wv
-                                        )
-                                    else:
-                                        sc_v0 = wv * cutlass.Float32(
-                                            sC[
-                                                warp_m_base + local_row,
-                                                local_col,
-                                                epi_buffer,
-                                            ]
-                                        )
-                                        sc_v1 = wv * cutlass.Float32(
-                                            sC[
-                                                warp_m_base + local_row,
-                                                local_col + Int32(1),
-                                                epi_buffer,
-                                            ]
-                                        )
-                                        sc_v2 = wv * cutlass.Float32(
-                                            sC[
-                                                warp_m_base + local_row,
-                                                local_col + Int32(2),
-                                                epi_buffer,
-                                            ]
-                                        )
-                                        sc_v3 = wv * cutlass.Float32(
-                                            sC[
-                                                warp_m_base + local_row,
-                                                local_col + Int32(3),
-                                                epi_buffer,
-                                            ]
-                                        )
-                                        sc_v4 = wv * cutlass.Float32(
-                                            sC[
-                                                warp_m_base + local_row,
-                                                local_col + Int32(4),
-                                                epi_buffer,
-                                            ]
-                                        )
-                                        sc_v5 = wv * cutlass.Float32(
-                                            sC[
-                                                warp_m_base + local_row,
-                                                local_col + Int32(5),
-                                                epi_buffer,
-                                            ]
-                                        )
-                                        sc_v6 = wv * cutlass.Float32(
-                                            sC[
-                                                warp_m_base + local_row,
-                                                local_col + Int32(6),
-                                                epi_buffer,
-                                            ]
-                                        )
-                                        sc_v7 = wv * cutlass.Float32(
-                                            sC[
-                                                warp_m_base + local_row,
-                                                local_col + Int32(7),
-                                                epi_buffer,
-                                            ]
-                                        )
-                                    if cutlass.const_expr(self.deterministic_output):
-                                        scatter_output[tok, global_col] = (
-                                            cutlass.BFloat16(
-                                                cutlass.Float32(
-                                                    scatter_output[tok, global_col]
+                                            sc_v2 = wv * cutlass.Float32(
+                                                sC[
+                                                    warp_m_base + local_row,
+                                                    local_col + Int32(2),
+                                                    epi_buffer,
+                                                ]
+                                            )
+                                            sc_v3 = wv * cutlass.Float32(
+                                                sC[
+                                                    warp_m_base + local_row,
+                                                    local_col + Int32(3),
+                                                    epi_buffer,
+                                                ]
+                                            )
+                                            sc_v4 = wv * cutlass.Float32(
+                                                sC[
+                                                    warp_m_base + local_row,
+                                                    local_col + Int32(4),
+                                                    epi_buffer,
+                                                ]
+                                            )
+                                            sc_v5 = wv * cutlass.Float32(
+                                                sC[
+                                                    warp_m_base + local_row,
+                                                    local_col + Int32(5),
+                                                    epi_buffer,
+                                                ]
+                                            )
+                                            sc_v6 = wv * cutlass.Float32(
+                                                sC[
+                                                    warp_m_base + local_row,
+                                                    local_col + Int32(6),
+                                                    epi_buffer,
+                                                ]
+                                            )
+                                            sc_v7 = wv * cutlass.Float32(
+                                                sC[
+                                                    warp_m_base + local_row,
+                                                    local_col + Int32(7),
+                                                    epi_buffer,
+                                                ]
+                                            )
+                                        if cutlass.const_expr(
+                                            self.deterministic_output
+                                        ):
+                                            scatter_output[tok, global_col] = (
+                                                cutlass.BFloat16(
+                                                    cutlass.Float32(
+                                                        scatter_output[tok, global_col]
+                                                    )
+                                                    + sc_v0
                                                 )
-                                                + sc_v0
                                             )
-                                        )
-                                        scatter_output[tok, global_col + Int32(1)] = (
-                                            cutlass.BFloat16(
+                                            scatter_output[
+                                                tok, global_col + Int32(1)
+                                            ] = cutlass.BFloat16(
                                                 cutlass.Float32(
                                                     scatter_output[
                                                         tok, global_col + Int32(1)
@@ -8014,9 +8097,9 @@ class MoEDynamicKernelBackend:
                                                 )
                                                 + sc_v1
                                             )
-                                        )
-                                        scatter_output[tok, global_col + Int32(2)] = (
-                                            cutlass.BFloat16(
+                                            scatter_output[
+                                                tok, global_col + Int32(2)
+                                            ] = cutlass.BFloat16(
                                                 cutlass.Float32(
                                                     scatter_output[
                                                         tok, global_col + Int32(2)
@@ -8024,9 +8107,9 @@ class MoEDynamicKernelBackend:
                                                 )
                                                 + sc_v2
                                             )
-                                        )
-                                        scatter_output[tok, global_col + Int32(3)] = (
-                                            cutlass.BFloat16(
+                                            scatter_output[
+                                                tok, global_col + Int32(3)
+                                            ] = cutlass.BFloat16(
                                                 cutlass.Float32(
                                                     scatter_output[
                                                         tok, global_col + Int32(3)
@@ -8034,9 +8117,9 @@ class MoEDynamicKernelBackend:
                                                 )
                                                 + sc_v3
                                             )
-                                        )
-                                        scatter_output[tok, global_col + Int32(4)] = (
-                                            cutlass.BFloat16(
+                                            scatter_output[
+                                                tok, global_col + Int32(4)
+                                            ] = cutlass.BFloat16(
                                                 cutlass.Float32(
                                                     scatter_output[
                                                         tok, global_col + Int32(4)
@@ -8044,9 +8127,9 @@ class MoEDynamicKernelBackend:
                                                 )
                                                 + sc_v4
                                             )
-                                        )
-                                        scatter_output[tok, global_col + Int32(5)] = (
-                                            cutlass.BFloat16(
+                                            scatter_output[
+                                                tok, global_col + Int32(5)
+                                            ] = cutlass.BFloat16(
                                                 cutlass.Float32(
                                                     scatter_output[
                                                         tok, global_col + Int32(5)
@@ -8054,9 +8137,9 @@ class MoEDynamicKernelBackend:
                                                 )
                                                 + sc_v5
                                             )
-                                        )
-                                        scatter_output[tok, global_col + Int32(6)] = (
-                                            cutlass.BFloat16(
+                                            scatter_output[
+                                                tok, global_col + Int32(6)
+                                            ] = cutlass.BFloat16(
                                                 cutlass.Float32(
                                                     scatter_output[
                                                         tok, global_col + Int32(6)
@@ -8064,9 +8147,9 @@ class MoEDynamicKernelBackend:
                                                 )
                                                 + sc_v6
                                             )
-                                        )
-                                        scatter_output[tok, global_col + Int32(7)] = (
-                                            cutlass.BFloat16(
+                                            scatter_output[
+                                                tok, global_col + Int32(7)
+                                            ] = cutlass.BFloat16(
                                                 cutlass.Float32(
                                                     scatter_output[
                                                         tok, global_col + Int32(7)
@@ -8074,27 +8157,26 @@ class MoEDynamicKernelBackend:
                                                 )
                                                 + sc_v7
                                             )
-                                        )
-                                    else:
-                                        scatter_add_v4_bf16x2(
-                                            get_ptr_as_int64(
-                                                scatter_output,
-                                                tok * scatter_N + global_col,
-                                            ),
-                                            sc_v0,
-                                            sc_v1,
-                                            sc_v2,
-                                            sc_v3,
-                                            sc_v4,
-                                            sc_v5,
-                                            sc_v6,
-                                            sc_v7,
-                                        )
-                                    vec_idx += Int32(self.num_threads_per_warp)
+                                        else:
+                                            scatter_add_v4_bf16x2(
+                                                get_ptr_as_int64(
+                                                    scatter_output,
+                                                    tok * scatter_N + global_col,
+                                                ),
+                                                sc_v0,
+                                                sc_v1,
+                                                sc_v2,
+                                                sc_v3,
+                                                sc_v4,
+                                                sc_v5,
+                                                sc_v6,
+                                                sc_v7,
+                                            )
+                                        vec_idx += Int32(self.num_threads_per_warp)
 
-                                # All warps must finish the current scatter
-                                # before the next output reuses sC.
-                                self.epilog_sync_barrier.arrive_and_wait()
+                                    # All warps must finish the current scatter
+                                    # before the next output reuses sC.
+                                    self.epilog_sync_barrier.arrive_and_wait()
 
                         if cutlass.const_expr(self.w4a8_named_pipeline):
                             self._arrive_w4a8_stage_done(par)

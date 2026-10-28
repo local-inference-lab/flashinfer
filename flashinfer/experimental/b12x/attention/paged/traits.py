@@ -259,10 +259,8 @@ def select_paged_forward_traits(
     # Choose the MMA tile and residency together from exact CUTLASS typed
     # allocations. This preserves the occupancy-first policy without deriving
     # a per-CTA budget from assumed residency and feeding it back into the tile.
-    # The general cta_q=16 backend is the exact-plane 64-row decode family.  An
-    # exact graph specialization may request a wider tile explicitly; keeping
-    # that choice out of the generic candidate sweep prevents unrelated decode
-    # families from silently changing their register and shared-memory shape.
+    # Decode uses one KV MMA per warp except H64 values, whose value-fragment
+    # layout requires two. Explicit graph specializations may request wider tiles.
     if exact_num_mma_kv is not None:
         exact_num_mma_kv = int(exact_num_mma_kv)
         if exact_num_mma_kv <= 0 or exact_num_mma_kv > max_num_mma_kv_reg:
@@ -273,7 +271,9 @@ def select_paged_forward_traits(
     max_candidate_mma_kv = (
         exact_num_mma_kv
         if exact_num_mma_kv is not None
-        else (1 if cta_tile_q == 16 else max_num_mma_kv_reg)
+        else (2 if num_mma_d_vo == 4 else 1)
+        if cta_tile_q == 16
+        else max_num_mma_kv_reg
     )
     candidates: list[tuple[int, int, int, int, int]] = []
     for candidate_mma_kv in range(1, max_candidate_mma_kv + 1):

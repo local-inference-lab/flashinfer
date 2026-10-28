@@ -1,4 +1,4 @@
-"""Prepare captured startup selection among measured joint collective modes."""
+"""Prepare captured selection among supplied or measured joint collective profiles."""
 
 from dataclasses import dataclass, field
 
@@ -27,8 +27,8 @@ class JointStartupSpec:
     rank: int
 
 
-def joint_startup_spec(plan):
-    """Describe all measured modes of a prepared plan's selected launcher."""
+def joint_startup_spec(plan, *, profiles=None):
+    """Describe supplied runtime profiles or measured finalists of a prepared launcher."""
     from ._joint_preparation import _JointExecutionState
 
     prepared = plan.prepared
@@ -38,23 +38,42 @@ def joint_startup_spec(plan):
     call = state.query.call
     family = call["transport"]
     geometry = (family, call["threads"], call["blocks"])
-    profiles = {}
-    for record in prepared.finalists:
-        assignment = record.assignment
-        if (
-            tuple(assignment[name] for name in ("implementation", "threads", "blocks"))
-            == geometry
+    if profiles is not None:
+        profiles = tuple(profiles)
+        if not profiles or any(
+            not isinstance(profile, (tuple, list)) or len(profile) != 2
+            for profile in profiles
         ):
-            mode = assignment["submode"]
-            active = assignment["active_blocks"]
+            raise ValueError(
+                "runtime profiles must be nonempty (mode, active CTA) pairs"
+            )
+        encoded = []
+        for mode, active in profiles:
             selected_profile(family, call["blocks"], mode, active)
-            profiles[mode] = (JOINT_MODES[mode], active)
-    modes = JOINT_FAMILIES[family]
-    if set(profiles) != set(modes):
-        raise ValueError(
-            "startup tuning requires measured finalists for every mode of the selected geometry"
-        )
-    profiles = tuple(profiles[mode] for mode in modes)
+            encoded.append((JOINT_MODES[mode], active))
+        if len(set(encoded)) != len(encoded):
+            raise ValueError("runtime profiles must be distinct")
+        profiles = tuple(encoded)
+    else:
+        measured = {}
+        for record in prepared.finalists:
+            assignment = record.assignment
+            if (
+                tuple(
+                    assignment[name] for name in ("implementation", "threads", "blocks")
+                )
+                == geometry
+            ):
+                mode = assignment["submode"]
+                active = assignment["active_blocks"]
+                selected_profile(family, call["blocks"], mode, active)
+                measured[mode] = (JOINT_MODES[mode], active)
+        modes = JOINT_FAMILIES[family]
+        if set(measured) != set(modes):
+            raise ValueError(
+                "startup tuning requires measured finalists for every mode of the selected geometry"
+            )
+        profiles = tuple(measured[mode] for mode in modes)
     inplace = bool(plan.query.inplace)
     import torch.distributed as dist
 

@@ -394,3 +394,16 @@ def test_laguna_page128_traits_reject_same_gqa_nonproduction_head_counts(
 
         assert traits.num_mma_kv == 1
         assert traits.cta_tile_kv == 64
+
+
+def test_bf16_head64_decode_selects_legal_even_kv_tile() -> None:
+    traits = select_paged_forward_traits(
+        cta_tile_q=16,
+        head_dim_qk=64,
+        head_dim_vo=64,
+        q_dtype=torch.bfloat16,
+        kv_dtype=torch.bfloat16,
+        device="cuda",
+    )
+    assert traits.num_mma_kv == 2
+    assert traits.cta_tile_kv == traits.num_warps_kv * 32

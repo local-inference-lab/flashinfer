@@ -13,7 +13,7 @@ groups through shared memory.
   context length and any mix of per-request query lengths (ragged verify).
 * Split partials are FP32 (normalized output + base-2 LSE); the merge kernel
   folds them, and the attention sink, into the BF16 output with one rounding.
-* Variants (constexpr): QK/VO head dims 192/128 or 128/128; causal, or
+* Variants (constexpr): QK/VO head dims 192/128, 128/128 or 64/64; causal, or
   non-causal (every row sees the whole sequence, bounded on the left by the
   window); BF16 or FP8-E4M3 KV (FP8 fragments are widened exactly to BF16 in
   registers after ``ldmatrix``, so the math is the BF16 math and the FP8 stage
@@ -245,8 +245,10 @@ class PagedDecodeKernel:
         kv_fp8: bool = False,
         descale_layout: str = "tensor",
     ):
-        if (head_dim_qk, head_dim_vo) not in ((192, 128), (128, 128)):
-            raise ValueError("decode kernel supports QK192/V128 and QK128/V128")
+        if (head_dim_qk, head_dim_vo) not in ((192, 128), (128, 128), (64, 64)):
+            raise ValueError(
+                "decode kernel supports QK192/V128, QK128/V128 and QK64/V64"
+            )
         if stage_rows not in (16, 32) or page_size % stage_rows != 0:
             raise ValueError(f"unsupported stage rows {stage_rows}")
         # The grid's z index also selects one of ``head_splits`` slices of the
@@ -1042,8 +1044,8 @@ class PagedDecodeMergeKernel:
         warps_per_row: int = 4,
         has_sinks: bool = False,
     ):
-        if head_dim_vo != 128:
-            raise ValueError("merge kernel is specialized for V128")
+        if head_dim_vo not in (64, 128):
+            raise ValueError("merge kernel requires V64 or V128")
         if num_q_heads % heads_per_cta != 0:
             raise ValueError("heads_per_cta must divide the head count")
         self.num_q_heads = int(num_q_heads)
@@ -1166,7 +1168,7 @@ class PagedDecodeMergeKernel:
         acc1 = Float32(0.0)
         acc2 = Float32(0.0)
         acc3 = Float32(0.0)
-        if m_row != -Float32.inf:
+        if m_row != -Float32.inf and lane < Int32(self.head_dim_vo // 4):
             # Every active split stores finite partials (zero with LSE -inf when
             # it saw no keys), so weights need no branch; four independent
             # vector loads per step keep the latency hidden.
@@ -1232,12 +1234,13 @@ class PagedDecodeMergeKernel:
                 stride=(WPR * self.head_dim_vo, self.head_dim_vo, 1),
             )
         )
-        sAcc[head_local, warp_in_row, lane * 4 + 0] = acc0
-        sAcc[head_local, warp_in_row, lane * 4 + 1] = acc1
-        sAcc[head_local, warp_in_row, lane * 4 + 2] = acc2
-        sAcc[head_local, warp_in_row, lane * 4 + 3] = acc3
+        if lane < Int32(self.head_dim_vo // 4):
+            sAcc[head_local, warp_in_row, lane * 4 + 0] = acc0
+            sAcc[head_local, warp_in_row, lane * 4 + 1] = acc1
+            sAcc[head_local, warp_in_row, lane * 4 + 2] = acc2
+            sAcc[head_local, warp_in_row, lane * 4 + 3] = acc3
         cute.arch.sync_threads()
-        if warp_in_row == Int32(0):
+        if warp_in_row == Int32(0) and lane < Int32(self.head_dim_vo // 4):
             inv = Float32(0.0)
             if s_row > Float32(0.0):
                 inv = Float32(1.0) / s_row

@@ -3399,8 +3399,15 @@ class PagedForwardKernel:
                     traits.num_warps_kv > 1
                     and traits.num_warps_q == 1
                     and traits.cta_tile_q == 16
-                    and self.stage_tile_rows == 64
-                    and traits.num_mma_kv == 1
+                    and (
+                        (self.stage_tile_rows == 64 and traits.num_mma_kv == 1)
+                        or (
+                            not self.kv_is_fp8
+                            and traits.head_dim_vo == 64
+                            and self.stage_tile_rows == 128
+                            and traits.num_mma_kv == 2
+                        )
+                    )
                 )
                 or laguna_page128_kv128_decode
                 or laguna_page128_gqa6_verify

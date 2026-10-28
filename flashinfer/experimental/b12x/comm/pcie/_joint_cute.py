@@ -114,9 +114,18 @@ class _JointLaunch(_PackedMath):
     @cute.jit
     def _owner(self, index: Int64, size: Int64) -> Int32:
         part = size // Int64(self._world_size)
-        owner = Int32(self._world_size - 1)
-        if part > Int64(0):
-            owner = Int32(cutlass.min(index // part, Int64(self._world_size - 1)))
+        if cutlass.const_expr(
+            self._family == "latency" and self._threads in (64, 128, 256)
+        ):
+            owner = Int32(0)
+            for peer in cutlass.range_constexpr(1, self._world_size):
+                if index >= part * Int64(peer):
+                    owner = Int32(peer)
+        else:
+            # Division preserves bandwidth-family and wide-block latency performance.
+            owner = Int32(self._world_size - 1)
+            if part > Int64(0):
+                owner = Int32(cutlass.min(index // part, Int64(self._world_size - 1)))
         return owner
 
     @cute.jit
