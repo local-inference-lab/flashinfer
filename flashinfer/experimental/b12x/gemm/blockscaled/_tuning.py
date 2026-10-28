@@ -69,6 +69,8 @@ class BlockscaledConfig:
     A null dense configuration uses the dense heuristic. ``a16_backend="packed"``
     retains the packed-weight kernel at every row count; ``"auto"`` may expand
     MXFP8 weights for a BF16 GEMM when caller scratch and capacity permit it.
+    ``quantized_backend="register_rows"`` retains N8 weight tiles in registers
+    for at most eight activation rows, using the same MXFP8 activation packer.
     """
 
     mode: str
@@ -79,6 +81,7 @@ class BlockscaledConfig:
     mma_warps: int | None = None
     dense_config: FrozenMapping | None = None
     a16_backend: str = "auto"
+    quantized_backend: str = "dense"
 
     def __post_init__(self):
         if self.dense_config is not None:
@@ -95,9 +98,10 @@ class BlockscaledConfig:
             "mma_warps",
             "dense_config",
             "a16_backend",
+            "quantized_backend",
         }:
             raise ValueError(
-                "packed precision config requires mode, A16 backend/knobs, and dense_config"
+                "packed precision config requires exact arithmetic, backend, and launch fields"
             )
         return cls(**dict(payload))
 
@@ -363,6 +367,14 @@ def _validate_config(query, config, device):
         raise ValueError("invalid packed precision configuration")
     if query.activation_mode != "auto" and config.mode != query.activation_mode:
         raise ValueError("configuration conflicts with caller activation precision")
+    if config.quantized_backend not in ("dense", "register_rows"):
+        raise ValueError("unknown quantized projection backend")
+    if config.quantized_backend == "register_rows" and not (
+        config.mode == "quantized"
+        and config.dense_config is None
+        and _register_mxfp8_eligible(query, device)
+    ):
+        raise ValueError("register rows require aligned MXFP8 M<=8 K1280/K5120 N32")
     if config.a16_backend not in ("auto", "packed") or (
         config.a16_backend != "auto"
         and (config.mode != "a16" or query.recipe != "mxfp8")
@@ -475,6 +487,22 @@ def _validate_config(query, config, device):
             raise ValueError("MXFP8 does not use an activation global scale")
 
 
+def _register_mxfp8_eligible(query, device):
+    return (
+        query.recipe == "mxfp8"
+        and query.activation_mode != "a16"
+        and 0 < query.num_tokens <= 8
+        and query.in_features == query.padded_in_features
+        and query.in_features in (1280, 5120)
+        and query.out_features % 32 == 0
+        and query.source_contiguous
+        and query.source_aligned
+        and not query.activation_scale_available
+        and device is not None
+        and device.compute_capability in ((12, 0), (12, 1))
+    )
+
+
 def _tuning_parameters(query, device):
     dense_configs = (None,)
     if (
@@ -498,6 +526,12 @@ def _tuning_parameters(query, device):
     expanded = mxfp8_a16_dequant(query, BlockscaledConfig(mode="a16"))
 
     def eligible(parameters):
+        if parameters["quantized_backend"] == "register_rows":
+            return (
+                parameters["mode"] == "quantized"
+                and parameters["dense_config"] is None
+                and _register_mxfp8_eligible(query, device)
+            )
         if (
             expanded
             and parameters["mode"] == "a16"
@@ -575,6 +609,9 @@ def _tuning_parameters(query, device):
             else (query.activation_mode,),
             "mma_warps": (2, 4) if query.recipe == "mxfp8" else (None,),
             "dense_config": dense_configs,
+            "quantized_backend": ("dense", "register_rows")
+            if _register_mxfp8_eligible(query, device)
+            else ("dense",),
             "a16_backend": ("auto", "packed") if expanded else ("auto",),
         },
         predicates=(
@@ -591,6 +628,8 @@ def _tuning_parameters(query, device):
 
 
 def _equivalence(query, device, config):
+    if config.quantized_backend == "register_rows":
+        return {"mode": "quantized", "backend": "register_rows"}
     if config.mode == "quantized":
         dense = config.dense_config
         if dense is None and query.recipe in ("nvfp4", "mxfp4", "mxfp8"):
@@ -620,7 +659,7 @@ def _equivalence(query, device, config):
 TUNING = TuningContract(
     component_id="gemm.blockscaled_precision",
     query_schema_version=23,
-    config_schema_version=25,
+    config_schema_version=26,
     query_fields=frozenset(BlockscaledQuery.__dataclass_fields__),
     config_fields=frozenset(BlockscaledConfig.__dataclass_fields__),
     encode_query=lambda query: {
@@ -631,10 +670,16 @@ TUNING = TuningContract(
     validate_query=_validate_query,
     validate_config=_validate_config,
     default_config=_default_config,
-    candidate_contract_version=24,
+    candidate_contract_version=25,
     knobs=(
         Knob(
             name="mode", values=("a16", "quantized"), binding=ParameterBinding.COMPILE
+        ),
+        Knob(
+            name="quantized_backend",
+            values=("dense",),
+            when=FrozenMapping({"mode": "quantized"}),
+            otherwise="dense",
         ),
         Knob(
             name="tile_m",
