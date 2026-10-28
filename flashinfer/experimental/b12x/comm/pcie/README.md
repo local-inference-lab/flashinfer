@@ -194,3 +194,87 @@ Cold-cache producers share one eviction buffer per runtime; producers replay
 serially. `producer.memory_requirements()` reports resident fixtures, timing,
 status, and eviction storage through the preparation memory interface, with
 shared storage keys suitable for deduplication.
+
+### Standalone transfer-size search
+
+`b12x.tools.collective_ladder` measures joint BF16 all-reduce configurations under
+`torchrun`. Defaults are disjoint buffers, cold caches, and 209 transfer sizes
+from 1 KiB through 8 MiB at 16 points per doubling. Each size recommends one
+confirmed full configuration, including compiled geometry and runtime profile.
+This tool does not change serving dispatch or preparation defaults.
+
+Search covers every compiled geometry and submode at every size, then refines
+runtime profiles using neighboring measurements. Screening rounds scale inversely
+with payload bytes, up to eight rounds by default. Up to eight candidates within
+10% of the screening best enter balanced confirmation targeting 1 ms of measured
+GPU time per candidate. The two fastest then compete with a 4 ms target; only
+these fresh final samples determine the recommendation. Counts use measured
+latency estimates and are capped at 512 rounds. `--rounds` raises the minimum.
+
+Each round uses three exact input fixtures. An untimed invocation precedes two
+individually timed invocations per fixture, with fresh input and the requested
+cache preparation before each timed invocation. The pair covers both shared-buffer
+slots. Eight-round captured graphs are reused to collect large sample sets with
+fixed timing storage. Complete reports require all size/group coverage and both
+confirmation stages; exhaustive reports additionally require the entire legal
+catalog.
+
+```sh
+torchrun --standalone --nproc-per-node=8 -m b12x.tools.collective_ladder \
+  --fresh --output ladder-short.jsonl
+
+torchrun --standalone --nproc-per-node=8 -m b12x.tools.collective_ladder \
+  --resume ladder-short.jsonl --budget-seconds 600
+
+torchrun --standalone --nproc-per-node=8 -m b12x.tools.collective_ladder \
+  --exhaustive --budget-seconds 3600 --output ladder-reference.jsonl
+
+torchrun --standalone --nproc-per-node=8 -m b12x.tools.collective_ladder \
+  --replay ladder-short.jsonl ladder-reference.jsonl --output ladder-comparison.jsonl
+```
+
+The default charged budget is 600 seconds, or 3600 seconds with `--exhaustive`.
+Only compilation time is excluded; fixture construction, correctness checks,
+capture, measurements, and report writing count. An executing measurement batch
+drains before stopping. Final stdout timings include report closure; report
+summary timings identify their checkpoint before the final summary write.
+
+Use `--sizes 1KiB 64KiB 8MiB` for explicit points, or `--min-bytes`, `--max-bytes`,
+and `--points-per-doubling` for another range. Sizes are 16-byte aligned.
+`--cache-policy warm` and `--alias` select cache and output aliasing semantics.
+`--fresh` requires an unused output path. `--resume` validates hardware, catalogs,
+versions, and measurement semantics before reusing actual samples. Reports retain
+all legal configurations, measured samples in microseconds, correctness results,
+GPU topology with physical indices, UUIDs and PCI bus IDs, recommendations, and
+missing configurations as incremental JSONL.
+
+`--replay` independently measures the union of input reports' recommended full
+configurations at every size, using the same 4 ms sampling target as final selection.
+Each measurement identifies the source reports recommending its configuration.
+Input reports must match sizes, hardware, catalogs, software versions, dtype,
+cache policy and aliasing. Sampling protocols may differ: replay imports only
+configurations and latency estimates for sample counts, and collects all timings
+afresh. Resume requires an identical sampling protocol. Replay reports
+identify unfinished sizes rather than treating an interrupted comparison as
+complete. Compare every size against an independently measured exhaustive
+reference; an aggregate alone does not establish a per-size regret bound.
+
+### Choice and bucket plots
+
+Install the optional Matplotlib dependency (`python -m pip install matplotlib`)
+and add `--plot` to a search command to render its recommendations after GPU
+resources are released. Rendering time counts toward the reported charged time.
+To render a saved report without initializing CUDA or collecting measurements:
+
+```sh
+python -m b12x.tools.collective_ladder plot ladder-short.jsonl
+```
+
+Each report produces two adjacent files: `ladder-short.choices.png` shows kernel
+family, runtime mode, threads, physical CTAs, and active CTAs across payloads;
+`ladder-short.buckets.png` lists every exact byte size and selected configuration.
+Each image contains only that report's topology and final summary. Missing and
+unconfirmed recommendations are marked explicitly. Columns represent exact
+sampled sizes, not inferred dispatch intervals. Regenerating plots overwrites
+the PNGs without modifying the JSONL report. Replay reports contain no selected
+recommendations and cannot be plotted.
