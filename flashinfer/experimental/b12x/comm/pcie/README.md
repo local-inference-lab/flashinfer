@@ -169,6 +169,13 @@ geometry. The preparation cache restores these finalists with the selected plan.
 `joint_startup_spec(plan)` then retains only the modes of the winning family,
 thread count, and physical grid; it rejects incomplete finalist sets.
 
+For offline recommendations, pin the geometry with `AllReduce.plan(...,
+joint_only=True, override=CollectiveConfig(...))` and supply explicit profiles
+to `joint_startup_spec(plan, profiles=(("bulk_push", 32), ("bulk_pull", 8)))`.
+This path needs no measured finalists or preparation-time geometry race. Modes
+must belong to the prepared family and active CTA counts must fit its physical
+grid. Multiple counts per mode are allowed; duplicate pairs are rejected.
+
 Collectively call `prepare_joint_startup_tuner(specs, cache_policy="cold")` before
 freezing kernel resolution. All specs in a producer must have the same semantic
 key, rank, and device. Each spec exposes its actual serving `selector` tensor.
