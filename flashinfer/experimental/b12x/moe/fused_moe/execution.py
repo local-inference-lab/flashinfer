@@ -17,6 +17,8 @@ class ExecutionCapacity:
     unweighted [tokens, top_k, hidden] GEMM outputs in activation precision for
     token or expert outer scaling. Invalid route entries are unspecified;
     consumers must mask them with the route IDs before applying their weights.
+    Expert-outer NVFP4 routes reduce FC2 slices in a fixed FP32 order before
+    the final BF16 conversion.
     """
 
     max_tokens: int

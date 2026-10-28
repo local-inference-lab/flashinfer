@@ -17,7 +17,7 @@ from b12x.preparation._efficiency import (
 
 from ._kernel import SMEM_LIMIT, default_max_splits
 
-HEAD_DIMS = ((192, 128), (128, 128))
+HEAD_DIMS = ((192, 128), (128, 128), (64, 64))
 KV_DTYPES = ("bfloat16", "float8_e4m3fn")
 PAGE_SIZES = (64, 128)
 MAX_Q_PER_REQ = 8

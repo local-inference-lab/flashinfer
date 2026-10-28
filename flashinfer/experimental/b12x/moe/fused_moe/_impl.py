@@ -3388,6 +3388,7 @@ def _plan_core_workspace(
     apply_router_weight_on_input: bool = False,
     collect_activation_amax: bool = False,
     deterministic_output: bool = False,
+    raw_routes: bool = False,
     swiglu_limit: float | None = None,
     swiglu_clamp_after_silu: bool = False,
     swiglu_alpha: float | None = None,
@@ -4066,11 +4067,14 @@ def _plan_core_workspace(
     )
     packed_input_shape = (1, dynamic_rows_padded, packed_input_cols)
     packed_input_dtype = torch.uint8
-    # Atomic scatter writes directly into the caller-owned [M, K] output and
-    # never addresses route_output.  Reserve only one ABI-compatible row for
-    # that production-default policy; the opt-in deterministic reduction owns
-    # a distinct fixed-capacity plan with one row per routed pair.
-    route_output_rows = max(int(routed_rows), 1) if deterministic_output else 1
+    # Raw routes retain FP32 FC2 partials until fixed-order reduction and BF16 conversion.
+    # Weighted token scatter uses the caller output directly; deterministic
+    # token reduction retains one BF16 row per routed pair.
+    route_output_rows = (
+        max(int(routed_rows), 1) if deterministic_output or raw_routes else 1
+    )
+    if raw_routes:
+        route_output_rows *= (int(n) + dynamic_tile_n - 1) // dynamic_tile_n
     # Materialized W4A8 phase 1 writes one E4M3 byte per activation plus one
     # UE8M0 byte per K32 block.  This storage must not alias route_output:
     # deterministic phase 2 writes one BF16 row per token-major route there
@@ -4137,7 +4141,11 @@ def _plan_core_workspace(
             _TensorAllocSpec(
                 "token_weights", (dynamic_rows_padded,), torch.float32, init="zeros"
             ),
-            _TensorAllocSpec("route_output", (route_output_rows, int(k)), dtype),
+            _TensorAllocSpec(
+                "route_output",
+                (route_output_rows, int(k)),
+                torch.float32 if raw_routes else dtype,
+            ),
             _TensorAllocSpec(
                 "materialized_intermediate",
                 (materialized_intermediate_rows, int(k)),
@@ -8305,6 +8313,7 @@ def plan_tp_moe_arena_layout(
     swiglu_beta: float | None = None,
     collect_activation_amax: bool = False,
     deterministic_output: bool | None = None,
+    raw_routes: bool = False,
     w4a16_block_size_m: int | None = None,
     w4a16_prefill_fused_sum: bool | None = None,
     decode_config: MoeDecodeConfig,
@@ -8418,6 +8427,7 @@ def plan_tp_moe_arena_layout(
             apply_router_weight_on_input=apply_router_weight_on_input,
             collect_activation_amax=collect_activation_amax,
             deterministic_output=plan.deterministic_output,
+            raw_routes=raw_routes,
             swiglu_limit=plan.swiglu_limit,
             swiglu_clamp_after_silu=plan.swiglu_clamp_after_silu,
             swiglu_alpha=plan.swiglu_alpha,
@@ -9034,6 +9044,7 @@ def _plan_tp_moe_arena_layout_from_caps(
         swiglu_beta=caps.swiglu_beta,
         collect_activation_amax=caps.collect_activation_amax,
         deterministic_output=deterministic_output,
+        raw_routes=caps.output_layout == "routes",
         w4a16_block_size_m=_resolve_trellis_route_block_size(caps),
         w4a16_prefill_fused_sum=caps.w4a16_prefill_fused_sum,
         decode_config=caps.decode_config,
@@ -9108,6 +9119,7 @@ def plan_tp_moe_scratch(
         apply_router_weight_on_input=caps.apply_router_weight_on_input,
         collect_activation_amax=caps.collect_activation_amax,
         deterministic_output=launch_plan.deterministic_output,
+        raw_routes=caps.output_layout == "routes",
         swiglu_limit=launch_plan.swiglu_limit,
         swiglu_clamp_after_silu=launch_plan.swiglu_clamp_after_silu,
         swiglu_alpha=launch_plan.swiglu_alpha,
@@ -9734,6 +9746,7 @@ def materialize_tp_moe_arena_workspaces(
             apply_router_weight_on_input=apply_router_weight_on_input,
             collect_activation_amax=collect_activation_amax,
             deterministic_output=plan.deterministic_output,
+            raw_routes=caps.output_layout == "routes",
             swiglu_limit=plan.swiglu_limit,
             swiglu_clamp_after_silu=plan.swiglu_clamp_after_silu,
             swiglu_alpha=plan.swiglu_alpha,
@@ -11671,7 +11684,12 @@ def _get_dynamic_kernel(
         (E,),
         assumed_align=16,
     )
-    scatter_fake = make_ptr(a_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
+    scatter_fake = make_ptr(
+        cutlass.Float32 if raw_routes else a_dtype,
+        16,
+        cute.AddressSpace.gmem,
+        assumed_align=16,
+    )
     token_map_fake = make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4)
     token_weights_fake = make_ptr(
         alpha_dtype, 16, cute.AddressSpace.gmem, assumed_align=16
@@ -11857,6 +11875,16 @@ def _launch_dynamic_flat(
     # Output rows follow the reduction contract, never an independent caller
     # quantity: route outputs use one row per route, token reductions one per token.
     scatter_rows = routed_rows if deterministic_output or raw_routes else m
+    if raw_routes:
+        tile_n = _select_dynamic_tile_mn(
+            routed_rows,
+            n,
+            quant_mode,
+            num_experts=E,
+            activation=activation,
+            planned_tile_m=planned_tile_m,
+        )[1]
+        scatter_rows *= (n + tile_n - 1) // tile_n
     # A trellis-native w4a8 binding carries the fp16 boundary rotations in
     # the sfb slot (the QMMA repack stores int32 scale words there); the
     # trellis geometry is recovered from the operand extents.
@@ -12166,7 +12194,7 @@ def _launch_dynamic_flat(
         w1_alpha,
         w2_alpha,
         down_input_scale,
-        _gptr(cutlass.BFloat16, scatter_output),
+        _gptr(cutlass.Float32 if raw_routes else cutlass.BFloat16, scatter_output),
         _gptr(cutlass.Int32, token_map, 4),
         _gptr(cutlass.Float32, token_weights, 4),
         m,
@@ -12590,9 +12618,7 @@ def _launch_dynamic(
             f"{workspace.route_output.numel()}"
         )
     kernel_output = (
-        workspace.route_output
-        if deterministic_output and not raw_routes
-        else scatter_output
+        workspace.route_output if deterministic_output or raw_routes else scatter_output
     )
     w4a8_repacked = w4a8_prepared is not None
     w13_rp = w4a8_prepared["w13_rp"] if w4a8_repacked else workspace.row_counts
@@ -12692,6 +12718,57 @@ def _launch_dynamic(
         launch_policy,
         m if planned_num_tokens is None else planned_num_tokens,
     )
+
+
+def _launch_raw_route_sum(parts, ids, output, routes, experts, intermediate, tile_n):
+    _raw_route_sum_op(
+        parts, ids, output, routes, experts, (intermediate + tile_n - 1) // tile_n
+    )
+
+
+@torch.library.custom_op("b12x::moe_raw_route_sum", mutates_args=("output",))
+def _raw_route_sum_op(
+    parts: torch.Tensor,
+    ids: torch.Tensor,
+    output: torch.Tensor,
+    routes: int,
+    experts: int,
+    slices: int,
+) -> None:
+    from b12x.moe._shared.kernels.raw_route_sum import compile_raw_route_sum
+
+    if (
+        parts.device.type != "cuda"
+        or parts.dtype != torch.float32
+        or output.dtype != torch.bfloat16
+        or ids.dtype not in (torch.int32, torch.int64)
+        or any(t.device != parts.device or not t.is_contiguous() for t in (ids, output))
+        or not parts.is_contiguous()
+        or routes < 0
+        or experts <= 0
+        or slices <= 0
+        or ids.numel() < routes
+        or output.numel() != routes * output.shape[-1]
+    ):
+        raise ValueError(
+            "raw route reduction requires contiguous FP32 partials, integer IDs and BF16 output"
+        )
+    if parts.numel() < slices * routes * output.shape[-1]:
+        raise ValueError(
+            "raw route partial storage is smaller than its reduction geometry"
+        )
+    compile_raw_route_sum(parts.device.index, output.shape[-1], slices, ids.dtype)(
+        parts,
+        ids,
+        output,
+        routes,
+        experts,
+    )
+
+
+@_raw_route_sum_op.register_fake
+def _raw_route_sum_fake(parts, ids, output, routes, experts, slices) -> None:
+    return None
 
 
 def _launch_dynamic_topk_sum(
@@ -14078,6 +14155,16 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
                 )
             ),
         )
+        if raw_routes:
+            _launch_raw_route_sum(
+                s.route_output,
+                flat_ids,
+                scatter_output,
+                m * num_topk,
+                weight_E,
+                n,
+                plan.execution.tile_n,
+            )
         if deterministic_output and not raw_routes:
             _launch_dynamic_topk_sum(
                 route_output=s.route_output,

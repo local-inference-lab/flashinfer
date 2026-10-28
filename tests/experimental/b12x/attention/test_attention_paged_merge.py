@@ -243,7 +243,7 @@ def _run_laguna_verify_merge_kernel(
 
 
 @torch.inference_mode()
-@pytest.mark.parametrize("head_dim", [192, 256])
+@pytest.mark.parametrize("head_dim", [64, 128, 192, 256])
 def test_paged_persistent_merge_matches_reference(head_dim) -> None:
     require_b12x()
     (

@@ -80,7 +80,7 @@ def _decode(packed):
     return values[codes.long()] * 0.125
 
 
-def _reference(x, ids, w13, w2, gains, gain2, *, gate_first):
+def _reference(x, ids, w13, w2, gains, gain2, *, gate_first, raw_routes=False):
     tokens, topk = ids.shape
     hidden, intermediate = x.shape[1], w2.shape[-1] * 2
     reference = torch.zeros(tokens, topk, hidden, device=x.device)
@@ -117,21 +117,45 @@ def _reference(x, ids, w13, w2, gains, gain2, *, gate_first):
                 activations[:, start : start + 128] @ down[:, start : start + 128].T
             ) * gain2[expert]
             total += part
-            absolute += part.abs()
+            if raw_routes:
+                absolute += (
+                    activations[:, start : start + 128].abs()
+                    @ down[:, start : start + 128].abs().T
+                ) * gain2[expert]
+            else:
+                absolute += part.abs()
         reference[rows, routes] = total
         magnitude[rows, routes] = absolute
         uncertainty[rows, routes] = (quantization_error @ down.abs().T) * gain2[expert]
     return reference, magnitude, uncertainty
 
 
-def _assert_reference(output, reference, magnitude, intermediate, uncertainty=0):
-    # Each 128-column FC2 slice rounds to BF16 before a BF16 atomic add.
-    # gamma counts both that conversion and accumulation, including cancellation.
-    rounds = 2 * math.ceil(intermediate / 128)
-    unit = 2.0**-8
-    gamma = rounds * unit / (1 - rounds * unit)
-    bound = (
-        uncertainty * (1 + gamma) + gamma * magnitude + torch.finfo(torch.float32).eps
+def _reference_bound(
+    reference, magnitude, intermediate, uncertainty=0, *, raw_routes=False
+):
+    slices = math.ceil(intermediate / 128)
+    if raw_routes:
+        # FP32 dot products, gain multiplication and slice accumulation precede
+        # the one BF16 output conversion. Absolute products cover cancellation.
+        rounds = 128 + slices + 2
+        unit = 2.0**-24
+        gamma = rounds * unit / (1 - rounds * unit)
+        arithmetic = gamma * magnitude
+        bound = uncertainty + arithmetic
+        bound += 2.0**-8 * (reference.abs() + bound)
+    else:
+        rounds = 2 * slices
+        unit = 2.0**-8
+        gamma = rounds * unit / (1 - rounds * unit)
+        bound = uncertainty * (1 + gamma) + gamma * magnitude
+    return bound + torch.finfo(torch.float32).eps
+
+
+def _assert_reference(
+    output, reference, magnitude, intermediate, uncertainty=0, *, raw_routes=False
+):
+    bound = _reference_bound(
+        reference, magnitude, intermediate, uncertainty, raw_routes=raw_routes
     )
     error = (output.float() - reference).abs()
     assert torch.all(error <= bound), (error.max().item(), bound.max().item())
@@ -149,10 +173,11 @@ def _assert_reference(output, reference, magnitude, intermediate, uncertainty=0)
         (8, 256, 512, 3, False, False, True, "routes", None),
         (8, 256, 512, 17, False, False, True, "token", None),
         (8, 256, 512, 17, False, None, True, "token", None),
-        (8, 256, 512, 17, True, True, True, "routes", 16),
-        (8, 256, 512, 17, True, True, True, "routes", 32),
-        (8, 256, 512, 17, True, True, True, "routes", 64),
-        (8, 256, 512, 17, True, True, True, "routes", 128),
+        *[
+            (8, 256, 512, tokens, True, True, True, "routes", tile)
+            for tokens in (1, 4, 17, 152)
+            for tile in (16, 32, 64, 128)
+        ],
     ],
 )
 def test_expert_routes_reference_and_graph_replay(
@@ -244,7 +269,13 @@ def test_expert_routes_reference_and_graph_replay(
             intermediate_scale=torch.ones(experts, device="cuda"),
         ),
     )
-    ids = torch.randint(0, experts, (tokens, topk), device="cuda", dtype=torch.int32)
+    ids = torch.randint(
+        0,
+        experts,
+        (tokens, topk),
+        device="cuda",
+        dtype=torch.int32 if fast_math else torch.int64,
+    )
     ids[-1, -1] = -1
     weights = torch.rand(tokens, topk, device="cuda")
     output_shape = (tokens, topk, hidden) if layout == "routes" else (tokens, hidden)
@@ -309,17 +340,26 @@ def test_expert_routes_reference_and_graph_replay(
                 ids.copy_(
                     torch.randint(0, experts, ids.shape, device="cuda", dtype=ids.dtype)
                 )
-                ids[-1, -1] = -1
+                ids[-1, -1] = -1 if ids.dtype == torch.int32 else 2**40
                 if tokens > 1:
                     ids[-1] = -1
                     ids[0, -1] = experts
                 weights.uniform_(0.01, 3)
+                if layout == "routes":
+                    weights[0, 0] = 0
                 for storage in scratch:
                     storage.view(torch.uint8).fill_(0xA5)
                 output.fill_(float("nan"))
                 graph.replay()
                 reference, magnitude, uncertainty = _reference(
-                    x, ids, w13, w2, gains, gain2, gate_first=gate_first
+                    x,
+                    ids,
+                    w13,
+                    w2,
+                    gains,
+                    gain2,
+                    gate_first=gate_first,
+                    raw_routes=layout == "routes",
                 )
                 reduction_width = intermediate
                 if layout == "token":
@@ -328,7 +368,12 @@ def test_expert_routes_reference_and_graph_replay(
                     uncertainty = (uncertainty * weights.abs()[..., None]).sum(1)
                     reduction_width *= topk
                 _assert_reference(
-                    output, reference, magnitude, reduction_width, uncertainty
+                    output,
+                    reference,
+                    magnitude,
+                    reduction_width,
+                    uncertainty,
+                    raw_routes=layout == "routes",
                 )
                 if epoch == 0 and paired and experts == 256 and tokens == 1:
                     for incorrect_gains in (
@@ -343,6 +388,7 @@ def test_expert_routes_reference_and_graph_replay(
                             incorrect_gains,
                             gain2,
                             gate_first=gate_first,
+                            raw_routes=layout == "routes",
                         )
                         with pytest.raises(AssertionError):
                             _assert_reference(
@@ -351,14 +397,15 @@ def test_expert_routes_reference_and_graph_replay(
                                 wrong_magnitude,
                                 intermediate,
                                 wrong_uncertainty,
+                                raw_routes=layout == "routes",
                             )
                 if intermediate == 4096:
-                    rounds = 2 * math.ceil(intermediate / 128)
-                    gamma = rounds * 2**-8 / (1 - rounds * 2**-8)
-                    bound = (
-                        uncertainty * (1 + gamma)
-                        + gamma * magnitude
-                        + torch.finfo(torch.float32).eps
+                    bound = _reference_bound(
+                        reference,
+                        magnitude,
+                        intermediate,
+                        uncertainty,
+                        raw_routes=layout == "routes",
                     )
                     for part in range(intermediate // 128):
                         assert torch.any(
@@ -373,6 +420,75 @@ def test_expert_routes_reference_and_graph_replay(
                 first = output.clone()
                 graph.replay()
                 second = output.clone()
-                # Independent replay orders may vary only within BF16 accumulation error.
-                _assert_reference(second, first.float(), magnitude, reduction_width)
+                if layout == "routes":
+                    assert torch.equal(first, second)
+                else:
+                    _assert_reference(second, first.float(), magnitude, reduction_width)
+            if layout == "routes" and tile_m is not None and tokens == 152:
+                for live_rows in (1, 4, tokens):
+                    short = moe.bind(
+                        declaration,
+                        scratch=scratch,
+                        a=x[:live_rows],
+                        topk_ids=ids[:live_rows],
+                        topk_weights=weights[:live_rows],
+                        output=output[:live_rows],
+                    )
+                    short_graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(short_graph):
+                        short.run()
+                    x.neg_()
+                    for storage in scratch:
+                        storage.view(torch.uint8).fill_(0xFF)
+                    output.fill_(float("nan"))
+                    short_graph.replay()
+                    ref, mag, unc = _reference(
+                        x[:live_rows],
+                        ids[:live_rows],
+                        w13,
+                        w2,
+                        gains,
+                        gain2,
+                        gate_first=gate_first,
+                        raw_routes=True,
+                    )
+                    _assert_reference(
+                        output[:live_rows], ref, mag, intermediate, unc, raw_routes=True
+                    )
+                    assert torch.isnan(output[live_rows:]).all()
+                    saved = output[:live_rows].clone()
+                    short_graph.replay()
+                    assert torch.equal(saved, output[:live_rows])
+                    short_graph.reset()
         del graph
+
+
+def test_raw_route_sum_large_flattened_domain():
+    """Invalid routes still overwrite BF16 outputs beyond the signed int32 boundary."""
+    require_b12x()
+    from b12x.moe.fused_moe._impl import _raw_route_sum_op
+
+    routes, hidden = (1 << 19) + 1, 4096
+    elements = routes * hidden
+    required = elements * 6 + routes * 4
+    free, _ = torch.cuda.mem_get_info()
+    if free < required + (2 << 30):
+        pytest.skip("requires 12 GiB of reducer storage plus 2 GiB device headroom")
+    parts = torch.empty((routes, hidden), dtype=torch.float32, device="cuda")
+    output = torch.full(
+        (routes, hidden), float("nan"), dtype=torch.bfloat16, device="cuda"
+    )
+    ids = torch.full((routes,), -1, dtype=torch.int32, device="cuda")
+    _raw_route_sum_op(parts, ids, output, routes, 1, 1)
+    torch.cuda.synchronize()
+    assert torch.count_nonzero(output).item() == 0
+    output.fill_(float("nan"))
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _raw_route_sum_op(parts, ids, output, routes, 1, 1)
+    before = torch.cuda.memory_allocated()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.cuda.memory_allocated() == before
+    assert torch.count_nonzero(output).item() == 0
+    graph.reset()

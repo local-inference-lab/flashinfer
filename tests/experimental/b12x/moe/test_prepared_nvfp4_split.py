@@ -50,7 +50,7 @@ def _check(output, reference):
     assert metrics.max_abs <= _bf16_output_bound(reference), metrics
 
 
-def _dynamic_down_reference(domain, source, ids, probabilities):
+def _dynamic_down_reference(domain, source, ids, probabilities, *, raw_routes=False):
     """Torch oracle with one routed row tile per expert and N128 scale tiles."""
     output = torch.zeros_like(source, dtype=torch.float32)
     for expert in range(domain["E"]):
@@ -66,14 +66,20 @@ def _dynamic_down_reference(domain, source, ids, probabilities):
             scale = max(6.0 * 448.0 / amax if amax else 0.0, 1e-12)
             _, quantized, _ = _quantize_nvfp4_rows(tile, scale)
             weight = domain["w2_dequant"][expert, :, start : start + 128]
-            contribution = ((quantized / scale) @ weight.T).bfloat16().float()
-            output[rows] += contribution * probabilities[rows]
+            contribution = (quantized / scale) @ weight.T
+            if raw_routes:
+                output[rows] += contribution
+            else:
+                output[rows] += contribution.bfloat16().float() * probabilities[rows]
     return output
 
 
 @pytest.mark.parametrize("intermediate_size", [128, 160])
 @pytest.mark.parametrize("tile_m", [16, 128])
-def test_prepared_dynamic_down_scale_live_graph(monkeypatch, intermediate_size, tile_m):
+@pytest.mark.parametrize("raw_routes", [False, True])
+def test_prepared_dynamic_down_scale_live_graph(
+    monkeypatch, intermediate_size, tile_m, raw_routes
+):
     """Both FC1 layouts use live tile maxima with per-expert down scales."""
     from b12x.moe.fused_moe import _impl
 
@@ -102,7 +108,11 @@ def test_prepared_dynamic_down_scale_live_graph(monkeypatch, intermediate_size, 
     )
     plan = moe.plan_execution(
         experts=experts,
-        capacity=moe.ExecutionCapacity(max_tokens=capacity, top_k=1),
+        capacity=moe.ExecutionCapacity(
+            max_tokens=capacity,
+            top_k=1,
+            output_layout="routes" if raw_routes else "token",
+        ),
         invocation={"fast_math": False},
         override=config,
     )
@@ -112,7 +122,11 @@ def test_prepared_dynamic_down_scale_live_graph(monkeypatch, intermediate_size, 
             torch.empty(s.shape, dtype=s.dtype, device=device)
             for s in state.scratch.scratch_specs()
         )
-        output = torch.empty_like(source)
+        output = (
+            torch.empty((capacity, 1, domain["K"]), device=device, dtype=source.dtype)
+            if raw_routes
+            else torch.empty_like(source)
+        )
         binding = state.bind(
             a=source,
             topk_ids=ids,
@@ -135,7 +149,11 @@ def test_prepared_dynamic_down_scale_live_graph(monkeypatch, intermediate_size, 
             torch.empty(s.shape, dtype=s.dtype, device=device)
             for s in plan.scratch_specs()
         )
-        output = torch.empty_like(source)
+        output = (
+            torch.empty((capacity, 1, domain["K"]), device=device, dtype=source.dtype)
+            if raw_routes
+            else torch.empty_like(source)
+        )
         session.freeze()
         for rows in (1, capacity):
             binding = moe.bind(
@@ -152,7 +170,11 @@ def test_prepared_dynamic_down_scale_live_graph(monkeypatch, intermediate_size, 
                 moe.run(binding=binding)
             source.mul_(-2)
             reference = _dynamic_down_reference(
-                domain, source[:rows], ids[:rows], probabilities[:rows]
+                domain,
+                source[:rows],
+                ids[:rows],
+                probabilities[:rows],
+                raw_routes=raw_routes,
             )
             output.fill_(float("nan"))
             addresses = tuple(t.data_ptr() for t in (*scratch, output))
@@ -163,7 +185,7 @@ def test_prepared_dynamic_down_scale_live_graph(monkeypatch, intermediate_size, 
                 torch.cuda.memory_stats(device)["allocation.all.allocated"] == allocated
             )
             assert tuple(t.data_ptr() for t in (*scratch, output)) == addresses
-            _check(output[:rows], reference)
+            _check(output[:rows].view_as(reference), reference)
             assert torch.isnan(output[rows:]).all()
             graph.reset()
 

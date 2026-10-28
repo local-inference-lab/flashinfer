@@ -1101,6 +1101,14 @@ def _program_carriers(
                 materialized_fc1_cta_budget=dynamic["materialized_fc1_cta_budget"],
             )
             launches.append(launch)
+        if caps.output_layout == "routes":
+            from b12x.moe._shared.kernels.raw_route_sum import compile_raw_route_sum
+
+            slices = (plan.n + plan.execution.tile_n - 1) // plan.execution.tile_n
+            launches.extend(
+                compile_raw_route_sum(plan.device.index, plan.k, slices, dtype)
+                for dtype in (torch.int32, torch.int64)
+            )
         if plan.deterministic_output:
             from b12x.moe._shared.kernels.w4a16.kernel.sum_launch import (
                 compile_w4a16_topk_sum,
