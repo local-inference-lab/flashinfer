@@ -141,6 +141,8 @@ class MoEDynamicKernelBackend:
         dynamic_down_scale: bool = False,
         share_input_across_experts: bool = False,
         deterministic_output: bool = False,
+        raw_routes: bool = False,
+        split_fc1_scales: bool = False,
         num_topk: int = 1,
         swap_ab: bool = False,
         separate_w13_halves: bool = False,
@@ -604,6 +606,8 @@ class MoEDynamicKernelBackend:
             )
         self.dynamic_down_scale = dynamic_down_scale
         self.share_input_across_experts = share_input_across_experts
+        self.raw_routes = bool(raw_routes)
+        self.split_fc1_scales = bool(split_fc1_scales)
         self.deterministic_output = bool(deterministic_output)
         # swap_ab runs the gated FC1 with the intermediate (logical N) on the
         # MMA M-role (mirrors dense.py), so a sub-64 tile_n that divides a
@@ -2968,7 +2972,9 @@ class MoEDynamicKernelBackend:
                 m1_slot_expert_id = local_expert_id(topk_ids[flat_tid], num_experts)
                 if m1_slot_expert_id >= Int32(0) and m1_slot_expert_id < num_experts:
                     m1_physical_row = flat_tid * Int32(self.tile_shape_mnk[0])
-                    token_map[m1_physical_row] = Int32(0)
+                    token_map[m1_physical_row] = (
+                        flat_tid if cutlass.const_expr(self.raw_routes) else Int32(0)
+                    )
                     token_weights[m1_physical_row] = topk_weights[flat_tid].to(
                         cutlass.Float32
                     )
@@ -3140,7 +3146,9 @@ class MoEDynamicKernelBackend:
                                         self.tile_shape_mnk[0]
                                     ) + row % Int32(self.tile_shape_mnk[0])
                                     map_value = token_idx
-                                    if cutlass.const_expr(self.deterministic_output):
+                                    if cutlass.const_expr(
+                                        self.deterministic_output or self.raw_routes
+                                    ):
                                         map_value = pair_idx
                                     st_global_i32(
                                         get_ptr_as_int64(token_map, phys_row), map_value
@@ -3604,7 +3612,9 @@ class MoEDynamicKernelBackend:
                                     self.tile_shape_mnk[0]
                                 ) + row % Int32(self.tile_shape_mnk[0])
                                 map_value = token_idx
-                                if cutlass.const_expr(self.deterministic_output):
+                                if cutlass.const_expr(
+                                    self.deterministic_output or self.raw_routes
+                                ):
                                     map_value = pair_idx
                                 st_global_i32(
                                     get_ptr_as_int64(token_map, phys_row), map_value
@@ -4757,7 +4767,10 @@ class MoEDynamicKernelBackend:
                     if cache_row < task_valid_rows_cache:
                         global_row_cache = tile_m_base_cache + cache_row
                         tok = token_map[global_row_cache].to(Int32)
-                        wv = token_weights[global_row_cache].to(cutlass.Float32)
+                        if cutlass.const_expr(self.raw_routes):
+                            wv = cutlass.Float32(1.0)
+                        else:
+                            wv = token_weights[global_row_cache].to(cutlass.Float32)
                     _st_shared_i32(scatter_tok_base_addr + cache_row * Int32(4), tok)
                     st_shared_f32(scatter_weight_base_addr + cache_row * Int32(4), wv)
                     cache_row += Int32(self.threads_per_cta)
@@ -4777,7 +4790,16 @@ class MoEDynamicKernelBackend:
                 task_slice_count_val = work_item[_WORK_SLICE_COUNT]
                 task_valid_rows_val = work_item[_WORK_VALID_ROWS]
 
-                alpha_value = alpha[task_expert_idx].to(cutlass.Float32)
+                if cutlass.const_expr(self.split_fc1_scales):
+                    up_alpha_value = alpha[task_expert_idx * Int32(2)].to(
+                        cutlass.Float32
+                    )
+                    alpha_value = alpha[task_expert_idx * Int32(2) + Int32(1)].to(
+                        cutlass.Float32
+                    )
+                else:
+                    alpha_value = alpha[task_expert_idx].to(cutlass.Float32)
+                    up_alpha_value = alpha_value
                 if cutlass.const_expr(self.is_w4a8):
                     # w4a8 activations are self-ranging: the calibrated input
                     # global scale is NOT applied at quantize time, so fold it
@@ -4786,6 +4808,7 @@ class MoEDynamicKernelBackend:
                     alpha_value = alpha_value * input_global_scale[task_expert_idx].to(
                         cutlass.Float32
                     )
+                    up_alpha_value = alpha_value
                 valid_rows = task_valid_rows_val
 
                 # In-loop SFA partition for sub-128 tiles. FC1 reads the
@@ -5193,7 +5216,7 @@ class MoEDynamicKernelBackend:
                                     _ir = _c[0]
                                     _tk = _c[1]
                                     _g = alpha_value * _g_mn[_am, _an]
-                                    _u = alpha_value * _u_mn[_am, _an]
+                                    _u = up_alpha_value * _u_mn[_am, _an]
                                     _int_col = _s * self._fc1_int_tile + _ir
                                     _val = self._gated_activation_value(_g, _u).to(
                                         cutlass.BFloat16
@@ -5888,7 +5911,7 @@ class MoEDynamicKernelBackend:
                                                 cute.size(tRS_rD_slice)
                                             ):
                                                 g = alpha_value * gate_slice[elem_idx]
-                                                u = alpha_value * up_slice[elem_idx]
+                                                u = up_alpha_value * up_slice[elem_idx]
                                                 tRS_rD_slice[elem_idx] = (
                                                     self._gated_activation_value(g, u)
                                                 )
@@ -5992,7 +6015,7 @@ class MoEDynamicKernelBackend:
                                                 cute.size(tRS_rD_slice)
                                             ):
                                                 tRS_rD_slice[elem_idx] = (
-                                                    alpha_value * up_slice[elem_idx]
+                                                    up_alpha_value * up_slice[elem_idx]
                                                 )
                                     acc_vec = tRS_rD.load()
                                     acc_vec = acc_vec.to(cutlass.BFloat16)
@@ -6139,7 +6162,7 @@ class MoEDynamicKernelBackend:
                                                 cute.size(tRS_rD_slice)
                                             ):
                                                 tRS_rD_slice[elem_idx] = (
-                                                    alpha_value * up_slice[elem_idx]
+                                                    up_alpha_value * up_slice[elem_idx]
                                                 )
                                     acc_vec = tRS_rD.load()
                                     acc_vec = acc_vec.to(cutlass.BFloat16)
@@ -7027,7 +7050,7 @@ class MoEDynamicKernelBackend:
                                                 cute.size(tRS_rD_slice)
                                             ):
                                                 g = alpha_value * gate_slice[elem_idx]
-                                                u = alpha_value * up_slice[elem_idx]
+                                                u = up_alpha_value * up_slice[elem_idx]
                                                 tRS_rD_slice[elem_idx] = (
                                                     self._gated_activation_value(g, u)
                                                 )

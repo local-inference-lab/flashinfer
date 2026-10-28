@@ -238,6 +238,8 @@ def _query(
         apply_router_weight_on_input=bool(routing.apply_router_weight_on_input),
         collect_activation_amax=bool(routing.collect_activation_amax),
         deterministic_output=deterministic_output,
+        output_layout=capacity.output_layout,
+        split_fc1_scales=experts._impl.w1_alphas.ndim == 2,
         swiglu_limit=_codec_scalar(experts.plan.activation.swiglu_limit),
         swiglu_clamp_after_silu=experts.plan.activation.swiglu_clamp_after_silu,
         swiglu_alpha=_codec_scalar(experts.plan.activation.swiglu_alpha),
@@ -355,6 +357,8 @@ def _lower_caps(
         apply_router_weight_on_input=query.apply_router_weight_on_input,
         collect_activation_amax=query.collect_activation_amax,
         deterministic_output=query.deterministic_output,
+        output_layout=query.output_layout,
+        split_fc1_scales=query.split_fc1_scales,
         swiglu_limit=_decode_scalar(query.swiglu_limit),
         swiglu_clamp_after_silu=query.swiglu_clamp_after_silu,
         swiglu_alpha=_decode_scalar(query.swiglu_alpha),
@@ -870,6 +874,7 @@ def _dynamic_program_arguments(plan, caps) -> dict[str, object]:
             default=dense or decode,
         )
     return {
+        "raw_routes": caps.output_layout == "routes",
         "n": n,
         "w4a8_repacked": prepared_w4a8,
         "w4a8_n64_repacked": n64_repacked,
@@ -1083,6 +1088,8 @@ def _program_carriers(
                 external_route_plan=dynamic["external_route_plan"],
                 share_input_across_experts=dynamic["share_input_across_experts"],
                 deterministic_output=plan.deterministic_output,
+                raw_routes=dynamic["raw_routes"],
+                split_fc1_scales=caps.split_fc1_scales,
                 swiglu_limit=plan.swiglu_limit,
                 swiglu_clamp_after_silu=plan.swiglu_clamp_after_silu,
                 swiglu_alpha=plan.swiglu_alpha,
@@ -1277,7 +1284,9 @@ class _FusedMoeState:
         if self.w4a16_launches is not None:
             kwargs["_w4a16_launches"] = self.w4a16_launches
         return replace(
-            self.scratch.bind(**kwargs), compact_launches=self.compact_launches
+            self.scratch.bind(**kwargs),
+            compact_launches=self.compact_launches,
+            output_layout=self.scratch.caps.output_layout,
         )
 
     def run(self, binding):
