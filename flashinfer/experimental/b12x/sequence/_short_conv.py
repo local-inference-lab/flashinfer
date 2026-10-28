@@ -449,6 +449,15 @@ def _short_conv_kernel(
 
 
 @triton.jit
+def _index(value, WIDE_INDEX: tl.constexpr):
+    """Address-arithmetic operand at the width the prepared query allows."""
+    if WIDE_INDEX:
+        return value.to(tl.int64)
+    else:
+        return value.to(tl.int32)
+
+
+@triton.jit
 def _short_conv_tiled_kernel(
     input_ptr,
     gathered_state_ptr,
@@ -468,14 +477,21 @@ def _short_conv_tiled_kernel(
     MAX_TOKENS: tl.constexpr,
     conv_bias_ptr=None,
     ROUND_CONV: tl.constexpr = True,
+    WIDE_INDEX: tl.constexpr = True,
 ):
-    """``_short_conv_kernel`` over a tile of tokens, with identical arithmetic."""
+    """``_short_conv_kernel`` over a tile of tokens, with identical arithmetic.
+
+    ``WIDE_INDEX`` selects Int64 or Int32 address arithmetic. The prepared query
+    chooses Int32 only when every offset, including the rows and channels of
+    partial tiles, stays below 2**31; the element arithmetic is unchanged.
+    """
     tokens = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)
     channels = tl.max_contiguous(
         tl.multiple_of(tl.program_id(1) * BLOCK_C + tl.arange(0, BLOCK_C), BLOCK_C),
         BLOCK_C,
     )
     channel_mask = channels < CHANNELS
+    channel_index = _index(channels, WIDE_INDEX)
     num_tokens = tl.load(num_tokens_ptr).to(tl.int32)
     token_live = tokens < num_tokens
     request = tl.load(request_ids_ptr + tokens, mask=token_live, other=-1).to(tl.int32)
@@ -499,16 +515,17 @@ def _short_conv_tiled_kernel(
             history_distance = (KERNEL_SIZE - 1 - tap) * DILATION
             source_relative = query_relative - history_distance
             from_query = source_relative >= 0
-            query_rows = (query_start + source_relative).to(tl.int64) * INPUT_ROW_STRIDE
+            query_rows = (
+                _index(query_start + source_relative, WIDE_INDEX) * INPUT_ROW_STRIDE
+            )
             query_value = tl.load(
-                input_ptr + query_rows[:, None] + channels[None, :],
+                input_ptr + query_rows[:, None] + channel_index[None, :],
                 mask=(live & from_query)[:, None] & channel_mask[None, :],
                 other=0.0,
             ).to(tl.float32)
             history_position = STATE_LENGTH + source_relative
             history_offsets = (
-                request.to(tl.int64)[:, None] * CHANNELS
-                + channels.to(tl.int64)[None, :]
+                _index(request, WIDE_INDEX)[:, None] * CHANNELS + channel_index[None, :]
             ) * STATE_LENGTH + history_position[:, None]
             history_value = tl.load(
                 gathered_state_ptr + history_offsets,
@@ -523,7 +540,7 @@ def _short_conv_tiled_kernel(
             ).to(tl.float32)
             source = tl.where(from_query[:, None], query_value, history_value)
             weight = tl.load(
-                conv_weight_ptr + channels.to(tl.int64) * KERNEL_SIZE + tap,
+                conv_weight_ptr + channel_index * KERNEL_SIZE + tap,
                 mask=channel_mask,
                 other=0.0,
             ).to(tl.float32)
@@ -531,14 +548,16 @@ def _short_conv_tiled_kernel(
     else:
         for tap in tl.static_range(0, KERNEL_SIZE):
             source_relative = query_relative - (KERNEL_SIZE - 1 - tap) * DILATION
-            query_rows = (query_start + source_relative).to(tl.int64) * INPUT_ROW_STRIDE
+            query_rows = (
+                _index(query_start + source_relative, WIDE_INDEX) * INPUT_ROW_STRIDE
+            )
             query_value = tl.load(
-                input_ptr + query_rows[:, None] + channels[None, :],
+                input_ptr + query_rows[:, None] + channel_index[None, :],
                 mask=live[:, None] & channel_mask[None, :],
                 other=0.0,
             ).to(tl.float32)
             weight = tl.load(
-                conv_weight_ptr + channels.to(tl.int64) * KERNEL_SIZE + tap,
+                conv_weight_ptr + channel_index * KERNEL_SIZE + tap,
                 mask=channel_mask,
                 other=0.0,
             ).to(tl.float32)
@@ -552,9 +571,9 @@ def _short_conv_tiled_kernel(
         accumulator.to(tl.bfloat16).to(tl.float32) if ROUND_CONV else accumulator
     )
     activated = (conv_float * tl.sigmoid(conv_float)).to(tl.bfloat16)
-    output_rows = tokens.to(tl.int64) * CHANNELS
+    output_rows = _index(tokens, WIDE_INDEX) * CHANNELS
     tl.store(
-        out_ptr + output_rows[:, None] + channels[None, :],
+        out_ptr + output_rows[:, None] + channel_index[None, :],
         tl.where(live[:, None], activated, 0.0),
         mask=(tokens < MAX_TOKENS)[:, None] & channel_mask[None, :],
     )

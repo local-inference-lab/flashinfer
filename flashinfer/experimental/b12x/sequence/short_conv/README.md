@@ -32,6 +32,18 @@ state slots. Inactive metadata may contain arbitrary values. Input, output,
 history, and scratch must not alias. Prepared plans, graph operands, and scratch
 must remain alive until replay has drained.
 
+Prefill and mixed plans with at least 256 token rows convolve tiles of tokens and
+channels. The token tile (8 to 64), the channel tile (64 to 256) and the warp
+count (4 or 8) are tactics that the preparation race selects per query, among
+the tiles whose live FP32 values (accumulator plus one tile per tap) fit the
+thread register budget. Every tile applies the same operations to each element
+in the same order, so all tiles produce bitwise identical outputs and history.
+Offsets use Int32 arithmetic when the query proves that every offset, including
+the partial tiles past the token and channel capacities, stays below 2**31;
+otherwise they use Int64. The 32 x 128 tile of four warps with Int64 addressing
+is the default and always a candidate, so a race can keep it on any device.
+Decode plans and plans below 256 token rows keep one fixed geometry.
+
 This example captures a four-token GDN prefill with caller-owned history:
 
 ```python

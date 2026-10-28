@@ -13,9 +13,21 @@ from b12x._lib.scratch_layout import (
     align_up,
     materialize_scratch_view,
 )
-from b12x.preparation import FrozenMapping, MemoryRequirements, Plan
+from b12x.preparation import (
+    CandidateResourceIneligibleError,
+    FrozenMapping,
+    MemoryRequirements,
+    Plan,
+)
+from triton.runtime.errors import OutOfResources
 
-from ._tuning import OPERANDS, TUNING, ShortConvQuery
+from ._tuning import (
+    OPERANDS,
+    TUNING,
+    ShortConvConfig,
+    ShortConvQuery,
+    program_payload,
+)
 
 _SCRATCH = frozenset(("gathered_state", "request_ids"))
 _BOOL = frozenset(("state_is_fresh", "request_is_prefill"))
@@ -103,16 +115,13 @@ def _speculative_args(q):
     )
 
 
-def _token_block(q) -> int:
-    """Tokens per convolution program: tiles amortize row loads in prefill."""
-    return 32 if q.max_tokens >= 256 else 1
-
-
 @program_cache(scope="preparation")
-def compile_pipeline(payload, ordinal):
+def compile_pipeline(payload, config_payload, ordinal):
     from .. import _short_conv as kernels
 
     q = ShortConvQuery(**dict(payload))
+    config = ShortConvConfig.from_config(FrozenMapping(config_payload))
+    TUNING.validate_config(q, config, None)
     p = {
         name: None
         if name == "conv_bias" and q.bias_dtype is None
@@ -133,7 +142,8 @@ def compile_pipeline(payload, ordinal):
         for name, alignment in zip(OPERANDS, q.input_alignments)
     }
     channel_grid = triton.cdiv(q.channels, 128)
-    token_tiles = triton.cdiv(q.max_tokens, _token_block(q))
+    token_tiles = triton.cdiv(q.max_tokens, config.block_t)
+    conv_channel_grid = triton.cdiv(q.channels, config.block_c)
     with torch.cuda.device(ordinal):
         if q.mode == "decode" and q.max_speculative_tokens > 0:
             return (
@@ -224,16 +234,17 @@ def compile_pipeline(payload, ordinal):
                 q.state_length,
                 q.kernel_size,
                 q.dilation,
-                128,
+                config.block_c,
                 q.input_row_stride,
-                _token_block(q),
+                config.block_t,
                 q.max_tokens,
                 conv_bias_ptr=p["conv_bias"],
                 ROUND_CONV=q.round_before_silu,
-                num_warps=4,
-                grid=(token_tiles, channel_grid),
+                WIDE_INDEX=config.wide_index,
+                num_warps=config.num_warps,
+                grid=(token_tiles, conv_channel_grid),
             )
-            if _token_block(q) > 1
+            if q.tiled
             else kernels._short_conv_kernel.warmup(
                 p["x"],
                 p["gathered_state"],
@@ -287,6 +298,7 @@ def _scratch_layout(query, device):
 @dataclass(frozen=True)
 class PreparedShortConv:
     query: ShortConvQuery
+    config: ShortConvConfig
     device: torch.device
     programs: tuple
 
@@ -536,9 +548,13 @@ class PreparedShortConv:
                 gathered_state,
                 *_state_args(q),
             )
-            token_block = _token_block(q)
-            if token_block > 1:
-                p[2][(triton.cdiv(q.max_tokens, token_block), channels, 1)](
+            if q.tiled:
+                grid = (
+                    triton.cdiv(q.max_tokens, self.config.block_t),
+                    triton.cdiv(q.channels, self.config.block_c),
+                    1,
+                )
+                p[2][grid](
                     x,
                     gathered_state,
                     conv_weight,
@@ -551,12 +567,13 @@ class PreparedShortConv:
                     q.state_length,
                     q.kernel_size,
                     q.dilation,
-                    128,
+                    self.config.block_c,
                     q.input_row_stride,
-                    token_block,
+                    self.config.block_t,
                     q.max_tokens,
                     conv_bias,
                     q.round_before_silu,
+                    self.config.wide_index,
                 )
             else:
                 p[2][(q.max_tokens, channels, 1)](
@@ -621,7 +638,8 @@ def make_plan(caps, *, invocation=None, override=None):
         return (
             CompileJob.create(
                 "b12x.sequence.short_conv._preparation:compile_pipeline",
-                TUNING.encode_query(query),
+                program_payload(query),
+                config.to_dict(),
                 CompileJob.DEVICE_ORDINAL,
             ),
         )
@@ -631,10 +649,22 @@ def make_plan(caps, *, invocation=None, override=None):
         return MemoryRequirements(scratch=(spec,))
 
     def materialize(selection, detected):
+        programs = compile_pipeline(
+            program_payload(query), selection.config.to_dict(), detected.ordinal
+        )
+        if query.mode != "decode":
+            # Loading the convolution program here reports a tile the device
+            # cannot launch where the session rejects candidates.
+            with torch.cuda.device(detected.ordinal):
+                try:
+                    programs[2].run
+                except OutOfResources as error:
+                    raise CandidateResourceIneligibleError(str(error)) from error
         return PreparedShortConv(
             query,
+            selection.config,
             torch.device("cuda", detected.ordinal),
-            compile_pipeline(TUNING.encode_query(query), detected.ordinal),
+            programs,
         )
 
     return Plan(
