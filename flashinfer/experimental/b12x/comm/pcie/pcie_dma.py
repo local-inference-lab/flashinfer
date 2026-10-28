@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 import os
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from typing import Optional
 
 import torch
@@ -203,6 +203,7 @@ class PCIeDmaAllReduce:
         self._ipc = ipc
         self._kernels = _load_kernels(self._ipc)
         self._closed = False
+        self._capture_context_depth = 0
         self._eager_replays: dict[
             torch.dtype,
             tuple[tuple[torch.Tensor, torch.Tensor, torch.cuda.CUDAGraph], ...],
@@ -386,6 +387,29 @@ class PCIeDmaAllReduce:
         if out is None:
             out = torch.empty_like(inp)
         return state.run(inp, out=out)
+
+    @contextmanager
+    def capture(self, stream: torch.cuda.Stream | None = None):
+        """Retain the ordered DMA channel while recording a CUDA graph.
+
+        Persistent events join the auxiliary streams to the captured stream,
+        and device counters advance during replay. Recording needs no counter
+        reset or additional channel storage. Graphs sharing this owner must
+        replay serially and drain before the owner closes.
+        """
+        if self._closed:
+            raise RuntimeError("PCIe DMA channel is closed")
+        if self._capture_context_depth:
+            raise RuntimeError("overlapping PCIe DMA capture contexts are not allowed")
+        if stream is not None and stream.device != self.device:
+            raise ValueError(
+                "PCIe DMA capture stream must belong to the channel device"
+            )
+        self._capture_context_depth = 1
+        try:
+            yield self
+        finally:
+            self._capture_context_depth = 0
 
     def _run_prepared(
         self, inp: torch.Tensor, *, out: Optional[torch.Tensor], state
@@ -955,6 +979,8 @@ class PCIeDmaAllReduce:
     def close(self) -> None:
         if self._closed:
             return
+        if self._capture_context_depth:
+            raise RuntimeError("cannot close PCIe DMA channel during capture")
         self._closed = True
         # Drain the main and four auxiliary streams before any rank unmaps a
         # peer allocation.  Every importer must unmap before its owner frees
