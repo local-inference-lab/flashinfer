@@ -1060,6 +1060,39 @@ class MoeRouteQuery:
     ids_row_stride: int
     weights_row_stride: int
     has_valid_tokens: bool = False
+    autotune_effort: str = "default"
+
+
+@dataclass(frozen=True, kw_only=True)
+class MoeRouteConfig:
+    """Launch geometry of the native top-k routing program.
+
+    ``num_warps`` threads cooperate on one row and each program routes
+    ``rows_per_program`` consecutive rows. Neither value changes the selection,
+    tie-breaking or weight arithmetic.
+    """
+
+    backend: str
+    num_warps: int
+    rows_per_program: int
+
+    @classmethod
+    def from_config(cls, payload: FrozenMapping) -> "MoeRouteConfig":
+        expected = {"backend", "num_warps", "rows_per_program"}
+        if set(payload) != expected:
+            raise ValueError(f"route top-k config fields must be {expected}")
+        return cls(
+            backend=str(payload["backend"]),
+            num_warps=int(payload["num_warps"]),
+            rows_per_program=int(payload["rows_per_program"]),
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "backend": self.backend,
+            "num_warps": self.num_warps,
+            "rows_per_program": self.rows_per_program,
+        }
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -1074,6 +1107,7 @@ class MoeFC2Query:
 
 
 def _validate_route_query(query: MoeRouteQuery, _device) -> None:
+    AutotuneEffort(query.autotune_effort)
     if min(query.num_tokens, query.num_experts, query.top_k) <= 0:
         raise ValueError("native route preparation requires positive geometry")
     if query.num_experts > 1024 or query.top_k > query.num_experts:
@@ -1113,11 +1147,126 @@ def _validate_fc2_query(query: MoeFC2Query, _device) -> None:
         raise TypeError("FC2 route IDs must be int32 or int64")
 
 
-ROUTE_TUNING = make_fixed_contract(
-    component_id="moe.route_topk", query_type=MoeRouteQuery, backend="triton"
+ROUTE_WARP_CANDIDATES = (1, 2, 4, 8)
+ROUTE_ROW_CANDIDATES = (1, 2, 4)
+# Reductions over at most one warp of lanes take the same shuffle sequence for
+# every warp count.
+_ROUTE_WARP_INDEPENDENT_TOPK_BLOCK = 32
+
+
+def _route_block_e(query: MoeRouteQuery) -> int:
+    return 1 << (query.num_experts - 1).bit_length()
+
+
+def _route_default_warps(query: MoeRouteQuery) -> int:
+    return 4 if _route_block_e(query) <= 256 else 8
+
+
+def _route_warp_count_preserves_arithmetic(query: MoeRouteQuery, warps: int) -> bool:
+    """Whether a warp count other than the original reproduces its weights.
+
+    Selection and tie-breaking use exact maxima. Weights also sum floating-point
+    values: across all experts when softmax runs with a selection bias, and
+    across the selected slots otherwise. A different warp count reorders the
+    expert-wide sum, and reorders a slot sum wider than one warp's lanes.
+    """
+    if warps == _route_default_warps(query):
+        return True
+    expert_sum = query.score_func == "softmax" and (
+        query.has_correction_bias or query.has_image_correction_bias
+    )
+    topk_block = 1 << (query.top_k - 1).bit_length()
+    return (
+        not expert_sum
+        and topk_block <= _ROUTE_WARP_INDEPENDENT_TOPK_BLOCK
+        and 32 * warps <= _route_block_e(query)
+    )
+
+
+def _route_default_config(query: MoeRouteQuery, _device) -> MoeRouteConfig:
+    return MoeRouteConfig(
+        backend="triton",
+        num_warps=_route_default_warps(query),
+        rows_per_program=1,
+    )
+
+
+def _route_legal(query: MoeRouteQuery, config: MoeRouteConfig) -> bool:
+    """Whether a geometry is the original or preserves its arithmetic."""
+    return (
+        config.num_warps in ROUTE_WARP_CANDIDATES
+        and _route_warp_count_preserves_arithmetic(query, config.num_warps)
+        and config.rows_per_program in ROUTE_ROW_CANDIDATES
+        and config.rows_per_program <= query.num_tokens
+    ) or config == _route_default_config(query, None)
+
+
+def _validate_route_config(query: MoeRouteQuery, config, _device) -> None:
+    if not isinstance(config, MoeRouteConfig):
+        raise TypeError("config must be MoeRouteConfig")
+    if config.backend != "triton":
+        raise ValueError(f"unsupported moe.route_topk backend {config.backend!r}")
+    if not _route_legal(query, config):
+        raise ValueError(
+            "route top-k geometry must preserve the original arithmetic and "
+            f"fit the token capacity, got {config.to_dict()}"
+        )
+
+
+def _route_parameters(query: MoeRouteQuery, device) -> ParameterSpace:
+    def legal(assignment):
+        return _route_legal(
+            query,
+            MoeRouteConfig(
+                backend=assignment["backend"],
+                num_warps=assignment["num_warps"],
+                rows_per_program=assignment["rows_per_program"],
+            ),
+        )
+
+    return ParameterSpace.create(
+        ROUTE_TUNING_KNOBS,
+        predicates=(legal,),
+        # Several rows per program only overlap row latency when few warps share
+        # the SM's issue slots.
+        efficiency_predicates=(
+            lambda p: p["rows_per_program"] == 1 or p["num_warps"] <= 4,
+        ),
+        autotune_effort=query.autotune_effort,
+    )
+
+
+ROUTE_TUNING_KNOBS = (
+    Knob(name="backend", values=("triton",), binding=ParameterBinding.COMPILE),
+    Knob(
+        name="num_warps",
+        values=ROUTE_WARP_CANDIDATES,
+        binding=ParameterBinding.COMPILE,
+    ),
+    Knob(
+        name="rows_per_program",
+        values=ROUTE_ROW_CANDIDATES,
+        binding=ParameterBinding.COMPILE,
+    ),
 )
-ROUTE_TUNING = replace(
-    ROUTE_TUNING, query_schema_version=23, validate_query=_validate_route_query
+
+ROUTE_TUNING = TuningContract(
+    component_id="moe.route_topk",
+    query_schema_version=24,
+    config_schema_version=23,
+    query_fields=frozenset(MoeRouteQuery.__dataclass_fields__),
+    config_fields=frozenset(MoeRouteConfig.__dataclass_fields__),
+    encode_query=lambda query: {
+        name: getattr(query, name) for name in MoeRouteQuery.__dataclass_fields__
+    },
+    encode_config=MoeRouteConfig.to_dict,
+    decode_config=MoeRouteConfig.from_config,
+    validate_query=_validate_route_query,
+    validate_config=_validate_route_config,
+    default_config=_route_default_config,
+    candidate_contract_version=2,
+    knobs=ROUTE_TUNING_KNOBS,
+    parameters=_route_parameters,
 )
 
 FC2_TUNING = make_fixed_contract(
