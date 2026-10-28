@@ -26,12 +26,15 @@ def family_bucket(obligation):
     request = obligation.request
     contract = request.plan.contract
     callback = contract.collective_family_bucket
-    space = obligation.configuration.space
     if (
         request.collective is None
         or callback is None
         or request.finalist_policy is not None
-        or space is None
+    ):
+        return None
+    space = obligation.configuration.space
+    if (
+        space is None
         or space.autotune_effort is not AutotuneEffort.DEFAULT
         or obligation.configuration.pinned is not None
         or request.dependencies
