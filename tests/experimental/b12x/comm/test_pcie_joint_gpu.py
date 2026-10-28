@@ -25,7 +25,7 @@ def _reference(operands, rank, mode):
     if mode in ("full", "pull"):
         return reduce(rank, 0, elements)
     packs = elements // 8
-    bulk = mode in ("bulk_push", "bulk_pull")
+    bulk = mode in ("bulk_push", "bulk_pull", "serial_push")
     shard = -(-packs // world) if bulk else packs // world
     result = torch.empty(elements, dtype=operands.dtype)
     for owner in range(world):
@@ -43,6 +43,7 @@ def _operands(world, elements, step):
     ).to(torch.bfloat16)
     if step % 6 == 1:
         values.zero_()
+        values[::2].neg_()
     elif step % 6 == 2:
         values[1] = -values[0]
     elif step % 6 == 3:
@@ -52,6 +53,10 @@ def _operands(world, elements, step):
     elif step % 6 == 5:
         values[:, 0] = float("inf")
         values[0, 1] = float("nan")
+    # These exactly representable BF16 inputs distinguish sequential FP32
+    # addition from reassociation, including each shard owner's cyclic order.
+    for rank in range(world):
+        values[rank, 2::8] = (2**24, 1, -(2**24), 1)[rank] if rank < 4 else 0
     return values
 
 
@@ -96,22 +101,58 @@ def _assert_epoch_wrapped(state):
     assert tuple(words) == (0, 0), tuple(words)
 
 
-def _exercise(rank, world, family, alias):
+def _barrier_counters(state):
+    import torch
+
+    from b12x.comm.pcie._joint_profile import JOINT_MAX_BLOCKS, JOINT_MAX_RANKS
+
+    counters = (ctypes.c_uint32 * (JOINT_MAX_BLOCKS * JOINT_MAX_RANKS))()
+    stream = torch.cuda.current_stream()
+    state.runtime._ipc.cudaMemcpyAsync(
+        ctypes.addressof(counters),
+        state.workspace.shared.local_ptr,
+        ctypes.sizeof(counters),
+        stream.cuda_stream,
+    )
+    stream.synchronize()
+    return tuple(counters)
+
+
+def _assert_serial_push_progress(state, before, active, replays):
+    from b12x.comm.pcie._joint_profile import JOINT_MAX_RANKS
+
+    world, rank = state.query.world_size, state.query.rank
+    for index, (start, end) in enumerate(
+        zip(before, _barrier_counters(state), strict=True)
+    ):
+        block, peer = divmod(index, JOINT_MAX_RANKS)
+        expected = (
+            2 * replays if block < active and peer < world and peer != rank else 0
+        )
+        assert (end - start) & 0xFFFFFFFF == expected, (
+            block,
+            peer,
+            start,
+            end,
+            expected,
+        )
+
+
+def _exercise(rank, world, family, alias, restricted=False):
     import torch
     import torch.distributed as dist
 
     from b12x.comm.pcie import CollectiveConfig
+    from b12x.comm.pcie._joint_profile import joint_modes
     from b12x.comm.pcie._oneshot_preparation import _prepare_plain_call
     from b12x.comm.pcie.pcie_allreduce import PCIeAllReduce
     from b12x.preparation import CollectiveRequirement, PreparationSession
 
     device = torch.device("cuda", rank)
-    pack_counts = tuple(sorted({1, world - 1, world + 1, 257, 4099}))
-    modes = (
-        ("full", "payload_rsag", "pull")
-        if family == "joint_latency"
-        else ("payload_rsag", "bulk_push", "bulk_pull", "pull")
+    pack_counts = tuple(
+        sorted({1, world - 1, world + 1, 257, 4099, 8 * 640, 128 * 640, 4096 * 640})
     )
+    modes = ("serial_push",) if restricted else joint_modes(family, world)
     manager = PCIeAllReduce.from_exchange_group(
         joint=True,
         exchange_group=dist.group.WORLD,
@@ -138,7 +179,7 @@ def _exercise(rank, world, family, alias):
                     threads=256,
                     blocks=64,
                     submode=modes[0],
-                    active_blocks=16,
+                    active_blocks=1 if restricted else 16,
                 ),
             )
             name = f"{family}-{packs}-{alias}"
@@ -147,18 +188,26 @@ def _exercise(rank, world, family, alias):
                     plan.request(
                         name=name,
                         collective=CollectiveRequirement(name, tuple(range(world))),
-                        prepare_call=lambda state,
-                        source=source,
-                        out=out: _prepare_plain_call(state, inp=source, out=out),
+                        prepare_call=lambda state, source=source, out=out: (
+                            _prepare_plain_call(state, inp=source, out=out)
+                        ),
                     ),
                 ),
-                coordinator=lambda progress: progress.ready_collectives[0].key
-                if progress.ready_collectives
-                else None,
+                coordinator=lambda progress: (
+                    progress.ready_collectives[0].key
+                    if progress.ready_collectives
+                    else None
+                ),
             )
             graph = torch.cuda.CUDAGraph()
             dist.barrier()
-            with session.capture(), manager.capture(), torch.cuda.graph(graph):
+            with (
+                session.capture(),
+                manager.capture(),
+                torch.cuda.graph(
+                    graph, stream=torch.cuda.current_stream() if restricted else None
+                ),
+            ):
                 manager.all_reduce(source, out=out, plan=plan)
             graphs.append((graph, source, out, plan.prepared.state))
         session.freeze()
@@ -169,10 +218,14 @@ def _exercise(rank, world, family, alias):
             for step, active in enumerate((1, 4, 2, 8, 1, 64)):
                 sequence = modes if step % 2 == 0 else tuple(reversed(modes))
                 for mode in sequence:
-                    state.select_profile(mode, active)
+                    selected_active = 1 if mode == "serial_push" else active
+                    state.select_profile(mode, selected_active)
                     _poison_scratch(state, rollover=step == 2)
                     values = _operands(world, source.numel(), step)
                     expected = _reference(values, rank, mode)
+                    counters = (
+                        _barrier_counters(state) if mode == "serial_push" else None
+                    )
                     for replay in range(3):
                         source.copy_(values[rank])
                         if not alias:
@@ -198,6 +251,12 @@ def _exercise(rank, world, family, alias):
                         torch.testing.assert_close(
                             out.cpu(), expected, rtol=0, atol=0, equal_nan=True
                         )
+                        if mode == "serial_push":
+                            non_nan = ~torch.isnan(expected)
+                            assert torch.equal(
+                                out.cpu().view(torch.int16)[non_nan],
+                                expected.view(torch.int16)[non_nan],
+                            )
                         if not alias:
                             torch.testing.assert_close(
                                 source.cpu(),
@@ -208,6 +267,10 @@ def _exercise(rank, world, family, alias):
                             )
                     if step == 2:
                         _assert_epoch_wrapped(state)
+                    if mode == "serial_push":
+                        _assert_serial_push_progress(
+                            state, counters, selected_active, 3
+                        )
                     assert selector_address == state.selector.data_ptr()
                     assert state.profiles == profiles
     finally:
@@ -217,7 +280,7 @@ def _exercise(rank, world, family, alias):
         manager.close()
 
 
-def _worker(rank, world, directory, family, alias):
+def _worker(rank, world, directory, family, alias, restricted=False):
     import torch
     import torch.distributed as dist
 
@@ -233,6 +296,25 @@ def _worker(rank, world, directory, family, alias):
     try:
         if family == "provisioning":
             _exercise_provisioning(rank)
+        elif restricted:
+            from cuda.bindings import driver
+            from torch.cuda.green_contexts import GreenContext
+
+            context = GreenContext.create(num_sms=8, device_id=rank)
+            stream = context.Stream()
+            result, resource = driver.cuStreamGetDevResource(
+                stream.cuda_stream, driver.CUdevResourceType.CU_DEV_RESOURCE_TYPE_SM
+            )
+            assert result == driver.CUresult.CUDA_SUCCESS, result
+            properties = torch.cuda.get_device_properties(rank)
+            assert (
+                resource.sm.smCount
+                * (properties.max_threads_per_multi_processor // 256)
+                < 64
+            )
+            with torch.cuda.stream(stream):
+                _exercise(rank, world, family, alias, restricted=True)
+            stream.synchronize()
         else:
             _exercise(rank, world, family, alias)
     finally:
@@ -257,6 +339,20 @@ def test_joint_profile_graph_transitions(world, family, alias, tmp_path):
     mp.spawn(
         _worker, args=(world, str(tmp_path), family, alias), nprocs=world, join=True
     )
+
+
+@pytest.mark.skipif(
+    os.environ.get("B12X_RUN_JOINT_PCIE_TEST") != "1",
+    reason="requires an assigned peer-accessible GPU group",
+)
+@pytest.mark.parametrize("family", ("joint_latency", "joint_bandwidth"))
+def test_serial_push_graph_replay_with_restricted_sms(family, tmp_path):
+    import torch
+    import torch.multiprocessing as mp
+
+    if torch.cuda.device_count() < 4:
+        pytest.skip("insufficient assigned GPUs")
+    mp.spawn(_worker, args=(4, str(tmp_path), family, True, True), nprocs=4, join=True)
 
 
 def _exercise_provisioning(rank):
@@ -308,9 +404,11 @@ def _exercise_provisioning(rank):
                         ),
                     ),
                 ),
-                coordinator=lambda progress: progress.ready_collectives[0].key
-                if progress.ready_collectives
-                else None,
+                coordinator=lambda progress: (
+                    progress.ready_collectives[0].key
+                    if progress.ready_collectives
+                    else None
+                ),
             )
             state = plan.prepared.state
             state.run_plain(source, out)

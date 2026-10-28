@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 import torch
 
 from b12x.preparation import FinalistPolicy
-from ._joint_profile import JOINT_FAMILIES, JOINT_MODES, selected_profile
+from ._joint_profile import JOINT_FAMILIES, JOINT_MODES, joint_modes, selected_profile
 
 
 def joint_finalist_policy():
@@ -13,7 +13,7 @@ def joint_finalist_policy():
     return FinalistPolicy(
         family_fields=("implementation", "threads", "blocks", "submode"),
         per_family=1,
-        max_total=35,
+        max_total=5 * sum(len(modes) for modes in JOINT_FAMILIES.values()),
     )
 
 
@@ -47,9 +47,11 @@ def joint_startup_spec(plan):
         ):
             mode = assignment["submode"]
             active = assignment["active_blocks"]
-            selected_profile(family, call["blocks"], mode, active)
+            selected_profile(
+                family, call["blocks"], mode, active, world_size=state.query.world_size
+            )
             profiles[mode] = (JOINT_MODES[mode], active)
-    modes = JOINT_FAMILIES[family]
+    modes = joint_modes(family, state.query.world_size)
     if set(profiles) != set(modes):
         raise ValueError(
             "startup tuning requires measured finalists for every mode of the selected geometry"
@@ -322,6 +324,7 @@ def prepare_joint_startup_tuner(specs, *, cache_policy="cold"):
                 call["blocks"],
                 call["submode"],
                 call["active_blocks"],
+                world_size=spec.state.query.world_size,
             )
         )
     producer.status.fill_(-1)

@@ -108,13 +108,22 @@ compares explicit transports and the static dispatch policy with CUDA graphs.
 Explicit joint-only plans for staged BF16 reductions with payload-ready peer
 storage race two joint entrypoints. `joint_latency` supports `full`, `payload_rsag`, and
 `pull`; `joint_bandwidth` supports `payload_rsag`, `bulk_push`, `bulk_pull`, and
-`pull`. Ordinary plans retain standalone transport competition. Each entrypoint
+`pull`. With at least three ranks, both families also admit `serial_push`, which
+batches direct writes by destination in one active CTA. TP2 has only one remote
+destination and does not admit this additional candidate. Ordinary plans retain
+standalone transport competition. Each entrypoint
 uses one compiled program per thread count and maximum grid; its submode and
 active CTA count are device data and do not specialize compilation. The maximum
 grid is capped by the device SM count and 64 CTAs. The tuning
 record includes both values. For example,
 `CollectiveConfig(implementation="joint_latency", threads=256, blocks=64,
 submode="full", active_blocks=16)` pins a joint configuration.
+
+`serial_push` requires `active_blocks=1`; preparation rejects other counts. It
+uses the bulk reduce-scatter/all-gather storage and owner-cyclic FP32 sum, with
+one BF16 rounding. CTA barriers and system fences order successive destination
+batches. It never waits for another CTA on the same GPU. Remote rank barriers
+publish the scatter and gather phases; the captured physical grid remains fixed.
 
 Joint workspace requires `joint=True` on `PCIeAllReduce.from_exchange_group`,
 `from_process_group`, or the corresponding oneshot channel/pool factory. The
@@ -143,7 +152,8 @@ from the profile; callers choose the prepared profile explicitly.
 competition. `AllReduce.plan(..., joint_only=True)` limits an eligible staged BF16 collective
 plan to the joint families. Attach `joint_finalist_policy()` to its preparation
 request to retain the best measured active CTA count for every mode and compiled
-geometry. The preparation cache restores these finalists with the selected plan.
+geometry. The single-CTA mode still races every supported thread count. The
+preparation cache restores these finalists with the selected plan.
 `joint_startup_spec(plan)` then retains only the modes of the winning family,
 thread count, and physical grid; it rejects incomplete finalist sets.
 

@@ -121,9 +121,15 @@ class _JointExecutionState(_OneshotExecutionState):
         self._bound_input = None
         self.workspace = workspace
         call = query.call
-        self.profiles = profile_records(call["transport"], call["blocks"])
+        self.profiles = profile_records(
+            call["transport"], call["blocks"], world_size=query.world_size
+        )
         selected = selected_profile(
-            call["transport"], call["blocks"], call["submode"], call["active_blocks"]
+            call["transport"],
+            call["blocks"],
+            call["submode"],
+            call["active_blocks"],
+            world_size=query.world_size,
         )
         self.selector = torch.tensor(
             [selected], dtype=torch.uint32, device=runtime.device
@@ -151,7 +157,11 @@ class _JointExecutionState(_OneshotExecutionState):
             owner="joint PCIe profile validation",
             exchange_group=self.runtime.exchange_group,
             setup=lambda: selected_profile(
-                call["transport"], call["blocks"], submode, active_blocks
+                call["transport"],
+                call["blocks"],
+                submode,
+                active_blocks,
+                world_size=self.query.world_size,
             ),
         )
         torch.cuda.synchronize(self.runtime.device)
@@ -194,7 +204,11 @@ class _JointExecutionState(_OneshotExecutionState):
 def plan(query, *, runtime, override=None):
     call = query.call
     profile_index(
-        call["transport"], call["blocks"], call["submode"], call["active_blocks"]
+        call["transport"],
+        call["blocks"],
+        call["submode"],
+        call["active_blocks"],
+        world_size=query.world_size,
     )
     if call["dtype"] != "bfloat16" or not call["stage_input"]:
         raise ValueError("joint PCIe all-reduce requires staged BF16 input")

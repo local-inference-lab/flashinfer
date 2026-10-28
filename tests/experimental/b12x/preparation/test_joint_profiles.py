@@ -8,6 +8,7 @@ from b12x.comm.pcie._collective_tuning import CollectiveConfig, CollectiveQuery,
 from b12x.comm.pcie._joint_profile import (
     JOINT_FAMILIES,
     JOINT_MODES,
+    joint_modes,
     joint_slot_packs,
     profile_index,
     profile_records,
@@ -17,27 +18,31 @@ from b12x.preparation import FrozenMapping, autotune_effort
 
 
 @pytest.mark.parametrize("family", JOINT_FAMILIES)
-def test_profile_table_selects_every_admitted_mode_and_grid(family):
-    records = profile_records(family, 64)
-    assert len(records) == 64 * len(JOINT_FAMILIES[family])
-    for mode in JOINT_FAMILIES[family]:
-        for blocks in range(1, 65):
-            selected = selected_profile(family, 64, mode, blocks)
+@pytest.mark.parametrize("world", (2, 3, 4))
+def test_profile_table_selects_every_admitted_mode_and_grid(family, world):
+    modes = joint_modes(family, world)
+    records = profile_records(family, 64, world_size=world)
+    assert len(records) == 64 * (len(modes) - (world > 2)) + (world > 2)
+    for mode in modes:
+        for blocks in (1,) if mode == "serial_push" else range(1, 65):
+            selected = selected_profile(family, 64, mode, blocks, world_size=world)
             assert selected >> 16 == JOINT_MODES[mode]
             assert selected & 0xFFFF == blocks
-            assert records[profile_index(family, 64, mode, blocks)] == (
+            assert records[
+                profile_index(family, 64, mode, blocks, world_size=world)
+            ] == (
                 JOINT_MODES[mode],
                 blocks,
             )
     for count in (0, 65, True):
         with pytest.raises(ValueError):
-            profile_index(family, 64, JOINT_FAMILIES[family][0], count)
+            profile_index(family, 64, modes[0], count, world_size=world)
         with pytest.raises(ValueError):
-            selected_profile(family, 64, JOINT_FAMILIES[family][0], count)
+            selected_profile(family, 64, modes[0], count, world_size=world)
     with pytest.raises(ValueError):
-        profile_index(family, 64, "invalid", 1)
+        profile_index(family, 64, "invalid", 1, world_size=world)
     with pytest.raises(ValueError):
-        selected_profile(family, 64, "invalid", 1)
+        selected_profile(family, 64, "invalid", 1, world_size=world)
 
 
 @pytest.mark.parametrize("world", (2, 3, 4, 6, 8, 10))
@@ -52,7 +57,7 @@ def test_bulk_gather_cannot_overlap_incoming_scatter(world, capacity):
     assert end >= (world + 1) * capacity + 2 * capacity
 
 
-def _query(family, packs):
+def _query(family, packs, world=2):
     call = dict(
         threads=256,
         blocks=64,
@@ -71,13 +76,13 @@ def _query(family, packs):
     )
     return CollectiveQuery(
         operation="all_reduce",
-        world_size=2,
+        world_size=world,
         rank=0,
         alternatives=FrozenMapping(
             {
                 family: dict(
                     surface="OneshotAllReduce.all_reduce",
-                    world_size=2,
+                    world_size=world,
                     rank=0,
                     topology="pcie_ipc",
                     setup={},
@@ -90,13 +95,16 @@ def _query(family, packs):
 
 
 @pytest.mark.parametrize("family", JOINT_FAMILIES)
-def test_joint_tuning_keeps_modes_at_large_tp2_payloads(family):
-    query = _query(family, 1 << 24)
+@pytest.mark.parametrize("world", (2, 3, 4))
+def test_joint_tuning_keeps_admitted_modes_at_large_payloads(family, world):
+    query = _query(family, 1 << 24, world)
     with autotune_effort("default"):
         candidates = tuple(
             config for _, config in TUNING.iterate(TUNING.configure(query, device=None))
         )
-    assert {c.submode for c in candidates} == set(JOINT_FAMILIES[family])
+    assert {c.submode for c in candidates} == set(joint_modes(family, world))
+    assert any(c.submode == "serial_push" for c in candidates) == (world > 2)
+    assert all(c.active_blocks == 1 for c in candidates if c.submode == "serial_push")
     assert {c.threads for c in candidates} == {32, 64, 128, 256, 512}
     assert {c.blocks for c in candidates} == {64}
     assert {c.active_blocks for c in candidates} == {1, 2, 4, 8, 16, 32, 36, 64}
