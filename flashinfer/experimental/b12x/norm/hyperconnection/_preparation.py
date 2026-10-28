@@ -35,8 +35,12 @@ def compile_hyperconnection(query_payload, config_payload, ordinal):
 
 
 def _program_query_payload(query_payload):
+    # Neither the search effort nor the declared alignments change a compiled
+    # program; they only decide which candidates are offered.
     return {
-        key: value for key, value in query_payload.items() if key != "autotune_effort"
+        key: value
+        for key, value in query_payload.items()
+        if key not in ("autotune_effort", "left_alignment", "output_alignment")
     }
 
 
@@ -181,6 +185,7 @@ def _compile_hyperconnection(query_payload, config_payload, ordinal):
             query.gate_stride,
             query.swiglu_alpha,
             query.swiglu_beta,
+            config.pointwise_vector,
         )
         return native._compile(
             key,
@@ -195,6 +200,7 @@ def _compile_hyperconnection(query_payload, config_payload, ordinal):
                 query.gate_stride,
                 query.swiglu_alpha,
                 query.swiglu_beta,
+                config.pointwise_vector,
             ),
             3,
             device,
@@ -249,8 +255,21 @@ def _launcher(query, config, compiled):
         else:
             runtime = lambda tensors: (tensors[-1].numel(),)
         has_eps = role in ("grouped_rmsnorm", "engram_mix", "combine_norm")
+        vector_bytes = (
+            config.pointwise_vector * 2
+            if role == "swiglu" and config.pointwise_vector > 1
+            else 0
+        )
 
         def invoke(*tensors, eps=None):
+            if vector_bytes and (
+                tensors[0].data_ptr() % vector_bytes
+                or tensors[-1].data_ptr() % vector_bytes
+            ):
+                raise ValueError(
+                    f"vectorized SwiGLU requires {vector_bytes}-byte-aligned gate_up "
+                    "and output storage"
+                )
             args = [native._pointer(tensor) for tensor in tensors]
             if has_eps:
                 args.append(query.eps)
@@ -304,6 +323,8 @@ def plan_hyperconnection(caps, *, invocation=FrozenMapping(), override=None):
         "paired",
         "indexed_rows",
         "index_dtype",
+        "left_alignment",
+        "output_alignment",
     }
     if set(invocation) - fields or "operation" not in invocation:
         raise ValueError(

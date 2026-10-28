@@ -42,6 +42,9 @@ class HyperConnectionQuery:
     autotune_effort: str = "default"
     indexed_rows: int = 0
     index_dtype: str = "int64"
+    # Byte alignment of the SwiGLU gate/up input and of its output.
+    left_alignment: int = 16
+    output_alignment: int = 16
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -50,6 +53,7 @@ class HyperConnectionConfig:
     reduction_block_h: int
     pointwise_block: int
     reduction_num_warps: int
+    pointwise_vector: int = 1
 
     @classmethod
     def from_config(cls, payload: FrozenMapping) -> "HyperConnectionConfig":
@@ -58,6 +62,7 @@ class HyperConnectionConfig:
             "reduction_block_h",
             "pointwise_block",
             "reduction_num_warps",
+            "pointwise_vector",
         }
         if set(payload) != expected:
             raise ValueError(f"HyperConnection config fields must be {expected}")
@@ -66,6 +71,7 @@ class HyperConnectionConfig:
             reduction_block_h=int(payload["reduction_block_h"]),
             pointwise_block=int(payload["pointwise_block"]),
             reduction_num_warps=int(payload["reduction_num_warps"]),
+            pointwise_vector=int(payload["pointwise_vector"]),
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -74,6 +80,7 @@ class HyperConnectionConfig:
             "reduction_block_h": self.reduction_block_h,
             "pointwise_block": self.pointwise_block,
             "reduction_num_warps": self.reduction_num_warps,
+            "pointwise_vector": self.pointwise_vector,
         }
 
 
@@ -83,6 +90,28 @@ def _encode(query: HyperConnectionQuery) -> dict[str, object]:
         for name in query.__dataclass_fields__
         for value in (getattr(query, name),)
     }
+
+
+POINTWISE_VECTOR_ELEMENTS = 8
+POINTWISE_VECTOR_BYTES = 2 * POINTWISE_VECTOR_ELEMENTS
+
+
+def supports_vector_swiglu(query: HyperConnectionQuery) -> bool:
+    """Whether eight-element BF16 vector SwiGLU is offered for this invocation.
+
+    Rows of the gate and up halves start on 16-byte boundaries exactly when the
+    width is a multiple of eight BF16 elements and the input and output storage
+    are themselves 16-byte aligned, as the query declares. The scalar kernel
+    stays in every candidate set and is the default, so a race can always keep
+    it.
+    """
+    return (
+        query.operation == "swiglu"
+        and query.hidden_size % POINTWISE_VECTOR_ELEMENTS == 0
+        and query.left_alignment % POINTWISE_VECTOR_BYTES == 0
+        and query.output_alignment % POINTWISE_VECTOR_BYTES == 0
+        and query.left_dtype == query.right_dtype == query.output_dtype == "bfloat16"
+    )
 
 
 def _default_config(
@@ -100,6 +129,7 @@ def _default_config(
         if query.operation == "combine_norm"
         or (_uses_triton_reduction(query) and reduction_block_h >= 2048)
         else 4,
+        pointwise_vector=1,
     )
 
 
@@ -125,6 +155,11 @@ def _validate(
     )
     if config.reduction_num_warps not in legal_warps:
         raise ValueError(f"reduction_num_warps must be one of {legal_warps}")
+    legal_vectors = (
+        (1, POINTWISE_VECTOR_ELEMENTS) if supports_vector_swiglu(query) else (1,)
+    )
+    if config.pointwise_vector not in legal_vectors:
+        raise ValueError(f"pointwise_vector must be one of {legal_vectors}")
 
 
 def _validate_query(query, device):
@@ -155,6 +190,11 @@ def _validate_query(query, device):
         )
     ):
         raise ValueError("HyperConnection dimensions must be positive integers")
+    if any(
+        type(value) is not int or value not in (1, 2, 4, 8, 16)
+        for value in (query.left_alignment, query.output_alignment)
+    ):
+        raise ValueError("HyperConnection operand alignments must be 1, 2, 4, 8 or 16")
     if query.output_mode not in ("provided", "functional"):
         raise ValueError("unknown HyperConnection output form")
     expected_mode = (
@@ -298,6 +338,9 @@ def _tuning_parameters(query, device):
         else (1, 2, 4, 8)
         if triton_reduction
         else (4,),
+        "pointwise_vector": (1, POINTWISE_VECTOR_ELEMENTS)
+        if supports_vector_swiglu(query)
+        else (1,),
     }
     return ParameterSpace.create(
         TUNING.knobs,
@@ -326,13 +369,14 @@ def _materialize_tuning(
         reduction_block_h=choice["reduction_block_h"],
         pointwise_block=choice["pointwise_block"],
         reduction_num_warps=choice["reduction_num_warps"],
+        pointwise_vector=choice["pointwise_vector"],
     )
 
 
 TUNING = TuningContract(
     component_id="norm.hyperconnection",
-    query_schema_version=29,
-    config_schema_version=23,
+    query_schema_version=30,
+    config_schema_version=24,
     query_fields=frozenset(HyperConnectionQuery.__dataclass_fields__),
     config_fields=frozenset(HyperConnectionConfig.__dataclass_fields__),
     encode_query=_encode,
@@ -341,13 +385,18 @@ TUNING = TuningContract(
     validate_query=_validate_query,
     validate_config=_validate,
     default_config=_default_config,
-    candidate_contract_version=9,
+    candidate_contract_version=10,
     knobs=(
         Knob(name="reduction_block_h", values=None, binding=ParameterBinding.COMPILE),
         Knob(name="pointwise_block", values=None, binding=ParameterBinding.COMPILE),
         Knob(
             name="reduction_num_warps",
             values=(1, 2, 4, 8, 10, 16),
+            binding=ParameterBinding.COMPILE,
+        ),
+        Knob(
+            name="pointwise_vector",
+            values=(1, POINTWISE_VECTOR_ELEMENTS),
             binding=ParameterBinding.COMPILE,
         ),
     ),
