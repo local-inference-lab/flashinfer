@@ -7,7 +7,7 @@ import torch
 from b12x._lib.compile_plan import load_programs
 from b12x._lib.compile_pool import CompileJob
 from b12x._lib.program_cache import program_cache
-from b12x.preparation import MemoryRequirements, PersistentMemory, Plan
+from b12x.preparation import MemoryRequirements, PersistentMemory, Plan, current_plan
 
 from ._joint_profile import profile_index, profile_records, selected_profile
 from ._oneshot_preparation import _OneshotExecutionState
@@ -230,7 +230,9 @@ def plan(query, *, runtime, override=None):
                     ("pcie-oneshot-runtime", id(runtime)), resident, resident
                 ),
                 PersistentMemory(
-                    ("pcie-joint-profile", id(query)), profiles_bytes, profiles_bytes
+                    (current_plan(), "pcie-joint-profile"),
+                    profiles_bytes,
+                    profiles_bytes,
                 ),
             )
         ),

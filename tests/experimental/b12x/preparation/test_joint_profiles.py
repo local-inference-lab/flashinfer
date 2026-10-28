@@ -259,9 +259,7 @@ def test_native_and_joint_plans_account_for_the_same_channel_workspace():
             )
         ),
     )
-    joint = _joint_preparation.plan(joint_query, runtime=runtime)._memory_requirements(
-        None, None
-    )
+    joint = _joint_preparation.plan(joint_query, runtime=runtime).memory_requirements()
     assert plain.persistent[0] == joint.persistent[0]
     assert (
         plain.persistent[0].resident_nbytes
