@@ -299,3 +299,79 @@ def test_tp10_unqualified_declarations_preserve_hierarchy(
     )
     assert manager._runtime is runtime
     assert manager.algorithm == "hierarchical"
+
+
+@pytest.mark.parametrize("world", (2, 4))
+@pytest.mark.parametrize("joint_blocks", (0, 64))
+@pytest.mark.parametrize("option", (None, False, True))
+def test_public_plan_requires_explicit_joint_opt_in(
+    monkeypatch, world, joint_blocks, option
+):
+    from b12x.comm.pcie import _preparation
+    from b12x.comm.pcie._joint_profile import JOINT_FAMILIES
+    from b12x.comm.pcie._tuning import PcieQuery
+    from b12x.preparation import FrozenMapping, autotune_effort
+
+    runtime = SimpleNamespace(rank=0, world_size=world, device=torch.device("cpu"))
+    runtime.single_channel = True
+    runtime._prepared_channel_for_stream = lambda stream, channel: runtime
+    manager = dispatch.PCIeAllReduce(runtime, "oneshot")
+    query = PcieQuery(
+        surface="OneshotAllReduce.all_reduce",
+        world_size=world,
+        rank=0,
+        topology="pcie_ipc",
+        call=FrozenMapping(
+            dict(
+                transport="pull",
+                dtype="bfloat16",
+                threads=256,
+                blocks=4,
+                eager_threads=256,
+                eager_blocks=4,
+                size_packs=32,
+                stage_input=True,
+                remote_push_region_packs=1024,
+                payload_ready_region_packs=(1 + 2 * (world - 1)) * 1024,
+            )
+        ),
+        setup=FrozenMapping(
+            dict(
+                eager_buffer_bytes=16384,
+                eager_storage_shards=1 + 2 * (world - 1) + world,
+                variants=((False, 0), (True, 0), (True, 1)),
+                joint_max_blocks=joint_blocks,
+            )
+        ),
+    )
+    monkeypatch.setattr(_preparation, "query_from_runtime", lambda *a, **k: query)
+    options = {} if option is None else {"joint_only": option}
+    if option and not joint_blocks:
+        with pytest.raises(ValueError, match="provisioned BF16 joint channel"):
+            manager.plan(torch.empty(256, dtype=torch.bfloat16), **options)
+        return
+    plan = manager.plan(torch.empty(256, dtype=torch.bfloat16), **options)
+    expected = (
+        set(JOINT_FAMILIES)
+        if option
+        else {
+            "pull",
+            "remote_push_ll",
+            "remote_push_simple",
+            "remote_push_full",
+            "remote_push_rsag",
+        }
+    )
+    if not option and world == 2:
+        expected |= {"tp2_remote_push", "tp2_remote_push_simple"}
+    assert set(plan.query.alternatives) == expected
+    assert plan.query.default.implementation == ("joint_latency" if option else "pull")
+    with autotune_effort("default"):
+        configs = tuple(
+            config
+            for _, config in plan.contract.iterate(
+                plan.contract.configure(plan.query, device=None)
+            )
+        )
+    assert {config.implementation for config in configs} == expected
+    assert len(configs) > len(expected)

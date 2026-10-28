@@ -233,7 +233,15 @@ def _run_graph_scratch_reuse(
     graph = torch.cuda.CUDAGraph()
     with pool.capture(stream, channel_id="graph:torture") as graph_channel:
         with torch.cuda.stream(stream):
-            declaration = _prepare_plan(prepared, graph_channel, scratch, outs[0])
+            declaration = _prepare_plan(
+                prepared,
+                graph_channel,
+                scratch,
+                outs[0],
+                plain_transport=None
+                if _tp2_plain_remote_push_active(world_size)
+                else "pull",
+            )
         with torch.cuda.graph(graph, stream=stream):
             for layer in range(layers):
                 scratch.copy_(sources[layer])

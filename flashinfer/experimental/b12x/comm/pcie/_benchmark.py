@@ -2,6 +2,8 @@
 
 from functools import partial
 from math import prod
+from dataclasses import dataclass
+from weakref import WeakValueDictionary
 
 import torch
 
@@ -16,6 +18,144 @@ _DTYPES = {
     "float16": torch.float16,
     "float32": torch.float32,
 }
+
+
+@dataclass(frozen=True)
+class _Reference:
+    seeds: tuple[torch.Tensor, ...]
+    expected: tuple[torch.Tensor, ...]
+    residual: tuple[torch.Tensor, ...] = ()
+    lse: torch.Tensor | None = None
+
+
+# Live benchmark calls own these immutable fixtures; the cache does not extend their lifetime.
+_REFERENCES = WeakValueDictionary()
+
+
+def _assert_output(actual, expected, *, rtol=0, atol=0):
+    if (
+        rtol == 0
+        and atol == 0
+        and actual.dtype == expected.dtype
+        and torch.equal(actual, expected)
+    ):
+        return
+    torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
+
+
+def _reduction_reference(query, shape, dtype, device, fused):
+    call = query.call
+    semantics = (
+        (
+            tuple(query.setup["logical_shape"]),
+            *(
+                call[name]
+                for name in (
+                    "group_size",
+                    "group_id_limit",
+                    "input_addend",
+                    "reduction_dtype",
+                    "residual_dtype",
+                    "normalize",
+                    "output_dtype",
+                    "zero_centered",
+                )
+            ),
+        )
+        if fused
+        else ()
+    )
+    key = ("reduction", query.world_size, query.rank, shape, dtype, device, semantics)
+    reference = _REFERENCES.get(key)
+    if reference is not None:
+        return reference
+    generator = torch.Generator().manual_seed(81721)
+    # Exactly representable partial sums isolate protocol and binding errors.
+    values = (
+        torch.randint(-16, 17, (query.world_size, *shape), generator=generator).float()
+        / 32
+    )
+    sources = (values, torch.zeros_like(values), -values)
+    seeds = tuple(value[query.rank].to(device=device, dtype=dtype) for value in sources)
+    expected_outputs, expected_residuals = [], []
+    for values in sources:
+        if fused:
+            if call["group_size"]:
+                values = (values * 0.5).sum(dim=2)
+                if call["group_id_limit"] == 0:
+                    values.zero_()
+                values = values.to(dtype).float()
+            if call["input_addend"]:
+                values = (values + 0.125).to(dtype).float()
+        expected = values.sum(dim=0)
+        if not fused:
+            expected_outputs.append(expected.to(device=device, dtype=dtype))
+            continue
+        if call["reduction_dtype"] is not None:
+            expected = expected.to(_DTYPES[call["reduction_dtype"]]).float()
+        expected = expected + 0.25
+        expected_residuals.append(
+            expected.to(device=device, dtype=_DTYPES[call["residual_dtype"]])
+        )
+        if call["normalize"]:
+            expected = expected * torch.rsqrt(
+                expected.square().mean(dim=-1, keepdim=True) + 1e-6
+            )
+            if call["zero_centered"]:
+                expected *= 2
+            expected_outputs.append(
+                expected.to(device=device, dtype=_DTYPES[call["output_dtype"]])
+            )
+    reference = _Reference(seeds, tuple(expected_outputs), tuple(expected_residuals))
+    _REFERENCES[key] = reference
+    return reference
+
+
+def _dcp_reference(query, shape, dtype, device, lse_reduce):
+    call = query.call
+    out_shape = tuple(call["out_shape"])
+    key = (
+        "dcp",
+        query.world_size,
+        query.rank,
+        shape,
+        out_shape,
+        dtype,
+        device,
+        lse_reduce,
+        call.get("natural_log"),
+    )
+    reference = _REFERENCES.get(key)
+    if reference is not None:
+        return reference
+    generator = torch.Generator().manual_seed(9419)
+    stacked = torch.randint(0, 16, (query.world_size, *shape), generator=generator).to(
+        dtype
+    )
+    seeds = tuple(
+        value[query.rank].to(device) for value in (stacked, torch.zeros_like(stacked))
+    )
+    lse = None
+    if lse_reduce:
+        from .pcie_dcp_a2a import lse_reduce_scatter_reference
+
+        scores = (
+            torch.arange(query.world_size, dtype=torch.float32)[:, None, None]
+            .expand(query.world_size, *shape[:2])
+            .contiguous()
+            / 8
+        )
+        expected = lse_reduce_scatter_reference(
+            stacked, scores, query.rank, is_lse_base_on_e=call["natural_log"]
+        )
+        lse = scores[query.rank].to(device)
+    else:
+        expected = stacked.permute(1, 0, 2, 3).reshape(out_shape)
+    reference = _Reference(
+        seeds, (expected.to(device), torch.zeros_like(expected, device=device)), lse=lse
+    )
+    _REFERENCES[key] = reference
+    return reference
 
 
 def _reduction_repetitions(shape):
@@ -33,19 +173,7 @@ class _ReductionInputs:
         shape = tuple(call["shape"] if self.twoshot else query.setup["shape"])
         dtype = _DTYPES[call["dtype"]]
         device = state.runtime.device
-        generator = torch.Generator().manual_seed(81721)
-        # Exactly representable partial sums isolate protocol and binding errors.
-        values = (
-            torch.randint(
-                -16, 17, (query.world_size, *shape), generator=generator
-            ).float()
-            / 32
-        )
-        self.expected_sources = (values, torch.zeros_like(values), -values)
-        self.seeds = tuple(
-            value[query.rank].to(device=device, dtype=dtype)
-            for value in self.expected_sources
-        )
+        self.reference = _reduction_reference(query, shape, dtype, device, self.fused)
         self.source = torch.empty(shape, dtype=dtype, device=device)
         self.out = self.source if inplace else torch.empty_like(self.source)
         self.residual = self.weight = self.addend = self.group_weights = (
@@ -86,12 +214,12 @@ class _ReductionInputs:
             tuple(query.setup["logical_shape"]) if self.fused else shape
         )
         self.producers = tuple(
-            partial(self.produce, index) for index in range(len(self.seeds))
+            partial(self.produce, index) for index in range(len(self.reference.seeds))
         )
 
     def produce(self, index):
         self.step = index
-        self.source.copy_(self.seeds[index])
+        self.source.copy_(self.reference.seeds[index])
         if self.residual is not None:
             self.residual.copy_(self.residual_seed)
 
@@ -123,35 +251,11 @@ class _ReductionInputs:
         return self.residual if self.out is None else self.out
 
     def validate(self):
-        query, call = self.state.query, self.state.query.call
-        values = self.expected_sources[self.step]
-        dtype = self.source.dtype
-        if self.fused:
-            if call["group_size"]:
-                values = (values * 0.5).sum(dim=2)
-                if call["group_id_limit"] == 0:
-                    values.zero_()
-                values = values.to(dtype).float()
-            if call["input_addend"]:
-                values = (values + 0.125).to(dtype).float()
-        expected = values.sum(dim=0)
         if not self.fused:
-            torch.testing.assert_close(
-                self.out.cpu(), expected.to(dtype), rtol=0, atol=0
-            )
+            _assert_output(self.out, self.reference.expected[self.step])
             return
-        if call["reduction_dtype"] is not None:
-            expected = expected.to(_DTYPES[call["reduction_dtype"]]).float()
-        expected = expected + 0.25
-        torch.testing.assert_close(
-            self.residual.cpu(), expected.to(self.residual.dtype), rtol=0, atol=0
-        )
+        _assert_output(self.residual, self.reference.residual[self.step])
         if self.out is not None:
-            expected = expected * torch.rsqrt(
-                expected.square().mean(dim=-1, keepdim=True) + 1e-6
-            )
-            if call["zero_centered"]:
-                expected *= 2
             tolerance = (
                 8e-3
                 if self.out.dtype == torch.bfloat16
@@ -159,25 +263,34 @@ class _ReductionInputs:
                 if self.out.dtype == torch.float16
                 else 2e-5
             )
-            torch.testing.assert_close(
-                self.out.cpu(),
-                expected.to(self.out.dtype),
+            _assert_output(
+                self.out,
+                self.reference.expected[self.step],
                 rtol=tolerance,
                 atol=tolerance,
             )
+
+    def close(self):
+        self.producers = ()
+        self.reference = None
 
 
 def benchmark_call(state, *, inplace=False):
     dcp = state.query.surface.startswith(("DcpAllToAll.", "DcpAllToAllPool."))
     inputs = _DcpInputs(state) if dcp else _ReductionInputs(state, inplace=inplace)
     if not dcp and not inputs.twoshot:
-        state.bind_input(inputs.source)
+        try:
+            state.bind_input(inputs.source)
+        except BaseException:
+            inputs.close()
+            raise
     return PreparedCall(
         run=inputs.run,
         output=inputs.out,
         produce=inputs.producers[0],
         benchmark_producers=inputs.producers,
         validate=inputs.validate,
+        close=inputs.close,
         owners=(inputs, state.runtime),
         capture_context=None if dcp else state.runtime.capture,
         benchmark_repetitions=1 if dcp else inputs.repetitions,
@@ -193,13 +306,8 @@ class _DcpInputs:
         shape = tuple(call["shape"])
         name = call["dtype"].removeprefix("torch.")
         dtype = _DTYPES.get(name) or getattr(torch, name)
-        generator = torch.Generator().manual_seed(9419)
-        stacked = torch.randint(
-            0, 16, (query.world_size, *shape), generator=generator
-        ).to(dtype)
-        self.seeds = tuple(
-            value[query.rank].to(runtime.device)
-            for value in (stacked, torch.zeros_like(stacked))
+        self.reference = _dcp_reference(
+            query, shape, dtype, runtime.device, self.lse_reduce
         )
         self.source = torch.empty_strided(
             shape, tuple(call["stride"]), dtype=dtype, device=runtime.device
@@ -212,32 +320,18 @@ class _DcpInputs:
         )
         self.lse = None
         if self.lse_reduce:
-            from .pcie_dcp_a2a import lse_reduce_scatter_reference
-
-            scores = (
-                torch.arange(query.world_size, dtype=torch.float32)[:, None, None]
-                .expand(query.world_size, *shape[:2])
-                .contiguous()
-                / 8
-            )
             self.lse = torch.empty_strided(
                 tuple(call["lse_shape"]),
                 tuple(call["lse_stride"]),
                 dtype=torch.float32,
                 device=runtime.device,
             )
-            self.lse.copy_(scores[query.rank])
-            expected = lse_reduce_scatter_reference(
-                stacked, scores, query.rank, is_lse_base_on_e=call["natural_log"]
-            )
-        else:
-            expected = stacked.permute(1, 0, 2, 3).reshape(self.out.shape)
-        self.expected = (expected, torch.zeros_like(expected))
+            self.lse.copy_(self.reference.lse)
         self.producers = tuple(partial(self.produce, index) for index in range(2))
 
     def produce(self, index):
         self.step = index
-        self.source.copy_(self.seeds[index])
+        self.source.copy_(self.reference.seeds[index])
 
     def run(self):
         if self.lse_reduce:
@@ -255,6 +349,10 @@ class _DcpInputs:
             if self.lse_reduce
             else 0
         )
-        torch.testing.assert_close(
-            self.out.cpu(), self.expected[self.step], rtol=tolerance, atol=tolerance
+        _assert_output(
+            self.out, self.reference.expected[self.step], rtol=tolerance, atol=tolerance
         )
+
+    def close(self):
+        self.producers = ()
+        self.reference = None

@@ -102,3 +102,74 @@ The test exercises duplicate declarations, cache reuse with a missing member
 cache, one-rank cancellation, inconsistent shapes, cache-only misses, and graph
 replay. `benchmarks/experimental/b12x/benchmark_pcie_allreduce_transports.py`
 compares explicit transports and the static dispatch policy with CUDA graphs.
+
+## Joint BF16 profiles
+
+Explicit joint-only plans for staged BF16 reductions with payload-ready peer
+storage race two joint entrypoints. `joint_latency` supports `full`, `payload_rsag`, and
+`pull`; `joint_bandwidth` supports `payload_rsag`, `bulk_push`, `bulk_pull`, and
+`pull`. Ordinary plans retain standalone transport competition. Each entrypoint
+uses one compiled program per thread count and maximum grid; its submode and
+active CTA count are device data and do not specialize compilation. The maximum
+grid is capped by the device SM count and 64 CTAs. The tuning
+record includes both values. For example,
+`CollectiveConfig(implementation="joint_latency", threads=256, blocks=64,
+submode="full", active_blocks=16)` pins a joint configuration.
+
+Joint workspace requires `joint=True` on `PCIeAllReduce.from_exchange_group`,
+`from_process_group`, or the corresponding oneshot channel/pool factory. The
+default `joint=False` allocates only static transport storage. Ranks agree on
+this option before shared allocation. The public direct constructor
+accepting externally supplied pointers retains standalone transports; BF16
+payload-ready support alone does not admit joint candidates. Joint alternatives
+require an existing workspace and never allocate one during declaration.
+
+Coordinated channel setup allocates every admitted submode's IPC storage before
+asynchronous compilation and tuning begin. Materialization reuses that storage
+and allocates a device selector without entering communicator collectives.
+Immutable host records enumerate admitted `(mode, active CTA count)` profiles;
+the selector encodes the selected record in one uint32. These resources remain
+owned by the established channel and execution state. The captured launch
+retains fixed addresses, thread count, and maximum grid. The state method
+`select_profile(submode, active_blocks)` collectively drains pending CUDA work,
+checks rank agreement, and updates that selector. Every rank must stop submitting
+work before entering this method with identical arguments. A profile change
+cannot occur during capture or overlap graph replay. No topology is inferred
+from the profile; callers choose the prepared profile explicitly.
+
+### Captured startup mode selection
+
+`AllReduce.plan(...)` excludes joint kernels by default and retains static transport
+competition. `AllReduce.plan(..., joint_only=True)` limits an eligible staged BF16 collective
+plan to the joint families. Attach `joint_finalist_policy()` to its preparation
+request to retain the best measured active CTA count for every mode and compiled
+geometry. The preparation cache restores these finalists with the selected plan.
+`joint_startup_spec(plan)` then retains only the modes of the winning family,
+thread count, and physical grid; it rejects incomplete finalist sets.
+
+Collectively call `prepare_joint_startup_tuner(specs, cache_policy="cold")` before
+freezing kernel resolution. All specs in a producer must have the same semantic
+key, rank, and device. Each spec exposes its actual serving `selector` tensor.
+The producer retains its specs, private fixtures, timing storage, and compiled
+programs. Its IPC storage remains owned by the collective runtime.
+
+Capture `producer.run()` into a separate startup graph. It times the same
+compiled collective launcher used by serving, with the measured CTA count for
+each mode. Seven interleaved rounds use the ordinary reduction benchmark's
+three fixtures and `ceil(100 / rows)` invocation chain. A device rank gate
+precedes each timer; each sample is the maximum rank elapsed time. The smallest
+median of 21 samples wins, with family mode order breaking ties. The producer
+publishes the packed profile to every spec's selector. No host selection or
+recapture is needed after startup replay.
+
+Before replay, set the producer's persistent `int32[1]` status to `-1`. Successful
+completion writes `0` after all numerical checks and positive timing samples.
+Serving graphs must wait for successful startup completion, and all ranks must
+replay equivalent startup graphs in the same order. Startup and serving must
+not execute concurrently on their shared collective workspace.
+
+Numerical checks run once for every mode and fixture before timing begins.
+Cold-cache producers share one eviction buffer per runtime; producers replay
+serially. `producer.memory_requirements()` reports resident fixtures, timing,
+status, and eviction storage through the preparation memory interface, with
+shared storage keys suitable for deduplication.

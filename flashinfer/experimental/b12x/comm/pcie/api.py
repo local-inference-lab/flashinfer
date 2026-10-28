@@ -57,6 +57,9 @@ def is_supported(device=None) -> bool:
 
 
 __all__ = [
+    "joint_finalist_policy",
+    "joint_startup_spec",
+    "prepare_joint_startup_tuner",
     "Plan",
     "PcieConfig",
     "PcieQuery",
@@ -80,3 +83,9 @@ __all__ = [
     "owner_stage_reference",
     "is_supported",
 ]
+
+from ._joint_startup import (
+    joint_finalist_policy,
+    joint_startup_spec,
+    prepare_joint_startup_tuner,
+)

@@ -1551,11 +1551,6 @@ class PreparationJob:
                 search=not self._warmup_only,
             )
             if request.finalist_policy is not None and not self._locally_stopped:
-                if request.collective is not None:
-                    raise ValueError(
-                        "collective operator finalist races require coordinated "
-                        "family samples and are not supported"
-                    )
                 if (
                     configuration.space is None
                     or self._warmup_only

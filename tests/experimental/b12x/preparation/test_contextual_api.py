@@ -54,13 +54,21 @@ def test_finalist_policy_requires_legal_family_and_bounded_request():
             finalist_policy=FinalistPolicy(family_fields=("width",)),
         )
     unpinned = replace(_plan(), override=None)
-    with pytest.raises(ValueError, match="collective operator"):
+    collective = unpinned.request(
+        name="collective",
+        prepare_call=lambda state: _call(),
+        benchmark_call=lambda state: _call(),
+        collective=CollectiveRequirement("c", (0, 1)),
+        finalist_policy=FinalistPolicy(family_fields=("width",)),
+    )
+    assert collective.finalist_policy.per_family == 1
+    with pytest.raises(ValueError, match="one winner per family"):
         unpinned.request(
             name="collective",
             prepare_call=lambda state: _call(),
             benchmark_call=lambda state: _call(),
             collective=CollectiveRequirement("c", (0, 1)),
-            finalist_policy=FinalistPolicy(family_fields=("width",)),
+            finalist_policy=FinalistPolicy(family_fields=("width",), per_family=2),
         )
     policy = FinalistPolicy(family_fields=("width",))
     empty_shard = TuningRequirement(

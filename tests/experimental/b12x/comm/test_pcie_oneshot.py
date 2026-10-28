@@ -1201,8 +1201,9 @@ def test_cuda_direct_runtime_requires_collective_factory():
 @pytest.mark.parametrize(
     "runtime_class", (PCIeOneshotAllReduce, PCIeOneshotAllReducePool)
 )
+@pytest.mark.parametrize("joint", (False, True))
 def test_process_group_max_input_sets_threshold_and_capacity(
-    monkeypatch, runtime_class
+    monkeypatch, runtime_class, joint
 ):
     captured = {}
 
@@ -1218,8 +1219,10 @@ def test_process_group_max_input_sets_threshold_and_capacity(
         process_group=object(),
         device=torch.device("cuda:0"),
         max_input_bytes=1 << 20,
+        joint=joint,
     )
 
+    assert captured["joint"] is joint
     assert captured["eager_buffer_bytes"] == 1 << 20
     assert captured["max_size"] == 1 << 20
 

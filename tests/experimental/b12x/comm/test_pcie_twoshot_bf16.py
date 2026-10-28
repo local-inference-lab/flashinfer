@@ -52,7 +52,12 @@ def test_prepared_all_reduce_counts_packs(monkeypatch, shape):
     )
     state = SimpleNamespace(
         query=SimpleNamespace(
-            call={"operation": "all_reduce", "threads": 512, "block_limit": 64}
+            call={
+                "operation": "all_reduce",
+                "transport": "push",
+                "threads": 512,
+                "block_limit": 64,
+            }
         ),
         launcher=lambda *key: lambda *args: launches.append((key, args)),
     )
@@ -73,9 +78,10 @@ def test_prepared_all_reduce_counts_packs(monkeypatch, shape):
     assert all(entry[1][-3:-1] == (4096, 16384) for entry in launches)
 
 
-def test_layout_has_only_payload_slots():
+def test_layout_has_payload_and_reduced_shard_slots():
     layout = _make_layout(131072, 8, 4)
-    assert layout.slot_bytes == 2 << 20
+    assert layout.reduced_offset == 2 << 20
+    assert layout.slot_bytes >= layout.reduced_offset + layout.pack_stride * 16
     assert layout.slab_bytes == layout.signal_bytes + 2 * layout.slot_bytes
     assert _make_layout(128, 4096, 4).slab_bytes > _make_layout(64, 4096, 4).slab_bytes
 
@@ -86,7 +92,8 @@ def test_private_launchers_reject_unsupported_world_sizes(world):
         get_twoshot_bf16_launcher("reduce_scatter", world, 0, False, 0, 512, 8, 0)
 
 
-def test_preparation_accounts_for_persistent_shard():
+@pytest.mark.parametrize("transport", ("push", "pull"))
+def test_preparation_accounts_for_persistent_shard(transport):
     layout = _make_layout(131072, 8, 4)
     runtime = SimpleNamespace(
         rank=0,
@@ -104,13 +111,16 @@ def test_preparation_accounts_for_persistent_shard():
     )
     inp = torch.empty(32768, dtype=torch.bfloat16)
     query = preparation.query_from_runtime(
-        runtime, surface="PCIeTwoShotBF16.all_reduce", call={"inp": inp}
+        runtime,
+        surface="PCIeTwoShotBF16.all_reduce",
+        call={"inp": inp, "transport": transport},
     )
     metadata = preparation.query_from_metadata(
         runtime,
         surface="PCIeTwoShotBF16.all_reduce",
         shape=tuple(inp.shape),
         dtype=inp.dtype,
+        transport=transport,
     )
     assert query.setup == metadata.setup
     assert query.setup["push_shard_nbytes"] == (2 << 20) // 4
@@ -119,10 +129,8 @@ def test_preparation_accounts_for_persistent_shard():
 
     with _plan_scope(plan):
         memory = plan._memory_requirements(None, None)
-    assert sorted(entry.required_nbytes for entry in memory.persistent) == [
-        1 << 19,
-        layout.slab_bytes,
-    ]
+    expected = [1 << 19, layout.slab_bytes]
+    assert sorted(entry.required_nbytes for entry in memory.persistent) == expected
     assert all(
         entry.required_nbytes == entry.resident_nbytes for entry in memory.persistent
     )
@@ -168,7 +176,12 @@ def test_packed_allreduce_tail_storage_and_launch(monkeypatch, world, packs):
     launches = []
     state = SimpleNamespace(
         query=SimpleNamespace(
-            call={"operation": "all_reduce", "threads": 512, "block_limit": 64}
+            call={
+                "operation": "all_reduce",
+                "transport": "push",
+                "threads": 512,
+                "block_limit": 64,
+            }
         ),
         launcher=lambda *key: lambda *args: launches.append((key, args)),
     )
@@ -302,11 +315,12 @@ def test_prepared_run_enforces_output_overlap(operation, overlap):
         assert not launches
 
 
-def _prepare(session, runtime, operation, payload, out):
+def _prepare(session, runtime, operation, payload, out, *, transport="push"):
     call = {"inp" if operation == "all_reduce" else "payload": payload, "out": out}
     if isinstance(runtime, PCIeAllReduce):
         plan = runtime.plan(payload, out=out)
     else:
+        call["transport"] = transport
         query = preparation.query_from_runtime(
             runtime, surface=f"PCIeTwoShotBF16.{operation}", call=call
         )
@@ -371,7 +385,9 @@ def _fill_exact(tensor, rank, step):
     tensor.copy_(values.add_(step).remainder_(7).add_(rank + 1).view_as(tensor))
 
 
-def _check_packed_tails(session, pool, rank, *, exact_inputs=False, equal_shards=False):
+def _check_packed_tails(
+    session, pool, rank, *, exact_inputs=False, equal_shards=False, transport="push"
+):
     cases = []
     pack_counts = (
         (4, 12, 20, 320, 512, 516, 16384, 32768, 65536)
@@ -385,7 +401,7 @@ def _check_packed_tails(session, pool, rank, *, exact_inputs=False, equal_shards
         )
         out = storage[8:-8]
         (_fill_exact if exact_inputs else _fill)(inp, rank, packs)
-        plan = _prepare(session, pool, "all_reduce", inp, out)
+        plan = _prepare(session, pool, "all_reduce", inp, out, transport=transport)
         with session.capture():
             pool.all_reduce(inp, plan=plan, out=out)
         torch.cuda.synchronize()
@@ -416,7 +432,7 @@ def _check_packed_tails(session, pool, rank, *, exact_inputs=False, equal_shards
                     graph.replay()
             torch.cuda.synchronize()
             assert _allocation_state(pool.device) == before
-            epoch += 2
+            epoch += 1 if transport == "pull" else 2
             assert _epoch(pool) == epoch
             assert pool._push_shard.data_ptr() == shard_address
             torch.testing.assert_close(out, expected, rtol=0, atol=0)
@@ -425,7 +441,7 @@ def _check_packed_tails(session, pool, rank, *, exact_inputs=False, equal_shards
         graph.reset()
 
 
-def _check_exact_alias(session, pool, rank):
+def _check_exact_alias(session, pool, rank, *, transport="push"):
     cases = []
     for number, packs in enumerate((1, 3, 17, 320, 512, 513, 16385, 32768, 65537)):
         storage = torch.full(
@@ -436,8 +452,12 @@ def _check_exact_alias(session, pool, rank):
         other_inp, other_out = torch.empty_like(inp), torch.empty_like(inp)
         _fill_exact(inp, rank, packs)
         other_inp.copy_(inp)
-        alias_plan = _prepare(session, pool, "all_reduce", inp, alias)
-        other_plan = _prepare(session, pool, "all_reduce", other_inp, other_out)
+        alias_plan = _prepare(
+            session, pool, "all_reduce", inp, alias, transport=transport
+        )
+        other_plan = _prepare(
+            session, pool, "all_reduce", other_inp, other_out, transport=transport
+        )
         # Priming the aliased call consumes its input.
         _fill_exact(inp, rank, packs)
         other_inp.copy_(inp)
@@ -487,7 +507,7 @@ def _check_exact_alias(session, pool, rank):
                     graph.replay()
             torch.cuda.synchronize()
             assert _allocation_state(pool.device) == before
-            epoch += 4
+            epoch += 2 if transport == "pull" else 4
             assert _epoch(pool) == epoch
             assert pool._push_shard.data_ptr() == shard_address
             torch.testing.assert_close(alias, expected, rtol=0, atol=0)
@@ -971,6 +991,7 @@ def _check_mixed(session, pool, rank):
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--transport", choices=("push", "pull"), default="push")
     parser.add_argument("--packed-only", action="store_true")
     parser.add_argument("--alias-only", action="store_true")
     parser.add_argument("--exact-inputs", action="store_true")
@@ -978,6 +999,8 @@ def main():
     parser.add_argument("--benchmark", action="store_true")
     parser.add_argument("--benchmark-only", action="store_true")
     args = parser.parse_args()
+    if args.transport == "pull" and not (args.packed_only or args.alias_only):
+        parser.error("--transport pull requires --packed-only or --alias-only")
     if (args.exact_inputs or args.equal_shards) and not args.packed_only:
         parser.error("--exact-inputs and --equal-shards require --packed-only")
     rank = int(os.environ["RANK"])
@@ -998,7 +1021,7 @@ def main():
         session = PreparationSession(device=device, autotune=False, compile_workers=1)
         try:
             if args.alias_only:
-                _check_exact_alias(session, pool, rank)
+                _check_exact_alias(session, pool, rank, transport=args.transport)
             else:
                 _check_packed_tails(
                     session,
@@ -1006,6 +1029,7 @@ def main():
                     rank,
                     exact_inputs=args.exact_inputs,
                     equal_shards=args.equal_shards,
+                    transport=args.transport,
                 )
             if rank == 0:
                 print(

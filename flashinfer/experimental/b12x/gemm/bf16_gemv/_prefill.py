@@ -112,11 +112,15 @@ class Bf16PrefillKernel:
     unroll_k = False
     buffer_align_bytes = 1024
 
-    def __init__(self, n: int, k: int):
+    def __init__(self, n: int, k: int, split_k: int = 1):
         self.n, self.k = int(n), int(k)
         if self.n <= 0 or self.k <= 0 or self.k % self.tile_k:
             raise ValueError("BF16 prefill needs positive N and K divisible by 64")
         self.k_tiles = self.k // self.tile_k
+        if split_k < 1 or self.k_tiles % split_k:
+            raise ValueError("split K must divide the number of reduction tiles")
+        self.split_k = split_k
+        self.slice_k_tiles = self.k_tiles // split_k
         self.n_tiles = (self.n + self.tile_n - 1) // self.tile_n
 
     def _get_tiled_mma(self) -> cute.TiledMma:
@@ -180,6 +184,8 @@ class Bf16PrefillKernel:
         output: cute.Tensor,
         num_tokens: Int32,
         stream: cuda.CUstream,
+        epilogue: cutlass.Constexpr = None,
+        epilogue_args: tuple = (),
     ):
         if const_expr(source.element_type != cutlass.BFloat16):
             raise TypeError("source must be BFloat16")
@@ -221,8 +227,10 @@ class Bf16PrefillKernel:
             tiled_mma,
             SharedStorage,
             num_tokens,
+            epilogue,
+            epilogue_args,
         ).launch(
-            grid=(grid_m, self.n_tiles, 1),
+            grid=(grid_m, self.n_tiles, self.split_k),
             block=[self.num_threads, 1, 1],
             stream=stream,
             min_blocks_per_mp=1,
@@ -241,9 +249,11 @@ class Bf16PrefillKernel:
         tiled_mma: cute.TiledMma,
         SharedStorage: cutlass.Constexpr,
         num_tokens: Int32,
+        epilogue: cutlass.Constexpr,
+        epilogue_args: tuple,
     ):
         tidx, _, _ = cute.arch.thread_idx()
-        m_tile, n_tile, _ = cute.arch.block_idx()
+        m_tile, n_tile, k_slice = cute.arch.block_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
         if warp_idx == 0:
@@ -331,7 +341,7 @@ class Bf16PrefillKernel:
             tSsA = smem_thr_copy_A.partition_S(sA)
             tSsB = smem_thr_copy_B.partition_S(sB)
 
-            for _k_tile in cutlass.range(self.k_tiles, unroll_full=self.unroll_k):
+            for _k_tile in cutlass.range(self.slice_k_tiles, unroll_full=self.unroll_k):
                 load_pipeline.consumer_wait(consumer_state)
                 _warp_gemm(
                     thr_mma,
@@ -355,35 +365,39 @@ class Bf16PrefillKernel:
                 token = m_tile * Int32(self.tile_m) + coord[0]
                 column = n_tile * Int32(self.tile_n) + coord[1]
                 if token < num_tokens and column < Int32(self.n):
-                    output[Int64(token), Int64(column)] = acc[index].to(
-                        output.element_type
-                    )
+                    output[Int64(k_slice * num_tokens + token), Int64(column)] = acc[
+                        index
+                    ].to(output.element_type)
 
         elif warp_idx == Int32(self.producer_warp):
             producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer,
                 self.num_stages,
             )
-            for k_tile in cutlass.range(self.k_tiles, unroll_full=self.unroll_k):
+            for k_tile in cutlass.range(self.slice_k_tiles, unroll_full=self.unroll_k):
                 load_pipeline.producer_acquire(producer_state)
                 # Consumers read a stage with ldmatrix (generic proxy) before
                 # releasing it; order those reads before the TMA refill.
                 cute.arch.fence_view_async_shared()
                 cute.copy(
                     tma_atom_A,
-                    tAgA[(None, m_tile, k_tile)],
+                    tAgA[(None, m_tile, k_slice * self.slice_k_tiles + k_tile)],
                     tAsA[(None, producer_state.index)],
                     tma_bar_ptr=load_pipeline.producer_get_barrier(producer_state),
                 )
                 cute.copy(
                     tma_atom_B,
-                    tBgB[(None, n_tile, k_tile)],
+                    tBgB[(None, n_tile, k_slice * self.slice_k_tiles + k_tile)],
                     tBsB[(None, producer_state.index)],
                     tma_bar_ptr=load_pipeline.producer_get_barrier(producer_state),
                 )
                 load_pipeline.producer_commit(producer_state)
                 producer_state.advance()
             load_pipeline.producer_tail(producer_state)
+
+        if const_expr(epilogue is not None):
+            cute.arch.sync_threads()
+            epilogue(output, num_tokens, m_tile, *epilogue_args)
 
 
 @cache
