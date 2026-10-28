@@ -185,6 +185,103 @@ def test_pcie_dma_all_reduce_eager_and_graph() -> None:
     mp.spawn(_worker, args=(world_size, _free_port()), nprocs=world_size, join=True)
 
 
+def _capture_context_worker(rank: int, port: int) -> None:
+    from b12x.comm.pcie._dma_preparation import query_from_metadata
+
+    torch.set_num_threads(1)
+    device = torch.device("cuda", rank)
+    torch.cuda.set_device(device)
+    dist.init_process_group(
+        "gloo", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=4
+    )
+    ring = PCIeDmaAllReduce(
+        exchange_group=dist.group.WORLD, device=device, max_bytes=80 << 20, fp8=""
+    )
+    session = PreparationSession(device=device, autotune=False, compile_workers=1)
+    stream = torch.cuda.Stream(device=device)
+    cases = []
+    try:
+        for rows in (8, 4096):
+            source = torch.full(
+                (rows, 5120), rank + 1, device=device, dtype=torch.bfloat16
+            )
+            output = torch.empty_like(source)
+            declaration = dma_plan(
+                query_from_metadata(
+                    ring, shape=tuple(source.shape), dtype=source.dtype
+                ),
+                runtime=ring,
+            )
+            session.prepare(
+                (
+                    declaration.request(
+                        name=f"dma.capture.m{rows}",
+                        prepare_call=lambda state, source=source, output=output: (
+                            prepared_call(state, inp=source, out=output)
+                        ),
+                    ),
+                )
+            )
+            graph = torch.cuda.CUDAGraph()
+            stream.wait_stream(torch.cuda.current_stream(device))
+            with (
+                session.capture(),
+                ring.capture(stream=stream),
+                torch.cuda.graph(graph, stream=stream),
+            ):
+                ring.all_reduce(source, plan=declaration, out=output)
+            cases.append((source, output, declaration, graph))
+        session.freeze()
+        for step, index in enumerate((0, 1, 0, 1)):
+            source, output, declaration, graph = cases[index]
+            source.fill_((rank + 1) * (step + 1))
+            original = source.clone()
+            for eager in (True, False):
+                output.fill_(float("nan"))
+                torch.cuda.synchronize(device)
+                dist.barrier()
+                before = torch.cuda.memory_stats(device)
+                if eager:
+                    ring.all_reduce(source, plan=declaration, out=output)
+                else:
+                    graph.replay()
+                torch.cuda.synchronize(device)
+                after = torch.cuda.memory_stats(device)
+                for counter in (
+                    "allocation.all.allocated",
+                    "allocation.all.freed",
+                    "segment.all.allocated",
+                    "segment.all.freed",
+                ):
+                    assert before[counter] == after[counter], counter
+                torch.testing.assert_close(source, original, rtol=0, atol=0)
+                torch.testing.assert_close(
+                    output, torch.full_like(output, 10 * (step + 1)), rtol=0, atol=0
+                )
+        with ring.capture(stream=stream):
+            with pytest.raises(RuntimeError, match="during capture"):
+                ring.close()
+        for *_, graph in cases:
+            graph.reset()
+        ring.close()
+        ring.close()
+        with pytest.raises(RuntimeError, match="closed"):
+            with ring.capture(stream=stream):
+                pass
+    finally:
+        for *_, graph in cases:
+            graph.reset()
+        session.close()
+        ring.close()
+        dist.destroy_process_group()
+
+
+def test_pcie_dma_capture_context_preserves_replay_and_owner_lifetime() -> None:
+    if not torch.cuda.is_available() or torch.cuda.device_count() < 4:
+        pytest.skip("requires four CUDA devices")
+    mp.spawn(_capture_context_worker, args=(_free_port(),), nprocs=4, join=True)
+
+
 def _fp8_worker(rank: int, world_size: int, port: int, mode: str) -> None:
     os.environ["B12X_PCIE_DMA_FP8"] = mode
     _worker(rank, world_size, port)
