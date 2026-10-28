@@ -14,7 +14,7 @@ from b12x.preparation import (
 from b12x.preparation._efficiency import capture_autotune_effort
 
 from ._tuning import PcieQuery, TUNING as NATIVE
-from ._joint_profile import JOINT_FAMILIES
+from ._joint_profile import JOINT_FAMILIES, JOINT_THREADS
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -42,10 +42,10 @@ def _configs(query):
         blocks = int(call.get("blocks", call.get("block_limit", 16)))
         threads = int(call["threads"])
         if name in JOINT_FAMILIES:
-            for count_threads in (32, 64, 128, 256, 512):
+            for count_threads in JOINT_THREADS:
                 for mode in JOINT_FAMILIES[name]:
                     units = int(call["size_packs"])
-                    if mode in ("bulk_push", "bulk_pull"):
+                    if mode in ("bulk_push", "bulk_pull", "bulk_push_phased"):
                         units = -(-units // query.world_size)
                     covering = max(1, -(-units // count_threads))
                     for active in dict.fromkeys(

@@ -1,9 +1,39 @@
 """Prepared profile geometry for joint BF16 PCIe all-reduce kernels."""
 
-JOINT_MODES = {"full": 0, "payload_rsag": 1, "bulk_push": 2, "bulk_pull": 3, "pull": 4}
+JOINT_MODES = {
+    "full": 0,
+    "payload_rsag": 1,
+    "bulk_push": 2,
+    "bulk_pull": 3,
+    "pull": 4,
+    "full_phased": 5,
+    "payload_rsag_phased": 6,
+    "bulk_push_phased": 7,
+}
+# Thread counts a joint entrypoint is compiled and tuned for.
+JOINT_THREADS = (32, 64, 128, 256, 512)
+# Phased modes move the same data as their base modes, but every CTA of a rank
+# writes to one peer at a time, in rank-staggered order. Where peers sit behind
+# different CPU host bridges, writes toward several peers at once collapse,
+# while one destination per rank keeps link rate; peer reads there stall in
+# bursts. Interleaving peers per pack stays faster for small messages on
+# switched fabrics, so both orders are prepared profiles.
 JOINT_FAMILIES = {
-    "joint_latency": ("full", "payload_rsag", "pull"),
-    "joint_bandwidth": ("payload_rsag", "bulk_push", "bulk_pull", "pull"),
+    "joint_latency": (
+        "full",
+        "payload_rsag",
+        "pull",
+        "full_phased",
+        "payload_rsag_phased",
+    ),
+    "joint_bandwidth": (
+        "payload_rsag",
+        "bulk_push",
+        "bulk_pull",
+        "pull",
+        "payload_rsag_phased",
+        "bulk_push_phased",
+    ),
 }
 
 
@@ -42,7 +72,8 @@ def selected_profile(implementation, max_blocks, submode, active_blocks):
 
 JOINT_MAX_BLOCKS = 64
 JOINT_MAX_RANKS = 16
-JOINT_SIGNAL_BYTES = 266248
+# Barrier counters and flags, local phase arrival and release, epoch and arrival.
+JOINT_SIGNAL_BYTES = 266256
 
 
 def joint_slot_packs(capacity, world):

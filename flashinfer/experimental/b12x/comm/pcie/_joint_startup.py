@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 import torch
 
 from b12x.preparation import FinalistPolicy
-from ._joint_profile import JOINT_FAMILIES, JOINT_MODES, selected_profile
+from ._joint_profile import JOINT_FAMILIES, JOINT_MODES, JOINT_THREADS, selected_profile
 
 
 def joint_finalist_policy():
@@ -13,7 +13,8 @@ def joint_finalist_policy():
     return FinalistPolicy(
         family_fields=("implementation", "threads", "blocks", "submode"),
         per_family=1,
-        max_total=35,
+        # One maximum grid per family: every thread count of every mode.
+        max_total=len(JOINT_THREADS) * sum(map(len, JOINT_FAMILIES.values())),
     )
 
 

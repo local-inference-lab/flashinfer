@@ -630,6 +630,59 @@ def graph_epoch_arrive_serialized(
 
 
 @dsl_user_op
+def local_phase_arrive_and_wait(
+    arrived_addr: Int64,
+    release_addr: Int64,
+    blocks: Uint32,
+    target: Uint32,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """Hold every participating CTA of one local launch until all reach a phase.
+
+    One thread per CTA calls this once per phase. ``atom.inc`` resets the
+    arrival count on the final CTA, which publishes ``target``; the others wait
+    until the release word equals it. While a CTA waits, the word holds the
+    previous phase's target, a value from an earlier launch, or its own target,
+    so equality needs no ordering between launches however long a workspace
+    runs other modes. This orders issue only: it carries no memory fence.
+    """
+
+    llvm.inline_asm(
+        None,
+        [
+            Int64(arrived_addr).ir_value(loc=loc, ip=ip),
+            Int64(release_addr).ir_value(loc=loc, ip=ip),
+            Uint32(blocks).ir_value(loc=loc, ip=ip),
+            Uint32(target).ir_value(loc=loc, ip=ip),
+        ],
+        """
+        {
+            .reg .pred final, reached;
+            .reg .b32 prior, last, seen;
+            sub.u32 last, $2, 1;
+            atom.relaxed.gpu.global.inc.u32 prior, [$0], last;
+            setp.eq.u32 final, prior, last;
+            @final st.relaxed.gpu.global.u32 [$1], $3;
+            @final bra local_phase_released;
+        local_phase_wait:
+            ld.relaxed.gpu.global.u32 seen, [$1];
+            setp.eq.u32 reached, seen, $3;
+            @!reached bra local_phase_wait;
+        local_phase_released:
+        }
+        """,
+        "l,l,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def plain_graph_epoch_arrive(
     epoch_addr: Int64,
     arrived_addr: Int64,
@@ -668,6 +721,21 @@ def plain_graph_epoch_arrive(
         }
         """,
         "l,l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def threadfence_system(*, loc=None, ip=None) -> None:
+    llvm.inline_asm(
+        None,
+        [],
+        "fence.sc.sys;",
+        "",
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,

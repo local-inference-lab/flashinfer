@@ -128,9 +128,24 @@ compares explicit transports and the static dispatch policy with CUDA graphs.
 ## Joint BF16 profiles
 
 Explicit joint-only plans for staged BF16 reductions with payload-ready peer
-storage race two joint entrypoints. `joint_latency` supports `full`, `payload_rsag`, and
-`pull`; `joint_bandwidth` supports `payload_rsag`, `bulk_push`, `bulk_pull`, and
-`pull`. Ordinary plans retain standalone transport competition. Each entrypoint
+storage race two joint entrypoints. `joint_latency` supports `full`, `payload_rsag`,
+`pull`, `full_phased`, and `payload_rsag_phased`; `joint_bandwidth` supports
+`payload_rsag`, `bulk_push`, `bulk_pull`, `pull`, `payload_rsag_phased`, and
+`bulk_push_phased`. Ordinary plans retain standalone transport competition.
+
+A phased mode moves the same data as its base mode with the same arithmetic.
+Every active CTA of a rank writes to one peer at a time, in rank-staggered
+order. Between destinations, each thread completes its peer writes with a
+system fence and a local phase barrier holds the rank's CTAs. The base modes
+interleave peers per pack. Where peers sit behind different CPU host bridges,
+concurrent writes toward several peers collapse to a few GB/s, while one
+destination per rank keeps link rate; concurrent peer reads there stall for
+milliseconds in bursts. On switched fabrics interleaving stays faster for small
+messages. The race measures both orders. Phases order issue only: payload
+readiness, barriers and pack ownership are unchanged, so every pack keeps the
+thread that publishes, reduces and gathers it, including for exact aliases.
+
+Each entrypoint
 uses one compiled program per thread count and maximum grid; its submode and
 active CTA count are device data and do not specialize compilation. The maximum
 grid is capped by the device SM count and 64 CTAs. The tuning

@@ -13,6 +13,8 @@ def _reference(operands, rank, mode):
     import torch
 
     world, elements = operands.shape
+    # Phased modes move the same data as their base modes in another order.
+    mode = mode.removesuffix("_phased")
 
     def reduce(owner, begin, end, zero_init=False):
         value = operands[owner, begin:end].float()
@@ -107,11 +109,9 @@ def _exercise(rank, world, family, alias):
 
     device = torch.device("cuda", rank)
     pack_counts = tuple(sorted({1, world - 1, world + 1, 257, 4099}))
-    modes = (
-        ("full", "payload_rsag", "pull")
-        if family == "joint_latency"
-        else ("payload_rsag", "bulk_push", "bulk_pull", "pull")
-    )
+    from b12x.comm.pcie._joint_profile import JOINT_FAMILIES
+
+    modes = JOINT_FAMILIES[family]
     manager = PCIeAllReduce.from_exchange_group(
         joint=True,
         exchange_group=dist.group.WORLD,

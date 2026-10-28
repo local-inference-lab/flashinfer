@@ -30,6 +30,7 @@ from b12x.comm.pcie import _twoshot_preparation as twoshot
 from b12x.comm.pcie.pcie_allreduce import PCIeAllReduce
 from b12x.comm.pcie import CollectiveConfig
 from b12x.comm.pcie._collective_tuning import plan as collective_plan
+from b12x.comm.pcie._joint_profile import JOINT_MODES
 from b12x.comm.pcie._tuning import PcieQuery
 from b12x.preparation import CollectiveRequirement, FrozenMapping, PreparationSession
 
@@ -268,7 +269,7 @@ def reference(operands, rank, transport, submode=None):
             "bulk_push": "bulk_push",
             "bulk_pull": "bulk_pull",
             "pull": "pull",
-        }[submode]
+        }[submode.removesuffix("_phased")]
     bulk = transport in ("bulk_push", "bulk_pull")
     if transport not in ("remote_push_rsag", "twoshot", "bulk_push", "bulk_pull"):
         total = operands[rank].float()
@@ -308,7 +309,7 @@ def main():
     parser.add_argument("--blocks", type=int, default=16)
     parser.add_argument(
         "--joint-submode",
-        choices=("full", "payload_rsag", "bulk_push", "bulk_pull", "pull"),
+        choices=tuple(JOINT_MODES),
     )
     parser.add_argument("--joint-active-blocks", type=int, default=16)
     parser.add_argument("--joint-max-blocks", type=int, default=64)

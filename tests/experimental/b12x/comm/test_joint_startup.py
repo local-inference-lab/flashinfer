@@ -8,7 +8,11 @@ def test_joint_finalist_policy_preserves_mode_and_compiled_geometry():
     policy = joint_finalist_policy()
     assert policy.family_fields == ("implementation", "threads", "blocks", "submode")
     assert policy.per_family == 1
-    assert policy.max_total == 35
+    from b12x.comm.pcie._joint_profile import JOINT_FAMILIES, JOINT_THREADS
+
+    assert policy.max_total == len(JOINT_THREADS) * sum(
+        len(modes) for modes in JOINT_FAMILIES.values()
+    )
 
 
 def test_unprepared_joint_startup_rejected():
