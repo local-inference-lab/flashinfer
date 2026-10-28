@@ -212,7 +212,7 @@ def test_unprepared_route_preserves_jit_arguments(monkeypatch):
     weights = _TensorMetadata((1, 2), torch.float32, (2, 1))
     routing.route_topk(logits, selected, ids, weights, renormalize=False)
     grid, args, options = calls[0]
-    assert grid == (1,)
+    assert grid == (1, 1, 1)
     assert len(args) == 17 and args[:4] == (logits, selected, ids, weights)
     assert options == {
         "BLOCK_E": 128,
@@ -367,3 +367,99 @@ def test_public_prepared_route_graph_replays_inputs_and_modality(
         finally:
             stream.synchronize()
             graph.reset()
+
+
+@pytest.mark.parametrize("rows_per_program,warps", [(1, 1), (2, 2), (4, 8), (3, 4)])
+def test_route_launch_geometry_reaches_the_launcher(rows_per_program, warps):
+    logits = _TensorMetadata((10, 288), torch.float32, (288, 1))
+    selected = _TensorMetadata((10, 8), torch.float32, (8, 1))
+    ids = _TensorMetadata((10, 8), torch.int32, (8, 1))
+    weights = _TensorMetadata((10, 8), torch.float32, (8, 1))
+    launcher = _CompiledLauncher()
+    routing.route_topk(
+        logits,
+        selected,
+        ids,
+        weights,
+        renormalize=True,
+        score_func="sigmoid",
+        _launcher=launcher,
+        _rows_per_program=rows_per_program,
+        _num_warps=warps,
+    )
+    ((grid, args, _),) = launcher.calls
+    assert grid == (-(-10 // rows_per_program), 1, 1)
+    if rows_per_program == 1:
+        assert len(args) == 25
+    else:
+        assert args[17] == 10 and args[-1] == rows_per_program
+        assert len(args) == 27
+
+
+def test_unprepared_route_jit_uses_requested_geometry(monkeypatch):
+    calls = []
+
+    class JitLauncher:
+        def __getitem__(self, grid):
+            return lambda *args, **kwargs: calls.append((grid, args, kwargs))
+
+    monkeypatch.setattr(routing, "_route_topk_rows_kernel", JitLauncher())
+    logits = _TensorMetadata((9, 288), torch.float32, (288, 1))
+    selected = _TensorMetadata((9, 8), torch.float32, (8, 1))
+    ids = _TensorMetadata((9, 8), torch.int32, (8, 1))
+    weights = _TensorMetadata((9, 8), torch.float32, (8, 1))
+    routing.route_topk(
+        logits,
+        selected,
+        ids,
+        weights,
+        renormalize=True,
+        _rows_per_program=4,
+        _num_warps=2,
+    )
+    grid, args, options = calls[0]
+    assert grid == (3, 1, 1)
+    assert args[-1] == 9
+    assert options["ROWS_PER_PROGRAM"] == 4 and options["num_warps"] == 2
+
+
+def test_single_row_route_uses_the_original_kernel(monkeypatch):
+    calls = []
+
+    class Jit:
+        def __init__(self, name):
+            self.name = name
+
+        def __getitem__(self, grid):
+            return lambda *args, **kwargs: calls.append((self.name, kwargs))
+
+    monkeypatch.setattr(routing, "_route_topk_kernel", Jit("single"))
+    monkeypatch.setattr(routing, "_route_topk_rows_kernel", Jit("rows"))
+    logits = _TensorMetadata((9, 288), torch.float32, (288, 1))
+    selected = _TensorMetadata((9, 8), torch.float32, (8, 1))
+    ids = _TensorMetadata((9, 8), torch.int32, (8, 1))
+    weights = _TensorMetadata((9, 8), torch.float32, (8, 1))
+    for rows in (1, 2):
+        routing.route_topk(
+            logits, selected, ids, weights, renormalize=True, _rows_per_program=rows
+        )
+    assert [name for name, _ in calls] == ["single", "rows"]
+    assert "ROWS_PER_PROGRAM" not in calls[0][1]
+
+
+@pytest.mark.parametrize("rows", [0, -1, 1.5])
+def test_route_rejects_invalid_rows_per_program(rows):
+    logits = _TensorMetadata((2, 8), torch.float32, (8, 1))
+    selected = _TensorMetadata((2, 2), torch.float32, (2, 1))
+    ids = _TensorMetadata((2, 2), torch.int32, (2, 1))
+    weights = _TensorMetadata((2, 2), torch.float32, (2, 1))
+    with pytest.raises(ValueError, match="rows per program"):
+        routing.route_topk(
+            logits,
+            selected,
+            ids,
+            weights,
+            renormalize=True,
+            _launcher=_CompiledLauncher(),
+            _rows_per_program=rows,
+        )
