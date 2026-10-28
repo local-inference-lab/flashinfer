@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from importlib import import_module
+from dataclasses import replace
+from math import prod
 
 from b12x.preparation import FrozenMapping, Plan
 from ._tuning import PcieConfig, PcieQuery, TUNING
@@ -66,8 +68,28 @@ def plan(
     ):
         from ._collective_tuning import plan as collective_plan
 
+        alternatives = {"dcp": (query, runtime)}
+        if query.surface.endswith(".all_gather_heads") and query.world_size == 4:
+            element_bytes = 1 if query.call["dtype"] == "torch.float8_e4m3fn" else 2
+            words = prod(query.call["shape"]) * element_bytes // 4
+            if (
+                0 < words <= query.setup.get("tagged_words", 0)
+                and not query.call.get("output_alias", True)
+                and query.call.get("word_aligned", False)
+            ):
+                tagged = replace(
+                    query,
+                    call=FrozenMapping(
+                        {
+                            **query.call,
+                            "gather_transport": "tagged_words",
+                            "block_limit": 1,
+                        }
+                    ),
+                )
+                alternatives["dcp_tagged"] = (tagged, runtime)
         return collective_plan(
-            {"dcp": (query, runtime)},
+            alternatives,
             default="dcp",
             invocation=invocation,
             override=override,

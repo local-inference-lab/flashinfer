@@ -95,6 +95,11 @@ def _configs(query):
                     yield CollectiveConfig(
                         implementation=name, threads=count_threads, blocks=count_blocks
                     )
+        elif name == "dcp_tagged":
+            for count_threads in (32, 64, 128, 256, 512):
+                yield CollectiveConfig(
+                    implementation=name, threads=count_threads, blocks=1
+                )
         elif name == "twoshot":
             from math import prod
 
@@ -271,7 +276,8 @@ def _collective_signature(query):
 
 TUNING = TuningContract(
     component_id="comm.pcie",
-    query_schema_version=5,
+    query_schema_version=6,
+    candidate_contract_version=2,
     config_schema_version=2,
     query_fields=frozenset(
         ("operation", "world_size", "rank", "alternatives", "default", "inplace")
