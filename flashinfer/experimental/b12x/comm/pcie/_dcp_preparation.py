@@ -86,6 +86,9 @@ def query_from_runtime(runtime, *, surface, call) -> PcieQuery:
             "head_dim": int(runtime.head_dim),
             "query_head_dim": int(runtime.query_head_dim),
             "slot_bytes": int(runtime._slot_bytes),
+            "exchange_chunks": getattr(runtime, "_exchange_chunks", 0),
+            "exchange_offset": getattr(runtime, "_exchange_offset", 0),
+            "exchange_counter_offset": getattr(runtime, "_exchange_counter_offset", 0),
             "signal_words": len(runtime._signal_ptrs),
             "threads_override": int(runtime._threads_override),
             "blocks_override": int(runtime._block_limit_override),
@@ -114,10 +117,20 @@ def query_from_runtime(runtime, *, surface, call) -> PcieQuery:
         )
     elif surface.endswith("all_gather_heads"):
         value = _call_value(call, "local_input")
+        out = call.get("out")
+        overlaps = (
+            out is not None
+            and value.data_ptr() < out.data_ptr() + out.nbytes
+            and out.data_ptr() < value.data_ptr() + value.nbytes
+        )
         metadata.update(
             dtype=str(value.dtype),
             shape=tuple(value.shape),
             stride=tuple(value.stride()),
+            gather_transport="barrier",
+            disjoint_output=not overlaps,
+            word_aligned=value.data_ptr() % 4 == 0
+            and (out is None or out.data_ptr() % 4 == 0),
         )
     elif surface.endswith("all_gather_pair"):
         first, second = (
@@ -164,6 +177,7 @@ def compile_dcp_surface(query_payload, ordinal):
     from . import _dcp_a2a_cute as cute
 
     query = PcieQuery(**dict(query_payload))
+    TUNING.validate_query(query, None)
     call = query.call
     surface = query.surface
     with torch.cuda.device(ordinal):
@@ -181,6 +195,20 @@ def compile_dcp_surface(query_payload, ordinal):
                 for slot in (False, True)
             }
         if surface.endswith("all_gather_heads"):
+            if call.get("gather_transport") == "word_exchange":
+                from ._word_exchange import compile_word_exchange
+
+                element_bytes = 1 if call["dtype"] == "torch.float8_e4m3fn" else 2
+                row_words = call["shape"][1] * call["shape"][2] * element_bytes // 4
+                program = compile_word_exchange(
+                    query.rank,
+                    query.world_size,
+                    row_words,
+                    int(call["threads"]),
+                    int(call["block_limit"]),
+                    int(query.setup["exchange_chunks"]),
+                )
+                return {False: program, True: program}
             return {
                 slot: cute._get_compiled_all_gather_heads(
                     query.world_size, query.rank, int(call["threads"]), slot
@@ -325,7 +353,12 @@ def plan(
         )
         return _DcpExecutionState(query, runtime, MappingProxyType(dict(launchers)))
 
-    resident = int(getattr(runtime, "_slot_bytes", 0)) * 2
+    owned = getattr(runtime, "_owned_buffers", ())
+    resident = (
+        sum(buffer.nbytes for buffer in owned)
+        if owned
+        else int(getattr(runtime, "_slot_bytes", 0)) * 2
+    )
     return Plan(
         contract=TUNING,
         query=query,

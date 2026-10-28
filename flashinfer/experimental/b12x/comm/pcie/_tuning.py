@@ -72,6 +72,35 @@ def _validate_query(query: PcieQuery, device) -> None:
         raise ValueError(f"{query.surface} supports world sizes {worlds}")
     if not 0 <= query.rank < query.world_size:
         raise ValueError("rank must belong to the caller's process group")
+    if query.surface.endswith(".all_gather_heads"):
+        transport = query.call.get("gather_transport", "barrier")
+        if transport not in ("barrier", "word_exchange"):
+            raise ValueError("unknown DCP gather transport")
+        if transport == "word_exchange":
+            from math import prod
+
+            element_bytes = 1 if query.call["dtype"] == "torch.float8_e4m3fn" else 2
+            nbytes = prod(query.call["shape"]) * element_bytes
+            chunks = query.setup.get("exchange_chunks", 0)
+            if (
+                query.world_size not in (2, 4)
+                or not 1 <= chunks <= 64
+                or not 0 < nbytes <= chunks * 64 * 4
+                or nbytes % 4
+                or not query.call.get("disjoint_output", False)
+                or not query.call.get("word_aligned", False)
+                or query.call["threads"] not in (32, 64, 128, 256)
+                or not 1 <= query.call["block_limit"] <= 64
+                or query.setup.get("exchange_offset", -1) < 0
+                or query.setup["exchange_offset"] % 256
+                or query.setup["exchange_offset"] + query.world_size * chunks * 64 * 8
+                > query.setup["slot_bytes"]
+                or query.setup.get("exchange_counter_offset", 0)
+                != 2 * query.setup["slot_bytes"]
+            ):
+                raise ValueError(
+                    "word exchange requires disjoint aligned data and owned TP2/TP4 state"
+                )
     if query.surface == "kimi_topk16":
         if query.topology != "local":
             raise ValueError("stateless kimi_topk16 uses one local device")
@@ -81,6 +110,6 @@ def _validate_query(query: PcieQuery, device) -> None:
         )
 
 
-TUNING = replace(TUNING, query_schema_version=38, validate_query=_validate_query)
+TUNING = replace(TUNING, query_schema_version=40, validate_query=_validate_query)
 
 __all__ = ["PcieQuery", "PcieConfig", "SURFACES", "TUNING"]

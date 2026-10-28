@@ -95,6 +95,28 @@ def _configs(query):
                     yield CollectiveConfig(
                         implementation=name, threads=count_threads, blocks=count_blocks
                     )
+        elif name == "dcp_word":
+            from math import prod
+
+            element_bytes = 1 if call["dtype"] == "torch.float8_e4m3fn" else 2
+            chunks = (prod(call["shape"]) * element_bytes // 4 + 63) // 64
+            setup = payload["setup"]
+            thread_counts = (
+                (threads,) if setup.get("threads_override", 0) else (32, 64, 128, 256)
+            )
+            for count_threads in thread_counts:
+                warps = count_threads // 32
+                if warps > 1 << (chunks - 1).bit_length():
+                    continue
+                grids = (
+                    (blocks,)
+                    if setup.get("blocks_override", 0)
+                    else sorted({1, (chunks + warps - 1) // warps})
+                )
+                for count_blocks in grids:
+                    yield CollectiveConfig(
+                        implementation=name, threads=count_threads, blocks=count_blocks
+                    )
         elif name == "twoshot":
             from math import prod
 
@@ -271,7 +293,8 @@ def _collective_signature(query):
 
 TUNING = TuningContract(
     component_id="comm.pcie",
-    query_schema_version=5,
+    query_schema_version=7,
+    candidate_contract_version=3,
     config_schema_version=2,
     query_fields=frozenset(
         ("operation", "world_size", "rank", "alternatives", "default", "inplace")

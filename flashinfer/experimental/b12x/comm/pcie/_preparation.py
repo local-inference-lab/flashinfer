@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from importlib import import_module
+from dataclasses import replace
+from math import prod
 
 from b12x.preparation import FrozenMapping, Plan
 from ._tuning import PcieConfig, PcieQuery, TUNING
@@ -66,8 +68,40 @@ def plan(
     ):
         from ._collective_tuning import plan as collective_plan
 
+        alternatives = {"dcp": (query, runtime)}
+        if (
+            query.surface.endswith(".all_gather_heads")
+            and query.world_size in (2, 4)
+            and query.setup.get("exchange_chunks", 0) > 0
+            and query.call.get("word_aligned", False)
+            and query.call.get("disjoint_output", False)
+            and (
+                not query.setup.get("threads_override", 0)
+                or query.call["threads"] in (32, 64, 128, 256)
+            )
+        ):
+            element_bytes = 1 if query.call["dtype"] == "torch.float8_e4m3fn" else 2
+            nbytes = prod(query.call["shape"]) * element_bytes
+            if (
+                nbytes % 4 == 0
+                and 0 < nbytes // 4 <= query.setup["exchange_chunks"] * 64
+            ):
+                call = dict(query.call)
+                call.update(
+                    gather_transport="word_exchange",
+                    threads=query.call["threads"]
+                    if query.setup.get("threads_override", 0)
+                    else 32,
+                    block_limit=query.call["block_limit"]
+                    if query.setup.get("blocks_override", 0)
+                    else 1,
+                )
+                alternatives["dcp_word"] = (
+                    replace(query, call=FrozenMapping(call)),
+                    runtime,
+                )
         return collective_plan(
-            {"dcp": (query, runtime)},
+            alternatives,
             default="dcp",
             invocation=invocation,
             override=override,

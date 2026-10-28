@@ -165,6 +165,9 @@ class _StagingLayout:
     lse_capacity: int
     slot_bytes: int
     slab_bytes: int
+    exchange_chunks: int
+    exchange_offset: int
+    exchange_counter_offset: int
 
 
 def _staging_layout(
@@ -201,6 +204,21 @@ def _staging_layout(
         lse_offset + lse_capacity * 4,
         IPC_SLAB_ALIGNMENT,
     )
+    # Receive banks and their counters have distinct declared lifetimes. The
+    # counters follow both slots; ordinary signal resets cannot touch them.
+    exchange_offset = slot_bytes
+    local_elements = total_heads // world_size * query_head_dim
+    exchange_words = (
+        min(4096, max_batch_size * local_elements // 2)
+        if world_size in (2, 4) and local_elements <= 16384
+        else 0
+    )
+    exchange_chunks = (exchange_words + 63) // 64
+    slot_bytes += exchange_chunks * world_size * 64 * 8
+    counter_bytes = (
+        _align_up(exchange_chunks * 4, IPC_SLAB_ALIGNMENT) if exchange_chunks else 0
+    )
+    exchange_counter_offset = 2 * slot_bytes
     staging0_offset = _align_up(signal_bytes, IPC_SLAB_ALIGNMENT)
     staging1_offset = staging0_offset + slot_bytes
     return _StagingLayout(
@@ -211,7 +229,10 @@ def _staging_layout(
         lse_offset=lse_offset,
         lse_capacity=lse_capacity,
         slot_bytes=slot_bytes,
-        slab_bytes=staging1_offset + slot_bytes,
+        slab_bytes=staging1_offset + slot_bytes + counter_bytes,
+        exchange_chunks=exchange_chunks,
+        exchange_offset=exchange_offset,
+        exchange_counter_offset=exchange_counter_offset,
     )
 
 
@@ -515,6 +536,11 @@ class PCIeDCPA2A:
                 "staging slot pointers must have one shared positive stride"
             )
         self._slot_bytes = next(iter(slot_deltas))
+        # Raw borrowed layouts expose only their existing DCP regions. The
+        # allocating factory enables word exchange after reserving zeroed state.
+        self._exchange_chunks = 0
+        self._exchange_offset = 0
+        self._exchange_counter_offset = 0
         self._output_capacity_elems = int(output_capacity_elems)
         self._lse_offset = int(lse_offset)
         self._lse_capacity = int(lse_capacity)
@@ -683,6 +709,9 @@ class PCIeDCPA2A:
             ext_module=ext_module,
             stream_affine=stream_affine,
         )
+        runtime._exchange_chunks = layout.exchange_chunks
+        runtime._exchange_offset = layout.exchange_offset
+        runtime._exchange_counter_offset = layout.exchange_counter_offset
 
         def abort_native_runtime() -> None:
             pointer = getattr(runtime, "_ptr", 0)
@@ -1017,6 +1046,39 @@ class PCIeDCPA2A:
         )
         if threads != state.query.call["threads"]:
             raise ValueError("DCP threads differ from the prepared launcher")
+        if state.query.call.get("gather_transport") == "word_exchange":
+            if str(local_input.dtype) != state.query.call["dtype"]:
+                raise ValueError(
+                    "word exchange dtype differs from its prepared word geometry"
+                )
+            nbytes = local_input.numel() * local_input.element_size()
+            if nbytes % 4 or nbytes // 4 > self._exchange_chunks * 64:
+                raise ValueError("word exchange exceeds its declared receive capacity")
+            if (
+                local_input.data_ptr() < out.data_ptr() + out.nbytes
+                and out.data_ptr() < local_input.data_ptr() + nbytes
+            ):
+                raise ValueError("word exchange requires disjoint input and output")
+            for field in (
+                "exchange_chunks",
+                "exchange_offset",
+                "exchange_counter_offset",
+                "slot_bytes",
+            ):
+                if state.query.setup[field] != getattr(self, "_" + field):
+                    raise ValueError(
+                        "word exchange plan does not match its owned state"
+                    )
+            state.launcher(False)(
+                local_input.data_ptr(),
+                out.data_ptr(),
+                self._staging0_ptrs,
+                self._slot_bytes,
+                self._exchange_offset,
+                self._exchange_counter_offset,
+                int(batch),
+            )
+            return out
         rows = int(batch) * self.total_heads
         warps_per_block = threads // 32
         blocks = max(
