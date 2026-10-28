@@ -87,6 +87,7 @@ class RouteTopKInvocation:
             topk_row_stride=self.topk_row_stride or self.top_k,
             ids_row_stride=self.ids_row_stride or self.top_k,
             weights_row_stride=self.weights_row_stride or self.top_k,
+            autotune_effort=capture_autotune_effort().value,
         )
 
 
@@ -1508,7 +1509,7 @@ def plan(
                 ),
                 CompileJob.create(
                     "b12x.moe.fused_moe._preparation:compile_route_topk",
-                    ROUTE_TUNING.encode_query(route_query),
+                    _route_program_payload(ROUTE_TUNING.encode_query(route_query)),
                     CompileJob.DEVICE_ORDINAL,
                 ),
                 *(
@@ -1563,7 +1564,8 @@ def plan(
                 )
             route_query = _route_query_from_moe(query, routing)
             route_launcher = compile_route_topk(
-                ROUTE_TUNING.encode_query(route_query), device.ordinal
+                _route_program_payload(ROUTE_TUNING.encode_query(route_query)),
+                device.ordinal,
             )
             launchers.append(route_launcher)
             launchers.extend(
@@ -1694,19 +1696,37 @@ def compile_dynamic_route_plan(payload, ordinal):
         )
 
 
+def _route_program_payload(query_payload):
+    """Encode route program inputs without search-effort policy."""
+    return {
+        key: value for key, value in query_payload.items() if key != "autotune_effort"
+    }
+
+
 @program_cache(scope="preparation")
-def compile_route_topk(query_payload, ordinal):
-    """Compile the exact Triton route program from immutable ABI metadata."""
+def compile_route_topk(query_payload, ordinal, config_payload=None):
+    """Compile the exact Triton route program from immutable ABI metadata.
+
+    Without ``config_payload`` the program has the original one-row geometry.
+    """
     import triton
-    from b12x.moe._shared.routing import _route_topk_kernel
-    from ._tuning import MoeRouteQuery
+    from b12x.moe._shared.routing import _route_topk_kernel, _route_topk_rows_kernel
+    from ._tuning import MoeRouteConfig, MoeRouteQuery
 
     query = MoeRouteQuery(**dict(query_payload))
     ROUTE_TUNING.validate_query(query, None)
+    config = (
+        ROUTE_TUNING.default_config(query, None)
+        if config_payload is None
+        else MoeRouteConfig.from_config(FrozenMapping(config_payload))
+    )
+    ROUTE_TUNING.validate_config(query, config, None)
     block_e = triton.next_power_of_2(query.num_experts)
     topk_block = triton.next_power_of_2(query.top_k)
+    multi_row = config.rows_per_program > 1
+    kernel = _route_topk_rows_kernel if multi_row else _route_topk_kernel
     with torch.cuda.device(ordinal):
-        return _route_topk_kernel.warmup(
+        return kernel.warmup(
             getattr(torch, query.logits_dtype),
             torch.float32,
             torch.int32,
@@ -1724,6 +1744,7 @@ def compile_route_topk(query_payload, ordinal):
             query.routed_scaling_factor,
             query.num_experts,
             torch.int32,
+            *((query.num_tokens,) if multi_row else ()),
             BLOCK_E=block_e,
             TOP_K=query.top_k,
             TOPK_BLOCK=topk_block,
@@ -1732,8 +1753,9 @@ def compile_route_topk(query_payload, ordinal):
             HAS_CORRECTION_BIAS=query.has_correction_bias,
             HAS_IMAGE_BIAS=query.has_image_correction_bias,
             HAS_VALID_TOKENS=query.has_valid_tokens,
-            num_warps=4 if block_e <= 256 else 8,
-            grid=(query.num_tokens,),
+            **({"ROWS_PER_PROGRAM": config.rows_per_program} if multi_row else {}),
+            num_warps=config.num_warps,
+            grid=(triton.cdiv(query.num_tokens, config.rows_per_program),),
         )
 
 
@@ -1741,6 +1763,7 @@ def compile_route_topk(query_payload, ordinal):
 class _RouteTopKState:
     query: object
     launcher: object
+    config: object = None
 
     def run(self, router_logits, topk_logits, topk_ids, topk_weights, **kwargs):
         from b12x.moe._shared.routing import route_topk
@@ -1796,6 +1819,10 @@ class _RouteTopKState:
             num_valid_tokens=num_valid_tokens,
             routed_scaling_factor=self.query.routed_scaling_factor,
             _launcher=self.launcher,
+            _rows_per_program=1
+            if self.config is None
+            else self.config.rows_per_program,
+            _num_warps=None if self.config is None else self.config.num_warps,
             **kwargs,
         )
 
@@ -1837,18 +1864,24 @@ def plan_route_topk(
     query = invocation.query()
     declaration_invocation = FrozenMapping(declaration_invocation)
 
+    program_query = _route_program_payload(ROUTE_TUNING.encode_query(query))
+
     def jobs(config, device):
         return (
             CompileJob.create(
                 "b12x.moe.fused_moe._preparation:compile_route_topk",
-                ROUTE_TUNING.encode_query(query),
+                program_query,
                 CompileJob.DEVICE_ORDINAL,
+                ROUTE_TUNING.encode_config(config),
             ),
         )
 
     def materialize(selection, device):
+        config_payload = ROUTE_TUNING.encode_config(selection.config)
         return _RouteTopKState(
-            query, compile_route_topk(ROUTE_TUNING.encode_query(query), device.ordinal)
+            query,
+            compile_route_topk(program_query, device.ordinal, config_payload),
+            selection.config,
         )
 
     return Plan(
