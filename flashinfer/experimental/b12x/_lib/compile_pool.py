@@ -21,6 +21,7 @@ __b12x_source_dependencies__ = ()
 
 from .compile_plan import (
     ProgramKey,
+    _planning_artifacts,
     observe_programs,
     plan_compilations,
     program_keys,
@@ -412,6 +413,10 @@ def _run_job(payload: bytes, expected: tuple[ProgramKey, ...]):
     try:
         with observe_programs() as observed, serialized_compilations():
             result = job.invoke()
+            if any(True for _ in _planning_artifacts(result)):
+                raise RuntimeError(
+                    f"compile factory returned an unresolved planning stub: {job.factory}"
+                )
             actual = set(program_keys(result))
         if not observed <= actual or actual != set(expected):
 
