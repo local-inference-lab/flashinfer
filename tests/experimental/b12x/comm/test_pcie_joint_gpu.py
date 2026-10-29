@@ -4,6 +4,7 @@ from datetime import timedelta
 import ctypes
 import gc
 import os
+import time
 from pathlib import Path
 
 import pytest
@@ -25,7 +26,7 @@ def _reference(operands, rank, mode):
     if mode in ("full", "pull"):
         return reduce(rank, 0, elements)
     packs = elements // 8
-    bulk = mode in ("bulk_push", "bulk_pull")
+    bulk = mode in ("bulk_push", "bulk_pull", "serial_push", "queued_push")
     shard = -(-packs // world) if bulk else packs // world
     result = torch.empty(elements, dtype=operands.dtype)
     for owner in range(world):
@@ -43,6 +44,7 @@ def _operands(world, elements, step):
     ).to(torch.bfloat16)
     if step % 6 == 1:
         values.zero_()
+        values[::2].neg_()
     elif step % 6 == 2:
         values[1] = -values[0]
     elif step % 6 == 3:
@@ -52,6 +54,10 @@ def _operands(world, elements, step):
     elif step % 6 == 5:
         values[:, 0] = float("inf")
         values[0, 1] = float("nan")
+    # These exactly representable BF16 inputs distinguish sequential FP32
+    # addition from reassociation, including each shard owner's cyclic order.
+    for rank in range(world):
+        values[rank, 2::8] = (2**24, 1, -(2**24), 1)[rank] if rank < 4 else 0
     return values
 
 
@@ -96,21 +102,224 @@ def _assert_epoch_wrapped(state):
     assert tuple(words) == (0, 0), tuple(words)
 
 
-def _exercise(rank, world, family, alias):
+def _barrier_counters(state):
+    import torch
+
+    from b12x.comm.pcie._joint_profile import JOINT_MAX_BLOCKS, JOINT_MAX_RANKS
+
+    counters = (ctypes.c_uint32 * (JOINT_MAX_BLOCKS * JOINT_MAX_RANKS))()
+    stream = torch.cuda.current_stream()
+    state.runtime._ipc.cudaMemcpyAsync(
+        ctypes.addressof(counters),
+        state.workspace.shared.local_ptr,
+        ctypes.sizeof(counters),
+        stream.cuda_stream,
+    )
+    stream.synchronize()
+    return tuple(counters)
+
+
+def _assert_serial_push_progress(state, before, active, replays):
+    from b12x.comm.pcie._joint_profile import JOINT_MAX_RANKS
+
+    world, rank = state.query.world_size, state.query.rank
+    for index, (start, end) in enumerate(
+        zip(before, _barrier_counters(state), strict=True)
+    ):
+        block, peer = divmod(index, JOINT_MAX_RANKS)
+        expected = (
+            2 * replays if block < active and peer < world and peer != rank else 0
+        )
+        assert (end - start) & 0xFFFFFFFF == expected, (
+            block,
+            peer,
+            start,
+            end,
+            expected,
+        )
+
+
+def _read_queue_words(state, generation=None):
+    import torch
+    from b12x.comm.pcie._joint_cute import _EPOCH_OFFSET
+    from b12x.comm.pcie._joint_profile import (
+        JOINT_QUEUE_SLOT0_OFFSET,
+        JOINT_QUEUE_SLOT_STRIDE,
+        JOINT_QUEUE_SLOT_BYTES,
+    )
+
+    stream = torch.cuda.current_stream()
+    epoch = (ctypes.c_uint32 * 2)()
+    ipc = state.runtime._ipc
+    base = state.workspace.shared.local_ptr
+    ipc.cudaMemcpyAsync(
+        ctypes.addressof(epoch), base + _EPOCH_OFFSET, 8, stream.cuda_stream
+    )
+    stream.synchronize()
+    if generation is None:
+        generation = (epoch[0] - 1) & 0xFFFFFFFF
+    words = (ctypes.c_uint64 * (JOINT_QUEUE_SLOT_BYTES // 8))()
+    address = (
+        base + JOINT_QUEUE_SLOT0_OFFSET + (generation % 2) * JOINT_QUEUE_SLOT_STRIDE
+    )
+    ipc.cudaMemcpyAsync(
+        ctypes.addressof(words), address, ctypes.sizeof(words), stream.cuda_stream
+    )
+    stream.synchronize()
+    return generation, tuple(words)
+
+
+def _assert_queued_progress(state):
+    from b12x.comm.pcie._joint_profile import (
+        JOINT_QUEUE_CLAIM_OFFSET,
+        JOINT_QUEUE_DONE_OFFSET,
+        JOINT_QUEUE_FIRST_PHASE,
+        JOINT_QUEUE_PACKS_PER_THREAD,
+    )
+
+    generation, words = _read_queue_words(state)
+    world, rank = state.query.world_size, state.query.rank
+    active = int(state.selector.item()) & 0xFFFF
+    packs = state.query.call["size_packs"]
+    shard = -(-packs // world)
+    tile = state.query.call["threads"] * JOINT_QUEUE_PACKS_PER_THREAD
+    assert words[0] == (generation << 32) | (JOINT_QUEUE_FIRST_PHASE + 2 * world)
+    for phase in range(2 * world):
+        owner = (rank + phase + 1) % world if phase < world - 1 else rank
+        count = min(shard, max(0, packs - owner * shard))
+        expected = max(1, -(-count // tile))
+        if phase == 2 * world - 1:
+            expected = (world - 1) * -(-shard // tile)
+        assert (
+            expected
+            <= words[JOINT_QUEUE_CLAIM_OFFSET // 8 + phase]
+            <= expected + active
+        )
+        assert words[JOINT_QUEUE_DONE_OFFSET // 8 + phase] == expected
+
+
+def _assert_partial_residency(graph, state, sms):
+    from cuda.bindings import driver
+
+    result, _, count = driver.cuGraphGetNodes(graph.raw_cuda_graph(), 0)
+    assert result == driver.CUresult.CUDA_SUCCESS
+    result, nodes, _ = driver.cuGraphGetNodes(graph.raw_cuda_graph(), count)
+    assert result == driver.CUresult.CUDA_SUCCESS
+    kernels = []
+    for node in nodes:
+        result, kind = driver.cuGraphNodeGetType(node)
+        assert result == driver.CUresult.CUDA_SUCCESS
+        if kind == driver.CUgraphNodeType.CU_GRAPH_NODE_TYPE_KERNEL:
+            result, parameters = driver.cuGraphKernelNodeGetParams(node)
+            assert result == driver.CUresult.CUDA_SUCCESS
+            result, resident = driver.cuOccupancyMaxActiveBlocksPerMultiprocessor(
+                parameters.func, parameters.blockDimX, parameters.sharedMemBytes
+            )
+            assert result == driver.CUresult.CUDA_SUCCESS
+            assert parameters.blockDimX == state.query.call["threads"]
+            assert parameters.gridDimX == state.query.call["blocks"]
+            assert sms * resident < parameters.gridDimX, (
+                sms,
+                resident,
+                parameters.gridDimX,
+            )
+            result, registers = driver.cuFuncGetAttribute(
+                driver.CUfunction_attribute.CU_FUNC_ATTRIBUTE_NUM_REGS, parameters.func
+            )
+            assert result == driver.CUresult.CUDA_SUCCESS
+            print(
+                f"queued occupancy: rank={state.query.rank} SMs={sms} resident/SM={resident} "
+                f"grid={parameters.gridDimX} threads={parameters.blockDimX} "
+                f"registers={registers} shared={parameters.sharedMemBytes}",
+                flush=True,
+            )
+            kernels.append(parameters)
+    assert len(kernels) == 1, len(kernels)
+
+
+def _force_epoch(state, generation):
+    import torch
+    import torch.distributed as dist
+    from b12x.comm.pcie._joint_cute import _EPOCH_OFFSET
+
+    words = (ctypes.c_uint32 * 2)(generation, 0)
+    stream = torch.cuda.current_stream()
+    state.runtime._ipc.cudaMemcpyAsync(
+        state.workspace.shared.local_ptr + _EPOCH_OFFSET,
+        ctypes.addressof(words),
+        ctypes.sizeof(words),
+        stream.cuda_stream,
+    )
+    stream.synchronize()
+    dist.barrier()
+
+
+def _exercise_stale_queue_generation(graph, source, out, state):
+    import torch
+    import torch.distributed as dist
+
+    world, rank = state.query.world_size, state.query.rank
+    state.select_profile("queued_push", 4)
+    _force_epoch(state, 0)
+    values = _operands(world, source.numel(), 0)
+    source.copy_(values[rank])
+    torch.cuda.synchronize()
+    dist.barrier()
+    graph.replay()
+    torch.cuda.synchronize()
+    _assert_queued_progress(state)
+    ancient = _read_queue_words(state, 0)[1][0]
+
+    # Payload-ready profiles do not touch queue controls. This represents their
+    # epoch advancement while a completed generation-zero queue remains unused.
+    state.select_profile("payload_rsag", 1)
+    _force_epoch(state, 0xFFFFFFFF)
+    source.copy_(values[rank])
+    torch.cuda.synchronize()
+    dist.barrier()
+    graph.replay()
+    torch.cuda.synchronize()
+    _assert_epoch_wrapped(state)
+    assert _read_queue_words(state, 0)[1][0] == ancient
+
+    state.select_profile("queued_push", 64)
+    values = _operands(world, source.numel(), 4)
+    source.copy_(values[rank])
+    if out.data_ptr() != source.data_ptr():
+        out.fill_(float("nan"))
+    torch.cuda.synchronize()
+    dist.barrier()
+    graph.replay()
+    torch.cuda.synchronize()
+    expected = _reference(values, rank, "queued_push")
+    torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0, equal_nan=True)
+    non_nan = ~torch.isnan(expected)
+    assert torch.equal(
+        out.cpu().view(torch.int16)[non_nan], expected.view(torch.int16)[non_nan]
+    )
+    _assert_queued_progress(state)
+
+
+def _exercise(
+    rank, world, family, alias, restricted=False, queued=False, sms=None, threads=256
+):
     import torch
     import torch.distributed as dist
 
     from b12x.comm.pcie import CollectiveConfig
+    from b12x.comm.pcie._joint_profile import joint_modes
     from b12x.comm.pcie._oneshot_preparation import _prepare_plain_call
     from b12x.comm.pcie.pcie_allreduce import PCIeAllReduce
     from b12x.preparation import CollectiveRequirement, PreparationSession
 
     device = torch.device("cuda", rank)
-    pack_counts = tuple(sorted({1, world - 1, world + 1, 257, 4099}))
+    pack_counts = tuple(
+        sorted({1, world - 1, world + 1, 257, 4099, 8 * 640, 128 * 640, 4096 * 640})
+    )
     modes = (
-        ("full", "payload_rsag", "pull")
-        if family == "joint_latency"
-        else ("payload_rsag", "bulk_push", "bulk_pull", "pull")
+        (("queued_push",) if queued else ("serial_push",))
+        if restricted
+        else joint_modes(family, world)
     )
     manager = PCIeAllReduce.from_exchange_group(
         joint=True,
@@ -135,10 +344,10 @@ def _exercise(rank, world, family, alias):
                 out=out,
                 override=CollectiveConfig(
                     implementation=family,
-                    threads=256,
+                    threads=threads,
                     blocks=64,
                     submode=modes[0],
-                    active_blocks=16,
+                    active_blocks=1 if restricted else 16,
                 ),
             )
             name = f"{family}-{packs}-{alias}"
@@ -147,21 +356,34 @@ def _exercise(rank, world, family, alias):
                     plan.request(
                         name=name,
                         collective=CollectiveRequirement(name, tuple(range(world))),
-                        prepare_call=lambda state,
-                        source=source,
-                        out=out: _prepare_plain_call(state, inp=source, out=out),
+                        prepare_call=lambda state, source=source, out=out: (
+                            _prepare_plain_call(state, inp=source, out=out)
+                        ),
                     ),
                 ),
-                coordinator=lambda progress: progress.ready_collectives[0].key
-                if progress.ready_collectives
-                else None,
+                coordinator=lambda progress: (
+                    progress.ready_collectives[0].key
+                    if progress.ready_collectives
+                    else None
+                ),
             )
-            graph = torch.cuda.CUDAGraph()
+            graph = torch.cuda.CUDAGraph(keep_graph=True)
             dist.barrier()
-            with session.capture(), manager.capture(), torch.cuda.graph(graph):
+            with (
+                session.capture(),
+                manager.capture(),
+                torch.cuda.graph(
+                    graph, stream=torch.cuda.current_stream() if restricted else None
+                ),
+            ):
                 manager.all_reduce(source, out=out, plan=plan)
+            graph.instantiate()
+            if restricted and queued and not graphs:
+                _assert_partial_residency(graph, plan.prepared.state, sms)
             graphs.append((graph, source, out, plan.prepared.state))
         session.freeze()
+        if "queued_push" in modes:
+            _exercise_stale_queue_generation(*graphs[0])
         for graph, source, out, state in graphs:
             profiles = state.profiles
             assert isinstance(profiles, tuple)
@@ -169,10 +391,16 @@ def _exercise(rank, world, family, alias):
             for step, active in enumerate((1, 4, 2, 8, 1, 64)):
                 sequence = modes if step % 2 == 0 else tuple(reversed(modes))
                 for mode in sequence:
-                    state.select_profile(mode, active)
+                    selected_active = 1 if mode == "serial_push" else active
+                    state.select_profile(mode, selected_active)
                     _poison_scratch(state, rollover=step == 2)
                     values = _operands(world, source.numel(), step)
                     expected = _reference(values, rank, mode)
+                    counters = (
+                        _barrier_counters(state)
+                        if mode in ("serial_push", "queued_push")
+                        else None
+                    )
                     for replay in range(3):
                         source.copy_(values[rank])
                         if not alias:
@@ -198,6 +426,14 @@ def _exercise(rank, world, family, alias):
                         torch.testing.assert_close(
                             out.cpu(), expected, rtol=0, atol=0, equal_nan=True
                         )
+                        if mode in ("serial_push", "queued_push"):
+                            non_nan = ~torch.isnan(expected)
+                            assert torch.equal(
+                                out.cpu().view(torch.int16)[non_nan],
+                                expected.view(torch.int16)[non_nan],
+                            )
+                        if mode == "queued_push":
+                            _assert_queued_progress(state)
                         if not alias:
                             torch.testing.assert_close(
                                 source.cpu(),
@@ -208,6 +444,12 @@ def _exercise(rank, world, family, alias):
                             )
                     if step == 2:
                         _assert_epoch_wrapped(state)
+                    if mode == "serial_push":
+                        _assert_serial_push_progress(
+                            state, counters, selected_active, 3
+                        )
+                    elif mode == "queued_push":
+                        _assert_serial_push_progress(state, counters, 1, 3)
                     assert selector_address == state.selector.data_ptr()
                     assert state.profiles == profiles
     finally:
@@ -217,7 +459,9 @@ def _exercise(rank, world, family, alias):
         manager.close()
 
 
-def _worker(rank, world, directory, family, alias):
+def _worker(
+    rank, world, directory, family, alias, restricted=False, queued=False, threads=256
+):
     import torch
     import torch.distributed as dist
 
@@ -233,8 +477,37 @@ def _worker(rank, world, directory, family, alias):
     try:
         if family == "provisioning":
             _exercise_provisioning(rank)
+        elif restricted:
+            from cuda.bindings import driver
+            from torch.cuda.green_contexts import GreenContext
+
+            context = GreenContext.create(num_sms=8, device_id=rank)
+            stream = context.Stream()
+            result, resource = driver.cuStreamGetDevResource(
+                stream.cuda_stream, driver.CUdevResourceType.CU_DEV_RESOURCE_TYPE_SM
+            )
+            assert result == driver.CUresult.CUDA_SUCCESS, result
+            properties = torch.cuda.get_device_properties(rank)
+            if not queued:
+                assert (
+                    resource.sm.smCount
+                    * (properties.max_threads_per_multi_processor // threads)
+                    < 64
+                )
+            with torch.cuda.stream(stream):
+                _exercise(
+                    rank,
+                    world,
+                    family,
+                    alias,
+                    restricted=True,
+                    queued=queued,
+                    sms=resource.sm.smCount,
+                    threads=threads,
+                )
+            stream.synchronize()
         else:
-            _exercise(rank, world, family, alias)
+            _exercise(rank, world, family, alias, threads=threads)
     finally:
         gc.collect()
         dist.destroy_process_group()
@@ -254,9 +527,76 @@ def test_joint_profile_graph_transitions(world, family, alias, tmp_path):
 
     if torch.cuda.device_count() < world:
         pytest.skip("insufficient assigned GPUs")
-    mp.spawn(
-        _worker, args=(world, str(tmp_path), family, alias), nprocs=world, join=True
-    )
+    _spawn_bounded(_worker, (world, str(tmp_path), family, alias), world)
+
+
+@pytest.mark.skipif(
+    os.environ.get("B12X_RUN_JOINT_PCIE_TEST") != "1",
+    reason="requires assigned GPUs",
+)
+@pytest.mark.parametrize(
+    "family,threads,alias",
+    (
+        ("joint_latency", 64, True),
+        ("joint_latency", 128, True),
+        ("joint_bandwidth", 64, False),
+        ("joint_bandwidth", 64, True),
+        ("joint_bandwidth", 128, False),
+        ("joint_bandwidth", 128, True),
+        ("joint_bandwidth", 512, True),
+    ),
+)
+def test_joint_profile_launch_geometries(family, threads, alias, tmp_path):
+    import torch
+
+    if torch.cuda.device_count() < 4:
+        pytest.skip("insufficient assigned GPUs")
+    _spawn_bounded(_worker, (4, str(tmp_path), family, alias, False, False, threads), 4)
+
+
+@pytest.mark.skipif(
+    os.environ.get("B12X_RUN_JOINT_PCIE_TEST") != "1",
+    reason="requires an assigned peer-accessible GPU group",
+)
+@pytest.mark.parametrize("family", ("joint_latency", "joint_bandwidth"))
+def test_serial_push_graph_replay_with_restricted_sms(family, tmp_path):
+    import torch
+    import torch.multiprocessing as mp
+
+    if torch.cuda.device_count() < 4:
+        pytest.skip("insufficient assigned GPUs")
+    mp.spawn(_worker, args=(4, str(tmp_path), family, True, True), nprocs=4, join=True)
+
+
+def _spawn_bounded(worker, args, world, seconds=300):
+    import torch.multiprocessing as mp
+
+    group = mp.spawn(worker, args=args, nprocs=world, join=False)
+    deadline = time.monotonic() + seconds
+    while not group.join(timeout=1):
+        if time.monotonic() >= deadline:
+            for process in group.processes:
+                if process.is_alive():
+                    process.terminate()
+            for process in group.processes:
+                process.join(timeout=5)
+                if process.is_alive():
+                    process.kill()
+                    process.join(timeout=5)
+            pytest.fail("queued collective worker deadline expired")
+
+
+@pytest.mark.skipif(
+    os.environ.get("B12X_RUN_JOINT_PCIE_TEST") != "1", reason="requires assigned GPUs"
+)
+@pytest.mark.parametrize("family", ("joint_latency", "joint_bandwidth"))
+@pytest.mark.parametrize("threads", (64, 256))
+def test_queued_push_graph_replay_with_restricted_sms(family, threads, tmp_path):
+    import torch
+
+    if torch.cuda.device_count() < 4:
+        pytest.skip("insufficient assigned GPUs")
+    _spawn_bounded(_worker, (4, str(tmp_path), family, True, True, True, threads), 4)
 
 
 def _exercise_provisioning(rank):
@@ -308,9 +648,11 @@ def _exercise_provisioning(rank):
                         ),
                     ),
                 ),
-                coordinator=lambda progress: progress.ready_collectives[0].key
-                if progress.ready_collectives
-                else None,
+                coordinator=lambda progress: (
+                    progress.ready_collectives[0].key
+                    if progress.ready_collectives
+                    else None
+                ),
             )
             state = plan.prepared.state
             state.run_plain(source, out)

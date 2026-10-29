@@ -15,7 +15,7 @@ from b12x.preparation import (
 from b12x.preparation._efficiency import capture_autotune_effort
 
 from ._tuning import PcieQuery, TUNING as NATIVE
-from ._joint_profile import JOINT_FAMILIES
+from ._joint_profile import JOINT_FAMILIES, JOINT_QUEUE_PACKS_PER_THREAD, joint_modes
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -44,15 +44,20 @@ def _configs(query):
         threads = int(call["threads"])
         if name in JOINT_FAMILIES:
             for count_threads in (32, 64, 128, 256, 512):
-                for mode in JOINT_FAMILIES[name]:
+                for mode in joint_modes(name, query.world_size):
                     units = int(call["size_packs"])
-                    if mode in ("bulk_push", "bulk_pull"):
+                    if mode in ("bulk_push", "bulk_pull", "serial_push", "queued_push"):
                         units = -(-units // query.world_size)
-                    covering = max(1, -(-units // count_threads))
-                    for active in dict.fromkeys(
-                        min(count, blocks)
-                        for count in (1, 2, 4, 8, 16, 32, 36, blocks, covering)
-                    ):
+                    packs_per_cta = count_threads * (
+                        JOINT_QUEUE_PACKS_PER_THREAD if mode == "queued_push" else 1
+                    )
+                    covering = max(1, -(-units // packs_per_cta))
+                    counts = (
+                        (1,)
+                        if mode == "serial_push"
+                        else (1, 2, 4, 8, 16, 32, 36, blocks, covering)
+                    )
+                    for active in dict.fromkeys(min(count, blocks) for count in counts):
                         yield CollectiveConfig(
                             implementation=name,
                             threads=count_threads,

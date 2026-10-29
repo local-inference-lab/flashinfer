@@ -243,9 +243,11 @@ def prepare(
     else:
         session.prepare(
             requests,
-            coordinator=lambda progress: progress.ready_collectives[0].key
-            if progress.ready_collectives
-            else None,
+            coordinator=lambda progress: (
+                progress.ready_collectives[0].key
+                if progress.ready_collectives
+                else None
+            ),
         )
     if target is manager._bf16_twoshot:
         prepared_call = plan.prepared.state.query.call
@@ -268,6 +270,8 @@ def reference(operands, rank, transport, submode=None):
             "bulk_push": "bulk_push",
             "bulk_pull": "bulk_pull",
             "pull": "pull",
+            "serial_push": "bulk_push",
+            "queued_push": "bulk_push",
         }[submode]
     bulk = transport in ("bulk_push", "bulk_pull")
     if transport not in ("remote_push_rsag", "twoshot", "bulk_push", "bulk_pull"):
@@ -306,10 +310,9 @@ def main():
     parser.add_argument("--cpu-threads", type=int, default=1)
     parser.add_argument("--threads", type=int, default=256)
     parser.add_argument("--blocks", type=int, default=16)
-    parser.add_argument(
-        "--joint-submode",
-        choices=("full", "payload_rsag", "bulk_push", "bulk_pull", "pull"),
-    )
+    from b12x.comm.pcie._joint_profile import JOINT_MODES
+
+    parser.add_argument("--joint-submode", choices=tuple(JOINT_MODES))
     parser.add_argument("--joint-active-blocks", type=int, default=16)
     parser.add_argument("--joint-max-blocks", type=int, default=64)
     parser.add_argument("--samples", type=int, default=7)

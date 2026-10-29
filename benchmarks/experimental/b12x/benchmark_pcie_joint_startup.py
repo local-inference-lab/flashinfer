@@ -121,7 +121,7 @@ def run_case(args, manager, size, family, alias):
         assert len(set(values)) == 1
         samples = tuner.samples.cpu().tolist()
         expected_index = min(
-            range(len(samples)), key=lambda index: (median(samples[index]), index)
+            range(len(samples)), key=lambda index: (sum(samples[index]), index)
         )
         assert packed == int(tuner.profiles[expected_index].item())
         for index, inp in enumerate(sources):
