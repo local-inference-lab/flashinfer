@@ -130,13 +130,33 @@ compares explicit transports and the static dispatch policy with CUDA graphs.
 Explicit joint-only plans for staged BF16 reductions with payload-ready peer
 storage race two joint entrypoints. `joint_latency` supports `full`, `payload_rsag`, and
 `pull`; `joint_bandwidth` supports `payload_rsag`, `bulk_push`, `bulk_pull`, and
-`pull`. Ordinary plans retain standalone transport competition. Each entrypoint
+`pull`. With at least three ranks, both families also admit `serial_push`, which
+batches direct writes by destination in one active CTA, and `queued_push`, which
+distributes each destination's tiles among active CTAs. TP2 has only one remote
+destination and does not admit these additional candidates. Ordinary plans retain
+standalone transport competition. Each entrypoint
 uses one compiled program per thread count and maximum grid; its submode and
 active CTA count are device data and do not specialize compilation. The maximum
 grid is capped by the device SM count and 64 CTAs. The tuning
 record includes both values. For example,
 `CollectiveConfig(implementation="joint_latency", threads=256, blocks=64,
 submode="full", active_blocks=16)` pins a joint configuration.
+
+`serial_push` requires `active_blocks=1`; preparation rejects other counts. It
+uses the bulk reduce-scatter/all-gather storage and owner-cyclic FP32 sum, with
+one BF16 rounding. CTA barriers and system fences order successive destination
+batches. It never waits for another CTA on the same GPU. Remote rank barriers
+publish the scatter and gather phases; the captured physical grid remains fixed.
+
+`queued_push` supports every prepared active CTA count. Workers claim one tile
+per atomic ticket; an exhausted worker waits for the phase to change before
+claiming again. The final completed tile publishes the next destination phase.
+Phase progress does not depend on CTAs that have not launched. The initializer
+locks the arrival word before publishing queue state and advancing the epoch,
+so profile changes and generation wrap cannot reuse a completed queue. Scatter
+and gather use signal block zero even when another CTA coordinates the barrier.
+The queues occupy reserved signal records and preserve the bulk FP32 arithmetic
+and payload layout.
 
 Joint workspace requires `joint=True` on `PCIeAllReduce.from_exchange_group`,
 `from_process_group`, or the corresponding oneshot channel/pool factory. The
@@ -174,7 +194,10 @@ joint_only=True, override=CollectiveConfig(...))` and supply explicit profiles
 to `joint_startup_spec(plan, profiles=(("bulk_push", 32), ("bulk_pull", 8)))`.
 This path needs no measured finalists or preparation-time geometry race. Modes
 must belong to the prepared family and active CTA counts must fit its physical
-grid. Multiple counts per mode are allowed; duplicate pairs are rejected.
+grid and the mode's peer-count and CTA constraints. Multiple counts per mode are
+allowed where supported; duplicate pairs are rejected. For example, a TP4
+bandwidth launcher may use `profiles=(("serial_push", 1), ("queued_push", 16),
+("queued_push", 64))`. Every profile executes in the same prepared program.
 
 Collectively call `prepare_joint_startup_tuner(specs, cache_policy="cold")` before
 freezing kernel resolution. All specs in a producer must have the same semantic
@@ -182,17 +205,20 @@ key, rank, and device. Each spec exposes its actual serving `selector` tensor.
 The producer retains its specs, private fixtures, timing storage, and compiled
 programs. Its IPC storage remains owned by the collective runtime.
 
-Capture `producer.run()` into a separate startup graph. It times the same
-compiled collective launcher used by serving, with the measured CTA count for
-each mode. Seven interleaved rounds use the ordinary reduction benchmark's
-three fixtures and `ceil(100 / rows)` invocation chain. A device rank gate
-precedes each timer; each sample is the maximum rank elapsed time. The smallest
-median of 21 samples wins, with family mode order breaking ties. The producer
-publishes the packed profile to every spec's selector. No host selection or
-recapture is needed after startup replay.
+Capture `run_joint_startup_tuners(producers)` into one startup graph. The producers
+must share the same device and ordered rank membership. The graph validates every
+group, then interleaves 21 sample passes across groups before publishing their
+selectors. Each profile uses seven samples of each of the three exact reduction
+fixtures and the ordinary `ceil(100 / rows)` invocation chain. Candidate order
+rotates after each set of three fixtures. A device rank gate precedes each timer;
+each sample is the maximum rank duration of a complete chain. The smallest sum of
+21 samples wins, with prepared profile order breaking exact ties. `producer.run()`
+performs the same schedule for one group. No host selection or recapture is needed
+after startup replay.
 
-Before replay, set the producer's persistent `int32[1]` status to `-1`. Successful
-completion writes `0` after all numerical checks and positive timing samples.
+Each replay resets the producer's persistent `int32[1]` status to `-1`.
+Publication writes `0` on success or `1` after failed numerical validation,
+nonpositive timing, or score overflow.
 Serving graphs must wait for successful startup completion, and all ranks must
 replay equivalent startup graphs in the same order. Startup and serving must
 not execute concurrently on their shared collective workspace.

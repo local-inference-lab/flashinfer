@@ -14,10 +14,10 @@ from b12x._lib.utils.device import current_cuda_stream
 from b12x._lib.utils.pointers import make_ptr
 from ._cute_intrinsics import pcie_arrive_and_wait
 from ._oneshot_cute import _dummy
+from ._joint_profile import JOINT_STARTUP_SAMPLES as SAMPLES_PER_MODE
 
 SIGNAL_BYTES = 64 + 2 * 16 * 32 * 4
 SCRATCH_BYTES = SIGNAL_BYTES + 32
-SAMPLES_PER_MODE = 21
 
 
 @dsl_user_op
@@ -89,6 +89,7 @@ class _Timing:
             if tid == 0:
                 local[2] = Int64(0)
                 local[3] = Int64(0)
+                status[0] = Int32(-1)
         elif cutlass.const_expr(self.action == "validate"):
             if tid == 0:
                 if invalid[0] != 0:
@@ -120,22 +121,20 @@ class _Timing:
                 best, winner = Int64(0x7FFFFFFFFFFFFFFF), Int32(0)
                 bad = local[3]
                 for mode in cutlass.range_constexpr(self.modes):
-                    values = cute.make_rmem_tensor((SAMPLES_PER_MODE,), Int64)
+                    total = Int64(0)
                     for i in cutlass.range_constexpr(SAMPLES_PER_MODE):
-                        values[i] = samples[mode * SAMPLES_PER_MODE + i]
-                        if values[i] <= 0:
+                        value = samples[mode * SAMPLES_PER_MODE + i]
+                        if value <= 0 or value > Int64(0x7FFFFFFFFFFFFFFF) - total:
                             bad = Int64(1)
-                    for i in range(SAMPLES_PER_MODE):
-                        for j in range(SAMPLES_PER_MODE - 1):
-                            left, right = values[j], values[j + 1]
-                            values[j] = cutlass.min(left, right)
-                            values[j + 1] = cutlass.max(left, right)
-                    median = values[SAMPLES_PER_MODE // 2]
-                    if median < best:
-                        best, winner = median, Int32(mode)
+                        else:
+                            total += value
+                    if total < best:
+                        best, winner = total, Int32(mode)
                 if bad == 0:
                     selector[0] = profiles[winner]
                     status[0] = Int32(0)
+                else:
+                    status[0] = Int32(1)
 
 
 @program_cache(scope="preparation")
@@ -148,7 +147,7 @@ def timing_launcher(world, rank, action, modes, ordinal):
         Int32(0),
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
-            "comm.pcie.joint_startup", 2, (world, rank, action, modes)
+            "comm.pcie.joint_startup", 3, (world, rank, action, modes)
         ),
     )
 

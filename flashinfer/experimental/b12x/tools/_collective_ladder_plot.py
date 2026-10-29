@@ -3,6 +3,7 @@
 import math
 from pathlib import Path
 
+from b12x.comm.pcie._joint_profile import JOINT_MODES
 from b12x.tools._collective_ladder_search import read_report
 
 
@@ -96,11 +97,19 @@ def _choice_figure(sizes, rows, heading, details):
     handles = []
     palettes = (
         ("#3366ad", "#e28c27"),
-        ("#4169a1", "#9561b1", "#49954a", "#169a9d", "#cc6a38"),
+        (
+            "#4169a1",
+            "#9561b1",
+            "#49954a",
+            "#169a9d",
+            "#cc6a38",
+            "#b34578",
+            "#8c7a32",
+        ),
     )
     orders = (
         ("joint_latency", "joint_bandwidth"),
-        ("full", "payload_rsag", "bulk_push", "bulk_pull", "pull"),
+        tuple(JOINT_MODES),
     )
     for axis, field, title, palette, order in zip(
         axes,

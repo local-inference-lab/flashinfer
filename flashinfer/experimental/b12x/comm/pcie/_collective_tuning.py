@@ -1,6 +1,7 @@
 """Logical PCIe operations with native transport and launch candidates."""
 
 from dataclasses import asdict, dataclass, replace
+from functools import lru_cache
 
 from b12x.preparation import (
     AutotuneEffort,
@@ -14,7 +15,7 @@ from b12x.preparation import (
 from b12x.preparation._efficiency import capture_autotune_effort
 
 from ._tuning import PcieQuery, TUNING as NATIVE
-from ._joint_profile import JOINT_FAMILIES
+from ._joint_profile import JOINT_FAMILIES, JOINT_QUEUE_PACKS_PER_THREAD, joint_modes
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -43,15 +44,20 @@ def _configs(query):
         threads = int(call["threads"])
         if name in JOINT_FAMILIES:
             for count_threads in (32, 64, 128, 256, 512):
-                for mode in JOINT_FAMILIES[name]:
+                for mode in joint_modes(name, query.world_size):
                     units = int(call["size_packs"])
-                    if mode in ("bulk_push", "bulk_pull"):
+                    if mode in ("bulk_push", "bulk_pull", "serial_push", "queued_push"):
                         units = -(-units // query.world_size)
-                    covering = max(1, -(-units // count_threads))
-                    for active in dict.fromkeys(
-                        min(count, blocks)
-                        for count in (1, 2, 4, 8, 16, 32, 36, blocks, covering)
-                    ):
+                    packs_per_cta = count_threads * (
+                        JOINT_QUEUE_PACKS_PER_THREAD if mode == "queued_push" else 1
+                    )
+                    covering = max(1, -(-units // packs_per_cta))
+                    counts = (
+                        (1,)
+                        if mode == "serial_push"
+                        else (1, 2, 4, 8, 16, 32, 36, blocks, covering)
+                    )
+                    for active in dict.fromkeys(min(count, blocks) for count in counts):
                         yield CollectiveConfig(
                             implementation=name,
                             threads=count_threads,
@@ -220,8 +226,9 @@ def _parameters(query, device):
                 or query.default.implementation == "pull"
                 or query.operation == "all_reduce"
             ),
-            lambda value: effort is AutotuneEffort.OFF
-            or _efficient_plain_grid(query, value),
+            lambda value: (
+                effort is AutotuneEffort.OFF or _efficient_plain_grid(query, value)
+            ),
         ),
         autotune_effort=effort,
     )
@@ -407,19 +414,19 @@ def plan(
         inplace=inplace,
     )
     TUNING.validate_query(query, None)
-    native_plans = {}
 
+    # Consecutive callbacks reuse one candidate's metadata. The logical plan
+    # outlives tuning, so it must not retain every losing native declaration.
+    @lru_cache(maxsize=1)
     def native(config):
-        if config not in native_plans:
-            q, runtime = alternatives[config.implementation]
-            call = dict(q.call)
-            call["threads"] = config.threads
-            call["blocks" if "blocks" in call else "block_limit"] = config.blocks
-            if config.implementation in JOINT_FAMILIES:
-                call.update(submode=config.submode, active_blocks=config.active_blocks)
-            q = replace(q, call=FrozenMapping(call))
-            native_plans[config] = _provider(q.surface).plan(q, runtime=runtime)
-        return native_plans[config]
+        q, runtime = alternatives[config.implementation]
+        call = dict(q.call)
+        call["threads"] = config.threads
+        call["blocks" if "blocks" in call else "block_limit"] = config.blocks
+        if config.implementation in JOINT_FAMILIES:
+            call.update(submode=config.submode, active_blocks=config.active_blocks)
+        q = replace(q, call=FrozenMapping(call))
+        return _provider(q.surface).plan(q, runtime=runtime)
 
     return Plan(
         contract=TUNING,

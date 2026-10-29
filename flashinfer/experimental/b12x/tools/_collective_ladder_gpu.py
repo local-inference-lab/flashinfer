@@ -385,6 +385,7 @@ class JointCollector:
                         config["blocks"],
                         config["submode"],
                         config["active_blocks"],
+                        world_size=self.world,
                     )
                 )
                 return state

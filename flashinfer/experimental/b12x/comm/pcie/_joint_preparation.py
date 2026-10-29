@@ -7,7 +7,7 @@ import torch
 from b12x._lib.compile_plan import load_programs
 from b12x._lib.compile_pool import CompileJob
 from b12x._lib.program_cache import program_cache
-from b12x.preparation import MemoryRequirements, PersistentMemory, Plan
+from b12x.preparation import MemoryRequirements, PersistentMemory, Plan, current_plan
 
 from ._joint_profile import profile_index, profile_records, selected_profile
 from ._oneshot_preparation import _OneshotExecutionState
@@ -121,9 +121,15 @@ class _JointExecutionState(_OneshotExecutionState):
         self._bound_input = None
         self.workspace = workspace
         call = query.call
-        self.profiles = profile_records(call["transport"], call["blocks"])
+        self.profiles = profile_records(
+            call["transport"], call["blocks"], world_size=query.world_size
+        )
         selected = selected_profile(
-            call["transport"], call["blocks"], call["submode"], call["active_blocks"]
+            call["transport"],
+            call["blocks"],
+            call["submode"],
+            call["active_blocks"],
+            world_size=query.world_size,
         )
         self.selector = torch.tensor(
             [selected], dtype=torch.uint32, device=runtime.device
@@ -151,7 +157,11 @@ class _JointExecutionState(_OneshotExecutionState):
             owner="joint PCIe profile validation",
             exchange_group=self.runtime.exchange_group,
             setup=lambda: selected_profile(
-                call["transport"], call["blocks"], submode, active_blocks
+                call["transport"],
+                call["blocks"],
+                submode,
+                active_blocks,
+                world_size=self.query.world_size,
             ),
         )
         torch.cuda.synchronize(self.runtime.device)
@@ -194,7 +204,11 @@ class _JointExecutionState(_OneshotExecutionState):
 def plan(query, *, runtime, override=None):
     call = query.call
     profile_index(
-        call["transport"], call["blocks"], call["submode"], call["active_blocks"]
+        call["transport"],
+        call["blocks"],
+        call["submode"],
+        call["active_blocks"],
+        world_size=query.world_size,
     )
     if call["dtype"] != "bfloat16" or not call["stage_input"]:
         raise ValueError("joint PCIe all-reduce requires staged BF16 input")
@@ -230,7 +244,9 @@ def plan(query, *, runtime, override=None):
                     ("pcie-oneshot-runtime", id(runtime)), resident, resident
                 ),
                 PersistentMemory(
-                    ("pcie-joint-profile", id(query)), profiles_bytes, profiles_bytes
+                    (current_plan(), "pcie-joint-profile"),
+                    profiles_bytes,
+                    profiles_bytes,
                 ),
             )
         ),

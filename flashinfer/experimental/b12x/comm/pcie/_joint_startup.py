@@ -5,7 +5,13 @@ from dataclasses import dataclass, field
 import torch
 
 from b12x.preparation import FinalistPolicy
-from ._joint_profile import JOINT_FAMILIES, JOINT_MODES, selected_profile
+from ._joint_profile import (
+    JOINT_FAMILIES,
+    JOINT_MODES,
+    JOINT_STARTUP_SAMPLES as SAMPLES_PER_MODE,
+    joint_modes,
+    selected_profile,
+)
 
 
 def joint_finalist_policy():
@@ -13,7 +19,7 @@ def joint_finalist_policy():
     return FinalistPolicy(
         family_fields=("implementation", "threads", "blocks", "submode"),
         per_family=1,
-        max_total=35,
+        max_total=5 * sum(len(modes) for modes in JOINT_FAMILIES.values()),
     )
 
 
@@ -49,7 +55,9 @@ def joint_startup_spec(plan, *, profiles=None):
             )
         encoded = []
         for mode, active in profiles:
-            selected_profile(family, call["blocks"], mode, active)
+            selected_profile(
+                family, call["blocks"], mode, active, world_size=state.query.world_size
+            )
             encoded.append((JOINT_MODES[mode], active))
         if len(set(encoded)) != len(encoded):
             raise ValueError("runtime profiles must be distinct")
@@ -66,9 +74,15 @@ def joint_startup_spec(plan, *, profiles=None):
             ):
                 mode = assignment["submode"]
                 active = assignment["active_blocks"]
-                selected_profile(family, call["blocks"], mode, active)
+                selected_profile(
+                    family,
+                    call["blocks"],
+                    mode,
+                    active,
+                    world_size=state.query.world_size,
+                )
                 measured[mode] = (JOINT_MODES[mode], active)
-        modes = JOINT_FAMILIES[family]
+        modes = joint_modes(family, state.query.world_size)
         if set(measured) != set(modes):
             raise ValueError(
                 "startup tuning requires measured finalists for every mode of the selected geometry"
@@ -144,7 +158,9 @@ class JointStartupTuner:
                     (1,), -1, dtype=torch.int32, device=runtime.device
                 )
                 self.samples = torch.empty(
-                    (len(first.profiles), 21), dtype=torch.int64, device=runtime.device
+                    (len(first.profiles), SAMPLES_PER_MODE),
+                    dtype=torch.int64,
+                    device=runtime.device,
                 )
                 self.profiles = torch.tensor(
                     [(mode << 16) | active for mode, active in first.profiles],
@@ -285,45 +301,85 @@ class JointStartupTuner:
             work.capacity_packs,
         )
 
+    def _reset_validate(self):
+        self._timing("reset", 0, self.state.selector)
+        for mode, active in self.specs[0].profiles:
+            self.state.selector.fill_((mode << 16) | active)
+            for producer in range(3):
+                self.inputs.produce(producer)
+                self._collective()
+                torch.ne(
+                    self.inputs.out,
+                    self.inputs.reference.expected[producer],
+                    out=self.mismatch,
+                )
+                torch.sum(
+                    self.mismatch,
+                    dim=tuple(range(self.mismatch.ndim)),
+                    dtype=torch.int32,
+                    out=self.invalid,
+                )
+                self._timing("validate", 0, self.state.selector)
+
+    def _sample(self, sample):
+        if type(sample) is not int or not 0 <= sample < SAMPLES_PER_MODE:
+            raise ValueError("startup sample index is outside the prepared schedule")
+        profiles = self.specs[0].profiles
+        for offset in range(len(profiles)):
+            mode_index = (offset + sample // 3) % len(profiles)
+            mode, active = profiles[mode_index]
+            self.state.selector.fill_((mode << 16) | active)
+            if self.eviction is not None:
+                torch.sum(self.eviction, dim=0, out=self.eviction_sum)
+            self.inputs.produce(sample % 3)
+            position = mode_index * SAMPLES_PER_MODE + sample
+            self._timing("begin", position, self.state.selector)
+            for _ in range(self.inputs.repetitions):
+                self._collective()
+            self._timing("end", position, self.state.selector)
+
+    def _publish(self):
+        for spec in self.specs:
+            self._timing("publish", 0, spec.selector)
+
     def run(self):
-        """Enqueue the race without allocation, compilation, or host decisions."""
-        with torch.cuda.device(self.runtime.device):
-            self._timing("reset", 0, self.state.selector)
-            for mode, active in self.specs[0].profiles:
-                self.state.selector.fill_((mode << 16) | active)
-                for producer in range(3):
-                    self.inputs.produce(producer)
-                    self._collective()
-                    torch.ne(
-                        self.inputs.out,
-                        self.inputs.reference.expected[producer],
-                        out=self.mismatch,
-                    )
-                    torch.sum(
-                        self.mismatch,
-                        dim=tuple(range(self.mismatch.ndim)),
-                        dtype=torch.int32,
-                        out=self.invalid,
-                    )
-                    self._timing("validate", 0, self.state.selector)
-            for round_index in range(7):
-                for producer in range(3):
-                    for offset in range(len(self.specs[0].profiles)):
-                        mode_index = (offset + round_index) % len(
-                            self.specs[0].profiles
-                        )
-                        mode, active = self.specs[0].profiles[mode_index]
-                        self.state.selector.fill_((mode << 16) | active)
-                        if self.eviction is not None:
-                            torch.sum(self.eviction, dim=0, out=self.eviction_sum)
-                        self.inputs.produce(producer)
-                        sample = mode_index * 21 + round_index * 3 + producer
-                        self._timing("begin", sample, self.state.selector)
-                        for _ in range(self.inputs.repetitions):
-                            self._collective()
-                        self._timing("end", sample, self.state.selector)
-            for spec in self.specs:
-                self._timing("publish", 0, spec.selector)
+        """Enqueue one group's race without allocation or host selection."""
+        run_joint_startup_tuners((self,))
+
+
+def run_joint_startup_tuners(producers):
+    """Interleave fixed sample passes across prepared groups on one rank.
+
+    Each profile keeps 21 complete-chain samples and seven uses of each exact
+    fixture. Other groups separate a group's samples in time; a single group
+    has no such separation. Publication minimizes the sum of maximum-rank
+    chain durations, with prepared profile order breaking exact ties.
+    """
+    import torch.distributed as dist
+
+    producers = tuple(producers)
+    if not producers or len({id(producer) for producer in producers}) != len(producers):
+        raise ValueError("startup groups must be nonempty and distinct")
+    first = producers[0]
+    members = tuple(dist.get_process_group_ranks(first.runtime.exchange_group))
+    for producer in producers:
+        if (
+            producer.runtime.device != first.runtime.device
+            or producer.specs[0].rank != first.specs[0].rank
+            or tuple(dist.get_process_group_ranks(producer.runtime.exchange_group))
+            != members
+        ):
+            raise ValueError(
+                "startup groups must share device and ordered rank membership"
+            )
+    with torch.cuda.device(first.runtime.device):
+        for producer in producers:
+            producer._reset_validate()
+        for sample in range(SAMPLES_PER_MODE):
+            for producer in producers:
+                producer._sample(sample)
+        for producer in producers:
+            producer._publish()
 
 
 def prepare_joint_startup_tuner(specs, *, cache_policy="cold"):
@@ -341,6 +397,7 @@ def prepare_joint_startup_tuner(specs, *, cache_policy="cold"):
                 call["blocks"],
                 call["submode"],
                 call["active_blocks"],
+                world_size=spec.state.query.world_size,
             )
         )
     producer.status.fill_(-1)
