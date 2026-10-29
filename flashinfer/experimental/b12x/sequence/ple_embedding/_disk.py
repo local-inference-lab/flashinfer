@@ -13,11 +13,31 @@ if TYPE_CHECKING:
 
 
 class DiskTable:
-    """Own PLE file sources and decode a compact batch cache outside graphs."""
+    """Own PLE row sources and decode a compact batch cache outside graphs.
+
+    Rows come from checkpoint shards (``add_shard``) or, with ``host_rows``,
+    from this TP shard's rows already resident in host RAM. ``cache_rows``
+    and ``cache_tier`` configure the host-tier C S3-FIFO row cache; see
+    ``DiskRowCache``.
+    """
 
     def __init__(
-        self, layout: TableLayout, shard_rows: int, *, queue_depth: int = 64
+        self,
+        layout: TableLayout,
+        shard_rows: int,
+        *,
+        queue_depth: int = 64,
+        cache_rows: int | None = None,
+        cache_tier: str | None = None,
+        host_rows: tuple[torch.Tensor, torch.Tensor | None] | None = None,
     ) -> None:
+        """Build the shared disk row cache for one bound PLE table layout.
+
+        Row widths come from ``layout`` (nvfp4 group-16 adds a scale plane),
+        and the staging planes are exposed reinterpreted with the table's
+        weight and scale dtypes. ``host_rows`` sources this TP shard's rows
+        from host RAM instead of checkpoint shards.
+        """
         from ._contracts import TableLayout
 
         if not isinstance(layout, TableLayout):
@@ -39,6 +59,9 @@ class DiskTable:
                 else 0
             ),
             queue_depth=queue_depth,
+            cache_rows=cache_rows,
+            cache_tier=cache_tier,
+            host_rows=host_rows,
         )
         self.weight = self._cache.weight.view(layout.weight_dtype)
         self.weight_host = (
@@ -60,18 +83,33 @@ class DiskTable:
     def add_shard(
         self, shard_index: int, path: str, offset: int, *, scale: bool = False
     ) -> None:
+        """Register one checkpoint shard file with the underlying row cache."""
         self._cache.add_shard(shard_index, path, offset, scale=scale)
 
     def _require_complete(self) -> None:
+        """Raise unless every shard the bound row range needs is registered."""
         self._cache.require_complete()
 
     def _freeze(self) -> None:
+        """Freeze shard registration after completeness is verified."""
         self._cache.freeze()
 
     def stats(self) -> dict[str, int | float]:
+        """Byte budgets and row-cache counters, delegated to ``DiskRowCache``."""
         return self._cache.stats()
 
+    def prefetch(self, ids) -> bool:
+        """Advisory warm of global row ``ids`` into the row cache; see ``DiskRowCache.prefetch``."""
+        return self._cache.prefetch(ids)
+
     def _run(self, binding: Binding, *, state, token_count: int) -> None:
+        """Hash tokens to row ids, read those rows, and decode in one transaction.
+
+        Runs the table hash, stages ``token_count * head_count`` row ids
+        through ``read_rows``, then the lookup kernel over the staged planes.
+        The whole sequence sits inside one cache ``transaction`` so staging
+        stays pinned until decoding completes.
+        """
         layout = self.layout
         with self._cache.transaction():
             state.hash_state.run(binding._hash_binding, token_count=token_count)
