@@ -195,9 +195,11 @@ class JointCollector:
         from b12x.preparation import autotune_effort
 
         with autotune_effort("audit"):
+            # PoC: host-bridge fabrics stall peer reads, so measure write-only submodes.
             return tuple(
                 asdict(config)
                 for _, config in TUNING.choices(query, self.session.device.identity)
+                if asdict(config).get("submode") not in ("pull", "bulk_pull")
             )
 
     def catalog(self, size):

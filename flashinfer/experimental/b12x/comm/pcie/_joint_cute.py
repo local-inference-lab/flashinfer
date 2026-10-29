@@ -655,7 +655,7 @@ def get_joint_launcher(family, world_size, rank, threads, max_blocks, device_ind
         1,
         1,
         current_cuda_stream(),
-        compile_spec=KernelCompileSpec.from_key("comm.pcie.joint", 10, key[:-1]),
+        compile_spec=KernelCompileSpec.from_key("comm.pcie.joint", 211, key[:-1]),
     )
 
     def run(
