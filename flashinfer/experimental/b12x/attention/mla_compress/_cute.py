@@ -9,8 +9,6 @@ Reduction and pointer/compiler handling reuse b12x helpers.
 
 from __future__ import annotations
 
-from functools import lru_cache
-
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
@@ -22,6 +20,7 @@ from b12x._lib.compiler import KernelCompileSpec, compile as compile_cute
 from b12x._lib.compiler import run_compiled
 from b12x._lib.intrinsics.reduction import block_reduce, warp_reduce
 from b12x._lib.intrinsics.math import fmax_f32
+from b12x._lib.program_cache import program_cache
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils.device import current_cuda_stream
 from b12x._lib.utils.pointers import make_ptr
@@ -276,7 +275,7 @@ def pointers(tensors):
     )
 
 
-@lru_cache(maxsize=None)
+@program_cache
 def compile_compress(ratio, max_tokens, max_requests, max_states, device_index):
     key = (ratio, max_tokens, max_requests, max_states)
     entry = _Compress(ratio, max_tokens, max_requests, max_states)

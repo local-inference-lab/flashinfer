@@ -1,5 +1,9 @@
 """An in-process compile never inherits the artifacts that compile planning left behind."""
 
+import multiprocessing
+import pickle
+import sys
+import types
 from pathlib import Path
 from types import SimpleNamespace
 import weakref
@@ -393,3 +397,99 @@ def test_mhc_program_bundle_hit_still_validates_codegen_snapshot(monkeypatch):
         )
         with pytest.raises(ValueError, match="code-generation snapshot"):
             mhc.compile_mhc(payload, {}, {}, 0)
+
+
+def _probe_planned_application_jit(connection):
+    """Plan an application (non-b12x) Triton kernel inside a compiler worker."""
+    import traceback
+
+    try:
+        import multiprocessing
+
+        import torch
+        import triton
+        import triton.language as tl
+        from b12x._lib.compile_pool import _initialize_worker
+
+        _initialize_worker(
+            0,
+            (12, 0),
+            "GPU-00000000-0000-0000-0000-000000000000",
+            "NVIDIA test target",
+            188,
+            232448,
+            233472,
+            multiprocessing.get_context("spawn").Array("q", (0, 0)),
+        )
+
+        @triton.jit
+        def _application_kernel(x_ptr, n: tl.constexpr):
+            tl.store(x_ptr, 0.0)
+
+        _application_kernel.fn.__module__ = "ignition.components.x"
+        with compile_plan.plan_compilations() as planned:
+            _application_kernel.warmup(torch.empty(1), n=4, grid=(1,))
+
+        def cached():
+            return [
+                kernel
+                for kernel_cache, *_ in _application_kernel.device_caches.values()
+                for kernel in kernel_cache.values()
+            ]
+
+        before = cached()
+        results = {
+            "planned": len(planned),
+            "in_planned_jits": _application_kernel in compile_plan._PLANNED_JITS,
+            "in_native_jits": _application_kernel in compile_plan._NATIVE_JITS,
+            "deferred_before": [isinstance(k, DeferredTritonKernel) for k in before],
+            "unretained_removed": compile_plan.evict_unretained_triton(frozenset()),
+            "kept_by_unretained": len(cached()),
+            "planning_removed": compile_plan.evict_planning_artifacts(),
+            "left_after_planning": len(cached()),
+        }
+        connection.send((results, None))
+    except Exception:
+        connection.send((None, traceback.format_exc()))
+
+
+def test_planning_evicts_deferred_kernels_of_application_jits():
+    """A worker's planning stub is swept for every JIT module, not only b12x's."""
+    context = multiprocessing.get_context("spawn")
+    parent, child = context.Pipe()
+    process = context.Process(target=_probe_planned_application_jit, args=(child,))
+    process.start()
+    try:
+        results, failure = parent.recv()
+    finally:
+        process.join()
+    assert failure is None, failure
+    assert results["planned"] == 1
+    assert results["in_planned_jits"] and not results["in_native_jits"]
+    assert results["deferred_before"] == [True]
+    # Retention reclaim ignores application kernels; planning eviction does not.
+    assert results["unretained_removed"] == 0 and results["kept_by_unretained"] == 1
+    assert results["planning_removed"] == 1 and results["left_after_planning"] == 0
+
+
+def test_run_job_rejects_unresolved_planning_stub(monkeypatch):
+    """A worker that lowered nothing must not report its planned programs complete."""
+    from b12x._lib import compile_pool
+
+    stub = DeferredTritonKernel(
+        ProgramKey("triton", "e" * 64, "stub"), source=SimpleNamespace(name="stub")
+    )
+    module = types.ModuleType("b12x_test_stub_factory")
+    module.factory = lambda: compile_plan.attach_programs(lambda: None, stub)
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    job = compile_pool.CompileJob.create(f"{module.__name__}:factory")
+
+    with pytest.raises(RuntimeError, match="unresolved planning stub"):
+        compile_pool._run_job(pickle.dumps(job), stub.__b12x_programs__)
+
+
+def test_compile_compress_memo_is_a_program_cache():
+    """The MLA compress compiler memo is visible to planning eviction."""
+    from b12x.attention.mla_compress import _cute
+
+    assert isinstance(_cute.compile_compress, program_cache.program_cache)
