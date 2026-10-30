@@ -234,7 +234,7 @@ TUNING = TuningContract(
     validate_config=validate_config,
     default_config=default_config,
     knobs=(Knob(name="head_splits", values=None, binding=ParameterBinding.COMPILE),),
-    candidate_contract_version=2,
+    candidate_contract_version=4,
     parameters=_parameters,
     materialize=_materialize,
 )
