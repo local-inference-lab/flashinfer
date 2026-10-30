@@ -14,6 +14,7 @@ from b12x.moe._shared.kernels.trellis_ring import (
 from b12x._lib.intrinsics.mma import bf16_mma_m16n8k16_f32
 from b12x._lib.intrinsics.mma import bf16_mma_rhs_fragments_as_mma_a_m16n8k16_f32
 from b12x._lib.intrinsics.packed import bfloat2_broadcast_lane
+from b12x._lib.intrinsics.packed import byte_perm
 from b12x._lib.intrinsics.packed import bfloat2_mul
 from b12x._lib.intrinsics.packed import bfloat2_to_float2_scaled
 from b12x._lib.quant.block_codec import block_codec
@@ -463,9 +464,10 @@ class W4A16GemmKernel:
             self.schedule_whole_tiles
             and not self.direct_topk_routes
             and not self.weight_layout_trellis256
+            and not self.dense_route_fast_path
         ):
             raise ValueError(
-                "schedule_whole_tiles requires direct_topk_routes or trellis_t256"
+                "schedule_whole_tiles requires direct routes, dense routes, or trellis_t256"
             )
         if self.fused_topk_sum and self.fused_sum_topk < 1:
             raise ValueError("fused_sum_topk must be >= 1")
@@ -517,7 +519,18 @@ class W4A16GemmKernel:
         # W4A16 shared-memory geometry, in int4 units unless noted.
         self.a_sh_stride = 16 * self.cta_k_blocks // 8
         self.a_sh_stage = self.a_sh_stride * (
-            8 if self.uses_m_block_8 and self.stages == 3 else 16 * self.cta_m_blocks
+            8
+            if self.uses_m_block_8
+            and (
+                self.stages == 3
+                or (
+                    self.stages == 4
+                    and weight_layout == "packed"
+                    and scale_format == "e4m3_k16"
+                    and self.size_k % self.tile_k == 0
+                )
+            )
+            else 16 * self.cta_m_blocks
         )
         self.a_gl_rd_delta_o = 16 * self.cta_k_blocks // 8
         self.a_sh_wr_delta = self.a_sh_stride * (
@@ -531,6 +544,16 @@ class W4A16GemmKernel:
         self.b_sh_stride_threads = self.b_sh_stride
         self.b_sh_stage = self.b_sh_stride * self.cta_k_blocks
         self.b_sh_wr_iters = self.b_sh_stage // self.cta_threads
+        self.carry_ring_fragments = (
+            self.dense_route_fast_path
+            and self.weight_layout == "packed"
+            and self.scale_format == "e4m3_k16"
+            and not self.is_fp16
+            and self.size_m <= 32
+            and self.tile_n == 512
+            and self.tile_k == 32
+            and self.stages == 4
+        )
         # Native t256 uses 4*bits bytes per 32 codes;
         # packed/modelopt use 16 bytes for the same logical unit.
         self.b_unit_bytes = 16
@@ -675,6 +698,9 @@ class W4A16GemmKernel:
             self.fused_sum_router_weights_fp32,
             self.fused_sum_topk,
             self.size_m if self.fused_sum_fp32 else None,
+            self.size_m <= 32,
+            self.size_m == 8,
+            self.carry_ring_fragments,
             self.cta_m_blocks,
             self.uses_m_block_8,
             self.shared_words,
@@ -735,6 +761,23 @@ class W4A16GemmKernel:
 
     @cute.jit
     def _dequant_scale_x4_to_elem2x2(self, packed: Uint32):
+        if cutlass.const_expr(
+            self.dense_route_fast_path
+            and self.weight_layout == "packed"
+            and self.scale_format == "e4m3_k16"
+            and not self.is_fp16
+            and self.size_m <= 32
+        ):
+            if cutlass.const_expr(self.size_m == 8):
+                return packed_dequant_e4m3x4_to_bfloat2x2(packed, native_fp4_bias=True)
+            lo = packed & Uint32(0x00FF00FF)
+            hi = (packed >> Uint32(8)) & Uint32(0x00FF00FF)
+            return (
+                ((lo & Uint32(0x007F007F)) << Uint32(4))
+                + ((lo & Uint32(0x00800080)) << Uint32(1)),
+                ((hi & Uint32(0x007F007F)) << Uint32(4))
+                + ((hi & Uint32(0x00800080)) << Uint32(1)),
+            )
         if cutlass.const_expr(self.native_nvfp4_scales):
             if cutlass.const_expr(self.is_fp16):
                 return fp8x4_e4m3_to_half2x2(packed)
@@ -2209,26 +2252,27 @@ class W4A16GemmKernel:
                             )
                     tile_idx += Int32(1)
             cute.arch.sync_threads()
-            if tile_idx < k_tiles:
-                self._load_b_scale_register_bundle(
-                    b_scale_cur,
-                    smem_base,
-                    tid,
-                    b_sh_rd,
-                    s_sh_rd,
-                    Int32(0),
-                    Int32(0),
-                    reduce_k_tile + tile_idx,
-                    dynamic_pair_override,
-                )
-                self._load_a_register_bundle(
-                    a_regs_cur,
-                    smem_base,
-                    a_sh_rd,
-                    Int32(0),
-                    Int32(0),
-                    uses_m_block_8,
-                )
+            if cutlass.const_expr(not self.carry_ring_fragments):
+                if tile_idx < k_tiles:
+                    self._load_b_scale_register_bundle(
+                        b_scale_cur,
+                        smem_base,
+                        tid,
+                        b_sh_rd,
+                        s_sh_rd,
+                        Int32(0),
+                        Int32(0),
+                        reduce_k_tile + tile_idx,
+                        dynamic_pair_override,
+                    )
+                    self._load_a_register_bundle(
+                        a_regs_cur,
+                        smem_base,
+                        a_sh_rd,
+                        Int32(0),
+                        Int32(0),
+                        uses_m_block_8,
+                    )
 
     @cute.jit
     def _dequant_and_accumulate_bundle(
@@ -3110,6 +3154,15 @@ class W4A16GemmKernel:
             )
         else:
             s_pack0, s_pack1 = ld_shared_v2_u32(s_addr)
+        if cutlass.const_expr(
+            self.dense_route_fast_path
+            and self.weight_layout == "packed"
+            and self.scale_format == "e4m3_k16"
+            and self.moe_block_size in (8, 16, 32)
+            and self.tile_n == 512
+            and self.tile_k == 32
+        ):
+            return q0, q1, q2, q3, s_pack0, s_pack1, Uint32(0), Uint32(0)
         s0, s1 = self._dequant_scale_x4_to_elem2x2(s_pack0)
         s2, s3 = self._dequant_scale_x4_to_elem2x2(s_pack1)
         return q0, q1, q2, q3, s0, s1, s2, s3
@@ -3162,6 +3215,18 @@ class W4A16GemmKernel:
 
     @cute.jit
     def _select_b_scale_register(self, jj: cutlass.Constexpr[int], regs: cute.Tensor):
+        if cutlass.const_expr(
+            self.dense_route_fast_path
+            and self.weight_layout == "packed"
+            and self.scale_format == "e4m3_k16"
+            and self.moe_block_size in (8, 16, 32)
+            and self.tile_n == 512
+            and self.tile_k == 32
+        ):
+            low, high = self._dequant_scale_x4_to_elem2x2(regs[1, jj // 2])
+            if cutlass.const_expr(jj % 2 == 0):
+                return regs[0, jj], low
+            return regs[0, jj], high
         return regs[0, jj], regs[1, jj]
 
     @cute.jit
@@ -3231,15 +3296,31 @@ class W4A16GemmKernel:
 
     @cute.jit
     def _scaled_dequant_b_fragment(self, frag: cute.Tensor, q: Uint32, s: Uint32):
-        if cutlass.const_expr(self.native_nvfp4_scales and self.is_fp16):
+        if cutlass.const_expr(
+            self.dense_route_fast_path
+            and self.weight_layout == "packed"
+            and self.scale_format == "e4m3_k16"
+            and not self.is_fp16
+            and self.size_m <= 32
+        ):
+            b0_0, b0_1, b1_0, b1_1 = _dequant_native_fp4_word(q, False)
+        elif cutlass.const_expr(self.native_nvfp4_scales and self.is_fp16):
             b0_0, b0_1, b1_0, b1_1 = _dequant_native_fp4_word(q, self.is_fp16)
         else:
             bq1 = q
             bq0 = bq1 << Uint32(8)
             b0_0, b0_1 = self._dequant_e2m1x4_to_elem2x2(bq0)
             b1_0, b1_1 = self._dequant_e2m1x4_to_elem2x2(bq1)
-        s_lane0 = bfloat2_broadcast_lane(s, Int32(0))
-        s_lane1 = bfloat2_broadcast_lane(s, Int32(1))
+        if cutlass.const_expr(
+            self.dense_route_fast_path
+            and self.weight_layout == "packed"
+            and self.scale_format == "e4m3_k16"
+        ):
+            s_lane0 = byte_perm(s, s, Int32(0x1010))
+            s_lane1 = byte_perm(s, s, Int32(0x3232))
+        else:
+            s_lane0 = bfloat2_broadcast_lane(s, Int32(0))
+            s_lane1 = bfloat2_broadcast_lane(s, Int32(1))
         b0_0 = self._elem2_mul(b0_0, s_lane0)
         b0_1 = self._elem2_mul(b0_1, s_lane0)
         b1_0 = self._elem2_mul(b1_0, s_lane1)

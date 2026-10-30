@@ -427,6 +427,9 @@ _W4A16_REGS_SM121 = {
     (256, 1, 16, 4, True): 118,
     (256, 1, 16, 8, True): 118,
     (256, 1, 32, 2, True): 118,
+    # Bound unmeasured wide dense tiles to one resident CTA.
+    (256, 1, 32, 2, False): 255,
+    (256, 2, 32, 2, False): 255,
     (128, 1, 4, 8, True): 118,
     (128, 1, 8, 4, True): 120,
     # K32 FC2 tile of intermediate sizes 32 mod 64 (2048/TP6 = 352): one warp
@@ -628,7 +631,21 @@ def _shared_memory_footprint(
         scale_format=scale_format,
         small_m_occupancy=small_m_occupancy,
     )
-    activation_rows = 8 if uses_m_block_8 and stages == 3 else cta_m
+    activation_rows = (
+        8
+        if uses_m_block_8
+        and (
+            stages == 3
+            or (
+                stages == 4
+                and weight_layout == "packed"
+                and scale_format == "e4m3_k16"
+                and problem_k > 0
+                and problem_k % cta_k == 0
+            )
+        )
+        else cta_m
+    )
     sh_block_meta_size = activation_rows * 16
     sh_a_size = stages * (activation_rows * cta_k) * 2
     staged_weight_bits = int(weight_bits)

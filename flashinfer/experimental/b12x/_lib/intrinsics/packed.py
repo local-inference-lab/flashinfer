@@ -674,7 +674,7 @@ def packed_dequant_e2m1x4_to_half2x2(
 
 @dsl_user_op
 def packed_dequant_e4m3x4_to_bfloat2x2(
-    packed: Uint32, *, loc=None, ip=None
+    packed: Uint32, *, native_fp4_bias: bool = False, loc=None, ip=None
 ) -> Tuple[Uint32, Uint32]:
     """FE4M3 scale dequant for one packed 4-value BF16 fragment."""
     result = llvm.inline_asm(
@@ -700,7 +700,15 @@ def packed_dequant_e4m3x4_to_bfloat2x2(
             mov.b32 $0, out2;
             mov.b32 $1, out1;
         }
-        """,
+        """.replace(
+            "shr.u32 out1, tmp, 1;",
+            "shr.u32 out1, tmp, 7;" if native_fp4_bias else "shr.u32 out1, tmp, 1;",
+        )
+        .replace(
+            "shr.u32 out2, tmp, 1;",
+            "shr.u32 out2, tmp, 7;" if native_fp4_bias else "shr.u32 out2, tmp, 1;",
+        )
+        .replace("or.b32", "add.u32" if native_fp4_bias else "or.b32"),
         "=r,=r,r",
         has_side_effects=False,
         is_align_stack=False,

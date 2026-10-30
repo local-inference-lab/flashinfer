@@ -60,6 +60,7 @@ def compile_w4a16_gemm(
     trellis_pair_kind: str | None = None,
     trellis_rate_axis: str | None = None,
     dense_route_fast_path: bool = False,
+    pipeline_stages: int | None = None,
 ) -> W4A16GemmCompileResult:
     scale_format = _normalize_scale_format(scale_format)
     cutlass_dtype = _cutlass_element_dtype(element_dtype)
@@ -87,9 +88,13 @@ def compile_w4a16_gemm(
         trellis_pair_kind=trellis_pair_kind,
         trellis_rate_axis=trellis_rate_axis,
         dense_route_fast_path=bool(dense_route_fast_path),
-        schedule_whole_tiles=weight_layout == "trellis_t256",
+        pipeline_stages=pipeline_stages,
+        schedule_whole_tiles=(
+            weight_layout == "trellis_t256"
+            or (dense_route_fast_path and weight_layout == "packed")
+        ),
     )
-    compile_key = ("w4a16_gemm", kernel.__cache_key__)
+    compile_key = ("w4a16_gemm", 36, kernel.__cache_key__)
     cache_key = (device, compile_key)
     cached = _CACHE.get(cache_key)
     if cached is not None:
@@ -197,7 +202,7 @@ def compile_w4a16_gemm(
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "moe.w4a16.gemm",
-            4,
+            21,
             compile_key,
         ),
     )
@@ -246,6 +251,7 @@ def _compile_w4a16_gemm_launch(
     trellis_pair_kind: str | None = None,
     trellis_rate_axis: str | None = None,
     dense_route_fast_path: bool = False,
+    pipeline_stages: int | None = None,
     route_slots: int | None = None,
     force_tile_config: tuple[int, int] | None = None,
 ) -> _W4A16GemmLaunch:
@@ -276,6 +282,11 @@ def _compile_w4a16_gemm_launch(
             tile_k=tile_k,
             cta_threads=cta_threads,
             max_shared_mem=max_shared_mem - 512,
+            allow_qualified_fc2_tile=(
+                dense_route_fast_path
+                and weight_layout == "packed"
+                and moe_block_size in (8, 16, 32)
+            ),
             scale_format=scale_format,
             weight_layout=weight_layout,
             weight_bits=planner_weight_bits,
@@ -304,6 +315,7 @@ def _compile_w4a16_gemm_launch(
         trellis_pair_kind=trellis_pair_kind,
         trellis_rate_axis=trellis_rate_axis,
         dense_route_fast_path=bool(dense_route_fast_path),
+        pipeline_stages=pipeline_stages,
     )
     if route_slots is None:
         if packed_route_indices is None:

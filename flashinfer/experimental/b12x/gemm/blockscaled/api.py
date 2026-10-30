@@ -17,6 +17,7 @@ from ._linear import (
 from . import META
 from ._a16 import NVFP4LinearWeight, w4a16, w8a16
 from ._iq2_xs import IQ2XSLinearWeight, BlockQuantLinearWeight
+from ._packed_nvfp4 import PackedNVFP4LinearWeight, pack_nvfp4_a16_linear_weight
 
 
 def workspace_size(plan: Plan) -> int:

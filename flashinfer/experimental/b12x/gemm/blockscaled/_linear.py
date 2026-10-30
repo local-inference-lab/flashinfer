@@ -33,6 +33,7 @@ from ._a16 import (
     pack_nvfp4_weight,
 )
 from ._iq2_xs import IQ2XSLinearWeight, pack_iq2_xs_weight
+from ._packed_nvfp4 import PackedNVFP4LinearWeight, pack_nvfp4_a16_linear_weight
 
 
 @dataclass(frozen=True)
@@ -59,7 +60,8 @@ class TensorFP8LinearWeight:
 
 
 Weight: TypeAlias = (
-    MXFP8LinearWeight
+    PackedNVFP4LinearWeight
+    | MXFP8LinearWeight
     | TensorFP8LinearWeight
     | NVFP4LinearWeight
     | MXFP4LinearWeight
@@ -963,10 +965,18 @@ def blockscaled_mm(
 ) -> torch.Tensor:
     """Dispatch packed linear weights or preserve the raw ``dense_gemm`` API."""
 
-    if plan is None and isinstance(rhs, IQ2XSLinearWeight):
+    if plan is None and isinstance(rhs, (IQ2XSLinearWeight, PackedNVFP4LinearWeight)):
         raise TypeError("block-quantized linear weights require a prepared Plan")
 
-    if isinstance(rhs, (NVFP4LinearWeight, MXFP4LinearWeight, IQ2XSLinearWeight)) or (
+    if isinstance(
+        rhs,
+        (
+            NVFP4LinearWeight,
+            PackedNVFP4LinearWeight,
+            MXFP4LinearWeight,
+            IQ2XSLinearWeight,
+        ),
+    ) or (
         isinstance(rhs, MXFP8LinearWeight)
         and isinstance(lhs, torch.Tensor)
         and lhs.dtype == torch.bfloat16

@@ -73,6 +73,8 @@ META = OpMeta(
     entry_points=(
         "Weight",
         "NVFP4LinearWeight",
+        "PackedNVFP4LinearWeight",
+        "pack_nvfp4_a16_linear_weight",
         "IQ2XSLinearWeight",
         "BlockQuantLinearWeight",
         "BlockscaledQuery",
@@ -107,6 +109,8 @@ if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
     from .api import (  # noqa: F401
         Weight,
         NVFP4LinearWeight,
+        PackedNVFP4LinearWeight,
+        pack_nvfp4_a16_linear_weight,
         IQ2XSLinearWeight,
         BlockQuantLinearWeight,
         BlockscaledQuery,
