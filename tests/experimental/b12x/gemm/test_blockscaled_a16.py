@@ -25,6 +25,7 @@ def prepared_execution(
     weight,
     *,
     activation_mode,
+    source_activation="identity",
     activation_global_scale=None,
     out=None,
     workspace=None,
@@ -36,6 +37,7 @@ def prepared_execution(
         source,
         weight,
         activation_mode=activation_mode,
+        source_activation=source_activation,
         activation_global_scale=activation_global_scale,
         out=out,
         workspace=workspace,
@@ -69,6 +71,7 @@ def make_workspace(
     weight,
     *,
     activation_mode,
+    source_activation="identity",
     out=None,
     config=None,
     activation_global_scale=None,
@@ -78,6 +81,7 @@ def make_workspace(
         source,
         weight,
         activation_mode=activation_mode,
+        source_activation=source_activation,
         out=out,
         activation_global_scale=activation_global_scale,
         expected_m=expected_m,
@@ -1125,3 +1129,123 @@ def test_nvfp4_split_partials_exceed_int32_elements():
         source.fill_(0.5)
         graph.replay()
         torch.testing.assert_close(out, torch.full_like(out, k / 2), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("rows", [1, 8, 16, 32, 64])
+@pytest.mark.parametrize("width", [128, 136])
+@pytest.mark.parametrize(
+    "mode,fuse", [("a16", False), ("quantized", False), ("quantized", True)]
+)
+def test_rounded_swiglu_projection_replay(rows, width, mode, fuse):
+    require_b12x()
+    weight, _, _ = make_weight("nvfp4", 128, 256)
+    weight = replace(
+        weight,
+        in_features=width,
+        activation_global_scale=torch.tensor([0.03125], device="cuda"),
+    )
+    source = torch.randn(rows, 2 * width, device="cuda", dtype=torch.bfloat16)
+    intermediate = torch.empty(rows, width, device="cuda", dtype=torch.bfloat16)
+    out, reference = (
+        torch.empty(rows, 128, device="cuda", dtype=torch.bfloat16) for _ in range(2)
+    )
+    config = (
+        BlockscaledConfig(mode=mode, tile_m=16, tile_n=64, tile_k=64, split_k=2)
+        if mode == "a16"
+        else BlockscaledConfig(mode=mode, fuse_swiglu=fuse)
+    )
+    plain_config = replace(config, fuse_swiglu=False)
+    workspace = make_workspace(
+        source,
+        weight,
+        activation_mode=mode,
+        source_activation="swiglu_bf16",
+        out=out,
+        config=config,
+    )
+    plain_workspace = make_workspace(
+        intermediate, weight, activation_mode=mode, out=reference, config=plain_config
+    )
+    with prepared_execution(
+        source,
+        weight,
+        activation_mode=mode,
+        source_activation="swiglu_bf16",
+        out=out,
+        workspace=workspace,
+        config=config,
+        activation_global_scale=weight.activation_global_scale,
+    ) as (_, plan):
+        with prepared_execution(
+            intermediate,
+            weight,
+            activation_mode=mode,
+            out=reference,
+            workspace=plain_workspace,
+            config=plain_config,
+            activation_global_scale=weight.activation_global_scale,
+        ) as (_, plain):
+
+            def run():
+                return blockscaled.mm(
+                    source, weight, plan=plan, out=out, workspace=workspace
+                )
+
+            compiled = torch.compile(run, fullgraph=True)
+            compiled()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                compiled()
+            values = torch.tensor(
+                [-80.0, -8.0, -1.0, -0.0, 0.0, 0.5, 1.0, 8.0, 80.0],
+                device="cuda",
+                dtype=torch.bfloat16,
+            )
+            for factor in (0.0, 0.125, 1.0, -2.0):
+                source.copy_(
+                    values[
+                        torch.arange(source.numel(), device="cuda") % values.numel()
+                    ].view_as(source)
+                    * factor
+                )
+                gate, up = source.chunk(2, dim=-1)
+                intermediate.copy_(torch.nn.functional.silu(gate) * up)
+                blockscaled.mm(
+                    intermediate,
+                    weight,
+                    plan=plain,
+                    out=reference,
+                    workspace=plain_workspace,
+                )
+                allocated = torch.cuda.memory_stats()["allocation.all.allocated"]
+                graph.replay()
+                torch.cuda.synchronize()
+                assert (
+                    torch.cuda.memory_stats()["allocation.all.allocated"] == allocated
+                )
+                assert_close(out, reference)
+            graph.reset()
+    torch._dynamo.reset()
+
+
+def test_rounded_swiglu_rejects_incompatible_sources():
+    require_b12x()
+    weight, _, _ = make_weight("nvfp4", 128, 256)
+    source = torch.zeros(16, 512, device="cuda", dtype=torch.bfloat16)
+    for invalid in (source.float(), source[:, :256]):
+        with pytest.raises(ValueError):
+            blockscaled.query_from_call(
+                invalid, weight, source_activation="swiglu_bf16"
+            )
+    strided = torch.zeros(16, 1024, device="cuda", dtype=torch.bfloat16)[:, ::2]
+    query = blockscaled.query_from_call(
+        strided, weight, source_activation="swiglu_bf16"
+    )
+    with pytest.raises(ValueError, match="contiguous"):
+        _preparation.TUNING.validate_query(query, detect_device(source.device).identity)
+    other_weight, _, _ = make_weight("mxfp8", 128, 256)
+    query = blockscaled.query_from_call(
+        source, other_weight, source_activation="swiglu_bf16"
+    )
+    with pytest.raises(ValueError, match="NVFP4"):
+        _preparation.TUNING.validate_query(query, detect_device(source.device).identity)

@@ -34,11 +34,24 @@ def _quantize(
     RECIPROCAL: tl.constexpr,
     GROUP: tl.constexpr,
     CHUNKS: tl.constexpr,
+    SWIGLU: tl.constexpr = False,
 ):
     row = tl.program_id(0).to(tl.int64)
     group = tl.program_id(1) * CHUNKS + tl.arange(0, CHUNKS)
     k = group[:, None] * GROUP + tl.arange(0, GROUP)[None, :]
-    x = tl.load(X + row * INPUT_K + k, (row < M) & (k < INPUT_K), 0).to(tl.float32)
+    if SWIGLU:
+        gate = tl.load(X + row * (2 * INPUT_K) + k, (row < M) & (k < INPUT_K), 0).to(
+            tl.float32
+        )
+        up = tl.load(
+            X + row * (2 * INPUT_K) + INPUT_K + k, (row < M) & (k < INPUT_K), 0
+        ).to(tl.float32)
+        activated = (
+            (gate * tl.div_rn(1.0, 1.0 + tl.exp(-gate))).to(tl.bfloat16).to(tl.float32)
+        )
+        x = (activated * up).to(tl.bfloat16).to(tl.float32)
+    else:
+        x = tl.load(X + row * INPUT_K + k, (row < M) & (k < INPUT_K), 0).to(tl.float32)
     amax = tl.max(tl.abs(x), 1)
     if FP4:
         if GROUP == 32:

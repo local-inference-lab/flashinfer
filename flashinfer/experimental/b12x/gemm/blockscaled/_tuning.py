@@ -30,6 +30,7 @@ class BlockscaledQuery:
     padded_in_features: int
     out_features: int
     activation_mode: str = "auto"
+    source_activation: str = "identity"
     activation_scale_available: bool = False
     global_scale_kind: str | None = None
     source_contiguous: bool = True
@@ -79,6 +80,7 @@ class BlockscaledConfig:
     mma_warps: int | None = None
     dense_config: FrozenMapping | None = None
     a16_backend: str = "auto"
+    fuse_swiglu: bool = False
 
     def __post_init__(self):
         if self.dense_config is not None:
@@ -95,6 +97,7 @@ class BlockscaledConfig:
             "mma_warps",
             "dense_config",
             "a16_backend",
+            "fuse_swiglu",
         }:
             raise ValueError(
                 "packed precision config requires mode, A16 backend/knobs, and dense_config"
@@ -153,6 +156,16 @@ def _validate_query(query, device):
     ):
         raise ValueError(
             "packed BF16 execution requires NVFP4, MXFP8, or IQ2_XS weights"
+        )
+    if query.source_activation not in ("identity", "swiglu_bf16"):
+        raise ValueError("unsupported packed source activation")
+    if query.source_activation == "swiglu_bf16" and (
+        query.recipe != "nvfp4"
+        or not query.source_contiguous
+        or not query.source_aligned
+    ):
+        raise ValueError(
+            "rounded SwiGLU requires contiguous aligned BF16 gate-first NVFP4 input"
         )
     if any(
         type(value) is not int or value <= 0
@@ -361,6 +374,13 @@ def _validate_config(query, config, device):
         "quantized",
     ):
         raise ValueError("invalid packed precision configuration")
+    if type(config.fuse_swiglu) is not bool or (
+        config.fuse_swiglu
+        and (query.source_activation != "swiglu_bf16" or config.mode != "quantized")
+    ):
+        raise ValueError(
+            "fused SwiGLU packing requires a rounded SwiGLU quantized projection"
+        )
     if query.activation_mode != "auto" and config.mode != query.activation_mode:
         raise ValueError("configuration conflicts with caller activation precision")
     if config.a16_backend not in ("auto", "packed") or (
@@ -575,6 +595,9 @@ def _tuning_parameters(query, device):
             else (query.activation_mode,),
             "mma_warps": (2, 4) if query.recipe == "mxfp8" else (None,),
             "dense_config": dense_configs,
+            "fuse_swiglu": (False, True)
+            if query.source_activation == "swiglu_bf16"
+            else (False,),
             "a16_backend": ("auto", "packed") if expanded else ("auto",),
         },
         predicates=(
@@ -602,6 +625,7 @@ def _equivalence(query, device, config):
             )
         return {
             "mode": "quantized",
+            "fuse_swiglu": config.fuse_swiglu,
             "dense_config": None if dense is None else dense.to_dict(),
         }
     if mxfp8_a16_dequant(query, config):
@@ -619,8 +643,8 @@ def _equivalence(query, device, config):
 
 TUNING = TuningContract(
     component_id="gemm.blockscaled_precision",
-    query_schema_version=23,
-    config_schema_version=25,
+    query_schema_version=24,
+    config_schema_version=26,
     query_fields=frozenset(BlockscaledQuery.__dataclass_fields__),
     config_fields=frozenset(BlockscaledConfig.__dataclass_fields__),
     encode_query=lambda query: {
@@ -657,6 +681,12 @@ TUNING = TuningContract(
             values=("auto",),
             when=FrozenMapping({"mode": "a16"}),
             otherwise="auto",
+        ),
+        Knob(
+            name="fuse_swiglu",
+            values=(False,),
+            when=FrozenMapping({"mode": "quantized"}),
+            otherwise=False,
         ),
         Knob(
             name="dense_config",
