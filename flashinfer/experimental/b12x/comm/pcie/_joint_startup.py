@@ -1,6 +1,7 @@
 """Prepare captured selection among supplied or measured joint collective profiles."""
 
 from dataclasses import dataclass, field
+import weakref
 
 import torch
 
@@ -20,6 +21,101 @@ def joint_finalist_policy():
         per_family=1,
         max_total=35,
     )
+
+
+class StartupTuningStorage:
+    """Caller-owned fixtures and eviction input for serial startup races.
+
+    Pass one instance to every startup producer in a preparation session. All
+    graphs using it must replay serially. Retain the producers until their
+    graphs drain; dropping the storage and producers releases their tensors.
+    """
+
+    def __init__(self, device):
+        self.device = torch.device(device)
+        if self.device.type != "cuda":
+            raise ValueError("startup tuning storage requires a CUDA device")
+        if self.device.index is None:
+            self.device = torch.device("cuda", torch.cuda.current_device())
+        self._fixtures = None
+        self._eviction = self._eviction_sum = None
+        self.external_eviction = False
+        self.captured = False
+        self._cold_users = weakref.WeakSet()
+
+    @property
+    def eviction_bytes(self):
+        """Minimum contiguous resident bytes needed to displace the device's L2."""
+        l2 = torch.cuda.get_device_properties(self.device).L2_cache_size
+        return max(2 * l2, 64 * 1024 * 1024)
+
+    @property
+    def fixtures(self):
+        from ._joint_startup_fixtures import StartupFixtures
+
+        if self._fixtures is None:
+            self._fixtures = StartupFixtures(self.device)
+        return self._fixtures
+
+    def _cold_eviction(self, producer):
+        if self._eviction is None:
+            self._eviction = torch.zeros(
+                self.eviction_bytes // 4, dtype=torch.float32, device=self.device
+            )
+        if self._eviction_sum is None:
+            self._eviction_sum = torch.empty(
+                (), dtype=torch.float32, device=self.device
+            )
+        self._cold_users.add(producer)
+        return self._eviction, self._eviction_sum
+
+    def use_eviction(self, source):
+        """Read caller-owned resident storage during cold races without copying it.
+
+        The source must be contiguous CUDA storage on this device, aligned to
+        four bytes, with at least ``eviction_bytes`` bytes. Configure it before
+        capture. Its contents are read as FP32 bits solely for cache eviction.
+        """
+        if self.captured:
+            raise RuntimeError(
+                "the startup eviction source cannot change after capture"
+            )
+        if not isinstance(source, torch.Tensor) or source.device != self.device:
+            raise ValueError(
+                "startup eviction source must be a CUDA tensor on the storage device"
+            )
+        if not source.is_contiguous():
+            raise ValueError("startup eviction source must be contiguous")
+        if source.data_ptr() % 4:
+            raise ValueError("startup eviction source must be four-byte aligned")
+        nbytes = self.eviction_bytes
+        if source.numel() * source.element_size() < nbytes:
+            raise ValueError(
+                "startup eviction source is smaller than the required L2 eviction input"
+            )
+        # Contiguity and alignment make these views aliases, never copies.
+        eviction = source.view(torch.uint8).view(-1)[:nbytes].view(torch.float32)
+        previous = self._eviction
+        self._eviction = eviction
+        self.external_eviction = True
+        for producer in list(self._cold_users):
+            producer.eviction = eviction
+            producer.owners = tuple(
+                eviction if item is previous else item for item in producer.owners
+            )
+
+    def _freeze(self):
+        self.captured = True
+        if self._fixtures is not None:
+            self._fixtures.frozen = True
+
+
+def _runtime_startup_storage(runtime):
+    storage = getattr(runtime, "_joint_startup_storage", None)
+    if storage is None:
+        storage = StartupTuningStorage(runtime.device)
+        runtime._joint_startup_storage = storage
+    return storage
 
 
 @dataclass(frozen=True)
@@ -115,9 +211,13 @@ def joint_startup_spec(plan, *, profiles=None):
 class JointStartupTuner:
     """Captureable bounded race; retained owners must outlive its CUDA graph."""
 
-    def __init__(self, specs, cache_policy):
-        from ._benchmark import _ReductionInputs
-        from ._gather_preparation import GatherInputs, SelectedGatherState
+    def __init__(self, specs, cache_policy, storage=None):
+        from ._benchmark import _DTYPES, _ReductionInputs, _reduction_repetitions
+        from ._gather_preparation import SelectedGatherState
+        from ._joint_startup_fixtures import (
+            StartupGatherInputs,
+            StartupReductionInputs,
+        )
         from ._joint_startup_cute import SCRATCH_BYTES, SIGNAL_BYTES, timing_launcher
         from .pcie_oneshot import (
             PCIeOneshotAllReduce,
@@ -147,6 +247,14 @@ class JointStartupTuner:
         self.state, self.runtime = state, runtime
         self.gather = isinstance(state, SelectedGatherState)
         self.cache_policy = cache_policy
+        if storage is None:
+            storage = _runtime_startup_storage(runtime)
+        if (
+            not isinstance(storage, StartupTuningStorage)
+            or storage.device != runtime.device
+        ):
+            raise ValueError("startup storage must belong to the runtime CUDA device")
+        self.storage = storage
         _require_collective_contract(
             owner="joint startup tuner",
             exchange_group=runtime.exchange_group,
@@ -169,35 +277,35 @@ class JointStartupTuner:
                     dtype=torch.uint32,
                     device=runtime.device,
                 )
-                self.inputs = (
-                    GatherInputs(state)
-                    if self.gather
-                    else _ReductionInputs(state, inplace=first.inplace)
+                query = state.query
+                self.fixtures = storage.fixtures
+                if self.gather:
+                    self.inputs = StartupGatherInputs(self.fixtures, state)
+                elif query.surface.endswith(
+                    ".all_reduce"
+                ) and not query.surface.startswith("PCIeTwoShotBF16."):
+                    self.inputs = StartupReductionInputs(
+                        self.fixtures,
+                        state,
+                        inplace=first.inplace,
+                        dtype=_DTYPES[query.call["dtype"]],
+                        repetitions=_reduction_repetitions(tuple(query.setup["shape"])),
+                    )
+                else:
+                    self.fixtures = None
+                    self.inputs = _ReductionInputs(state, inplace=first.inplace)
+                    self.inputs.checked = self.inputs.out
+                    self.inputs.mismatch = torch.empty_like(
+                        self.inputs.out, dtype=torch.bool
+                    )
+                self.invalid = torch.zeros(
+                    (1,), dtype=torch.int32, device=runtime.device
                 )
-                self.checked_output = (
-                    self.inputs.out.view(torch.uint8).reshape(-1)
-                    if self.gather
-                    else self.inputs.out
-                )
-                self.mismatch = torch.empty_like(self.checked_output, dtype=torch.bool)
-                self.invalid = torch.zeros((), dtype=torch.int32, device=runtime.device)
+                # The validator reads the int32 word; only its first byte is ever written.
+                self.invalid_any = self.invalid.view(torch.bool)[0]
                 self.eviction = self.eviction_sum = None
                 if cache_policy == "cold":
-                    eviction = getattr(runtime, "_joint_startup_eviction", None)
-                    if eviction is None:
-                        l2 = torch.cuda.get_device_properties(
-                            runtime.device
-                        ).L2_cache_size
-                        eviction = (
-                            torch.ones(
-                                max(2 * l2, 64 * 1024 * 1024) // 4,
-                                dtype=torch.float32,
-                                device=runtime.device,
-                            ),
-                            torch.empty((), dtype=torch.float32, device=runtime.device),
-                        )
-                        runtime._joint_startup_eviction = eviction
-                    self.eviction, self.eviction_sum = eviction
+                    self.eviction, self.eviction_sum = storage._cold_eviction(self)
                 self.launchers = {
                     action: timing_launcher(
                         runtime.world_size,
@@ -216,44 +324,67 @@ class JointStartupTuner:
             setup=prepare_local,
         )
         with torch.cuda.device(runtime.device):
-            shared = PCIeOneshotAllReduce._allocate_shared_buffer(
-                runtime.exchange_group, SCRATCH_BYTES, zero_fill=True, ipc=runtime._ipc
-            )
-            local_error = None
-            try:
+            # Races of one runtime replay one at a time on every rank, so they share
+            # its timing exchange: its barrier counters only ever advance.
+            shared = getattr(runtime, "_joint_startup_shared", None)
+            if shared is None:
+                shared = PCIeOneshotAllReduce._allocate_shared_buffer(
+                    runtime.exchange_group,
+                    SCRATCH_BYTES,
+                    zero_fill=True,
+                    ipc=runtime._ipc,
+                )
+                local_error = None
+                try:
+                    self.peers.copy_(
+                        torch.tensor(
+                            shared.peer_ptrs, dtype=torch.uint64, device=runtime.device
+                        )
+                    )
+                except Exception as error:
+                    local_error = error
+                _finish_collective_runtime_setup(
+                    owner="joint startup tuner",
+                    exchange_group=runtime.exchange_group,
+                    ipc=runtime._ipc,
+                    shared=shared,
+                    local_error=local_error,
+                    detach_shared_ownership=lambda: None,
+                )
+                runtime._owned_buffers.append(shared)
+                runtime._joint_startup_shared = shared
+            else:
                 self.peers.copy_(
                     torch.tensor(
                         shared.peer_ptrs, dtype=torch.uint64, device=runtime.device
                     )
                 )
-            except Exception as error:
-                local_error = error
-            _finish_collective_runtime_setup(
-                owner="joint startup tuner",
-                exchange_group=runtime.exchange_group,
-                ipc=runtime._ipc,
-                shared=shared,
-                local_error=local_error,
-                detach_shared_ownership=lambda: None,
-            )
-            runtime._owned_buffers.append(shared)
             self.shared = shared
         self.local_address = shared.local_ptr + SIGNAL_BYTES
         self.owners = (
             self.specs,
+            storage,
             runtime,
             shared,
             self.inputs,
+            self.fixtures,
             self.peers,
             self.status,
             self.samples,
             self.profiles,
-            self.mismatch,
             self.invalid,
             self.eviction,
             self.eviction_sum,
             self.launchers,
         )
+
+    @property
+    def checked_output(self):
+        return self.inputs.checked
+
+    @property
+    def mismatch(self):
+        return self.inputs.mismatch
 
     def memory_requirements(self):
         """Resident startup storage, with shared fixtures and eviction deduplicated."""
@@ -270,7 +401,7 @@ class JointStartupTuner:
             self.profiles,
             self.mismatch,
             self.invalid,
-            self.eviction,
+            None if self.storage.external_eviction else self.eviction,
             self.eviction_sum,
         )
         entries = {}
@@ -318,6 +449,9 @@ class JointStartupTuner:
     def run(self):
         """Enqueue the race without allocation, compilation, or host decisions."""
         with torch.cuda.device(self.runtime.device):
+            if torch.cuda.is_current_stream_capturing():
+                # A captured race reads its fixtures and eviction source by address from now on.
+                self.storage._freeze()
             self._timing("reset", 0, self.state.selector)
             for mode, active in self.specs[0].profiles:
                 self.state.selector.fill_((mode << 16) | active)
@@ -329,12 +463,9 @@ class JointStartupTuner:
                         self.inputs.reference.expected[producer],
                         out=self.mismatch,
                     )
-                    torch.sum(
-                        self.mismatch,
-                        dim=tuple(range(self.mismatch.ndim)),
-                        dtype=torch.int32,
-                        out=self.invalid,
-                    )
+                    # A bool reduction needs no int32 copy of the mask, which a
+                    # captured race would otherwise keep in the graph pool.
+                    torch.any(self.mismatch, out=self.invalid_any)
                     self._timing("validate", 0, self.state.selector)
             for round_index in range(7):
                 for producer in range(3):
@@ -356,9 +487,9 @@ class JointStartupTuner:
                 self._timing("publish", 0, spec.selector)
 
 
-def prepare_joint_startup_tuner(specs, *, cache_policy="cold"):
+def prepare_joint_startup_tuner(specs, *, cache_policy="cold", storage=None):
     """Collectively allocate and compile a startup producer before capture freeze."""
-    producer = JointStartupTuner(specs, cache_policy)
+    producer = JointStartupTuner(specs, cache_policy, storage)
     producer.run()
     torch.cuda.synchronize(producer.runtime.device)
     if producer.status.item() != 0:
