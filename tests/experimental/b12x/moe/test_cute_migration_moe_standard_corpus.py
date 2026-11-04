@@ -894,6 +894,48 @@ def test_standard_moe_nvfp4_n16_tail_dynamic_live_graph_oracle(
     )
 
 
+def test_standard_moe_nvfp4_m16_four_warp_dynamic_live_graph_oracle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Compile and replay the four-N-warp NVFP4 M16 dynamic tuning candidate."""
+
+    device = require_b12x()
+    _reset_dispatch_environment(monkeypatch)
+    weights = _make_nvfp4_weights(device, seed=207)
+    initial = _make_inputs(device, m=16, seed=208, route_shift=0)
+    changed = _make_inputs(device, m=16, seed=209, route_shift=2)
+    initial_reference = _nvfp4_oracle(weights, initial)
+    changed_reference = _nvfp4_oracle(weights, changed)
+    case = _prepare_and_bind(
+        weights,
+        initial,
+        quant_mode="nvfp4",
+        source_format="modelopt_nvfp4",
+        decode_config=MoeDecodeConfig(
+            backend="dynamic",
+            route_planner="triton",
+            max_active_clusters=None,
+            dynamic_tile_m=16,
+            dynamic_mma_warps=4,
+            dynamic_route_mode="grouped",
+        ),
+    )
+    launch_plan = case.scratch_plan.launch_plan
+    assert launch_plan.implementation == "dynamic"
+    assert case.binding.implementation == "dynamic"
+    assert launch_plan.execution.tile_m == 16
+    _run_live_graph_check(
+        case,
+        initial=initial,
+        changed=changed,
+        initial_reference=initial_reference,
+        changed_reference=changed_reference,
+        context="standard-moe-dynamic-nvfp4-m16-four-warp",
+        min_cos=0.999,
+        max_normalized_rmse=0.03,
+    )
+
+
 @pytest.mark.parametrize("share_input", [False, True])
 @pytest.mark.parametrize("topk", [8, 10])
 @pytest.mark.parametrize("m", [4, 7, 25])
