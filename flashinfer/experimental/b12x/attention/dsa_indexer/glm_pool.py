@@ -1,4 +1,4 @@
-"""Prepared GLM C4 pool production and FP8 index-query rotation.
+"""Prepared C4 pool production and FP8 index-query quantization.
 
 The caller owns paged index records and per-sequence BF16 key/gate tails.
 Main-token slots address model pages of 256 or more tokens; each page maps to
@@ -12,6 +12,7 @@ import torch
 import triton
 
 from b12x._lib.compile_pool import CompileJob
+from b12x._lib.compile_plan import load_programs
 from b12x._lib.program_cache import program_cache
 from b12x.preparation import (
     FrozenMapping,
@@ -33,6 +34,7 @@ class PoolQuery:
     model_block_size: int = 256
     parent_stride_pages: int = 1
     strides: tuple[int, ...] = ()
+    rotation: str = "hadamard"
 
 
 _CONTRACT = make_fixed_contract(
@@ -75,6 +77,8 @@ def compile_pool(payload, ordinal):
                     4,
                     True,
                     1 / 64,
+                    query.rotation == "hadamard",
+                    1e-4 if query.rotation == "hadamard" else 1e-10,
                     num_warps=1,
                     grid=(triton.cdiv(query.rows, 4),),
                 ),
@@ -229,6 +233,8 @@ class _State:
             4,
             True,
             1 / 64,
+            self.query.rotation == "hadamard",
+            1e-4 if self.query.rotation == "hadamard" else 1e-10,
         )
 
     def update(
@@ -296,16 +302,21 @@ def _plan(query, device):
         ),
         _memory_requirements=lambda config, detected: MemoryRequirements(),
         _materialize=lambda selection, detected: _State(
-            query, compile_pool(payload, detected.ordinal)
+            query, load_programs(compile_pool(payload, detected.ordinal))
         ),
         _device=device,
     )
 
 
-def plan_queries(source, output, scales, weights):
-    """Declare rotated FP8 query rows and in-place scale-adjusted head weights."""
+def plan_queries(source, output, scales, weights, *, rotation="hadamard"):
+    """Declare FP8 query rows and head weights, optionally rotating before quantization."""
+    if rotation not in ("hadamard", "none"):
+        raise ValueError("index query rotation must be hadamard or none")
     _validate_quant(source, output, scales, weights)
-    return _plan(PoolQuery(mode="quantize", rows=source.shape[0]), source.device)
+    return _plan(
+        PoolQuery(mode="quantize", rows=source.shape[0], rotation=rotation),
+        source.device,
+    )
 
 
 def plan_pools(

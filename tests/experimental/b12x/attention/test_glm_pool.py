@@ -5,6 +5,7 @@ import torch
 
 from b12x.attention.dsa_indexer import glm_pool
 from b12x.preparation import PreparationSession, PreparedCall
+from b12x._lib.runtime_control import kernel_resolution_guard
 
 from ..conftest import require_b12x
 
@@ -21,6 +22,59 @@ def _quantize(source):
     )
     quantized = (value / scale.unsqueeze(-1)).clamp(-448, 448).to(torch.float8_e4m3fn)
     return quantized, scale
+
+
+@torch.no_grad()
+def test_unrotated_queries_are_resident_without_priming():
+    device = require_b12x()
+    source = torch.randn((65, 128), device=device, dtype=torch.bfloat16)
+    source[0].zero_()
+    source[1].fill_(1e-7)
+    output = torch.empty_like(source, dtype=torch.float8_e4m3fn)
+    scales = torch.empty(65, device=device)
+    initial = torch.randn(65, device=device)
+    weights = initial.clone()
+    plan = glm_pool.plan_queries(source, output, scales, weights, rotation="none")
+    with PreparationSession(
+        device=device, autotune=False, compile_workers=0, prime=False
+    ) as session:
+        session.prepare(
+            (
+                plan.request(
+                    name="query",
+                    prepare_call=lambda state: PreparedCall(
+                        run=lambda: state.quantize(source, output, scales, weights)
+                    ),
+                ),
+            )
+        )
+        # The first execution already has loaded kernel handles, even when preparation skips execution.
+        with kernel_resolution_guard("captured index input quantization"):
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                weights.copy_(initial)
+                glm_pool.quantize_queries(source, output, scales, weights, plan=plan)
+        session.freeze()
+        for _ in range(3):
+            graph.replay()
+            torch.cuda.synchronize()
+            expected_scales = torch.exp2(
+                torch.ceil(
+                    torch.log2(source.float().abs().amax(-1).clamp_min(1e-10) / 448)
+                )
+            )
+            expected = (source.float() / expected_scales[:, None]).to(
+                torch.float8_e4m3fn
+            )
+            torch.testing.assert_close(
+                output.view(torch.uint8), expected.view(torch.uint8), rtol=0, atol=0
+            )
+            torch.testing.assert_close(scales, expected_scales, rtol=0, atol=0)
+            torch.testing.assert_close(
+                weights, initial * expected_scales / 64, rtol=0, atol=0
+            )
+            source.normal_()
+        graph.reset()
 
 
 @pytest.mark.parametrize("rows", [32, 2080])
