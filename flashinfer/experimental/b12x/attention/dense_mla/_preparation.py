@@ -335,6 +335,8 @@ def _query(caps: Caps, abi: FrozenMapping) -> DenseMlaQuery:
         num_cache_pages=caps.num_cache_pages,
         abi=abi,
         partial_dtype=str(caps.partial_dtype).removeprefix("torch."),
+        max_splits=None if caps.budget is None else caps.budget.max_splits,
+        max_partial_rows=None if caps.budget is None else caps.budget.max_partial_rows,
     )
 
 
@@ -360,7 +362,7 @@ def _caps(query: DenseMlaQuery, config: DenseMlaConfig, device: torch.device) ->
         partial_dtype=_dtype(query.partial_dtype),
         budget=__import__(
             "b12x.attention.dense_mla.planner", fromlist=["Budget"]
-        ).Budget(max_splits=config.max_splits),
+        ).Budget(max_splits=config.max_splits, max_partial_rows=query.max_partial_rows),
     )
 
 

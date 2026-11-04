@@ -42,6 +42,8 @@ class DenseMlaQuery:
     abi: FrozenMapping
     causal: bool = True
     partial_dtype: str = "bfloat16"
+    max_splits: int | None = None
+    max_partial_rows: int | None = None
     autotune_effort: str = field(default_factory=capture_autotune_effort)
 
     def to_dict(self) -> dict[str, object]:
@@ -64,6 +66,8 @@ class DenseMlaQuery:
             "num_cache_pages": self.num_cache_pages,
             "abi": self.abi.to_dict(),
             "partial_dtype": self.partial_dtype,
+            "max_splits": self.max_splits,
+            "max_partial_rows": self.max_partial_rows,
             "autotune_effort": self.autotune_effort,
         }
 
@@ -117,7 +121,9 @@ def _default_config(
         num_q_heads=query.num_q_heads,
         query_tile=_query_tile(query),
         sm_count=1 if device is None else device.sm_count,
-        budget=Budget(),
+        budget=Budget(
+            max_splits=query.max_splits, max_partial_rows=query.max_partial_rows
+        ),
     )
     return DenseMlaConfig(max_splits=splits)
 
@@ -125,6 +131,19 @@ def _default_config(
 def _validate_query(query: DenseMlaQuery, _device: DeviceIdentity | None) -> None:
     if not isinstance(query, DenseMlaQuery):
         raise TypeError("query must be DenseMlaQuery")
+    Budget(max_splits=query.max_splits, max_partial_rows=query.max_partial_rows)
+
+
+def _split_capacity(query: DenseMlaQuery) -> int:
+    capacity = max(1, (query.cache_tokens + 63) // 64)
+    if query.max_splits is not None:
+        capacity = min(capacity, int(query.max_splits))
+    if query.max_partial_rows is not None:
+        # One split writes the final output directly, without partial rows.
+        capacity = min(
+            capacity, max(1, int(query.max_partial_rows) // max(1, query.query_rows))
+        )
+    return capacity
 
 
 def _validate_config(
@@ -139,10 +158,12 @@ def _validate_config(
     max_chunks = max(1, (query.cache_tokens + 63) // 64)
     if config.max_splits > max_chunks:
         raise ValueError("dense MLA max_splits cannot exceed the cache chunk count")
+    if config.max_splits > _split_capacity(query):
+        raise ValueError("dense MLA max_splits exceeds the caller scratch budget")
 
 
 def _tuning_parameters(query: DenseMlaQuery, device: DeviceIdentity | None):
-    capacity = max(1, (query.cache_tokens + 63) // 64)
+    capacity = _split_capacity(query)
     splits = set(powers_of_two(capacity))
     divisor = 1
     while divisor <= capacity:
@@ -162,7 +183,7 @@ def _tuning_parameters(query: DenseMlaQuery, device: DeviceIdentity | None):
 
 TUNING = TuningContract(
     component_id="attention.mla",
-    query_schema_version=23,
+    query_schema_version=24,
     config_schema_version=23,
     query_fields=frozenset(
         {
@@ -184,6 +205,8 @@ TUNING = TuningContract(
             "num_cache_pages",
             "abi",
             "partial_dtype",
+            "max_splits",
+            "max_partial_rows",
             "autotune_effort",
         }
     ),
