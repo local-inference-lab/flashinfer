@@ -6,7 +6,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils as cutlass_utils
-from cutlass import Float32, Int32, Int64
+from cutlass import BFloat16, Float32, Int32, Int64
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import dsl_user_op
 
@@ -485,6 +485,23 @@ class DenseMlaForwardKernel:
             active_chunks = Int32(0)
 
         if active_chunks == Int32(0):
+            # Without a split merge this CTA owns the final output, including an empty row.
+            # Publishing only -inf LSE would leave the previous replay's vector visible.
+            if active_splits == Int32(1):
+                value = tid
+                while value < Int32(self.query_tile * HEADS_PER_TILE * self.value_dim):
+                    query_slot = value // Int32(HEADS_PER_TILE * self.value_dim)
+                    local_value = value % Int32(HEADS_PER_TILE * self.value_dim)
+                    local_head = local_value // Int32(self.value_dim)
+                    dimension = local_value % Int32(self.value_dim)
+                    query_row = query_start + query_slot
+                    if query_row < total_q and head_base + local_head < Int32(
+                        self.num_heads
+                    ):
+                        output[query_row, head_base + local_head, dimension] = BFloat16(
+                            0.0
+                        )
+                    value += Int32(self.block_threads)
             entry = tid
             while entry < Int32(self.query_tile * HEADS_PER_TILE):
                 query_slot = entry // Int32(HEADS_PER_TILE)
