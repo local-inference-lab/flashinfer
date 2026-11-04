@@ -293,6 +293,29 @@ storage keys suitable for deduplication. Registered external storage is
 excluded because its caller already accounts for it; the reduction scalar is
 still reported.
 
+### Retained startup memory check
+
+`benchmarks/pcie_startup_storage.py` measures live startup tensors and total
+CUDA memory after capture, validated replay, synchronization, and allocator
+cache release. It keeps the graphs alive and allocates the same 512 MiB resident
+weight tensor before each measurement. Four BF16 message sizes use one runtime;
+`--arm candidate` shares an explicit owner and reads the resident tensor for
+L2 eviction. `--arm base` uses the installed revision's default preparation API.
+
+Run from the desired FlashInfer checkout with its preparation environment and
+four unused GPUs:
+
+```sh
+CUDA_VISIBLE_DEVICES=0,1,2,3 python benchmarks/pcie_startup_storage.py \
+  --arm candidate --source . --output /tmp/pcie-startup-memory
+```
+
+To measure a baseline, run the same script with that checkout imported, pass its
+path as `--source`, and select `--arm base`. The script rejects an import from a
+different source tree. Recorded SM120 TP4 measurements are in
+`benchmarks/results/pcie_startup_storage_tp4_sm120_{base,shared}.json`. These
+measure retained startup memory, not inference latency.
+
 ### Standalone transfer-size search
 
 `b12x.tools.collective_ladder` measures joint BF16 all-reduce configurations under
