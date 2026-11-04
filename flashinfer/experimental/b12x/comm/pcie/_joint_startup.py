@@ -401,9 +401,16 @@ class JointStartupTuner:
             self.profiles,
             self.mismatch,
             self.invalid,
-            None if self.storage.external_eviction else self.eviction,
-            self.eviction_sum,
+            None if self.storage.external_eviction else self.storage._eviction,
+            self.storage._eviction_sum,
         )
+        fixtures = self.storage._fixtures
+        if fixtures is not None:
+            # Frozen owners retain these allocations even when this producer
+            # uses larger private fixtures and every shared-fixture user is gone.
+            tensors += (fixtures.scratch,)
+            for bank in fixtures.banks.values():
+                tensors += (*bank.seeds, *bank.expected)
         entries = {}
         for tensor in tensors:
             if tensor is not None:
