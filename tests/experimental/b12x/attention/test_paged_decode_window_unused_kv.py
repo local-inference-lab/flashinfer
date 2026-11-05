@@ -5,7 +5,10 @@ sliding-window request also excludes live keys below the earliest query row's
 window start. With ``window_left=W`` and width ``n`` query tokens per request,
 keys at positions below ``length - n - W`` are unattended by every row, so
 poisoning them must not change any output bit, while the first windowed key
-must stay live. Follows the conventions of ``test_paged_unused_kv_paths.py``.
+must stay live. Each case runs in direct mode and again captured in a CUDA
+graph and replayed; the live control poisons the value cache only, with K
+finite, so the V path the fix targets is exercised on its own. Follows the
+conventions of ``test_paged_unused_kv_paths.py``.
 """
 
 from __future__ import annotations
@@ -35,7 +38,7 @@ def _fill_nonfinite(tensor, value):
         tensor.fill_(value)
 
 
-def _run_case(q_heads, kv_heads, head_dim, kv_dtype, width, length):
+def _run_case(q_heads, kv_heads, head_dim, kv_dtype, width, length, replay):
     device = require_b12x()
     key = (torch.randn(NUM_PAGES, PAGE, kv_heads, head_dim, device=device) * 0.2).to(
         kv_dtype
@@ -87,8 +90,9 @@ def _run_case(q_heads, kv_heads, head_dim, kv_dtype, width, length):
         window_left=WINDOW_LEFT,
         has_sinks=False,
         kv_dtype=kv_dtype,
-        # Per-head descales ([BATCH, kv_heads]): the default "tensor" layout
-        # makes bind reshape the descale to [1], which rejects this shape.
+        # Per-head descales ([BATCH, kv_heads]) — the default "tensor" layout
+        # makes bind reshape the descale to [1], which rejects the per-head
+        # shape and failed every FP8 case at prepare on both trees (reg201b).
         descale_layout="head",
     )
     if not paged_decode.supports(
@@ -129,11 +133,34 @@ def _run_case(q_heads, kv_heads, head_dim, kv_dtype, width, length):
     window_start = length - width - WINDOW_LEFT
     assert window_start > 0, "case must expose a below-window region"
 
-    def run():
+    if replay:
+        # CUDA-graph replay mode: capture the prepared call once on clean
+        # caches, then poison between replays. The graph reads the live cache
+        # buffers, so below-window poison must stay invisible under replay
+        # exactly as in direct mode. Binding happens outside the capture;
+        # preparation documents that binding inside capture is also safe.
         lengths.fill_(length)
-        paged_decode.run(binding)
         torch.cuda.synchronize(device)
-        return output
+        warmup = torch.cuda.Stream(device)
+        warmup.wait_stream(torch.cuda.current_stream(device))
+        with torch.cuda.stream(warmup):
+            paged_decode.run(binding)
+        torch.cuda.current_stream(device).wait_stream(warmup)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            paged_decode.run(binding)
+
+        def run():
+            graph.replay()
+            torch.cuda.synchronize(device)
+            return output
+    else:
+
+        def run():
+            lengths.fill_(length)
+            paged_decode.run(binding)
+            torch.cuda.synchronize(device)
+            return output
 
     clean = run().clone()
     assert torch.equal(run(), clean), "non-repeatable clean result"
@@ -182,14 +209,15 @@ def _run_case(q_heads, kv_heads, head_dim, kv_dtype, width, length):
                 failures.append(f"{case}: finite={finite}, unchanged={unchanged}")
 
     # Live control: the first windowed key must stay live. Poison exactly that
-    # position in both caches; a correct kernel reads it and the output goes
-    # non-finite. A pass here with the below-window cases failing would mean
-    # the window boundary itself moved rather than the mask working.
+    # position in the value cache only, with K kept finite: a V NaN must
+    # surface on its own, since a K NaN reaches the output through the score
+    # path and would prove nothing about the V mask this fix adds. A pass here
+    # with the below-window cases failing would mean the window boundary
+    # itself moved rather than the mask working.
     key.copy_(clean_key)
     value.copy_(clean_value)
-    for cache in (key, value):
-        rows = cache.view(BATCH, -1, *cache.shape[-2:])
-        _fill_nonfinite(rows[:, window_start], float("nan"))
+    rows = value.view(BATCH, -1, *value.shape[-2:])
+    _fill_nonfinite(rows[:, window_start], float("nan"))
     observed = run()
     live_nan_visible = not bool(torch.isfinite(observed).all())
     print(
@@ -203,10 +231,11 @@ def _run_case(q_heads, kv_heads, head_dim, kv_dtype, width, length):
     assert not failures, "\n".join(failures)
 
 
+@pytest.mark.parametrize("replay", (False, True))
 @pytest.mark.parametrize("length", (257, 129))
 @pytest.mark.parametrize("width", (8, 1))
 @pytest.mark.parametrize("kv_dtype", DTYPES)
 @pytest.mark.parametrize("geom", GEOMS)
-def test_paged_decode_window_unused_kv(geom, kv_dtype, width, length):
+def test_paged_decode_window_unused_kv(geom, kv_dtype, width, length, replay):
     q_heads, kv_heads, head_dim = geom
-    _run_case(q_heads, kv_heads, head_dim, kv_dtype, width, length)
+    _run_case(q_heads, kv_heads, head_dim, kv_dtype, width, length, replay)
