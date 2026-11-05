@@ -22,8 +22,12 @@ _LOCK = threading.Lock()
 _LIB: ctypes.CDLL | None = None
 
 BLOB_STRUCT_ERR = "roce proxy blob size mismatch"
-# Region layout and doorbell protocol of ``_roce_proxy.c``; native runtimes vendor the same file.
-ABI_VERSION = 11
+# Region layout, doorbell protocol and connection blob of ``_roce_proxy.c``; native runtimes vendor
+# the same file.
+ABI_VERSION = 12
+# Reliable queue pairs per rail (``ROCE_MAX_LANES``): consecutive chunks of one peer and rail use
+# separate lanes.
+MAX_LANES = 4
 
 
 def _traffic_class() -> int:
@@ -115,6 +119,7 @@ def load() -> ctypes.CDLL:
             ctypes.c_int,
             ctypes.c_int,
             ctypes.POINTER(ctypes.c_char_p),
+            ctypes.c_int,
             ctypes.c_int,
             ctypes.c_int,
             ctypes.c_int,
@@ -264,8 +269,15 @@ class Proxy:
         varlen_bytes: int = 0,
         ring: bool = False,
         ring_open: bool = False,
+        lanes: int = 1,
     ) -> None:
-        """Create the proxy context: open the HCAs, register the pinned region, create the queue pairs."""
+        """Create the proxy context: open the HCAs, register the pinned region, create the queue pairs.
+
+        ``lanes`` (1..``MAX_LANES``) reliable queue pairs connect each rail; every rank must use the
+        same count, which ``connect`` checks against every peer's blob.
+        """
+        if not 1 <= int(lanes) <= MAX_LANES:
+            raise ValueError(f"lanes must be 1..{MAX_LANES}, got {lanes}")
         self.traffic_class = _traffic_class()
         self._lib = load()
         names = (ctypes.c_char_p * len(hca_names))(*[n.encode() for n in hca_names])
@@ -277,6 +289,7 @@ class Proxy:
             len(hca_names),
             int(gid_index),
             self.traffic_class,
+            int(lanes),
             ctypes.c_void_p(int(region_ptr)),
             int(region_bytes),
             int(slot_bytes),
@@ -301,6 +314,7 @@ class Proxy:
         self.world_size = int(world_size)
         self.rank = int(rank)
         self.hca_names = tuple(hca_names)
+        self.lanes = int(lanes)
 
     def local_blob(self) -> bytes:
         """Serialized connection record (region address, keys, queue-pair numbers) to send to every peer."""

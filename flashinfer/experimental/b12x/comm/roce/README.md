@@ -80,7 +80,7 @@ recreate every rank's runtime to reset the sequence. The bound preserves the
 meaning of zero-initialized chunk-ready words and the healthy error sentinel.
 It applies to the direct and ring transports and does not change the proxy ABI.
 
-## Rails
+## Rails and lanes
 
 Each peer is reached over up to two rails, each a pair of RDMA devices on one
 IPv4 subnet. The direct transport routes a peer over the narrowest subnet it
@@ -89,6 +89,19 @@ cabled to one partner, the partner's rails use the cable's two functions and
 every other peer's use the switch's. A peer's two rails use devices behind
 different PCIe links when possible, because the two ConnectX-7 functions behind
 one PCIe x4 link share its bandwidth.
+
+Each rail is `lanes` reliable queue pairs (constructor `lanes`, else
+`B12X_ROCE_LANES`, else 4; at most 4, equal on every rank). Two-shot and
+variable-length chunk `c` uses lane `c % lanes`; one-shot and ring relays use
+lane 0. A stripe and its flag always share a lane, so the flag-after-payload
+ordering holds per stripe. Proxy ABI 12 carries every lane's queue-pair number
+and the lane count in the connection blob; the region layout is unchanged.
+
+On four DGX Sparks with both a switch and partner cables, a CPU-driven 16 MiB
+two-shot (every chunk marked ready at once, 128 KiB chunks, 60 operations) sent
+192.5 Gb/s per rank with one lane and 206.8 Gb/s with four; over the switch
+alone it sent 190.8 Gb/s with either. A single queue pair per peer and device
+does not keep both PCIe links of a host busy once a cable adds wire capacity.
 
 ## Runnable checks
 

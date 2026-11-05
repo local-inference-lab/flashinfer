@@ -102,6 +102,12 @@ def main():
     )
     parser.add_argument("--hca-names", default="roceP2p1s0f0,rocep1s0f0")
     parser.add_argument("--gid-index", type=int, default=3)
+    parser.add_argument(
+        "--lanes",
+        type=int,
+        default=4,
+        help="queue pairs per rail; two-shot and variable-length chunks rotate over them",
+    )
     parser.add_argument("--source", type=Path)
     args = parser.parse_args()
     if args.source is None:
@@ -136,6 +142,7 @@ def main():
         varlen_bytes=1 << 20,
         ring=not args.mesh and not args.ring_open,
         ring_open=args.ring_open,
+        lanes=args.lanes,
     )
     endpoints = routes_api.local_endpoints(names, args.gid_index)
     local = {
@@ -331,6 +338,7 @@ def main():
                     "rank": args.rank,
                     "world": world,
                     "iterations": args.iterations,
+                    "lanes": args.lanes,
                     "routes": routes,
                     "stats": stats,
                 }
