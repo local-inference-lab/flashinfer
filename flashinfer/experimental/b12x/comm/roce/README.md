@@ -80,6 +80,16 @@ recreate every rank's runtime to reset the sequence. The bound preserves the
 meaning of zero-initialized chunk-ready words and the healthy error sentinel.
 It applies to the direct and ring transports and does not change the proxy ABI.
 
+## Rails
+
+Each peer is reached over up to two rails, each a pair of RDMA devices on one
+IPv4 subnet. The direct transport routes a peer over the narrowest subnet it
+shares: on DGX Sparks whose first port joins a switch and whose second port is
+cabled to one partner, the partner's rails use the cable's two functions and
+every other peer's use the switch's. A peer's two rails use devices behind
+different PCIe links when possible, because the two ConnectX-7 functions behind
+one PCIe x4 link share its bandwidth.
+
 ## Runnable checks
 
 The transport validator uses real libibverbs registrations and RDMA writes,

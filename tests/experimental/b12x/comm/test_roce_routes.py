@@ -7,9 +7,24 @@ import pytest
 from b12x.comm.roce._routes import Endpoint, plan_routes
 
 
-def ep(name, iface=None):
-    """Endpoint named ``name`` with an optional IPv4 interface such as ``10.0.0.1/30``."""
-    return Endpoint(name, None if iface is None else ipaddress.IPv4Interface(iface))
+def ep(name, iface=None, link=None):
+    """Endpoint named ``name`` with an optional IPv4 interface such as ``10.0.0.1/30`` and PCIe link."""
+    return Endpoint(
+        name, None if iface is None else ipaddress.IPv4Interface(iface), link
+    )
+
+
+# DGX Spark ConnectX-7 functions: each PCIe x4 link carries one function of each port.
+SPARK_LINKS = {
+    "roceP2p1s0f0": "0002:01:00",
+    "roceP2p1s0f1": "0002:01:00",
+    "rocep1s0f0": "0000:01:00",
+    "rocep1s0f1": "0000:01:00",
+}
+
+
+def spark(name, iface):
+    return ep(name, iface, SPARK_LINKS[name])
 
 
 # Three DGX Sparks cabled port 0 -> next node's port 1 (no switch). Every cable shows up as two
@@ -176,6 +191,127 @@ def test_fallback_tie_break_is_symmetric_on_a_shared_subnet():
     assert backward == [(r, l) for l, r in forward]
 
 
+# Four DGX Sparks whose first port joins a switch (two functions on 10.200.0.0/24 and 10.200.1.0/24)
+# and whose second port is cabled to one partner: ranks 1 and 2 over 10.200.2.0/24 and 10.200.3.0/24,
+# ranks 0 and 3 over 10.200.4.0/24 and 10.200.5.0/24. Devices are listed in discovery (name) order.
+PARTNER = {0: 3, 1: 2, 2: 1, 3: 0}
+SWITCH_DEVICES = {"roceP2p1s0f0", "rocep1s0f0"}
+DIRECT_DEVICES = {"roceP2p1s0f1", "rocep1s0f1"}
+
+
+def _switch_with_partner_cables():
+    endpoints = []
+    for rank in range(4):
+        host = 11 + rank
+        direct = 2 if rank in (1, 2) else 4
+        endpoints.append(
+            [
+                spark("roceP2p1s0f0", f"10.200.0.{host}/24"),
+                spark("roceP2p1s0f1", f"10.200.{direct}.{host}/24"),
+                spark("rocep1s0f0", f"10.200.1.{host}/24"),
+                spark("rocep1s0f1", f"10.200.{direct + 1}.{host}/24"),
+            ]
+        )
+    return endpoints
+
+
+def _route_devices(endpoints, rank, links):
+    return {endpoints[rank][local].name for local, _ in links}
+
+
+@pytest.mark.parametrize("switch_first", [False, True])
+def test_partner_cable_carries_both_rails_to_the_partner_and_the_switch_the_rest(
+    switch_first,
+):
+    """Each rank reaches its partner over both cable functions and every other peer over the switch.
+
+    Listing the switch functions first would make index pairing valid; the cable still wins.
+    """
+    endpoints = _switch_with_partner_cables()
+    if switch_first:
+        endpoints = [
+            sorted(devices, key=lambda e: e.name not in SWITCH_DEVICES)
+            for devices in endpoints
+        ]
+    plans = [plan_routes(endpoints, rank, 2) for rank in range(4)]
+    for rank in range(4):
+        for peer in range(4):
+            if peer == rank:
+                assert plans[rank][peer] == []
+                continue
+            links = plans[rank][peer]
+            expected = DIRECT_DEVICES if peer == PARTNER[rank] else SWITCH_DEVICES
+            assert _route_devices(endpoints, rank, links) == expected
+            assert all(_link(endpoints, rank, peer, a, b) for a, b in links)
+            assert links == [(b, a) for a, b in plans[peer][rank]]
+
+
+def test_partner_cable_down_at_one_end_moves_that_pair_to_the_switch():
+    """A partner whose cable functions are absent is reached over the switch from both ends."""
+    endpoints = _switch_with_partner_cables()
+    endpoints[2] = [e for e in endpoints[2] if e.name in SWITCH_DEVICES]
+    plans = [plan_routes(endpoints, rank, 2) for rank in range(4)]
+    assert _route_devices(endpoints, 1, plans[1][2]) == SWITCH_DEVICES
+    assert plans[1][2] == [(b, a) for a, b in plans[2][1]]
+    assert _route_devices(endpoints, 0, plans[0][3]) == DIRECT_DEVICES
+    assert _route_devices(endpoints, 3, plans[3][0]) == DIRECT_DEVICES
+
+
+def test_link_local_addresses_on_two_uncabled_ports_do_not_attract_rails():
+    """Two ranks with IPv4 link-local addresses share 169.254.0.0/16 without a cable between them."""
+    endpoints = [
+        [ep("roceP2p1s0f0", "10.200.0.14/24"), ep("rocep1s0f0", "10.200.1.14/24")],
+        [
+            ep("roceP2p1s0f0", "10.200.0.12/24"),
+            ep("rocep1s0f0", "10.200.1.12/24"),
+            ep("rocep1s0f1", "169.254.210.217/16"),
+        ],
+        [ep("roceP2p1s0f0", "10.200.0.13/24"), ep("rocep1s0f0", "10.200.1.13/24")],
+        [
+            ep("roceP2p1s0f0", "10.200.0.11/24"),
+            ep("rocep1s0f0", "10.200.1.11/24"),
+            ep("rocep1s0f1", "169.254.21.112/16"),
+        ],
+    ]
+    for rank in range(4):
+        for peer, links in enumerate(plan_routes(endpoints, rank, 2)):
+            assert links == ([] if peer == rank else [(0, 0), (1, 1)])
+
+
+def test_a_cabled_pair_keeps_its_two_rails_on_separate_pcie_links():
+    """Two ranks cabled to each other and to a switch hold every subnet in common. Index pairing in
+    name order would put both rails behind one PCIe x4 link; the planner uses one function of each."""
+    pair = [_switch_with_partner_cables()[r] for r in (0, 3)]
+    for rank in range(2):
+        links = plan_routes(pair, rank, 2)[1 - rank]
+        assert {SPARK_LINKS[pair[rank][l].name] for l, _ in links} == {
+            "0002:01:00",
+            "0000:01:00",
+        }
+        assert _route_devices(pair, rank, links) == SWITCH_DEVICES
+    assert plan_routes(pair, 0, 2)[1] == [(b, a) for a, b in plan_routes(pair, 1, 2)[0]]
+    # Without PCIe link information the planner keeps device order.
+    unknown = [[ep(e.name, str(e.ipv4)) for e in devices] for devices in pair]
+    assert plan_routes(unknown, 0, 2)[1] == [(0, 0), (1, 1)]
+
+
+def test_a_switched_fabric_with_both_functions_of_a_link_listed_first_avoids_the_shared_link():
+    """Index pairing is rejected when a rank's first two devices share a PCIe link."""
+    switched = [
+        [
+            spark("roceP2p1s0f0", f"10.1.0.{r}/24"),
+            spark("roceP2p1s0f1", f"10.1.1.{r}/24"),
+            spark("rocep1s0f0", f"10.1.2.{r}/24"),
+            spark("rocep1s0f1", f"10.1.3.{r}/24"),
+        ]
+        for r in range(1, 4)
+    ]
+    for rank in range(3):
+        for peer, links in enumerate(plan_routes(switched, rank, 2)):
+            if peer != rank:
+                assert len({SPARK_LINKS[switched[rank][l].name] for l, _ in links}) == 2
+
+
 def test_rails_out_of_range_rejected():
     """Rail counts outside 1..MAX_RAILS are rejected."""
     with pytest.raises(ValueError):
@@ -210,8 +346,11 @@ def test_local_endpoints_uses_gid_netdev_prefix(
         return netmask
 
     monkeypatch.setattr(_routes, "_netmask", mask)
+    function = tmp_path / "pci" / "0002:01:00.1"
+    function.mkdir(parents=True)
+    (tmp_path / "rdma0" / "device").symlink_to(function)
     actual = _routes.local_endpoints(("rdma0", "missing"), 3, root=tmp_path)
-    assert actual == (ep("rdma0", expected), ep("missing"))
+    assert actual == (ep("rdma0", expected, "0002:01:00"), ep("missing"))
     assert seen == (["eth7"] if "ffff" in gid else [])
 
 

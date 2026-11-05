@@ -140,15 +140,15 @@ def main():
     endpoints = routes_api.local_endpoints(names, args.gid_index)
     local = {
         "blob": proxy.local_blob().hex(),
-        "endpoints": [(e.name, str(e.ipv4)) for e in endpoints],
+        "endpoints": [(e.name, str(e.ipv4), e.link) for e in endpoints],
     }
     records = group.exchange(local)
     import ipaddress
 
     all_endpoints = [
         [
-            routes_api.Endpoint(n, ipaddress.IPv4Interface(ip))
-            for n, ip in record["endpoints"]
+            routes_api.Endpoint(n, ipaddress.IPv4Interface(ip), link)
+            for n, ip, link in record["endpoints"]
         ]
         for record in records
     ]

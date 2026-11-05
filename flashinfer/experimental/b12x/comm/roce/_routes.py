@@ -4,16 +4,32 @@ On a switched fabric every device reaches every peer, so rail ``h`` simply pairs
 with the peer's device ``h``. A switchless topology breaks that: three DGX Sparks cabled in a ring
 (port 0 to the next node's port 1) reach each neighbour through one port only, and each port is two
 PCIe functions with their own point-to-point subnet. There, rail ``h`` to a peer must use a local
-device and a remote device on the same subnet.
+device and a remote device on the same subnet. A fabric can also combine both: DGX Sparks whose
+first port joins a switch and whose second port is cabled to one partner reach that partner over
+subnets only the two of them hold, and every other peer over the switch's subnets. A subnet's
+breadth is the number of ranks holding an address on it: two for a direct cable, the whole world for
+a switch.
 
-``plan_routes`` uses index pairing (rail ``h`` on device ``h`` at both ends) whenever every pair of
-ranks shares a subnet on each such pair, which every switched fabric does, and otherwise pairs devices
-per peer by subnet. A device without an IPv4 GID cannot be checked, so both modes trust the caller's
-device order for it: index pairing skips the check, and per-peer pairing uses a same-index pair with
-such a device only when no choice of verified same-subnet links fills every rail. Per-peer pairing
-picks the device-disjoint set of links with the most verified ones. Every rank runs the planner over
-the same exchanged endpoint list, and rails are ordered by link network address, so both ends of a
-link always agree on which rail it carries.
+``plan_routes`` uses index pairing (rail ``h`` on device ``h`` at both ends) when every pair of ranks
+shares a subnet on each such pair and every subnet joining two or more ranks joins all of them, which
+every purely switched fabric satisfies. Otherwise it pairs devices per peer by subnet. A device without
+an IPv4 GID cannot be checked, so both modes trust the caller's device order for it: index pairing
+skips the check, and per-peer pairing uses a same-index pair with such a device only when no choice of
+verified same-subnet links fills every rail. Per-peer pairing picks the device-disjoint set of links
+with the most verified ones and, among those, the narrowest subnets, so a peer with a direct cable is
+reached over that cable's functions rather than over a switch. IPv4 link-local subnets
+(169.254.0.0/16) count as world-wide: every host using link-local addressing shares that subnet
+whether or not its ports are cabled together, so it never identifies a direct link. Every rank runs
+the planner over the same exchanged endpoint list, and rails are ordered by subnet breadth and then by
+link network address, so both ends of a link always agree on which rail it carries.
+
+A DGX Spark exposes each ConnectX-7 port as two PCIe functions, one behind each of its two PCIe x4
+links, and the two functions of one link share its bandwidth. An endpoint records its PCIe link (the
+function's PCI address without the function number, for example ``0002:01:00``). Index pairing
+requires distinct links among the rail devices of every rank, and per-peer pairing prefers rails on
+distinct links at both ends before it compares subnet breadth, so a peer's rails never share a link
+when another choice exists. Two ranks cabled to each other and to a switch hold every subnet in
+common; their rails then use both functions of one port rather than one function of each port.
 """
 
 from __future__ import annotations
@@ -32,10 +48,22 @@ _SIOCGIFNETMASK = 0x891B
 
 @dataclass(frozen=True)
 class Endpoint:
-    """One local RDMA device: its name and, when its GID is IPv4-mapped, the address with prefix."""
+    """One local RDMA device: its name, the address with prefix when its GID is IPv4-mapped, and the
+    PCIe link it shares with sibling functions (PCI domain:bus:device) when known."""
 
     name: str
     ipv4: Optional[ipaddress.IPv4Interface]
+    link: Optional[str] = None
+
+
+def _pcie_link(device: Path) -> Optional[str]:
+    """PCI domain:bus:device of an RDMA device's function, from its sysfs ``device`` link."""
+    try:
+        address = device.resolve(strict=True).name
+    except OSError:
+        return None
+    base, dot, function = address.rpartition(".")
+    return base if dot and base.count(":") == 2 and function.isdigit() else None
 
 
 def _netmask(ifname: str) -> Optional[str]:
@@ -61,7 +89,8 @@ def local_endpoints(
     """Describe ``names``: the IPv4 address of each device's GID at ``gid_index`` and its netdev's prefix.
 
     A device whose GID is not IPv4-mapped, or whose netdev or netmask cannot be read, gets
-    ``ipv4=None`` and is treated as reachable by index pairing only.
+    ``ipv4=None`` and is treated as reachable by index pairing only. ``link`` is the device's PCIe
+    link from its sysfs ``device`` entry, or None when that cannot be read.
     """
     out = []
     for name in names:
@@ -88,7 +117,7 @@ def local_endpoints(
             mask = _netmask(ifname)
             if mask is not None:
                 ipv4 = ipaddress.IPv4Interface(f"{socket.inet_ntoa(raw[12:])}/{mask}")
-        out.append(Endpoint(name, ipv4))
+        out.append(Endpoint(name, ipv4, _pcie_link(root / name / "device")))
     return tuple(out)
 
 
@@ -99,9 +128,42 @@ def _same_link(a: Endpoint, b: Endpoint) -> bool:
     )
 
 
-def _index_pairing_valid(endpoints: Sequence[Sequence[Endpoint]], rails: int) -> bool:
-    """True when rail ``h`` can pair device ``h`` with device ``h`` between every pair of ranks."""
+def _breadths(
+    endpoints: Sequence[Sequence[Endpoint]],
+) -> dict[ipaddress.IPv4Network, int]:
+    """Per IPv4 network, the number of ranks holding an address on it; a link-local network counts
+    as held by every rank, since sharing it does not imply a cable between the holders."""
+    world = len(endpoints)
+    counts: dict[ipaddress.IPv4Network, int] = {}
+    for devices in endpoints:
+        for network in {e.ipv4.network for e in devices if e.ipv4 is not None}:
+            counts[network] = counts.get(network, 0) + 1
+    return {
+        network: world if network.is_link_local else count
+        for network, count in counts.items()
+    }
+
+
+def _shared_links(devices: Sequence[Endpoint]) -> int:
+    """How many of ``devices`` share a known PCIe link with an earlier one."""
+    known = [d.link for d in devices if d.link is not None]
+    return len(known) - len(set(known))
+
+
+def _index_pairing_valid(
+    endpoints: Sequence[Sequence[Endpoint]],
+    rails: int,
+    breadths: dict[ipaddress.IPv4Network, int],
+) -> bool:
+    """True when rail ``h`` can pair device ``h`` with device ``h`` between every pair of ranks, no
+    subnet links some ranks but not all of them (a direct cable that per-peer pairing would prefer),
+    and no rank's rail devices share a PCIe link."""
+    world = len(endpoints)
+    if any(2 <= breadth < world for breadth in breadths.values()):
+        return False
     if any(len(devices) < rails for devices in endpoints):
+        return False
+    if any(_shared_links(devices[:rails]) for devices in endpoints):
         return False
     for a in range(len(endpoints)):
         for b in range(a + 1, len(endpoints)):
@@ -114,9 +176,16 @@ def _index_pairing_valid(endpoints: Sequence[Sequence[Endpoint]], rails: int) ->
     return True
 
 
-def _best_matching(candidates: list, rails: int) -> Optional[list[tuple[int, int]]]:
+def _best_matching(
+    candidates: list,
+    rails: int,
+    local: Sequence[Endpoint] = (),
+    remote: Sequence[Endpoint] = (),
+) -> Optional[list[tuple[int, int]]]:
     """The ``rails`` candidates with distinct local and remote devices that use the most verified links,
-    ties broken by the smallest sorted keys; ``None`` when no such set exists.
+    then the fewest rails sharing a PCIe link at either end (``local`` and ``remote`` name the
+    devices), then the narrowest subnets (smallest total breadth), ties broken by the smallest sorted
+    keys; ``None`` when no such set exists.
 
     ``candidates`` is sorted by key, so each combination, and therefore the rail order, is ordered by key.
     A rank has at most four devices, so the search is at most C(16, 2) combinations.
@@ -128,7 +197,15 @@ def _best_matching(candidates: list, rails: int) -> Optional[list[tuple[int, int
             or len({r for _, _, r in combo}) < rails
         ):
             continue
-        score = (sum(key[0] for key, _, _ in combo), [key for key, _, _ in combo])
+        shared = (_shared_links([local[l] for _, l, _ in combo]) if local else 0) + (
+            _shared_links([remote[r] for _, _, r in combo]) if remote else 0
+        )
+        score = (
+            sum(key[0] for key, _, _ in combo),
+            shared,
+            sum(key[1] for key, _, _ in combo),
+            [key for key, _, _ in combo],
+        )
         if best is None or score < best[0]:
             best = (score, combo)
     return None if best is None else [(l, r) for _, l, r in best[1]]
@@ -168,7 +245,8 @@ def plan_routes(
         subset = [endpoints[p] for p in peers]
         planned = plan_routes(subset, peers.index(rank), rails)
         return [planned[peers.index(p)] if p in peers else [] for p in range(world)]
-    if _index_pairing_valid(endpoints, rails):
+    breadths = _breadths(endpoints)
+    if _index_pairing_valid(endpoints, rails, breadths):
         return [
             [] if p == rank else [(h, h) for h in range(rails)] for p in range(world)
         ]
@@ -179,13 +257,15 @@ def plan_routes(
             routes.append([])
             continue
         remote = endpoints[peer]
-        # Candidates: verified same-subnet links, keyed by network and the link's two addresses; and
-        # same-index pairs with no IPv4 GID on either end, which cannot be checked and are trusted in
-        # caller order, as index pairing would. Every key is symmetric between the two ranks.
+        # Candidates: verified same-subnet links, keyed by subnet breadth (narrowest first, so a direct
+        # cable precedes a switch), network and the link's two addresses; and same-index pairs with no
+        # IPv4 GID on either end, which cannot be checked and are trusted in caller order, as index
+        # pairing would. Every key is symmetric between the two ranks.
         verified = [
             (
                 (
                     0,
+                    breadths[local[l].ipv4.network],
                     int(local[l].ipv4.network.network_address),
                     min(int(local[l].ipv4.ip), int(remote[r].ipv4.ip)),
                     max(int(local[l].ipv4.ip), int(remote[r].ipv4.ip)),
@@ -198,12 +278,12 @@ def plan_routes(
             if _same_link(local[l], remote[r])
         ]
         unverifiable = [
-            ((1, h, 0, 0), h, h)
+            ((1, 0, h, 0, 0), h, h)
             for h in range(min(len(local), len(remote)))
             if local[h].ipv4 is None or remote[h].ipv4 is None
         ]
         candidates = sorted(verified + unverifiable)
-        chosen = _best_matching(candidates, rails)
+        chosen = _best_matching(candidates, rails, local, remote)
         if chosen is None:
             reach = next(
                 (k for k in range(rails - 1, 0, -1) if _best_matching(candidates, k)), 0
