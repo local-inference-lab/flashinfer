@@ -102,3 +102,100 @@ def test_selected_gather_profiles_encode_mode_and_active_grid(transport, mode):
     )
     with pytest.raises(ValueError):
         selected_gather_profile(transport, 32, mode, 33)
+
+
+@pytest.mark.parametrize("world", [2, 4, 8, 9, 10, 12, 16])
+@pytest.mark.parametrize("threads", [32, 64, 128, 256, 512])
+@pytest.mark.parametrize(
+    "transport", ["selected_phased_barrier", "selected_phased_push"]
+)
+def test_phased_gather_requires_a_complete_cluster(world, threads, transport):
+    q = query()
+    q = replace(
+        q,
+        world_size=world,
+        setup=FrozenMapping(dict(q.setup, total_heads=world)),
+        call=FrozenMapping(
+            dict(
+                q.call,
+                threads=threads,
+                block_limit=8,
+                active_blocks=8,
+                out_shape=(64, world, 64),
+                out_stride=(world * 64, 64, 1),
+                gather_transport=transport,
+            )
+        ),
+    )
+    TUNING.validate_query(q, None)
+    assert selected_gather_profile(transport, 8, "barrier", 8) == 8
+    for blocks, active in ((8, 1), (8, 4), (16, 8), (64, 8), (7, 7), (8, 9)):
+        with pytest.raises(ValueError):
+            TUNING.validate_query(
+                replace(
+                    q,
+                    call=FrozenMapping(
+                        dict(q.call, block_limit=blocks, active_blocks=active)
+                    ),
+                ),
+                None,
+            )
+
+
+@pytest.mark.parametrize("origin", [0, 1])
+@pytest.mark.parametrize("entered", [False, True])
+@pytest.mark.parametrize(
+    "transport",
+    [
+        "selected_barrier",
+        "selected_phased_barrier",
+        "selected_phased_push",
+        "joint",
+        "selected_word_exchange",
+    ],
+)
+def test_selected_calls_preserve_the_channel_bank_origin(origin, entered, transport):
+    import torch
+    from b12x.comm.pcie._gather_preparation import SelectedGatherState
+
+    runtime = SimpleNamespace(
+        _device_slot_selection=entered,
+        _next_slot=1 - origin if entered else origin,
+        _graph_base_slot=origin if entered else 0,
+        _staging_ptrs=((0x10000, 0x20000), (0x11000, 0x21000)),
+        _signal_ptrs=(0x30000, 0x40000),
+        _slot_bytes=4096,
+        _exchange_offset=1024,
+        _exchange_counter_offset=8192,
+    )
+    source = torch.zeros((1, 1, 64), dtype=torch.bfloat16)
+    output = torch.empty((1, 2, 64), dtype=source.dtype)
+    q = replace(
+        query(),
+        call=FrozenMapping(
+            dict(
+                query().call,
+                shape=tuple(source.shape),
+                dtype=str(source.dtype),
+                gather_transport=transport,
+            )
+        ),
+    )
+    launches = []
+    state = SelectedGatherState(
+        q,
+        runtime,
+        lambda *args: launches.append(args),
+        torch.zeros(1, dtype=torch.uint32),
+    )
+    state.run_selected(source, output)
+    runtime._next_slot ^= 1
+    state.run_selected(source, output)
+    bank = 0 if transport == "selected_word_exchange" else origin
+    assert len(launches) == 2
+    for args in launches:
+        assert args[3] == runtime._staging_ptrs[bank]
+        assert args[6] == (4096 if bank == 0 else -4096)
+        assert args[7:] == (1024, 8192)
+    if transport != "selected_word_exchange":
+        assert runtime._device_slot_selection and runtime._graph_base_slot == origin

@@ -14,6 +14,8 @@ from ._tuning import TUNING
 GATHER_MODES = {
     "joint": ("barrier", "word_exchange"),
     "selected_barrier": ("barrier",),
+    "selected_phased_barrier": ("barrier",),
+    "selected_phased_push": ("barrier",),
     "selected_word_exchange": ("word_exchange",),
 }
 
@@ -27,6 +29,10 @@ def selected_gather_profile(transport, blocks, mode, active):
         or not 1 <= active <= blocks <= 64
     ):
         raise ValueError("active gather CTAs must fit the physical grid")
+    if transport in ("selected_phased_barrier", "selected_phased_push") and (
+        blocks != 8 or active != 8
+    ):
+        raise ValueError("phased gather requires one complete eight-CTA cluster")
     return (int(mode == "word_exchange") << 16) | active
 
 
@@ -72,7 +78,11 @@ def validate_query(query):
         raise ValueError(
             "selected gather requires disjoint contiguous 16-byte-aligned rows"
         )
-    if transport != "selected_barrier":
+    if transport not in (
+        "selected_barrier",
+        "selected_phased_barrier",
+        "selected_phased_push",
+    ):
         chunks = query.setup["exchange_chunks"]
         if (
             query.world_size not in (2, 4)
@@ -114,14 +124,21 @@ class SelectedGatherState:
             raise ValueError(
                 "selected gather input differs from the prepared shape or dtype"
             )
+        barrier = "barrier" in GATHER_MODES[c["gather_transport"]]
+        if barrier and not runtime._device_slot_selection:
+            # Selected barrier kernels retire device epochs even in eager warmup.
+            # Enter the same bank sequence as ordinary captured DCP operations.
+            runtime._graph_base_slot = runtime._next_slot & 1
+            runtime._device_slot_selection = True
+        bank = runtime._graph_base_slot if barrier else 0
         self.launcher(
             source.data_ptr(),
             output.data_ptr(),
             self.selector.data_ptr(),
-            runtime._staging0_ptrs,
+            runtime._staging_ptrs[bank],
             runtime._signal_ptrs,
             source.shape[0],
-            runtime._slot_bytes,
+            runtime._slot_bytes if bank == 0 else -runtime._slot_bytes,
             runtime._exchange_offset,
             runtime._exchange_counter_offset,
         )
@@ -173,6 +190,10 @@ def plan(query, *, runtime, invocation, override):
 
     def materialize(selection, device):
         launcher = load_programs(compile_selected_gather(*args))
+        if c["gather_transport"] in ("selected_phased_barrier", "selected_phased_push"):
+            from ._joint_cluster_cute import validate_cluster_residency
+
+            validate_cluster_residency(launcher, c["block_limit"], c["threads"], 8)
         value = selected_gather_profile(
             c["gather_transport"], c["block_limit"], c["submode"], c["active_blocks"]
         )

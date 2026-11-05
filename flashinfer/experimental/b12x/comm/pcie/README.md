@@ -288,6 +288,47 @@ with `gather_transport` set to `joint`, `selected_barrier`, or
 Explicit profiles passed to `joint_startup_spec` use the shared captured startup
 tuner. Ordinary DCP plans retain their preparation-time selection policy.
 
+Experimental phased gathers send the complete local input to one destination
+at a time. They reuse the DCP channel's two staging banks and signals, and
+launch one eight-CTA cluster. Every thread fences its phase writes before the
+cluster advances, including threads with no remaining input. The
+`selected_phased_barrier` transport also synchronizes peer ranks after each
+destination; `selected_phased_push` uses one peer barrier after all sends.
+Both assemble exact token-major output from local staging after peer completion.
+
+These transports require `block_limit=8`, `active_blocks=8`, and
+`submode="barrier"`. Materialization checks the compiled kernel's cluster
+residency before capture. Other active/grid combinations are rejected; the
+ordinary gather defaults do not change. For an established `DcpAllToAll`
+channel and matching contiguous input/output tensors, declare a phased plan
+with explicit geometry:
+
+```python
+from dataclasses import replace
+from b12x.comm import pcie
+from b12x.preparation import FrozenMapping
+
+query = pcie.query_from_runtime(
+    runtime,
+    surface="DcpAllToAll.all_gather_heads",
+    call=dict(local_input=source, out=output, threads=128, block_limit=8),
+)
+query = replace(query, call=FrozenMapping(dict(
+    query.call,
+    gather_transport="selected_phased_barrier",
+    submode="barrier",
+    active_blocks=8,
+)))
+plan = pcie.plan(query, runtime=runtime)
+```
+
+Submit this plan through the ordinary collective preparation session. Selected
+barrier profiles and ordinary captured DCP calls share the channel's bank origin
+and device epoch. Joint word exchange retains canonical packet and counter
+offsets even when that barrier origin is bank one. All ranks must use the same
+profile and serialize calls sharing a channel; profile changes require earlier
+replays to have drained.
+
 ```sh
 torchrun --standalone --nproc-per-node=4 -m b12x.tools.collective_ladder \
   --operation all_gather --row-bytes 128 --gather-kernel runtime \

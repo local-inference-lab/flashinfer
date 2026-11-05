@@ -111,6 +111,12 @@ class SelectedGather(_AllGatherHeadsLaunch):
         tid, _, _ = cute.arch.thread_idx()
         previous, first_word, second_word = Uint32(0), Uint32(0), Uint32(0)
         profile = Uint32(0)
+        word_shift, word_stride = Int64(0), stride
+        if cutlass.const_expr(self.transport == "joint"):
+            # Barrier banks may start at bank one and advance with a negative
+            # stride. Word packets and counters always address canonical bank zero.
+            word_shift = cutlass.min(stride, Int64(0))
+            word_stride = stride - Int64(2) * word_shift
         if cutlass.const_expr(self.transport == "joint"):
             if cutlass.const_expr(self._threads == 32):
                 if Int32(tid) < Int32(32):
@@ -119,6 +125,7 @@ class SelectedGather(_AllGatherHeadsLaunch):
                     if Int32(block) * Int32(64) < total:
                         previous = _counter(
                             stages[self._rank].toint()
+                            + word_shift
                             + counter
                             + Int64(block) * Int64(4)
                         )
@@ -137,7 +144,10 @@ class SelectedGather(_AllGatherHeadsLaunch):
                 word = Int32(block) * Int32(64) + Int32(tid)
                 profile, previous, first_word, second_word = _prefetch(
                     selector.toint(),
-                    stages[self._rank].toint() + counter + Int64(block) * Int64(4),
+                    stages[self._rank].toint()
+                    + word_shift
+                    + counter
+                    + Int64(block) * Int64(4),
                     source.toint() + Int64(word) * Int64(4),
                     word,
                     rows * Int32(self.row_words),
@@ -151,11 +161,11 @@ class SelectedGather(_AllGatherHeadsLaunch):
                 self.words.exchange(
                     source,
                     output,
-                    stages[0],
-                    stages[1],
-                    stages[2],
-                    stages[3],
-                    stride,
+                    stages[0] + word_shift,
+                    stages[1] + word_shift,
+                    stages[2] + word_shift,
+                    stages[3] + word_shift,
+                    word_stride,
                     offset,
                     counter,
                     rows,
@@ -168,11 +178,11 @@ class SelectedGather(_AllGatherHeadsLaunch):
                         self.words.exchange(
                             source,
                             output,
-                            stages[0],
-                            stages[1],
-                            stages[2],
-                            stages[3],
-                            stride,
+                            stages[0] + word_shift,
+                            stages[1] + word_shift,
+                            stages[2] + word_shift,
+                            stages[3] + word_shift,
+                            word_stride,
                             offset,
                             counter,
                             rows,
@@ -207,9 +217,22 @@ class SelectedGather(_AllGatherHeadsLaunch):
 
 @program_cache
 def compile_selected_gather(world, rank, row_words, threads, blocks, chunks, transport):
-    operation = SelectedGather(
-        world, rank, row_words, threads, blocks, chunks, transport
-    )
+    if transport in ("phased_barrier", "phased_push"):
+        from ._phased_gather_cute import PhasedGather
+
+        operation = PhasedGather(
+            world,
+            rank,
+            row_words,
+            threads,
+            blocks,
+            chunks,
+            phase_peer_barrier=transport == "phased_barrier",
+        )
+    else:
+        operation = SelectedGather(
+            world, rank, row_words, threads, blocks, chunks, transport
+        )
 
     def pointer(dtype, address=16, alignment=16):
         return make_ptr(
@@ -238,7 +261,10 @@ def compile_selected_gather(world, rank, row_words, threads, blocks, chunks, tra
     def run(source, output, selector, stages, signals, rows, stride, offset, counter):
         if len(stages) != world or len(signals) != world:
             raise ValueError("gather requires one staging and signal address per rank")
-        if rows <= 0 or (transport != "barrier" and rows * row_words > chunks * 64):
+        if rows <= 0 or (
+            transport not in ("barrier", "phased_barrier", "phased_push")
+            and rows * row_words > chunks * 64
+        ):
             raise ValueError("gather exceeds its declared word exchange capacity")
         if source % 16 or output % 16:
             raise ValueError("gather requires 16-byte aligned input and output")

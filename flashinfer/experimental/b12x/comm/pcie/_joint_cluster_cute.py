@@ -347,16 +347,16 @@ def validate_cluster_residency(launcher, blocks, threads, cluster_size):
     (raw,) = launcher.__b12x_dependencies__
     executable = raw._executable
     if len(executable.kernel_info) != 1:
-        raise RuntimeError("clustered joint launcher must retain one CUDA kernel")
+        raise RuntimeError("clustered collective launcher must retain one CUDA kernel")
     (name,) = executable.kernel_info
     status, kernel = cuda.cuLibraryGetKernel(
         cuda.CUlibrary(int(executable.library)), name.encode()
     )
     if status != cuda.CUresult.CUDA_SUCCESS:
-        raise RuntimeError("cannot resolve clustered joint kernel")
+        raise RuntimeError("cannot resolve clustered collective kernel")
     status, function = cuda.cuKernelGetFunction(kernel)
     if status != cuda.CUresult.CUDA_SUCCESS:
-        raise RuntimeError("cannot query clustered joint kernel")
+        raise RuntimeError("cannot query clustered collective kernel")
     attribute = cuda.CUlaunchAttribute()
     attribute.id = cuda.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION
     attribute.value.clusterDim.x = cluster_size
@@ -369,7 +369,7 @@ def validate_cluster_residency(launcher, blocks, threads, cluster_size):
     status, potential = cuda.cuOccupancyMaxPotentialClusterSize(function, config)
     if status != cuda.CUresult.CUDA_SUCCESS:
         raise CandidateResourceIneligibleError(
-            "cannot support the prepared joint cluster geometry"
+            "cannot support the prepared collective cluster geometry"
         )
     status, resident = cuda.cuOccupancyMaxActiveClusters(function, config)
     if (
@@ -378,5 +378,5 @@ def validate_cluster_residency(launcher, blocks, threads, cluster_size):
         or resident * cluster_size < blocks
     ):
         raise CandidateResourceIneligibleError(
-            "joint cluster grid exceeds compiled kernel residency"
+            "collective cluster grid exceeds compiled kernel residency"
         )
