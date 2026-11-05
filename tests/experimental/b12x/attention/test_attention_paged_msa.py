@@ -720,6 +720,7 @@ def test_msa_extend_eager_fp8_kv_matches_reference_varlen(
     "kv_fp8,page_size,msa_union_tile",
     [
         (False, 64, None),
+        (True, 64, None),
         (False, 128, None),
         (False, 128, False),
         (True, 128, None),
