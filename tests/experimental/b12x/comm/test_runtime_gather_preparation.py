@@ -199,3 +199,39 @@ def test_selected_calls_preserve_the_channel_bank_origin(origin, entered, transp
         assert args[7:] == (1024, 8192)
     if transport != "selected_word_exchange":
         assert runtime._device_slot_selection and runtime._graph_base_slot == origin
+
+
+def test_ring_gather_requires_its_explicit_neighbor_geometry():
+    q = query()
+    q = replace(
+        q,
+        world_size=16,
+        setup=FrozenMapping(dict(q.setup, total_heads=16)),
+        call=FrozenMapping(
+            dict(
+                q.call,
+                gather_transport="selected_ring",
+                threads=128,
+                block_limit=8,
+                active_blocks=8,
+                out_shape=(64, 16, 64),
+                out_stride=(1024, 64, 1),
+            )
+        ),
+    )
+    TUNING.validate_query(q, None)
+    assert selected_gather_profile("selected_ring", 8, "barrier", 8) == 8
+    for change in (
+        {"threads": 32},
+        {"threads": 512},
+        {"active_blocks": 7},
+        {"block_limit": 16},
+        {"submode": "word_exchange"},
+    ):
+        with pytest.raises(ValueError):
+            TUNING.validate_query(
+                replace(q, call=FrozenMapping(dict(q.call, **change))), None
+            )
+    for world in (2, 4, 8, 12):
+        with pytest.raises(ValueError):
+            TUNING.validate_query(replace(q, world_size=world), None)

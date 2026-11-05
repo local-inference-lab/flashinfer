@@ -344,6 +344,20 @@ offsets even when that barrier origin is bank one. All ranks must use the same
 profile and serialize calls sharing a channel; profile changes require earlier
 replays to have drained.
 
+The experimental `selected_ring` profile uses one fixed outgoing neighbor and
+one incoming neighbor. Each CTA relays its own 512-byte segments through all
+other ranks, copying received bytes into their final output positions before
+acknowledging receive storage. Later hops read those output positions. Ready
+and acknowledgment records reuse the channel's per-CTA, per-peer counters;
+ordinary calls remain pairwise-compatible with those counters. Staging banks
+and operation epochs retain the same layout.
+
+Ring declarations currently require TP16, `threads=128`, `block_limit=8`,
+`active_blocks=8`, and `submode="barrier"`; they use no cluster. Set
+`gather_transport="selected_ring"` in the declaration above to select it.
+This profile is a preparation experiment with bounded component validation;
+it is not an ordinary gather default or a full-model serving qualification.
+
 ```sh
 torchrun --standalone --nproc-per-node=4 -m b12x.tools.collective_ladder \
   --operation all_gather --row-bytes 128 --gather-kernel runtime \

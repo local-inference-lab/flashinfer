@@ -217,7 +217,11 @@ class SelectedGather(_AllGatherHeadsLaunch):
 
 @program_cache
 def compile_selected_gather(world, rank, row_words, threads, blocks, chunks, transport):
-    if transport in ("phased_barrier", "phased_push"):
+    if transport == "ring":
+        from ._ring_gather_cute import RingGather
+
+        operation = RingGather(world, rank, row_words, threads, blocks, chunks)
+    elif transport in ("phased_barrier", "phased_push"):
         from ._phased_gather_cute import PhasedGather
 
         operation = PhasedGather(
@@ -262,7 +266,7 @@ def compile_selected_gather(world, rank, row_words, threads, blocks, chunks, tra
         if len(stages) != world or len(signals) != world:
             raise ValueError("gather requires one staging and signal address per rank")
         if rows <= 0 or (
-            transport not in ("barrier", "phased_barrier", "phased_push")
+            transport not in ("barrier", "phased_barrier", "phased_push", "ring")
             and rows * row_words > chunks * 64
         ):
             raise ValueError("gather exceeds its declared word exchange capacity")
