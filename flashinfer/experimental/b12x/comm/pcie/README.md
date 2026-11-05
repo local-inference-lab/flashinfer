@@ -14,7 +14,7 @@ tuning keys. Every caller still binds its own serving operands.
 | Staged `AllReduce.all_reduce`, direct peer groups | Native pull; LL and Simple peer push; BF16 payload-ready full reduction and reduce-scatter/all-gather; provisioned BF16 two-shot |
 | Staged fused residual addition and RMSNorm | Native staged transports compatible with declared input, residual, normalization, grouping, and output arithmetic |
 | DCP `all_gather_heads` and `lse_reduce_scatter`, TP2/4/8 | Thread count and block limit; equivalent effective grids are measured once |
-| DCP `all_gather_heads`, TP16 | Ordinary DCP geometry; per-phase peer exchange in one eight-CTA cluster on SM120 devices with at least 64 SMs |
+| DCP `all_gather_heads`, TP16 | Ordinary DCP geometry; phased peer exchange and neighbor-ring profiles on SM120 devices with at least 64 SMs |
 
 Payload-ready transports require their reserved incoming slots, BF16 support,
 and sufficient SMs to keep their grid resident. Two-shot retains its native
@@ -47,12 +47,14 @@ disabled tuning retains the static dispatch policy. Explicit
 `CollectiveConfig(implementation=..., threads=..., blocks=...)` pins a legal
 configuration. Native low-level plans still use `PcieConfig`.
 
-TP16 gather tuning retains ordinary DCP as its default. The phased alternative
-requires disjoint contiguous, 16-byte-aligned rows and a compiled kernel that can
-keep its complete eight-CTA cluster active. Unpinned phased thread counts are
-128, 256, and 512; physical and active grids both remain eight. Existing DCP
-thread and block overrides constrain both implementations. A block override
-other than eight excludes the phased alternative; `PcieConfig(backend="native")`
+TP16 gather tuning retains ordinary DCP as its default. Selected alternatives
+require disjoint contiguous, 16-byte-aligned rows. The phased profile requires a
+compiled kernel that can keep its complete eight-CTA cluster active; its
+unpinned thread counts are 128, 256, and 512. The ring profile uses 128 threads
+and no cluster. Both profiles have eight physical and active CTAs. Existing DCP
+thread and block overrides constrain every implementation. A block override
+other than eight excludes both selected profiles; a thread override other than
+128 excludes ring. `PcieConfig(backend="native")`
 retains the fixed native declaration. Each exact message shape races normally
 without enabling a runtime ladder or changing the all-reduce channel.
 The loaded phased kernel must pass its occupancy check before capture; failure

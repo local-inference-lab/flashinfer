@@ -41,9 +41,9 @@ def _configs(query, device=None):
         call = payload["call"]
         blocks = int(call.get("blocks", call.get("block_limit", 16)))
         threads = int(call["threads"])
-        if name == "dcp_phased":
-            # Automatic admission covers the qualified TP16 hardware. The loaded
-            # kernel still has to pass the native cluster occupancy check.
+        if name in ("dcp_phased", "dcp_ring"):
+            # Automatic admission covers the qualified TP16 hardware. Phased
+            # kernels also have to pass the native cluster occupancy check.
             if (
                 device is None
                 or device.vendor != "nvidia"
@@ -54,7 +54,7 @@ def _configs(query, device=None):
             counts = (
                 (threads,)
                 if payload["setup"].get("threads_override", 0)
-                else (128, 256, 512)
+                else ((128,) if name == "dcp_ring" else (128, 256, 512))
             )
             for count in counts:
                 yield CollectiveConfig(
@@ -284,13 +284,14 @@ def _validate_query(query, device):
         NATIVE.validate_query(native, device)
         if (native.world_size, native.rank) != (query.world_size, query.rank):
             raise ValueError("native alternatives must use the same rank group")
-        if name == "dcp_phased" and (
+        if name in ("dcp_phased", "dcp_ring") and (
             query.operation != "all_gather_heads"
             or query.world_size != 16
             or not native.surface.endswith(".all_gather_heads")
-            or native.call.get("gather_transport") != "selected_phased_barrier"
+            or native.call.get("gather_transport")
+            != ("selected_ring" if name == "dcp_ring" else "selected_phased_barrier")
         ):
-            raise ValueError("phased gather tuning requires the TP16 barrier profile")
+            raise ValueError("selected gather tuning requires its TP16 barrier profile")
 
 
 def _validate_config(query, config, device):
@@ -399,7 +400,7 @@ def _family_bucket(query):
 TUNING = TuningContract(
     component_id="comm.pcie",
     query_schema_version=7,
-    candidate_contract_version=4,
+    candidate_contract_version=5,
     config_schema_version=2,
     query_fields=frozenset(
         ("operation", "world_size", "rank", "alternatives", "default", "inplace")
@@ -470,9 +471,9 @@ def plan(
             call = dict(q.call)
             call["threads"] = config.threads
             call["blocks" if "blocks" in call else "block_limit"] = config.blocks
-            if (
-                config.implementation in JOINT_FAMILIES
-                or config.implementation == "dcp_phased"
+            if config.implementation in JOINT_FAMILIES or config.implementation in (
+                "dcp_phased",
+                "dcp_ring",
             ):
                 call.update(submode=config.submode, active_blocks=config.active_blocks)
             q = replace(q, call=FrozenMapping(call))

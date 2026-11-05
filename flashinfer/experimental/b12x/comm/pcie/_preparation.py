@@ -44,7 +44,7 @@ def query_from_runtime(runtime, *, surface: str, call) -> PcieQuery:
     return _provider(surface).query_from_runtime(runtime, surface=surface, call=call)
 
 
-def _phased_gather_query(query):
+def _selected_gather_query(query, transport, thread_counts):
     from ._gather_preparation import validate_query
 
     call, setup = query.call, query.setup
@@ -54,16 +54,18 @@ def _phased_gather_query(query):
         or not call.get("disjoint_output", False)
         or not call.get("pack_aligned", False)
         or (setup.get("blocks_override", 0) and call["block_limit"] != 8)
-        or (setup.get("threads_override", 0) and call["threads"] not in (128, 256, 512))
+        or (setup.get("threads_override", 0) and call["threads"] not in thread_counts)
     ):
         return None
-    phased = replace(
+    selected = replace(
         query,
         call=FrozenMapping(
             dict(
                 call,
-                gather_transport="selected_phased_barrier",
-                threads=call["threads"] if call["threads"] in (128, 256, 512) else 128,
+                gather_transport=transport,
+                threads=call["threads"]
+                if call["threads"] in thread_counts
+                else thread_counts[0],
                 block_limit=8,
                 submode="barrier",
                 active_blocks=8,
@@ -71,10 +73,10 @@ def _phased_gather_query(query):
         ),
     )
     try:
-        validate_query(phased)
+        validate_query(selected)
     except ValueError:
         return None
-    return phased
+    return selected
 
 
 def plan(
@@ -87,7 +89,7 @@ def plan(
     """Declare native work; neither topology nor a communicator is constructed.
 
     DCP head gather and LSE reduce-scatter expose launch candidates on TP2–8.
-    TP16 head gather also races eligible phased clusters. Other low-level
+    TP16 head gather also races eligible phased and ring profiles. Other low-level
     declarations retain their explicit native configuration.
     ``AllReduce.plan`` composes eligible one-shot and two-shot transports.
     """
@@ -115,9 +117,13 @@ def plan(
         from ._collective_tuning import plan as collective_plan
 
         alternatives = {"dcp": (query, runtime)}
-        phased = _phased_gather_query(query)
-        if phased is not None:
-            alternatives["dcp_phased"] = (phased, runtime)
+        for name, transport, threads in (
+            ("dcp_phased", "selected_phased_barrier", (128, 256, 512)),
+            ("dcp_ring", "selected_ring", (128,)),
+        ):
+            selected = _selected_gather_query(query, transport, threads)
+            if selected is not None:
+                alternatives[name] = (selected, runtime)
         if (
             query.surface.endswith(".all_gather_heads")
             and query.world_size in (2, 4)

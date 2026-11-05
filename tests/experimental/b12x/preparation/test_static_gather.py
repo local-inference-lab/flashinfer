@@ -73,7 +73,7 @@ def test_static_tp16_gather_races_native_geometry_and_complete_phase_clusters():
     query, runtime = native_query()
     plan = _preparation.plan(query, runtime=runtime)
     assert plan.contract is TUNING
-    assert set(plan.query.alternatives) == {"dcp", "dcp_phased"}
+    assert set(plan.query.alternatives) == {"dcp", "dcp_phased", "dcp_ring"}
     assert plan.query.default == CollectiveConfig(
         implementation="dcp", threads=256, blocks=16
     )
@@ -93,7 +93,10 @@ def test_environment_geometry_overrides_constrain_both_implementations(pins):
     query, runtime = native_query(pins=pins)
     plan = _preparation.plan(query, runtime=runtime)
     values = configs(plan)
-    assert {value.implementation for value in values} == {"dcp", "dcp_phased"}
+    expected = {"dcp", "dcp_phased"}
+    if pins[0] in (0, 128):
+        expected.add("dcp_ring")
+    assert {value.implementation for value in values} == expected
     if pins[0]:
         assert {value.threads for value in values} == {pins[0]}
     if pins[1]:
@@ -193,7 +196,9 @@ def test_tp16_lse_and_explicit_selected_queries_remain_native():
     query, runtime = native_query()
     lse = replace(query, surface="DcpAllToAll.lse_reduce_scatter")
     assert _preparation.plan(lse, runtime=runtime).contract is NATIVE
-    explicit = _preparation._phased_gather_query(query)
+    explicit = _preparation._selected_gather_query(
+        query, "selected_phased_barrier", (128, 256, 512)
+    )
     assert _preparation.plan(explicit, runtime=runtime).contract is NATIVE
 
 
@@ -206,10 +211,19 @@ def test_shape_rank_and_byte_width_participate_in_collective_identity():
     assert signatures[0] == signatures[1]
     assert signatures[0] != signatures[2]
     assert signatures[0] != signatures[3]
-    assert TUNING.candidate_contract_version == 4
+    assert TUNING.candidate_contract_version == 5
 
 
-def test_selected_compile_and_materialization_use_the_winning_profile(monkeypatch):
+@pytest.mark.parametrize(
+    "implementation,threads,transport",
+    [
+        ("dcp_phased", 512, "phased_barrier"),
+        ("dcp_ring", 128, "ring"),
+    ],
+)
+def test_selected_compile_and_materialization_use_the_winning_profile(
+    monkeypatch, implementation, threads, transport
+):
     from b12x.comm.pcie import (
         _gather_preparation,
         _runtime_gather_cute,
@@ -232,11 +246,11 @@ def test_selected_compile_and_materialization_use_the_winning_profile(monkeypatc
         "validate_cluster_residency",
         lambda *args: occupancy.append(args),
     )
-    query, runtime = native_query(pins=(512, 8))
+    query, runtime = native_query(pins=(0, 8))
     plan = _preparation.plan(query, runtime=runtime)
     winner = CollectiveConfig(
-        implementation="dcp_phased",
-        threads=512,
+        implementation=implementation,
+        threads=threads,
         blocks=8,
         submode="barrier",
         active_blocks=8,
@@ -244,23 +258,53 @@ def test_selected_compile_and_materialization_use_the_winning_profile(monkeypatc
     device = DetectedDevice(ordinal=None, identity=SM120)
     (job,) = plan._compile_jobs(winner, device)
     assert job.factory.endswith("_runtime_gather_cute:compile_selected_gather")
-    assert job.args == (16, 0, 8, 512, 8, 64, "phased_barrier")
+    assert job.args == (16, 0, 8, threads, 8, 64, transport)
     state = plan._materialize(SimpleNamespace(config=winner), device)
     assert compiled == [job.args]
-    assert occupancy == [(launcher, 8, 512, 8)]
+    assert occupancy == (
+        [(launcher, 8, threads, 8)] if implementation == "dcp_phased" else []
+    )
     assert state.runtime is runtime and state.selector.item() == 8
     assert (state.query.call["submode"], state.query.call["active_blocks"]) == (
         "barrier",
         8,
     )
-    assert (state.query.call["threads"], state.query.call["block_limit"]) == (512, 8)
+    assert (state.query.call["threads"], state.query.call["block_limit"]) == (
+        threads,
+        8,
+    )
 
     def reject(*args):
         raise CandidateResourceIneligibleError("compiled cluster does not fit")
 
     monkeypatch.setattr(_joint_cluster_cute, "validate_cluster_residency", reject)
-    with pytest.raises(CandidateResourceIneligibleError, match="does not fit"):
-        plan._materialize(SimpleNamespace(config=winner), device)
+    if implementation == "dcp_phased":
+        with pytest.raises(CandidateResourceIneligibleError, match="does not fit"):
+            plan._materialize(SimpleNamespace(config=winner), device)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        dict(threads=64),
+        dict(threads=512),
+        dict(blocks=16),
+        dict(active_blocks=4),
+        dict(submode="word_exchange"),
+    ],
+)
+def test_ring_candidate_rejects_profiles_outside_its_qualified_geometry(changes):
+    query, runtime = native_query(pins=(0, 8))
+    plan = _preparation.plan(query, runtime=runtime)
+    ring = next(value for value in configs(plan) if value.implementation == "dcp_ring")
+    assert (ring.threads, ring.blocks, ring.active_blocks, ring.submode) == (
+        128,
+        8,
+        8,
+        "barrier",
+    )
+    with pytest.raises(ValueError, match="parameter space"):
+        TUNING.validate_config(plan.query, replace(ring, **changes), SM120)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
