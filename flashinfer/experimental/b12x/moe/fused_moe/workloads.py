@@ -8,7 +8,7 @@ import random
 import torch
 
 
-TUNING_WORKLOAD_VERSION = "statistical_mix_v1"
+TUNING_WORKLOAD_VERSION = "statistical_shared_mix_v1"
 ROUTING_MIX = ("diffuse", "skewed", "correlated")
 ROUTING_WORKLOADS = (
     *ROUTING_MIX,
@@ -132,10 +132,12 @@ def make_tuning_routes(
     seed: int = 104729,
     samples_per_workload: int = 2,
 ) -> torch.Tensor:
-    """Equally weight diffuse, skewed, and correlated synthetic route scenarios.
+    """Equally weight diffuse, skewed, correlated, and whole-batch shared routes.
 
-    Each scenario uses independent seeds. Popularity varies across experts;
-    correlated scenarios also share preferences within groups of four tokens.
+    Diffuse, skewed, and correlated scenarios vary expert popularity; correlated
+    scenarios also share preferences within groups of four tokens. ``shared_100``
+    sends every token to the same randomly selected set of distinct experts.
+    Each scenario uses two seeds by default.
     These weights provide workload coverage, not measured traffic frequencies.
     """
     if samples_per_workload < 1:
@@ -150,7 +152,7 @@ def make_tuning_routes(
                 seed=seed + tokens + 1009 * index,
                 device=device,
             )
-            for workload in ROUTING_MIX
+            for workload in (*ROUTING_MIX, "shared_100")
             for index in range(samples_per_workload)
         ]
     )
