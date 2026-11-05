@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""GLM C4 softmax pooling, tail updates, and FP8 query rotation."""
+"""GLM C4 softmax pooling, tail updates, and FP8 query quantization."""
 
 import triton
 import triton.language as tl
@@ -40,6 +40,7 @@ def _fwht_quant_kernel(
     BLOCK_R: tl.constexpr,
     SCALE_WEIGHTS: tl.constexpr,
     WEIGHT_NORM: tl.constexpr,
+    HADAMARD: tl.constexpr = True,
 ):
     pid = tl.program_id(0)
     row = pid * BLOCK_R + tl.arange(0, BLOCK_R)
@@ -50,17 +51,18 @@ def _fwht_quant_kernel(
         mask=row_mask[:, None],
         other=0.0,
     ).to(tl.float32)
-    n: tl.constexpr = BLOCK_R * HEAD_DIM
-    x = tl.reshape(x, (n,))
-    x = _fwht_stage(x, n, BLOCK_R * 64, 1)
-    x = _fwht_stage(x, n, BLOCK_R * 32, 2)
-    x = _fwht_stage(x, n, BLOCK_R * 16, 4)
-    x = _fwht_stage(x, n, BLOCK_R * 8, 8)
-    x = _fwht_stage(x, n, BLOCK_R * 4, 16)
-    x = _fwht_stage(x, n, BLOCK_R * 2, 32)
-    x = _fwht_stage(x, n, BLOCK_R, 64)
-    x = (x * 0.08838834764831845).to(tl.bfloat16).to(tl.float32)
-    x = tl.reshape(x, (BLOCK_R, HEAD_DIM))
+    if HADAMARD:
+        n: tl.constexpr = BLOCK_R * HEAD_DIM
+        x = tl.reshape(x, (n,))
+        x = _fwht_stage(x, n, BLOCK_R * 64, 1)
+        x = _fwht_stage(x, n, BLOCK_R * 32, 2)
+        x = _fwht_stage(x, n, BLOCK_R * 16, 4)
+        x = _fwht_stage(x, n, BLOCK_R * 8, 8)
+        x = _fwht_stage(x, n, BLOCK_R * 4, 16)
+        x = _fwht_stage(x, n, BLOCK_R * 2, 32)
+        x = _fwht_stage(x, n, BLOCK_R, 64)
+        x = (x * 0.08838834764831845).to(tl.bfloat16).to(tl.float32)
+        x = tl.reshape(x, (BLOCK_R, HEAD_DIM))
     absmax = tl.maximum(tl.max(tl.abs(x), axis=1), 1e-4)
     scale = tl.exp2(tl.ceil(tl.log2(absmax / FP8_MAX)))
     quantized = tl.minimum(tl.maximum(x / scale[:, None], -FP8_MAX), FP8_MAX)
@@ -90,11 +92,20 @@ def _write_pool(
     PAGE_SIZE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     FP8_MAX: tl.constexpr,
+    HADAMARD: tl.constexpr = True,
+    POWER_OF_TWO_SCALE: tl.constexpr = True,
 ):
-    x = _fwht128(x.to(tl.bfloat16).to(tl.float32)).to(tl.bfloat16).to(tl.float32)
+    x = x.to(tl.bfloat16).to(tl.float32)
+    if HADAMARD:
+        x = _fwht128(x).to(tl.bfloat16).to(tl.float32)
     absmax = tl.maximum(tl.max(tl.abs(x), axis=0), 1e-4)
-    scale = tl.exp2(tl.ceil(tl.log2(absmax / FP8_MAX)))
-    quantized = tl.minimum(tl.maximum(x / scale, -FP8_MAX), FP8_MAX)
+    if POWER_OF_TWO_SCALE:
+        scale = tl.exp2(tl.ceil(tl.log2(absmax / FP8_MAX)))
+        quantized = tl.minimum(tl.maximum(x / scale, -FP8_MAX), FP8_MAX)
+    else:
+        scale = tl.div_rn(absmax, FP8_MAX)
+        inverse_scale = tl.div_rn(1.0, scale)
+        quantized = tl.minimum(tl.maximum(x * inverse_scale, -FP8_MAX), FP8_MAX)
     location = cache_location.to(tl.int64)
     page = location // PAGE_SIZE
     offset = location - page * PAGE_SIZE
