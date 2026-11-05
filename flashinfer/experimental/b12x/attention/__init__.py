@@ -30,6 +30,7 @@ _OP_MODULES = (
     "sparse_mla",
     "compressed_sparse_mla",
     "dsa_indexer",
+    "row_topk",
     "qsa",
     "varlen",
     "mla_compress",

@@ -12,7 +12,7 @@ from __future__ import annotations
 import importlib
 from typing import Any
 
-_OP_MODULES = ("pcie", "roce")
+_OP_MODULES = ("pcie", "roce", "peer_record_gather")
 
 
 def __getattr__(name: str) -> Any:
