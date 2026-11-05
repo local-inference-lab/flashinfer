@@ -1,0 +1,317 @@
+"""Static DCP gather races preserve byte semantics, launch pins, and ownership."""
+
+from dataclasses import replace
+from types import MethodType, SimpleNamespace
+
+import pytest
+import torch
+
+from b12x.comm.pcie import _preparation
+from b12x.comm.pcie._benchmark import _DcpInputs, _dcp_reference
+from b12x.comm.pcie._collective_tuning import CollectiveConfig, TUNING
+from b12x.comm.pcie._tuning import PcieConfig, TUNING as NATIVE
+from b12x.comm.pcie.pcie_dcp_a2a import PCIeDCPA2A
+from b12x.preparation import DeviceIdentity, FrozenMapping, autotune_effort
+from b12x.preparation.device import DetectedDevice
+from b12x.preparation.types import CandidateResourceIneligibleError
+
+
+SM120 = DeviceIdentity("nvidia", (12, 0), 188, "test device")
+
+
+@pytest.fixture(autouse=True)
+def no_cuda_initialization(monkeypatch):
+    def refuse(*args, **kwargs):
+        pytest.fail("static gather contract tests must not initialize CUDA")
+
+    monkeypatch.setattr(torch.cuda, "_lazy_init", refuse)
+
+
+def native_query(*, world=16, rank=0, rows=3, dtype=torch.bfloat16, pins=(0, 0)):
+    runtime = SimpleNamespace(
+        world_size=world,
+        rank=rank,
+        device=torch.device("cpu"),
+        max_batch_size=128,
+        total_heads=2 * world,
+        heads_per_rank=2,
+        head_dim=8,
+        query_head_dim=8,
+        _slot_bytes=1 << 20,
+        _exchange_chunks=64,
+        _exchange_offset=16384,
+        _exchange_counter_offset=2 << 20,
+        _signal_ptrs=tuple(range(world)),
+        _threads_override=pins[0],
+        _block_limit_override=pins[1],
+        _owned_buffers=(SimpleNamespace(nbytes=2 << 20),),
+    )
+    runtime._resolve_launch_config = MethodType(
+        PCIeDCPA2A._resolve_launch_config, runtime
+    )
+    source = torch.empty((rows, 2, 8), dtype=dtype)
+    output = torch.empty((rows, world * 2, 8), dtype=dtype)
+    query = _preparation.query_from_runtime(
+        runtime,
+        surface="DcpAllToAll.all_gather_heads",
+        call={"local_input": source, "out": output},
+    )
+    return query, runtime
+
+
+def configured(plan, device=SM120, *, effort="default"):
+    with autotune_effort(effort):
+        return TUNING.configure(plan.query, device=device, override=plan.override)
+
+
+def configs(plan, device=SM120, *, effort="default"):
+    configuration = configured(plan, device, effort=effort)
+    return [value for _, value in TUNING.iterate(configuration)]
+
+
+def test_static_tp16_gather_races_native_geometry_and_complete_phase_clusters():
+    query, runtime = native_query()
+    plan = _preparation.plan(query, runtime=runtime)
+    assert plan.contract is TUNING
+    assert set(plan.query.alternatives) == {"dcp", "dcp_phased"}
+    assert plan.query.default == CollectiveConfig(
+        implementation="dcp", threads=256, blocks=16
+    )
+    values = configs(plan)
+    phased = [value for value in values if value.implementation == "dcp_phased"]
+    assert {value.threads for value in phased} == {128, 256, 512}
+    assert all(
+        (value.blocks, value.active_blocks, value.submode) == (8, 8, "barrier")
+        for value in phased
+    )
+    assert any(value.implementation == "dcp" for value in values)
+    assert "selected_phased_push" not in repr(plan.query.alternatives)
+
+
+@pytest.mark.parametrize("pins", [(512, 8), (128, 8), (256, 0), (0, 8)])
+def test_environment_geometry_overrides_constrain_both_implementations(pins):
+    query, runtime = native_query(pins=pins)
+    plan = _preparation.plan(query, runtime=runtime)
+    values = configs(plan)
+    assert {value.implementation for value in values} == {"dcp", "dcp_phased"}
+    if pins[0]:
+        assert {value.threads for value in values} == {pins[0]}
+    if pins[1]:
+        assert {value.blocks for value in values} == {pins[1]}
+    if pins == (512, 8):
+        assert len(values) == 2
+
+
+@pytest.mark.parametrize("pins", [(512, 16), (128, 4), (64, 8), (96, 8)])
+def test_incompatible_environment_pins_leave_the_native_candidate(pins):
+    query, runtime = native_query(pins=pins)
+    plan = _preparation.plan(query, runtime=runtime)
+    assert set(plan.query.alternatives) == {"dcp"}
+    assert configs(plan) == [
+        CollectiveConfig(implementation="dcp", threads=pins[0], blocks=pins[1])
+    ]
+
+
+def test_native_pin_retains_the_fixed_plan_and_explicit_profile_is_authoritative():
+    query, runtime = native_query(pins=(512, 8))
+    pin = PcieConfig(backend="native")
+    fixed = _preparation.plan(query, runtime=runtime, override=pin)
+    assert fixed.contract is NATIVE and fixed.query == query and fixed.override is pin
+    phased = CollectiveConfig(
+        implementation="dcp_phased",
+        threads=512,
+        blocks=8,
+        submode="barrier",
+        active_blocks=8,
+    )
+    selected = _preparation.plan(query, runtime=runtime, override=phased)
+    configuration = configured(selected)
+    assert configuration.pinned == configuration.default == phased
+    with pytest.raises(ValueError, match="parameter space"):
+        configured(
+            _preparation.plan(
+                query, runtime=runtime, override=replace(phased, threads=128)
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        None,
+        DeviceIdentity("nvidia", (12, 1), 188, "test device"),
+        DeviceIdentity("nvidia", (10, 0), 148, "test device"),
+        DeviceIdentity("nvidia", (12, 0), 63, "test device"),
+        DeviceIdentity("other", (12, 0), 188, "test device"),
+    ],
+)
+@pytest.mark.parametrize("effort", ["default", "off"])
+def test_unqualified_hardware_does_not_admit_phased_candidates(device, effort):
+    query, runtime = native_query()
+    plan = _preparation.plan(query, runtime=runtime)
+    assert {value.implementation for value in configs(plan, device, effort=effort)} == {
+        "dcp"
+    }
+    phased = CollectiveConfig(
+        implementation="dcp_phased",
+        threads=256,
+        blocks=8,
+        submode="barrier",
+        active_blocks=8,
+    )
+    with pytest.raises(ValueError, match="parameter space"):
+        TUNING.validate_config(plan.query, phased, device)
+
+
+@pytest.mark.parametrize("world", [2, 4, 8, 9, 10, 12])
+def test_other_rank_counts_retain_their_existing_catalog(world):
+    query, runtime = native_query(world=world)
+    plan = _preparation.plan(query, runtime=runtime)
+    if world <= 8:
+        assert "dcp_phased" not in plan.query.alternatives
+    else:
+        assert plan.contract is NATIVE and plan.query == query
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        dict(disjoint_output=False),
+        dict(pack_aligned=False),
+        dict(stride=(17, 8, 1)),
+        dict(out_stride=(257, 8, 1)),
+    ],
+)
+def test_phased_candidate_requires_its_actual_layout_contract(change):
+    query, runtime = native_query()
+    query = replace(query, call=FrozenMapping(dict(query.call, **change)))
+    plan = _preparation.plan(query, runtime=runtime)
+    assert set(plan.query.alternatives) == {"dcp"}
+
+
+def test_tp16_lse_and_explicit_selected_queries_remain_native():
+    query, runtime = native_query()
+    lse = replace(query, surface="DcpAllToAll.lse_reduce_scatter")
+    assert _preparation.plan(lse, runtime=runtime).contract is NATIVE
+    explicit = _preparation._phased_gather_query(query)
+    assert _preparation.plan(explicit, runtime=runtime).contract is NATIVE
+
+
+def test_shape_rank_and_byte_width_participate_in_collective_identity():
+    signatures = []
+    for options in ({}, {"rank": 15}, {"rows": 1}, {"dtype": torch.float8_e4m3fn}):
+        query, runtime = native_query(**options)
+        plan = _preparation.plan(query, runtime=runtime)
+        signatures.append(TUNING.collective_signature(plan.query))
+    assert signatures[0] == signatures[1]
+    assert signatures[0] != signatures[2]
+    assert signatures[0] != signatures[3]
+    assert TUNING.candidate_contract_version == 4
+
+
+def test_selected_compile_and_materialization_use_the_winning_profile(monkeypatch):
+    from b12x.comm.pcie import (
+        _gather_preparation,
+        _runtime_gather_cute,
+        _joint_cluster_cute,
+    )
+
+    compiled, occupancy = [], []
+    launcher = lambda *args: None
+
+    def compile_selected(*args):
+        compiled.append(args)
+        return launcher
+
+    monkeypatch.setattr(
+        _runtime_gather_cute, "compile_selected_gather", compile_selected
+    )
+    monkeypatch.setattr(_gather_preparation, "load_programs", lambda value: value)
+    monkeypatch.setattr(
+        _joint_cluster_cute,
+        "validate_cluster_residency",
+        lambda *args: occupancy.append(args),
+    )
+    query, runtime = native_query(pins=(512, 8))
+    plan = _preparation.plan(query, runtime=runtime)
+    winner = CollectiveConfig(
+        implementation="dcp_phased",
+        threads=512,
+        blocks=8,
+        submode="barrier",
+        active_blocks=8,
+    )
+    device = DetectedDevice(ordinal=None, identity=SM120)
+    (job,) = plan._compile_jobs(winner, device)
+    assert job.factory.endswith("_runtime_gather_cute:compile_selected_gather")
+    assert job.args == (16, 0, 8, 512, 8, 64, "phased_barrier")
+    state = plan._materialize(SimpleNamespace(config=winner), device)
+    assert compiled == [job.args]
+    assert occupancy == [(launcher, 8, 512, 8)]
+    assert state.runtime is runtime and state.selector.item() == 8
+    assert (state.query.call["submode"], state.query.call["active_blocks"]) == (
+        "barrier",
+        8,
+    )
+    assert (state.query.call["threads"], state.query.call["block_limit"]) == (512, 8)
+
+    def reject(*args):
+        raise CandidateResourceIneligibleError("compiled cluster does not fit")
+
+    monkeypatch.setattr(_joint_cluster_cute, "validate_cluster_residency", reject)
+    with pytest.raises(CandidateResourceIneligibleError, match="does not fit"):
+        plan._materialize(SimpleNamespace(config=winner), device)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("rows", [1, 3, 31, 32])
+def test_gather_reference_reorders_mutable_bytes_without_numeric_conversion(
+    dtype, rows
+):
+    references = []
+    for rank in range(16):
+        query, runtime = native_query(rank=rank, rows=rows, dtype=dtype)
+        references.append(
+            _dcp_reference(query, (rows, 2, 8), dtype, runtime.device, False)
+        )
+    assert all(len(reference.seeds) == 3 for reference in references)
+    for seed in range(3):
+        rank_bytes = torch.stack(
+            [reference.seeds[seed].view(torch.uint8) for reference in references]
+        )
+        expected = rank_bytes.permute(1, 0, 2, 3).reshape(rows, 32, -1)
+        for reference in references:
+            assert torch.equal(reference.expected[seed].view(torch.uint8), expected)
+    assert not torch.equal(
+        references[0].seeds[0].view(torch.uint8),
+        references[0].seeds[2].view(torch.uint8),
+    )
+
+
+def test_byte_validation_detects_signed_zero_corruption_and_input_mutation():
+    query, runtime = native_query()
+    inputs = _DcpInputs(SimpleNamespace(query=query, runtime=runtime))
+    assert len(inputs.producers) == 3
+    inputs.produce(1)
+    assert torch.all(inputs.out.view(torch.uint8) == 0xA5)
+    with pytest.raises(AssertionError):
+        inputs.validate()
+    inputs.out.copy_(inputs.reference.expected[1])
+    inputs.validate()
+    inputs.out.view(torch.uint8).reshape(-1)[1] = 0x80
+    assert torch.equal(inputs.out, inputs.reference.expected[1])
+    with pytest.raises(AssertionError):
+        inputs.validate()
+    inputs.out.copy_(inputs.reference.expected[1])
+    inputs.source.view(torch.uint8).reshape(-1)[0] = 1
+    with pytest.raises(AssertionError):
+        inputs.validate()
+
+
+def test_byte_validation_accepts_exact_nan_payloads():
+    query, runtime = native_query()
+    inputs = _DcpInputs(SimpleNamespace(query=query, runtime=runtime))
+    inputs.produce(0)
+    inputs.out.copy_(inputs.reference.expected[0])
+    assert inputs.out.isnan().any()
+    inputs.validate()

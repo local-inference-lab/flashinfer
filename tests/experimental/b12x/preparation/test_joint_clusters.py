@@ -79,12 +79,12 @@ def collective_query(native):
     )
 
 
-def test_ordinary_contract_and_exact_profile_records_are_unchanged():
+def test_parameter_fields_and_ordinary_profile_records_are_unchanged():
     assert (
         TUNING.query_schema_version,
         TUNING.candidate_contract_version,
         TUNING.config_schema_version,
-    ) == (7, 3, 2)
+    ) == (7, 4, 2)
     assert NATIVE.query_schema_version == 42
     assert tuple(CollectiveConfig.__dataclass_fields__) == (
         "implementation",

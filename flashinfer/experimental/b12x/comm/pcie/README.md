@@ -14,6 +14,7 @@ tuning keys. Every caller still binds its own serving operands.
 | Staged `AllReduce.all_reduce`, direct peer groups | Native pull; LL and Simple peer push; BF16 payload-ready full reduction and reduce-scatter/all-gather; provisioned BF16 two-shot |
 | Staged fused residual addition and RMSNorm | Native staged transports compatible with declared input, residual, normalization, grouping, and output arithmetic |
 | DCP `all_gather_heads` and `lse_reduce_scatter`, TP2/4/8 | Thread count and block limit; equivalent effective grids are measured once |
+| DCP `all_gather_heads`, TP16 | Ordinary DCP geometry; per-phase peer exchange in one eight-CTA cluster on SM120 devices with at least 64 SMs |
 
 Payload-ready transports require their reserved incoming slots, BF16 support,
 and sufficient SMs to keep their grid resident. Two-shot retains its native
@@ -45,6 +46,17 @@ Tuning races the native alternatives over their launch geometry; explicitly
 disabled tuning retains the static dispatch policy. Explicit
 `CollectiveConfig(implementation=..., threads=..., blocks=...)` pins a legal
 configuration. Native low-level plans still use `PcieConfig`.
+
+TP16 gather tuning retains ordinary DCP as its default. The phased alternative
+requires disjoint contiguous, 16-byte-aligned rows and a compiled kernel that can
+keep its complete eight-CTA cluster active. Unpinned phased thread counts are
+128, 256, and 512; physical and active grids both remain eight. Existing DCP
+thread and block overrides constrain both implementations. A block override
+other than eight excludes the phased alternative; `PcieConfig(backend="native")`
+retains the fixed native declaration. Each exact message shape races normally
+without enabling a runtime ladder or changing the all-reduce channel.
+The loaded phased kernel must pass its occupancy check before capture; failure
+stops preparation.
 
 Default-effort plain all-reduce tuning calibrates transfer-size buckets before
 restricting exact-shape races to two families. Bucket upper bounds are
@@ -83,8 +95,11 @@ must remain serialized.
 
 The `_benchmark.py` fixtures allocate private operands, generate and reset inputs,
 capture candidate calls, and check arithmetic before timing. They preserve
-declared tensor layouts and residual aliasing. A caller can supply an explicit
-`benchmark_call` for a different representative execution context.
+declared tensor layouts and residual aliasing. Gather fixtures change arbitrary
+byte patterns, poison their destinations, and compare exact output and input
+bytes, including NaN payloads and FP32 values transported through BF16 views.
+A caller can supply an explicit `benchmark_call` for a different representative
+execution context.
 
 All ranks compile and bind a candidate before any rank primes it. Each rank
 queues the same captured calls behind a stream gate; the coordinator releases

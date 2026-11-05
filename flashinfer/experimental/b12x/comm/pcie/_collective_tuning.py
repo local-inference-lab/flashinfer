@@ -36,11 +36,35 @@ class CollectiveQuery:
     inplace: bool = False
 
 
-def _configs(query):
+def _configs(query, device=None):
     for name, payload in query.alternatives.items():
         call = payload["call"]
         blocks = int(call.get("blocks", call.get("block_limit", 16)))
         threads = int(call["threads"])
+        if name == "dcp_phased":
+            # Automatic admission covers the qualified TP16 hardware. The loaded
+            # kernel still has to pass the native cluster occupancy check.
+            if (
+                device is None
+                or device.vendor != "nvidia"
+                or device.compute_capability != (12, 0)
+                or device.sm_count < 64
+            ):
+                continue
+            counts = (
+                (threads,)
+                if payload["setup"].get("threads_override", 0)
+                else (128, 256, 512)
+            )
+            for count in counts:
+                yield CollectiveConfig(
+                    implementation=name,
+                    threads=count,
+                    blocks=8,
+                    submode="barrier",
+                    active_blocks=8,
+                )
+            continue
         if name in JOINT_FAMILIES:
             cluster_size = call.get("joint_cluster_size", 1)
             if cluster_size != 1:
@@ -200,9 +224,10 @@ def _efficient_plain_grid(query, value):
 
 
 def _parameters(query, device):
-    configs = tuple(dict.fromkeys(_configs(query)))
+    configs = tuple(dict.fromkeys(_configs(query, device)))
     effort = capture_autotune_effort()
     if effort is AutotuneEffort.OFF:
+        eligible = {config.implementation for config in configs}
         configs = tuple(
             dict.fromkeys(
                 CollectiveConfig(
@@ -217,6 +242,7 @@ def _parameters(query, device):
                     ),
                 )
                 for name, payload in query.alternatives.items()
+                if name in eligible
             )
         )
     legal_configs = frozenset(configs)
@@ -237,8 +263,9 @@ def _parameters(query, device):
                 or query.default.implementation == "pull"
                 or query.operation == "all_reduce"
             ),
-            lambda value: effort is AutotuneEffort.OFF
-            or _efficient_plain_grid(query, value),
+            lambda value: (
+                effort is AutotuneEffort.OFF or _efficient_plain_grid(query, value)
+            ),
         ),
         autotune_effort=effort,
     )
@@ -252,15 +279,24 @@ def _validate_query(query, device):
         or not 0 <= query.rank < query.world_size
     ):
         raise ValueError("collective tuning requires a supported world size and rank")
-    for payload in query.alternatives.values():
+    for name, payload in query.alternatives.items():
         native = PcieQuery(**payload)
         NATIVE.validate_query(native, device)
         if (native.world_size, native.rank) != (query.world_size, query.rank):
             raise ValueError("native alternatives must use the same rank group")
+        if name == "dcp_phased" and (
+            query.operation != "all_gather_heads"
+            or query.world_size != 16
+            or not native.surface.endswith(".all_gather_heads")
+            or native.call.get("gather_transport") != "selected_phased_barrier"
+        ):
+            raise ValueError("phased gather tuning requires the TP16 barrier profile")
 
 
 def _validate_config(query, config, device):
-    if not isinstance(config, CollectiveConfig) or config not in tuple(_configs(query)):
+    if not isinstance(config, CollectiveConfig) or config not in tuple(
+        _configs(query, device)
+    ):
         raise ValueError(
             "configuration is outside the native collective parameter space"
         )
@@ -363,7 +399,7 @@ def _family_bucket(query):
 TUNING = TuningContract(
     component_id="comm.pcie",
     query_schema_version=7,
-    candidate_contract_version=3,
+    candidate_contract_version=4,
     config_schema_version=2,
     query_fields=frozenset(
         ("operation", "world_size", "rank", "alternatives", "default", "inplace")
@@ -434,7 +470,10 @@ def plan(
             call = dict(q.call)
             call["threads"] = config.threads
             call["blocks" if "blocks" in call else "block_limit"] = config.blocks
-            if config.implementation in JOINT_FAMILIES:
+            if (
+                config.implementation in JOINT_FAMILIES
+                or config.implementation == "dcp_phased"
+            ):
                 call.update(submode=config.submode, active_blocks=config.active_blocks)
             q = replace(q, call=FrozenMapping(call))
             native_plans[config] = _provider(q.surface).plan(q, runtime=runtime)

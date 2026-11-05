@@ -44,6 +44,39 @@ def query_from_runtime(runtime, *, surface: str, call) -> PcieQuery:
     return _provider(surface).query_from_runtime(runtime, surface=surface, call=call)
 
 
+def _phased_gather_query(query):
+    from ._gather_preparation import validate_query
+
+    call, setup = query.call, query.setup
+    if (
+        query.world_size != 16
+        or not query.surface.endswith(".all_gather_heads")
+        or not call.get("disjoint_output", False)
+        or not call.get("pack_aligned", False)
+        or (setup.get("blocks_override", 0) and call["block_limit"] != 8)
+        or (setup.get("threads_override", 0) and call["threads"] not in (128, 256, 512))
+    ):
+        return None
+    phased = replace(
+        query,
+        call=FrozenMapping(
+            dict(
+                call,
+                gather_transport="selected_phased_barrier",
+                threads=call["threads"] if call["threads"] in (128, 256, 512) else 128,
+                block_limit=8,
+                submode="barrier",
+                active_blocks=8,
+            )
+        ),
+    )
+    try:
+        validate_query(phased)
+    except ValueError:
+        return None
+    return phased
+
+
 def plan(
     query: PcieQuery,
     *,
@@ -54,7 +87,8 @@ def plan(
     """Declare native work; neither topology nor a communicator is constructed.
 
     DCP head gather and LSE reduce-scatter expose launch candidates on TP2–8.
-    Other low-level declarations retain their explicit native configuration.
+    TP16 head gather also races eligible phased clusters. Other low-level
+    declarations retain their explicit native configuration.
     ``AllReduce.plan`` composes eligible one-shot and two-shot transports.
     """
     if not isinstance(query, PcieQuery):
@@ -62,22 +96,28 @@ def plan(
     TUNING.validate_query(query, None)
     from ._gather_preparation import GATHER_MODES
 
-    if (
-        query.surface.endswith(".all_gather_heads")
-        and query.call.get("gather_transport") in GATHER_MODES
+    if query.surface.endswith(".all_gather_heads") and (
+        query.call.get("gather_transport") in GATHER_MODES
+        or (query.world_size == 16 and isinstance(override, PcieConfig))
     ):
         return _provider(query.surface).plan(
             query, runtime=runtime, invocation=invocation, override=override
         )
     if (
         runtime is not None
-        and query.world_size <= 8
+        and (
+            query.world_size <= 8
+            or (query.world_size == 16 and query.surface.endswith(".all_gather_heads"))
+        )
         and query.surface.startswith(("DcpAllToAll.", "DcpAllToAllPool."))
         and query.surface.endswith((".lse_reduce_scatter", ".all_gather_heads"))
     ):
         from ._collective_tuning import plan as collective_plan
 
         alternatives = {"dcp": (query, runtime)}
+        phased = _phased_gather_query(query)
+        if phased is not None:
+            alternatives["dcp_phased"] = (phased, runtime)
         if (
             query.surface.endswith(".all_gather_heads")
             and query.world_size in (2, 4)

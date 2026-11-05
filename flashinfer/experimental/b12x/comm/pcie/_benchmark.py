@@ -129,28 +129,51 @@ def _dcp_reference(query, shape, dtype, device, lse_reduce):
     if reference is not None:
         return reference
     generator = torch.Generator().manual_seed(9419)
+    if not lse_reduce:
+        # Gather transports preserve arbitrary bits, including FP32 views whose
+        # BF16 lanes can encode NaNs or signed zero. No arithmetic is permitted.
+        row_bytes = prod(shape[1:]) * dtype.itemsize
+        stacked = torch.randint(
+            0,
+            256,
+            (query.world_size, shape[0], row_bytes),
+            dtype=torch.uint8,
+            generator=generator,
+        )
+        values = (stacked, torch.zeros_like(stacked), torch.bitwise_not(stacked))
+        reference = _Reference(
+            tuple(
+                value[query.rank].to(device).view(dtype).view(shape) for value in values
+            ),
+            tuple(
+                value.permute(1, 0, 2)
+                .contiguous()
+                .view(dtype)
+                .view(out_shape)
+                .to(device)
+                for value in values
+            ),
+        )
+        _REFERENCES[key] = reference
+        return reference
     stacked = torch.randint(0, 16, (query.world_size, *shape), generator=generator).to(
         dtype
     )
     seeds = tuple(
         value[query.rank].to(device) for value in (stacked, torch.zeros_like(stacked))
     )
-    lse = None
-    if lse_reduce:
-        from .pcie_dcp_a2a import lse_reduce_scatter_reference
+    from .pcie_dcp_a2a import lse_reduce_scatter_reference
 
-        scores = (
-            torch.arange(query.world_size, dtype=torch.float32)[:, None, None]
-            .expand(query.world_size, *shape[:2])
-            .contiguous()
-            / 8
-        )
-        expected = lse_reduce_scatter_reference(
-            stacked, scores, query.rank, is_lse_base_on_e=call["natural_log"]
-        )
-        lse = scores[query.rank].to(device)
-    else:
-        expected = stacked.permute(1, 0, 2, 3).reshape(out_shape)
+    scores = (
+        torch.arange(query.world_size, dtype=torch.float32)[:, None, None]
+        .expand(query.world_size, *shape[:2])
+        .contiguous()
+        / 8
+    )
+    expected = lse_reduce_scatter_reference(
+        stacked, scores, query.rank, is_lse_base_on_e=call["natural_log"]
+    )
+    lse = scores[query.rank].to(device)
     reference = _Reference(
         seeds, (expected.to(device), torch.zeros_like(expected, device=device)), lse=lse
     )
@@ -327,11 +350,15 @@ class _DcpInputs:
                 device=runtime.device,
             )
             self.lse.copy_(self.reference.lse)
-        self.producers = tuple(partial(self.produce, index) for index in range(2))
+        self.producers = tuple(
+            partial(self.produce, index) for index in range(len(self.reference.seeds))
+        )
 
     def produce(self, index):
         self.step = index
         self.source.copy_(self.reference.seeds[index])
+        if not self.lse_reduce:
+            self.out.view(torch.uint8).fill_(0xA5)
 
     def run(self):
         if self.lse_reduce:
@@ -344,11 +371,17 @@ class _DcpInputs:
         return self.state.run(local_input=self.source, out=self.out)
 
     def validate(self):
-        tolerance = (
-            (2e-2 if self.out.dtype == torch.bfloat16 else 2e-3)
-            if self.lse_reduce
-            else 0
-        )
+        if not self.lse_reduce:
+            _assert_output(
+                self.out.view(torch.uint8),
+                self.reference.expected[self.step].view(torch.uint8),
+            )
+            _assert_output(
+                self.source.view(torch.uint8),
+                self.reference.seeds[self.step].view(torch.uint8),
+            )
+            return
+        tolerance = 2e-2 if self.out.dtype == torch.bfloat16 else 2e-3
         _assert_output(
             self.out, self.reference.expected[self.step], rtol=tolerance, atol=tolerance
         )
