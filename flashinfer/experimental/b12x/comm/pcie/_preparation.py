@@ -89,7 +89,7 @@ def plan(
     """Declare native work; neither topology nor a communicator is constructed.
 
     DCP head gather and LSE reduce-scatter expose launch candidates on TP2–8.
-    TP16 head gather also races eligible phased and ring profiles. Other low-level
+    TP16 head gather also races phased, ring, and recursive-doubling profiles. Other low-level
     declarations retain their explicit native configuration.
     ``AllReduce.plan`` composes eligible one-shot and two-shot transports.
     """
@@ -120,6 +120,7 @@ def plan(
         for name, transport, threads in (
             ("dcp_phased", "selected_phased_barrier", (128, 256, 512)),
             ("dcp_ring", "selected_ring", (128,)),
+            ("dcp_recursive", "selected_recursive", (128,)),
         ):
             selected = _selected_gather_query(query, transport, threads)
             if selected is not None:

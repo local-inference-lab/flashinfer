@@ -73,7 +73,12 @@ def test_static_tp16_gather_races_native_geometry_and_complete_phase_clusters():
     query, runtime = native_query()
     plan = _preparation.plan(query, runtime=runtime)
     assert plan.contract is TUNING
-    assert set(plan.query.alternatives) == {"dcp", "dcp_phased", "dcp_ring"}
+    assert set(plan.query.alternatives) == {
+        "dcp",
+        "dcp_phased",
+        "dcp_ring",
+        "dcp_recursive",
+    }
     assert plan.query.default == CollectiveConfig(
         implementation="dcp", threads=256, blocks=16
     )
@@ -95,7 +100,7 @@ def test_environment_geometry_overrides_constrain_both_implementations(pins):
     values = configs(plan)
     expected = {"dcp", "dcp_phased"}
     if pins[0] in (0, 128):
-        expected.add("dcp_ring")
+        expected.update(("dcp_ring", "dcp_recursive"))
     assert {value.implementation for value in values} == expected
     if pins[0]:
         assert {value.threads for value in values} == {pins[0]}
@@ -219,6 +224,7 @@ def test_shape_rank_and_byte_width_participate_in_collective_identity():
     [
         ("dcp_phased", 512, "phased_barrier"),
         ("dcp_ring", 128, "ring"),
+        ("dcp_recursive", 128, "recursive"),
     ],
 )
 def test_selected_compile_and_materialization_use_the_winning_profile(
@@ -293,10 +299,15 @@ def test_selected_compile_and_materialization_use_the_winning_profile(
         dict(submode="word_exchange"),
     ],
 )
-def test_ring_candidate_rejects_profiles_outside_its_qualified_geometry(changes):
+@pytest.mark.parametrize("implementation", ["dcp_ring", "dcp_recursive"])
+def test_gather_candidate_rejects_profiles_outside_its_qualified_geometry(
+    changes, implementation
+):
     query, runtime = native_query(pins=(0, 8))
     plan = _preparation.plan(query, runtime=runtime)
-    ring = next(value for value in configs(plan) if value.implementation == "dcp_ring")
+    ring = next(
+        value for value in configs(plan) if value.implementation == implementation
+    )
     assert (ring.threads, ring.blocks, ring.active_blocks, ring.submode) == (
         128,
         8,

@@ -18,6 +18,7 @@ GATHER_MODES = {
     "selected_phased_push": ("barrier",),
     "selected_word_exchange": ("word_exchange",),
     "selected_ring": ("barrier",),
+    "selected_recursive": ("barrier",),
 }
 
 
@@ -34,8 +35,12 @@ def selected_gather_profile(transport, blocks, mode, active):
         blocks != 8 or active != 8
     ):
         raise ValueError("phased gather requires one complete eight-CTA cluster")
-    if transport == "selected_ring" and (blocks != 8 or active != 8):
-        raise ValueError("ring gather requires eight active and physical CTAs")
+    if transport in ("selected_ring", "selected_recursive") and (
+        blocks != 8 or active != 8
+    ):
+        raise ValueError(
+            "ring and recursive gathers require eight active and physical CTAs"
+        )
     return (int(mode == "word_exchange") << 16) | active
 
 
@@ -66,10 +71,12 @@ def validate_query(query):
     selected_gather_profile(
         transport, call["block_limit"], call["submode"], call["active_blocks"]
     )
-    if transport == "selected_ring" and (
+    if transport in ("selected_ring", "selected_recursive") and (
         query.world_size != 16 or call["threads"] != 128
     ):
-        raise ValueError("ring gather requires TP16 with 128 threads per CTA")
+        raise ValueError(
+            "ring and recursive gathers require TP16 with 128 threads per CTA"
+        )
     if (
         call["threads"] not in (32, 64, 128, 256, 512)
         or row_bytes % 16
@@ -90,6 +97,7 @@ def validate_query(query):
         "selected_phased_barrier",
         "selected_phased_push",
         "selected_ring",
+        "selected_recursive",
     ):
         chunks = query.setup["exchange_chunks"]
         if (

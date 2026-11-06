@@ -41,7 +41,7 @@ def _configs(query, device=None):
         call = payload["call"]
         blocks = int(call.get("blocks", call.get("block_limit", 16)))
         threads = int(call["threads"])
-        if name in ("dcp_phased", "dcp_ring"):
+        if name in ("dcp_phased", "dcp_ring", "dcp_recursive"):
             # Automatic admission covers the qualified TP16 hardware. Phased
             # kernels also have to pass the native cluster occupancy check.
             if (
@@ -54,7 +54,9 @@ def _configs(query, device=None):
             counts = (
                 (threads,)
                 if payload["setup"].get("threads_override", 0)
-                else ((128,) if name == "dcp_ring" else (128, 256, 512))
+                else (
+                    (128,) if name in ("dcp_ring", "dcp_recursive") else (128, 256, 512)
+                )
             )
             for count in counts:
                 yield CollectiveConfig(
@@ -284,12 +286,16 @@ def _validate_query(query, device):
         NATIVE.validate_query(native, device)
         if (native.world_size, native.rank) != (query.world_size, query.rank):
             raise ValueError("native alternatives must use the same rank group")
-        if name in ("dcp_phased", "dcp_ring") and (
+        if name in ("dcp_phased", "dcp_ring", "dcp_recursive") and (
             query.operation != "all_gather_heads"
             or query.world_size != 16
             or not native.surface.endswith(".all_gather_heads")
             or native.call.get("gather_transport")
-            != ("selected_ring" if name == "dcp_ring" else "selected_phased_barrier")
+            != {
+                "dcp_ring": "selected_ring",
+                "dcp_recursive": "selected_recursive",
+                "dcp_phased": "selected_phased_barrier",
+            }[name]
         ):
             raise ValueError("selected gather tuning requires its TP16 barrier profile")
 
@@ -474,6 +480,7 @@ def plan(
             if config.implementation in JOINT_FAMILIES or config.implementation in (
                 "dcp_phased",
                 "dcp_ring",
+                "dcp_recursive",
             ):
                 call.update(submode=config.submode, active_blocks=config.active_blocks)
             q = replace(q, call=FrozenMapping(call))

@@ -201,7 +201,8 @@ def test_selected_calls_preserve_the_channel_bank_origin(origin, entered, transp
         assert runtime._device_slot_selection and runtime._graph_base_slot == origin
 
 
-def test_ring_gather_requires_its_explicit_neighbor_geometry():
+@pytest.mark.parametrize("transport", ["selected_ring", "selected_recursive"])
+def test_pairwise_gather_requires_its_explicit_geometry(transport):
     q = query()
     q = replace(
         q,
@@ -210,7 +211,7 @@ def test_ring_gather_requires_its_explicit_neighbor_geometry():
         call=FrozenMapping(
             dict(
                 q.call,
-                gather_transport="selected_ring",
+                gather_transport=transport,
                 threads=128,
                 block_limit=8,
                 active_blocks=8,
@@ -220,7 +221,7 @@ def test_ring_gather_requires_its_explicit_neighbor_geometry():
         ),
     )
     TUNING.validate_query(q, None)
-    assert selected_gather_profile("selected_ring", 8, "barrier", 8) == 8
+    assert selected_gather_profile(transport, 8, "barrier", 8) == 8
     for change in (
         {"threads": 32},
         {"threads": 512},
