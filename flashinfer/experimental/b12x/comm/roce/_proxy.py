@@ -24,7 +24,7 @@ _LIB: ctypes.CDLL | None = None
 BLOB_STRUCT_ERR = "roce proxy blob size mismatch"
 # Region layout, doorbell protocol and connection blob of ``_roce_proxy.c``; native runtimes vendor
 # the same file.
-ABI_VERSION = 12
+ABI_VERSION = 13
 # Reliable queue pairs per rail (``ROCE_MAX_LANES``): consecutive chunks of one peer and rail use
 # separate lanes.
 MAX_LANES = 4
@@ -145,6 +145,8 @@ def load() -> ctypes.CDLL:
             ctypes.POINTER(ctypes.c_int32),
             ctypes.c_int,
         ]
+        lib.roce_set_relay.restype = ctypes.c_int
+        lib.roce_set_relay.argtypes = [p, ctypes.POINTER(ctypes.c_int32), ctypes.c_int]
         lib.roce_start.restype = ctypes.c_int
         lib.roce_start.argtypes = [p]
         lib.roce_stop.restype = None
@@ -361,6 +363,17 @@ class Proxy:
         if self._lib.roce_connect(self._ctx, buf, len(joined), table, rails) != 0:
             raise RuntimeError(f"RoCE queue-pair connect failed: {self.error()}")
 
+    def set_relay(self, plan: list[int]) -> None:
+        """Relay two-shot all-gather chunks per ``plan`` (``_routes.relay_plan``); after ``connect``,
+        before ``start``.
+
+        ``plan[p]`` is the rank that forwards this rank's chunks to rank ``p`` (-1: sent directly) and
+        ``plan[world + s]`` the rank this rank forwards rank ``s``'s chunks to (-1: none).
+        """
+        table = (ctypes.c_int32 * len(plan))(*(int(v) for v in plan))
+        if self._lib.roce_set_relay(self._ctx, table, len(plan)) != 0:
+            raise RuntimeError(f"RoCE all-gather relay setup failed: {self.error()}")
+
     def start(self) -> None:
         """Start the proxy thread; a restart resumes from the last posted sequence."""
         if self._lib.roce_start(self._ctx) != 0:
@@ -380,10 +393,12 @@ class Proxy:
         return raw.decode(errors="replace") if raw else ""
 
     def stats(self) -> dict[str, int | list[int]]:
-        """Counters: ops posted, RDMA writes completed, last posted sequence."""
+        """Counters: ops posted, RDMA writes completed, last posted sequence, relayed chunks."""
         return {
             "ops_posted": int(self._lib.roce_stat(self._ctx, 0)),
             "ring_forwarded": int(self._lib.roce_stat(self._ctx, 3)),
+            "relay": bool(self._lib.roce_stat(self._ctx, 6)),
+            "relay_forwarded": int(self._lib.roce_stat(self._ctx, 5)),
             "connected_peers": int(self._lib.roce_stat(self._ctx, 4)),
             "writes_completed": int(self._lib.roce_stat(self._ctx, 1)),
             "last_seq": int(self._lib.roce_stat(self._ctx, 2)),

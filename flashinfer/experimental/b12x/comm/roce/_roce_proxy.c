@@ -61,6 +61,17 @@
 // sequence of the three kinds: a rank's kernel N finishes only on peers' chunks
 // of N, and every peer posts N + 1 after its kernel N + 1 started.
 //
+// A cabled fabric can relay the all-gather chunks (phase 1 of a two-shot op or a shard gather)
+// when its ranks form pairs joined by direct cables (roce_set_relay).  A rank then sends its
+// reduced shard to its partner and to one rank in every other pair, which forwards each chunk to
+// its own partner after the flags of every rail of that chunk arrived: from its pipe_recv row for
+// the source to the same row and flags at the partner, each stripe again followed by its flag on
+// the same queue pair.  The receiver waits on the same flags as for a direct write.  A forwarder
+// reads the row between the chunk's arrival and its own pipe_done, which counts the forwarded
+// writes, so the row's reuse rules are those of its kernel's reads.  The bytes are copied, not
+// combined, so results are unchanged bit for bit.  With two pairs, each rank's two-shot traffic is
+// half cable and half switch instead of one third cable.
+//
 // A variable-length all-gather (ctrl kind[slot] = 2) streams each rank's contribution, whose size
 // the kernel reads from device memory, through
 //
@@ -99,7 +110,7 @@
 #define ROCE_FLAG_STRIDE 128
 #define ROCE_PORT 1
 #define ROCE_SEND_DEPTH 512
-#define ROCE_ABI_VERSION 12
+#define ROCE_ABI_VERSION 13
 #define ROCE_MAX_CHUNKS 64
 #define ROCE_VARLEN_MAX_CHUNKS 512
 #define ROCE_CTRL_BYTES 4096
@@ -242,6 +253,12 @@ typedef struct {
   uint8_t ring_previous[ROCE_MAX_PEERS][ROCE_MAX_RAILS][RING_WINDOW];
   uint64_t ring_inflight[ROCE_MAX_PEERS][ROCE_MAX_RAILS][RING_WINDOW];
   uint64_t ring_forwarded;
+  // All-gather relay (roce_set_relay): per peer, the rank that forwards our chunks to it (-1: we
+  // send them); per source, the rank we forward its chunks to (-1: none).
+  int relay;
+  int8_t relay_via[ROCE_MAX_PEERS];
+  int8_t relay_to[ROCE_MAX_PEERS];
+  uint64_t relay_forwarded;
   char err[512];
 } roce_ctx_t;
 
@@ -656,6 +673,38 @@ int roce_connect(roce_ctx_t* c, const void* blobs, uint64_t blobs_len, const int
       }
     }
   }
+  return 0;
+}
+
+// plan holds 2 * world ints: plan[p] is the rank that forwards our all-gather chunks to rank p
+// (-1: we send them ourselves) and plan[world + s] the rank we forward rank s's chunks to (-1:
+// none).  Call after roce_connect and before roce_start.  Every rank must pass the plan derived
+// from the same topology: a chunk nobody forwards stops its receiver's kernel at its wait timeout.
+int roce_set_relay(roce_ctx_t* c, const int32_t* plan, int n) {
+  if (c->started || c->n_rail == 0 || c->ring != NULL || n != 2 * c->world) {
+    snprintf(c->err, sizeof(c->err),
+             "all-gather relay needs a connected mesh transport that has not started and a plan "
+             "of %d entries, got %d",
+             2 * c->world, n);
+    return -1;
+  }
+  for (int p = 0; p < c->world; p++) {
+    int via = plan[p], to = plan[c->world + p];
+    int bad = (p == c->rank && (via != -1 || to != -1)) ||
+              (via != -1 &&
+               (via < 0 || via >= c->world || via == c->rank || via == p || plan[via] != -1)) ||
+              (to != -1 && (to < 0 || to >= c->world || to == c->rank || to == p));
+    if (bad) {
+      snprintf(c->err, sizeof(c->err), "invalid all-gather relay plan entry for rank %d: %d, %d", p,
+               via, to);
+      return -1;
+    }
+  }
+  for (int p = 0; p < c->world; p++) {
+    c->relay_via[p] = (int8_t)plan[p];
+    c->relay_to[p] = (int8_t)plan[c->world + p];
+  }
+  c->relay = 1;
   return 0;
 }
 
@@ -1079,7 +1128,7 @@ static int post_pipe_chunk(roce_ctx_t* c, uint32_t seq, int phase, uint32_t chun
                            uint32_t chunk_packs) {
   const uint8_t* send = c->region + c->pipe_send_off;
   for (int p = 0; p < c->world; p++) {
-    if (p == c->rank) {
+    if (p == c->rank || (phase == 1 && c->relay && c->relay_via[p] >= 0)) {
       continue;
     }
     int shard = phase == 0 ? p : c->rank;
@@ -1108,9 +1157,51 @@ static int post_pipe_chunk(roce_ctx_t* c, uint32_t seq, int phase, uint32_t chun
   return 0;
 }
 
+// True once every rail's flag of all-gather chunk `chunk` from rank s holds seq.  Each flag follows
+// its stripe on one queue pair, so the chunk's bytes are in our pipe_recv row for s.
+static int pipe_chunk_arrived(const roce_ctx_t* c, uint32_t seq, int s, uint32_t chunk) {
+  uint64_t base = c->pipe_flag_off +
+                  ((((uint64_t)c->world + s) * ROCE_MAX_CHUNKS + chunk) * (uint64_t)c->n_rail) *
+                      ROCE_FLAG_STRIDE;
+  for (int k = 0; k < c->n_rail; k++) {
+    const uint32_t* flag = (const uint32_t*)(c->region + base + (uint64_t)k * ROCE_FLAG_STRIDE);
+    if (__atomic_load_n(flag, __ATOMIC_ACQUIRE) != seq) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+// Forward all-gather chunk `chunk` of rank s, which arrived in our pipe_recv row for s, to the same
+// row and flags at rank relay_to[s].
+static int forward_pipe_chunk(roce_ctx_t* c, uint32_t seq, int s, uint32_t chunk, uint32_t total,
+                              uint32_t chunk_packs) {
+  uint32_t first = shard_start(c, total, s);
+  uint32_t end = shard_start(c, total, s + 1);
+  uint64_t lo = (uint64_t)first + (uint64_t)chunk * chunk_packs;
+  uint64_t hi = lo + chunk_packs;
+  if (lo > end) {
+    lo = end;
+  }
+  if (hi > end) {
+    hi = end;
+  }
+  uint64_t row = c->pipe_recv_off + ((uint64_t)s * 2 + 1) * c->shard_cap + (lo - first) * 16;
+  uint64_t flag_off = c->pipe_flag_off +
+                      ((((uint64_t)c->world + s) * ROCE_MAX_CHUNKS + chunk) * (uint64_t)c->n_rail) *
+                          ROCE_FLAG_STRIDE;
+  if (post_striped(c, c->relay_to[s], c->region + row, row, (uint32_t)(hi - lo), flag_off, seq,
+                   (int)(chunk % (uint32_t)c->n_lane)) != 0) {
+    return -1;
+  }
+  c->relay_forwarded += 1;
+  return 0;
+}
+
 // Run pipelined op seq over the phases in `phases`: post each reduce-scatter
 // chunk once the kernel staged it and each all-gather chunk once the kernel
-// reduced (or, for a shard gather, staged) it.
+// reduced (or, for a shard gather, staged) it.  With the relay, also forward each relayed source's
+// all-gather chunk as it arrives.
 static int run_pipe_op(roce_ctx_t* c, uint32_t seq, uint32_t nbytes, uint32_t chunk_packs,
                        uint32_t chunks, uint32_t phases) {
   volatile uint32_t* ctrl = (volatile uint32_t*)(c->region + c->ctrl_off);
@@ -1125,8 +1216,17 @@ static int run_pipe_op(roce_ctx_t* c, uint32_t seq, uint32_t nbytes, uint32_t ch
   }
   uint32_t rs = (phases & PIPE_PHASE_RS) ? 0 : chunks;
   uint32_t ag = (phases & PIPE_PHASE_AG) ? 0 : chunks;
+  uint32_t forwarded[ROCE_MAX_PEERS];
+  int forwarding = 0;  // relayed sources with chunks still to forward
+  for (int s = 0; s < c->world; s++) {
+    forwarded[s] = chunks;
+    if (c->relay && (phases & PIPE_PHASE_AG) && c->relay_to[s] >= 0) {
+      forwarded[s] = 0;
+      forwarding++;
+    }
+  }
   uint64_t idle = 0;
-  while (rs < chunks || ag < chunks) {
+  while (rs < chunks || ag < chunks || forwarding > 0) {
     int posted = 0;
     if (rs < chunks && __atomic_load_n(&ctrl[CTRL_READY_RS + rs], __ATOMIC_ACQUIRE) == seq) {
       if (post_pipe_chunk(c, seq, 0, rs, total, chunk_packs) != 0) {
@@ -1141,6 +1241,17 @@ static int run_pipe_op(roce_ctx_t* c, uint32_t seq, uint32_t nbytes, uint32_t ch
       }
       ag++;
       posted = 1;
+    }
+    for (int s = 0; forwarding > 0 && s < c->world; s++) {
+      if (forwarded[s] < chunks && pipe_chunk_arrived(c, seq, s, forwarded[s])) {
+        if (forward_pipe_chunk(c, seq, s, forwarded[s], total, chunk_packs) != 0) {
+          return -1;
+        }
+        if (++forwarded[s] == chunks) {
+          forwarding--;
+        }
+        posted = 1;
+      }
     }
     if (posted) {
       idle = 0;
@@ -1392,6 +1503,10 @@ uint64_t roce_stat(roce_ctx_t* c, int which) {
       if (c->ring == NULL) return c->world - 1;
       if (c->world == 2 || (c->ring_open && (c->rank == 0 || c->rank == c->world - 1))) return 1;
       return 2;
+    case 5:
+      return c->relay_forwarded;
+    case 6:
+      return (uint64_t)c->relay;
     default:
       return 0;
   }

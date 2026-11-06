@@ -108,8 +108,16 @@ def main():
         default=4,
         help="queue pairs per rail; two-shot and variable-length chunks rotate over them",
     )
+    parser.add_argument(
+        "--relay",
+        action="store_true",
+        help="relay two-shot all-gather chunks through cable partners (mesh only); the ranks "
+        "must form pairs joined by direct cables",
+    )
     parser.add_argument("--source", type=Path)
     args = parser.parse_args()
+    if args.relay and not args.mesh:
+        parser.error("--relay requires --mesh")
     if args.source is None:
         args.source = (
             Path(__file__).resolve().parents[4]
@@ -177,6 +185,14 @@ def main():
         linked = {peer for peer, links in enumerate(routes) if links}
         assert linked == neighbors, (linked, neighbors)
     proxy.connect([bytes.fromhex(r["blob"]) for r in records], routes)
+    relay = None
+    if args.relay:
+        relay = routes_api.relay_plan(all_endpoints, args.rank, 2)
+        if relay is None:
+            raise SystemExit(
+                "--relay: the ranks do not form pairs joined by direct cables"
+            )
+        proxy.set_relay(relay)
     group.exchange("connected")
     proxy.start()
     ctrl = (ctypes.c_uint32 * 1024).from_address(address + layout.ctrl_off)
@@ -332,6 +348,8 @@ def main():
         # On a line the end ranks relay nothing; every other rank of a world above three does.
         if not args.mesh and world > 3 and not end:
             assert stats["ring_forwarded"] > 0, stats
+        if relay is not None:
+            assert stats["relay"] and stats["relay_forwarded"] > 0, stats
         print(
             json.dumps(
                 {
@@ -339,6 +357,7 @@ def main():
                     "world": world,
                     "iterations": args.iterations,
                     "lanes": args.lanes,
+                    "relay": relay,
                     "routes": routes,
                     "stats": stats,
                 }

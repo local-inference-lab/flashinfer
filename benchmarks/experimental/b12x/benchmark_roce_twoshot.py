@@ -80,7 +80,7 @@ def prepare(state):
 session = PreparationSession(device=device, autotune=False, compile_workers=2)
 session.prepare((plan.request(name="roce", prepare_call=prepare),))
 log(
-    f"runtime ready: {json.dumps({k: v for k, v in runtime.stats().items() if 'pipe' in k or k in ('rails', 'max_size')})}"
+    f"runtime ready: {json.dumps({k: v for k, v in runtime.stats().items() if 'pipe' in k or k in ('rails', 'lanes', 'relay_plan', 'max_size')})}"
 )
 
 paths = args.paths.split(",") + (["auto"] if args.auto else [])

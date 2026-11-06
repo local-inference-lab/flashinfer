@@ -30,6 +30,13 @@ requires distinct links among the rail devices of every rank, and per-peer pairi
 distinct links at both ends before it compares subnet breadth, so a peer's rails never share a link
 when another choice exists. Two ranks cabled to each other and to a switch hold every subnet in
 common; their rails then use both functions of one port rather than one function of each port.
+
+``relay_plan`` derives the two-shot all-gather relay (see ``_roce_proxy.c``) for a fabric whose ranks
+form pairs joined by direct cables: each rank's partner is the one peer whose rails all use subnets
+only the two of them hold. Each pair orders its two ranks by rank number, giving every rank a side.
+A rank sends its all-gather chunks directly to its partner and to the rank on its own side in every
+other pair; that rank forwards them over its cable to its partner. With two pairs every rank then
+sends two of its three all-gather shards over its cable.
 """
 
 from __future__ import annotations
@@ -297,4 +304,69 @@ def plan_routes(
     return routes
 
 
-__all__ = ["Endpoint", "MAX_RAILS", "local_endpoints", "plan_routes"]
+def partners(
+    endpoints: Sequence[Sequence[Endpoint]], rails: int
+) -> list[Optional[int]]:
+    """Per rank, its only peer whose every rail uses a subnet the two of them alone hold, else
+    ``None``. With two ranks every subnet joins both, so no rank has a partner."""
+    world = len(endpoints)
+    if world < 3:
+        return [None] * world
+    breadths = _breadths(endpoints)
+    out: list[Optional[int]] = []
+    for rank in range(world):
+        local = endpoints[rank]
+        direct = [
+            peer
+            for peer, links in enumerate(plan_routes(endpoints, rank, rails))
+            if links
+            and all(
+                local[l].ipv4 is not None and breadths[local[l].ipv4.network] == 2
+                for l, _ in links
+            )
+        ]
+        out.append(direct[0] if len(direct) == 1 else None)
+    return out
+
+
+def relay_plan(
+    endpoints: Sequence[Sequence[Endpoint]], rank: int, rails: int
+) -> Optional[list[int]]:
+    """The all-gather relay plan of ``rank`` for ``Proxy.set_relay``, or ``None`` unless the ranks
+    form at least two pairs of mutual partners and no rank is left out.
+
+    Entry ``p`` names the rank that forwards ``rank``'s chunks to rank ``p`` (-1: sent directly) and
+    entry ``world + s`` the rank to which ``rank`` forwards rank ``s``'s chunks (-1: none).
+    """
+    world = len(endpoints)
+    mates = partners(endpoints, rails)
+    if (
+        world < 4
+        or world % 2
+        or any(m is None or mates[m] != r for r, m in enumerate(mates))
+    ):
+        return None
+    side = [0 if r < mates[r] else 1 for r in range(world)]
+    mate = mates[rank]
+    via = [-1] * world
+    forward = [-1] * world
+    for peer in range(world):
+        if peer in (rank, mate):
+            continue
+        if side[peer] != side[rank]:
+            # Peer's partner is on our side and receives our chunks directly.
+            via[peer] = mates[peer]
+        else:
+            # Peer is on our side: we receive its chunks and pass them to our partner.
+            forward[peer] = mate
+    return via + forward
+
+
+__all__ = [
+    "Endpoint",
+    "MAX_RAILS",
+    "local_endpoints",
+    "partners",
+    "plan_routes",
+    "relay_plan",
+]

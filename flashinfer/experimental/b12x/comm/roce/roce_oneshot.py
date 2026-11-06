@@ -43,7 +43,7 @@ from torch.distributed import ProcessGroup
 from . import _allgather_cute, _scatter_gather_cute, _twoshot_cute, _varlen_cute
 from ._oneshot_cute import PACK_BYTES, get_launcher
 from ._proxy import MAX_LANES, Layout, Proxy, load as _load_proxy_library
-from ._routes import MAX_RAILS, local_endpoints, plan_routes
+from ._routes import MAX_RAILS, local_endpoints, plan_routes, relay_plan
 
 logger = logging.getLogger(__name__)
 
@@ -245,11 +245,17 @@ class RoceOneshotAllReduce:
         ring: bool = False,
         ring_open: bool = False,
         lanes: Optional[int] = None,
+        relay: Optional[bool] = None,
     ) -> None:
         """Allocate the pinned region, build and connect the proxy, and start it.
 
         ``lanes`` (default ``B12X_ROCE_LANES``, else ``DEFAULT_LANES``) is the number of reliable
         queue pairs per rail, 1 through ``MAX_LANES``; every rank must select the same count.
+
+        ``relay`` (default ``B12X_ROCE_RELAY``, else on) relays two-shot all-gather chunks through
+        cable partners when the ranks form pairs joined by direct cables (``_routes.relay_plan``);
+        on any other fabric it has no effect. Results are the same bit for bit either way. Every
+        rank must select the same value.
 
         ``ring=True`` connects only neighbors in rank order (2..16 ranks),
         forwarding other writes through bounded native RDMA mailboxes along
@@ -348,6 +354,13 @@ class RoceOneshotAllReduce:
         )
         if not 1 <= self.lanes <= MAX_LANES:
             raise ValueError(f"lanes must be 1..{MAX_LANES}, got {self.lanes}")
+        self.relay = (
+            _env_int("B12X_ROCE_RELAY", default=1) != 0
+            if relay is None
+            else bool(relay)
+        )
+        # The relay plan in effect (``Proxy.set_relay``), or None.
+        self.relay_plan: Optional[list[int]] = None
         names = tuple(hca_names) if hca_names else discover_hcas(self.gid_index)
         if not names:
             raise RuntimeError("no active RDMA device found for the RoCE all-reduce")
@@ -479,6 +492,7 @@ class RoceOneshotAllReduce:
             "ring_open": self.ring_open,
             "max_rails": MAX_RAILS,
             "lanes": self.lanes,
+            "relay": self.relay,
             "traffic_class": self._proxy.traffic_class if error is None else None,
             "slot_bytes": slot_bytes,
             "slots": self._layout.slots,
@@ -527,6 +541,10 @@ class RoceOneshotAllReduce:
                 ring_open=self.ring_open,
             )
             self._proxy.connect([s[1] for s in statuses], self.routes)
+            if self.relay and not (self.ring or self.ring_open):
+                self.relay_plan = relay_plan(all_endpoints, self.rank, self.rail_count)
+            if self.relay_plan is not None:
+                self._proxy.set_relay(self.relay_plan)
             self._proxy.start()
         except Exception as exc:  # noqa: BLE001
             error = str(exc)
@@ -537,11 +555,12 @@ class RoceOneshotAllReduce:
             raise RuntimeError("RoCE all-reduce connect failed: " + "; ".join(failures))
         if self.rank == 0:
             logger.info(
-                "RoCEnante ready: world=%d hcas=%s rails=%d lanes=%d gid_index=%d max_size=%d traffic_class=%d",
+                "RoCEnante ready: world=%d hcas=%s rails=%d lanes=%d relay=%s gid_index=%d max_size=%d traffic_class=%d",
                 self.world_size,
                 ",".join(self.hca_names),
                 self.rail_count,
                 self.lanes,
+                "on" if self.relay_plan is not None else "off",
                 self.gid_index,
                 self.max_size,
                 self._proxy.traffic_class,
@@ -1176,6 +1195,9 @@ class RoceOneshotAllReduce:
 
         ``lanes`` is the number of queue pairs per rail the restoring runtime must
         create (the ``roce_create`` lane count); every rank uses the same value.
+
+        ``relay_plan``, when not ``None``, is the all-gather relay plan the restoring runtime must
+        pass to ``roce_set_relay`` after ``roce_connect`` and before ``roce_start``.
         """
         if self._proxy is None:
             raise RuntimeError("RoCE runtime is closed")
@@ -1203,6 +1225,7 @@ class RoceOneshotAllReduce:
             "traffic_class": self._proxy.traffic_class,
             "rails": self.rail_count,
             "lanes": self.lanes,
+            "relay_plan": None if self.relay_plan is None else list(self.relay_plan),
             "routes": [[list(link) for link in links] for links in self.routes],
         }
 
@@ -1590,6 +1613,7 @@ class RoceOneshotAllReduce:
             "spin_limit": self.spin_limit,
             "rails": self.rail_count,
             "lanes": self.lanes,
+            "relay_plan": self.relay_plan,
             "routes": [list(links) for links in self.routes],
         }
         if self._proxy is not None:

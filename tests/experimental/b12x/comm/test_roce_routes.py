@@ -4,7 +4,7 @@ import ipaddress
 
 import pytest
 
-from b12x.comm.roce._routes import Endpoint, plan_routes
+from b12x.comm.roce._routes import Endpoint, partners, plan_routes, relay_plan
 
 
 def ep(name, iface=None, link=None):
@@ -293,6 +293,102 @@ def test_a_cabled_pair_keeps_its_two_rails_on_separate_pcie_links():
     # Without PCIe link information the planner keeps device order.
     unknown = [[ep(e.name, str(e.ipv4)) for e in devices] for devices in pair]
     assert plan_routes(unknown, 0, 2)[1] == [(0, 0), (1, 1)]
+
+
+def _paired_switch(pairs):
+    """``2 * pairs`` ranks on one switch; ranks 2i and 2i + 1 are also cabled to each other."""
+    endpoints = []
+    for rank in range(2 * pairs):
+        host, pair = 11 + rank, rank // 2
+        endpoints.append(
+            [
+                spark("roceP2p1s0f0", f"10.200.0.{host}/24"),
+                spark("roceP2p1s0f1", f"10.201.{2 * pair}.{host}/24"),
+                spark("rocep1s0f0", f"10.200.1.{host}/24"),
+                spark("rocep1s0f1", f"10.201.{2 * pair + 1}.{host}/24"),
+            ]
+        )
+    return endpoints
+
+
+def _relay_writers(plans):
+    """Per (source, receiver), the ranks that write the source's all-gather chunks to the receiver."""
+    world = len(plans)
+    writers = {}
+    for source in range(world):
+        for peer in range(world):
+            if peer != source and plans[source][peer] == -1:
+                writers.setdefault((source, peer), []).append(source)
+    for forwarder in range(world):
+        for source in range(world):
+            target = plans[forwarder][world + source]
+            if target != -1:
+                # A forwarder receives the source's chunks directly.
+                assert writers.get((source, forwarder)) == [source]
+                writers.setdefault((source, target), []).append(forwarder)
+    return writers
+
+
+@pytest.mark.parametrize(
+    "endpoints, mates",
+    [
+        (_switch_with_partner_cables(), PARTNER),
+        (_paired_switch(4), {r: r ^ 1 for r in range(8)}),
+    ],
+    ids=["four-ranks", "eight-ranks"],
+)
+def test_relay_delivers_every_shard_once_and_forwards_only_over_cables(
+    endpoints, mates
+):
+    """Every rank receives every other rank's all-gather chunks from exactly one writer: the
+    source itself, or the rank that its plan names for that receiver, which is the receiver's
+    partner. Each rank forwards only to its partner."""
+    world = len(endpoints)
+    assert partners(endpoints, 2) == [mates[r] for r in range(world)]
+    plans = [relay_plan(endpoints, rank, 2) for rank in range(world)]
+    writers = _relay_writers(plans)
+    for source in range(world):
+        for peer in range(world):
+            if peer == source:
+                continue
+            (writer,) = writers[(source, peer)]
+            assert writer in (source, plans[source][peer])
+            if writer != source:
+                assert writer == mates[peer]
+    for rank in range(world):
+        assert {t for t in plans[rank][world:] if t != -1} <= {mates[rank]}
+
+
+def test_relay_puts_two_of_three_all_gather_shards_on_the_cable_with_two_pairs():
+    """With two pairs, each rank sends its shard to its partner and to one rank of the other pair,
+    and forwards one shard to its partner: two cable sends and one switch send."""
+    endpoints = _switch_with_partner_cables()
+    for rank in range(4):
+        plan = relay_plan(endpoints, rank, 2)
+        direct = [p for p in range(4) if p != rank and plan[p] == -1]
+        forwarded = [t for t in plan[4:] if t != -1]
+        sends = direct + forwarded
+        assert sends.count(PARTNER[rank]) == 2 and len(sends) == 3
+
+
+def test_relay_plan_needs_every_rank_in_a_cable_pair():
+    """No plan on a switched fabric, with a pair's cable down at one end, or with two ranks."""
+    switched = [
+        [
+            spark("roceP2p1s0f0", f"10.200.0.{11 + r}/24"),
+            spark("rocep1s0f0", f"10.200.1.{11 + r}/24"),
+        ]
+        for r in range(4)
+    ]
+    assert partners(switched, 2) == [None] * 4
+    assert relay_plan(switched, 0, 2) is None
+    endpoints = _switch_with_partner_cables()
+    endpoints[2] = [e for e in endpoints[2] if e.name in SWITCH_DEVICES]
+    assert partners(endpoints, 2) == [3, None, None, 0]
+    assert all(relay_plan(endpoints, rank, 2) is None for rank in range(4))
+    pair = [_switch_with_partner_cables()[r] for r in (0, 3)]
+    assert partners(pair, 2) == [None, None]
+    assert relay_plan(pair, 0, 2) is None
 
 
 def test_a_switched_fabric_with_both_functions_of_a_link_listed_first_avoids_the_shared_link():
