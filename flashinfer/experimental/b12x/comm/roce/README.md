@@ -74,6 +74,19 @@ the world size, and whose whole message fits `pipe_bytes`. The control record
 carries them as op kinds 3 and 4; proxy ABI 11 adds the two kinds and changes
 no region layout.
 
+Each pipelined kind reuses one receive row and one flag per source, phase and
+chunk, and a kernel waits until a flag equals its op's sequence number. Two
+transitions let a rank write a peer's rows before that peer finished reading
+the previous op: a reduce-scatter or two-shot after a reduce-scatter (phase 0),
+and a shard gather after a two-shot or shard gather (phase 1). For those, every
+rank writes its start-of-op sequence into a credit word of each peer's control
+record, and the proxy holds the hazardous phase until every peer's credit
+reached the op (proxy ABI 12). Without the credits, a write overtaking a slow
+peer's read ends in that peer's wait timeout or in silently mixed rows. Other
+transitions are ordered by data dependencies and carry no credits. On the ring
+transports, a credit to a rank that is not a neighbor travels as an empty
+mailbox write.
+
 Collective generations range from 1 through 2,147,483,647. The proxy fails
 with `RoCE sequence space exhausted` before dispatching a larger generation;
 recreate every rank's runtime to reset the sequence. The bound preserves the
@@ -96,7 +109,9 @@ python3 tests/experimental/b12x/comm/validate_roce_ring_native.py \
 
 The default source directory is this checkout. Use `--source PATH` to validate
 another proxy source directory, `--skew-rank R` to delay one CPU driver between
-operations, or `--mesh` to check the ordinary direct transport. The validator
+operations, `--consume-delay-ms D` to make that rank read peers' rows late,
+`--scatter-gather` to add reduce-scatter and shard-gather ops in every order
+between pipelined kinds, or `--mesh` to check the ordinary direct transport. The validator
 alternates one-shot, two-shot, and variable-length operations, including changing
 payload sizes, uneven shards, and empty contributions. Each rank reports routes,
 connected-peer count, forwarding count, and completed writes as JSON.
