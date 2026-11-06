@@ -1,5 +1,6 @@
 """Per-peer RoCE route planning: switched fabrics keep index pairing, switchless rings pair by subnet."""
 
+import dataclasses
 import ipaddress
 
 import pytest
@@ -279,8 +280,9 @@ def test_link_local_addresses_on_two_uncabled_ports_do_not_attract_rails():
 
 
 def test_a_cabled_pair_keeps_its_two_rails_on_separate_pcie_links():
-    """Two ranks cabled to each other and to a switch hold every subnet in common. Index pairing in
-    name order would put both rails behind one PCIe x4 link; the planner uses one function of each."""
+    """Two ranks cabled to each other and to a switch hold every subnet in common, and without LLDP
+    neighbors nothing identifies the cable. Index pairing in name order would put both rails behind
+    one PCIe x4 link; the planner uses one function of each."""
     pair = [_switch_with_partner_cables()[r] for r in (0, 3)]
     for rank in range(2):
         links = plan_routes(pair, rank, 2)[1 - rank]
@@ -293,6 +295,68 @@ def test_a_cabled_pair_keeps_its_two_rails_on_separate_pcie_links():
     # Without PCIe link information the planner keeps device order.
     unknown = [[ep(e.name, str(e.ipv4)) for e in devices] for devices in pair]
     assert plan_routes(unknown, 0, 2)[1] == [(0, 0), (1, 1)]
+
+
+def _with_lldp(endpoints, partner):
+    """``endpoints`` with the LLDP view of DGX Sparks whose cable joins rank ``r`` to ``partner[r]``:
+    each function has its own MAC address and lists its sibling function on the same port; a switch
+    function also lists the switch, and a cable function both functions of the partner's cable port."""
+
+    def mac(rank, device):
+        return f"02:00:00:00:{rank:02x}:{device:02x}"
+
+    def port(rank, cable):
+        return [
+            mac(rank, d)
+            for d, e in enumerate(endpoints[rank])
+            if (e.name in DIRECT_DEVICES) == cable
+        ]
+
+    out = []
+    for rank, devices in enumerate(endpoints):
+        row = []
+        for d, e in enumerate(devices):
+            cable = e.name in DIRECT_DEVICES
+            neighbors = [m for m in port(rank, cable) if m != mac(rank, d)]
+            neighbors += port(partner[rank], True) if cable else ["02:00:00:00:ff:00"]
+            row.append(
+                dataclasses.replace(
+                    e, mac=mac(rank, d), neighbors=tuple(sorted(neighbors))
+                )
+            )
+        out.append(row)
+    return out
+
+
+def test_lldp_neighbors_route_a_two_rank_cabled_pair_over_its_cable():
+    """A two-rank group on a cabled pair holds every subnet in common; LLDP identifies the cable,
+    which then carries both rails, one function behind each PCIe link."""
+    full = _with_lldp(_switch_with_partner_cables(), PARTNER)
+    pair = [full[0], full[3]]
+    plans = [plan_routes(pair, rank, 2) for rank in range(2)]
+    for rank in range(2):
+        links = plans[rank][1 - rank]
+        assert _route_devices(pair, rank, links) == DIRECT_DEVICES
+        assert {SPARK_LINKS[pair[rank][l].name] for l, _ in links} == {
+            "0002:01:00",
+            "0000:01:00",
+        }
+        assert links == [(b, a) for a, b in plans[1 - rank][rank]]
+    assert partners(pair, 2) == [None, None]
+    assert relay_plan(pair, 0, 2) is None
+
+
+@pytest.mark.parametrize("fabric", ["partner_cables", "paired_switch"])
+def test_lldp_neighbors_leave_routes_planned_by_breadth_unchanged(fabric):
+    if fabric == "partner_cables":
+        endpoints, partner = _switch_with_partner_cables(), PARTNER
+    else:
+        endpoints, partner = _paired_switch(2), {0: 1, 1: 0, 2: 3, 3: 2}
+    lldp = _with_lldp(endpoints, partner)
+    for rank in range(len(endpoints)):
+        assert plan_routes(lldp, rank, 2) == plan_routes(endpoints, rank, 2)
+        assert relay_plan(lldp, rank, 2) == relay_plan(endpoints, rank, 2)
+    assert partners(lldp, 2) == partners(endpoints, 2)
 
 
 def _paired_switch(pairs):
@@ -443,11 +507,46 @@ def test_local_endpoints_uses_gid_netdev_prefix(
 
     monkeypatch.setattr(_routes, "_netmask", mask)
     function = tmp_path / "pci" / "0002:01:00.1"
-    function.mkdir(parents=True)
+    (function / "net" / "eth7").mkdir(parents=True)
+    (function / "net" / "eth7" / "address").write_text("4C:BB:47:2C:1E:AB\n")
     (tmp_path / "rdma0" / "device").symlink_to(function)
-    actual = _routes.local_endpoints(("rdma0", "missing"), 3, root=tmp_path)
-    assert actual == (ep("rdma0", expected, "0002:01:00"), ep("missing"))
+    asked = []
+
+    def lldp(ifnames):
+        asked.extend(ifnames)
+        return {"eth7": ("4c:bb:47:7f:c3:c3",)}
+
+    actual = _routes.local_endpoints(("rdma0", "missing"), 3, root=tmp_path, lldp=lldp)
+    rdma0 = dataclasses.replace(
+        ep("rdma0", expected, "0002:01:00"),
+        mac="4c:bb:47:2c:1e:ab",
+        neighbors=("4c:bb:47:7f:c3:c3",),
+    )
+    assert actual == (rdma0, ep("missing"))
+    assert asked == ["eth7"]
     assert seen == (["eth7"] if "ffff" in gid else [])
+
+
+def test_lldp_neighbors_are_the_port_mac_addresses_listed_per_netdev():
+    from b12x.comm.roce._routes import _mac_address, _parse_lldp
+
+    text = "\n".join(
+        [
+            "lldp.enp1s0f1np1.via=LLDP",
+            "lldp.enp1s0f1np1.chassis.mac=4c:bb:47:7f:c3:c1",
+            "lldp.enp1s0f1np1.port.mac=4C:BB:47:7F:C3:C3",
+            "lldp.enp1s0f1np1.port.mac=4c:bb:47:2c:1e:ab",
+            "lldp.enp1s0f1np1.port.mac=4c:bb:47:7f:c3:c3",
+            "lldp.enp1s0f0np0.port.ifname=qsfp56-dd-1-1",
+            "lldp.enp1s0f1np1.100.port.mac=02:00:00:00:00:01",
+            "lldp.other.port.mac=02:00:00:00:00:02",
+        ]
+    )
+    assert _parse_lldp(text, ["enp1s0f1np1", "enp1s0f0np0"]) == {
+        "enp1s0f1np1": ("4c:bb:47:2c:1e:ab", "4c:bb:47:7f:c3:c3")
+    }
+    assert _mac_address("4c:bb:47:2c:1e") is None
+    assert _mac_address("4c:bb:47:2c:1e:zz") is None
 
 
 @pytest.mark.parametrize("switched", [False, True])

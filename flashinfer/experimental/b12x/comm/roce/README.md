@@ -103,6 +103,14 @@ every other peer's use the switch's. A peer's two rails use devices behind
 different PCIe links when possible, because the two ConnectX-7 functions behind
 one PCIe x4 link share its bandwidth.
 
+The two ranks of a group on one cabled pair hold every subnet in common, so
+subnet breadth cannot tell their cable from the switch. Each endpoint therefore
+also records its netdev's MAC address and, when lldpd runs on the host, the port
+MAC addresses that `lldpctl` reports for its neighbors. LLDP frames do not cross
+a switch, so devices of two ranks that list each other share a cable, and the
+planner prefers such links. Without lldpd on both hosts, a two-rank group on a
+cabled pair uses the switch.
+
 Each rail is `lanes` reliable queue pairs (constructor `lanes`, else
 `B12X_ROCE_LANES`, else 4; at most 4, equal on every rank). Two-shot and
 variable-length chunk `c` uses lane `c % lanes`; one-shot and ring relays use

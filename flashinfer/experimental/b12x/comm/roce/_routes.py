@@ -31,6 +31,14 @@ distinct links at both ends before it compares subnet breadth, so a peer's rails
 when another choice exists. Two ranks cabled to each other and to a switch hold every subnet in
 common; their rails then use both functions of one port rather than one function of each port.
 
+Subnet breadth cannot identify the cable between two such ranks, so an endpoint also records its
+netdev's MAC address and the MAC addresses its LLDP neighbors advertise as port IDs, read from
+``lldpctl`` when lldpd runs on the host. LLDP frames do not cross a bridge, so devices of two ranks
+that list each other share a cable. Index pairing requires that no such pair exists, and per-peer
+pairing prefers links between LLDP neighbors after PCIe link separation and before subnet breadth;
+a two-rank group on a cabled pair then uses one cable function behind each PCIe link. A host
+without lldpd records no neighbors and is routed by subnet breadth alone.
+
 ``relay_plan`` derives the two-shot all-gather relay (see ``_roce_proxy.c``) for a fabric whose ranks
 form pairs joined by direct cables: each rank's partner is the one peer whose rails all use subnets
 only the two of them hold. Each pair orders its two ranks by rank number, giving every rank a side.
@@ -45,9 +53,10 @@ import ipaddress
 import itertools
 import socket
 import struct
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Callable, Mapping, Optional, Sequence
 
 MAX_RAILS = 2
 _SIOCGIFNETMASK = 0x891B
@@ -55,12 +64,16 @@ _SIOCGIFNETMASK = 0x891B
 
 @dataclass(frozen=True)
 class Endpoint:
-    """One local RDMA device: its name, the address with prefix when its GID is IPv4-mapped, and the
-    PCIe link it shares with sibling functions (PCI domain:bus:device) when known."""
+    """One local RDMA device: its name, the address with prefix when its GID is IPv4-mapped, the PCIe
+    link it shares with sibling functions (PCI domain:bus:device) when known, its netdev's MAC
+    address when known, and the MAC addresses its LLDP neighbors advertise as port IDs (sorted,
+    lowercase)."""
 
     name: str
     ipv4: Optional[ipaddress.IPv4Interface]
     link: Optional[str] = None
+    mac: Optional[str] = None
+    neighbors: tuple[str, ...] = ()
 
 
 def _pcie_link(device: Path) -> Optional[str]:
@@ -71,6 +84,52 @@ def _pcie_link(device: Path) -> Optional[str]:
         return None
     base, dot, function = address.rpartition(".")
     return base if dot and base.count(":") == 2 and function.isdigit() else None
+
+
+def _mac_address(text: str) -> Optional[str]:
+    """``text`` as a lowercase MAC address (six colon-separated pairs of hex digits), or None."""
+    pairs = text.strip().split(":")
+    if len(pairs) != 6 or any(
+        len(p) != 2 or any(c not in "0123456789abcdefABCDEF" for c in p) for p in pairs
+    ):
+        return None
+    return ":".join(pairs).lower()
+
+
+def _parse_lldp(text: str, ifnames: Sequence[str]) -> dict[str, tuple[str, ...]]:
+    """Per netdev in ``ifnames``, the sorted MAC addresses that ``lldpctl -f keyvalue`` lists as
+    neighbor port IDs (``lldp.<netdev>.port.mac=<mac>`` lines)."""
+    found: dict[str, set[str]] = {}
+    for line in text.splitlines():
+        key, sep, value = line.partition("=")
+        if not sep or not key.startswith("lldp."):
+            continue
+        for ifname in ifnames:
+            if key == f"lldp.{ifname}.port.mac":
+                mac = _mac_address(value)
+                if mac is not None:
+                    found.setdefault(ifname, set()).add(mac)
+    return {ifname: tuple(sorted(macs)) for ifname, macs in found.items()}
+
+
+def lldp_neighbors(ifnames: Sequence[str]) -> dict[str, tuple[str, ...]]:
+    """LLDP neighbors of ``ifnames`` from lldpd (see ``_parse_lldp``); empty when lldpctl is
+    missing, fails, or does not answer within two seconds."""
+    if not ifnames:
+        return {}
+    try:
+        done = subprocess.run(
+            ["lldpctl", "-f", "keyvalue", *ifnames],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    return _parse_lldp(done.stdout, ifnames) if done.returncode == 0 else {}
 
 
 def _netmask(ifname: str) -> Optional[str]:
@@ -91,16 +150,31 @@ def _netmask(ifname: str) -> Optional[str]:
 
 
 def local_endpoints(
-    names: Sequence[str], gid_index: int, root: Path = Path("/sys/class/infiniband")
+    names: Sequence[str],
+    gid_index: int,
+    root: Path = Path("/sys/class/infiniband"),
+    lldp: Callable[[Sequence[str]], Mapping[str, tuple[str, ...]]] = lldp_neighbors,
 ) -> tuple[Endpoint, ...]:
     """Describe ``names``: the IPv4 address of each device's GID at ``gid_index`` and its netdev's prefix.
 
     A device whose GID is not IPv4-mapped, or whose netdev or netmask cannot be read, gets
     ``ipv4=None`` and is treated as reachable by index pairing only. ``link`` is the device's PCIe
-    link from its sysfs ``device`` entry, or None when that cannot be read.
+    link from its sysfs ``device`` entry, or None when that cannot be read. ``mac`` is the netdev's
+    address under the device's PCI function, and ``neighbors`` its LLDP neighbors from ``lldp``.
     """
-    out = []
+    ifnames: list[str] = []
     for name in names:
+        try:
+            ifnames.append(
+                (root / name / "ports" / "1" / "gid_attrs" / "ndevs" / str(gid_index))
+                .read_text()
+                .strip()
+            )
+        except OSError:
+            ifnames.append("")
+    neighbors = lldp([i for i in ifnames if i])
+    out = []
+    for name, netdev in zip(names, ifnames):
         port = root / name / "ports" / "1"
         ipv4 = None
         try:
@@ -110,21 +184,34 @@ def local_endpoints(
                 .strip()
                 .replace(":", "")
             )
-            ifname = (
-                port.joinpath("gid_attrs", "ndevs", str(gid_index)).read_text().strip()
-            )
         except (OSError, ValueError):
-            raw, ifname = b"", ""
+            raw = b""
         if (
             len(raw) == 16
             and raw[:10] == bytes(10)
             and raw[10:12] == b"\xff\xff"
-            and ifname
+            and netdev
         ):
-            mask = _netmask(ifname)
+            mask = _netmask(netdev)
             if mask is not None:
                 ipv4 = ipaddress.IPv4Interface(f"{socket.inet_ntoa(raw[12:])}/{mask}")
-        out.append(Endpoint(name, ipv4, _pcie_link(root / name / "device")))
+        mac = None
+        if netdev:
+            try:
+                mac = _mac_address(
+                    (root / name / "device" / "net" / netdev / "address").read_text()
+                )
+            except OSError:
+                mac = None
+        out.append(
+            Endpoint(
+                name,
+                ipv4,
+                _pcie_link(root / name / "device"),
+                mac,
+                tuple(neighbors.get(netdev, ())) if netdev else (),
+            )
+        )
     return tuple(out)
 
 
@@ -132,6 +219,25 @@ def _same_link(a: Endpoint, b: Endpoint) -> bool:
     """True when both endpoints have IPv4 addresses on the same network."""
     return (
         a.ipv4 is not None and b.ipv4 is not None and a.ipv4.network == b.ipv4.network
+    )
+
+
+def _lldp_adjacent(a: Endpoint, b: Endpoint) -> bool:
+    """Whether either device lists the other's MAC address among its LLDP neighbors: LLDP frames do
+    not cross a bridge, so the two devices share a cable. Callers compare devices of different ranks."""
+    return (b.mac is not None and b.mac in a.neighbors) or (
+        a.mac is not None and a.mac in b.neighbors
+    )
+
+
+def _any_lldp_adjacency(endpoints: Sequence[Sequence[Endpoint]]) -> bool:
+    """Whether any device of one rank is an LLDP neighbor of a device of another rank."""
+    return any(
+        _lldp_adjacent(x, y)
+        for a in range(len(endpoints))
+        for b in range(a + 1, len(endpoints))
+        for x in endpoints[a]
+        for y in endpoints[b]
     )
 
 
@@ -163,10 +269,12 @@ def _index_pairing_valid(
     breadths: dict[ipaddress.IPv4Network, int],
 ) -> bool:
     """True when rail ``h`` can pair device ``h`` with device ``h`` between every pair of ranks, no
-    subnet links some ranks but not all of them (a direct cable that per-peer pairing would prefer),
-    and no rank's rail devices share a PCIe link."""
+    subnet links some ranks but not all of them and no devices of two ranks are LLDP neighbors (a
+    direct cable that per-peer pairing would prefer), and no rank's rail devices share a PCIe link."""
     world = len(endpoints)
     if any(2 <= breadth < world for breadth in breadths.values()):
+        return False
+    if _any_lldp_adjacency(endpoints):
         return False
     if any(len(devices) < rails for devices in endpoints):
         return False
@@ -191,8 +299,8 @@ def _best_matching(
 ) -> Optional[list[tuple[int, int]]]:
     """The ``rails`` candidates with distinct local and remote devices that use the most verified links,
     then the fewest rails sharing a PCIe link at either end (``local`` and ``remote`` name the
-    devices), then the narrowest subnets (smallest total breadth), ties broken by the smallest sorted
-    keys; ``None`` when no such set exists.
+    devices), then the most links between LLDP neighbors, then the narrowest subnets (smallest total
+    breadth), ties broken by the smallest sorted keys; ``None`` when no such set exists.
 
     ``candidates`` is sorted by key, so each combination, and therefore the rail order, is ordered by key.
     A rank has at most four devices, so the search is at most C(16, 2) combinations.
@@ -211,6 +319,7 @@ def _best_matching(
             sum(key[0] for key, _, _ in combo),
             shared,
             sum(key[1] for key, _, _ in combo),
+            sum(key[2] for key, _, _ in combo),
             [key for key, _, _ in combo],
         )
         if best is None or score < best[0]:
@@ -264,7 +373,7 @@ def plan_routes(
             routes.append([])
             continue
         remote = endpoints[peer]
-        # Candidates: verified same-subnet links, keyed by subnet breadth (narrowest first, so a direct
+        # Candidates: verified same-subnet links, keyed by LLDP adjacency and subnet breadth (a direct
         # cable precedes a switch), network and the link's two addresses; and same-index pairs with no
         # IPv4 GID on either end, which cannot be checked and are trusted in caller order, as index
         # pairing would. Every key is symmetric between the two ranks.
@@ -272,6 +381,7 @@ def plan_routes(
             (
                 (
                     0,
+                    0 if _lldp_adjacent(local[l], remote[r]) else 1,
                     breadths[local[l].ipv4.network],
                     int(local[l].ipv4.network.network_address),
                     min(int(local[l].ipv4.ip), int(remote[r].ipv4.ip)),
@@ -285,7 +395,7 @@ def plan_routes(
             if _same_link(local[l], remote[r])
         ]
         unverifiable = [
-            ((1, 0, h, 0, 0), h, h)
+            ((1, 1, 0, h, 0, 0), h, h)
             for h in range(min(len(local), len(remote)))
             if local[h].ipv4 is None or remote[h].ipv4 is None
         ]
