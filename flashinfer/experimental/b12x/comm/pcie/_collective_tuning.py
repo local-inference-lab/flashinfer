@@ -42,7 +42,7 @@ def _configs(query, device=None):
         blocks = int(call.get("blocks", call.get("block_limit", 16)))
         threads = int(call["threads"])
         if name in ("dcp_phased", "dcp_ring", "dcp_recursive"):
-            # Automatic admission covers the qualified TP16 hardware. Phased
+            # Automatic admission covers the supported SM120 geometry. Phased
             # kernels also have to pass the native cluster occupancy check.
             if (
                 device is None
@@ -288,7 +288,7 @@ def _validate_query(query, device):
             raise ValueError("native alternatives must use the same rank group")
         if name in ("dcp_phased", "dcp_ring", "dcp_recursive") and (
             query.operation != "all_gather_heads"
-            or query.world_size != 16
+            or query.world_size not in ((8, 16) if name in ("dcp_ring", "dcp_recursive") else (16,))
             or not native.surface.endswith(".all_gather_heads")
             or native.call.get("gather_transport")
             != {
@@ -297,7 +297,7 @@ def _validate_query(query, device):
                 "dcp_phased": "selected_phased_barrier",
             }[name]
         ):
-            raise ValueError("selected gather tuning requires its TP16 barrier profile")
+            raise ValueError("selected gather tuning requires its supported barrier profile")
 
 
 def _validate_config(query, config, device):

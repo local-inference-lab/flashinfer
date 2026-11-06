@@ -49,7 +49,7 @@ def _selected_gather_query(query, transport, thread_counts):
 
     call, setup = query.call, query.setup
     if (
-        query.world_size != 16
+        query.world_size not in ((8, 16) if transport in ("selected_ring", "selected_recursive") else (16,))
         or not query.surface.endswith(".all_gather_heads")
         or not call.get("disjoint_output", False)
         or not call.get("pack_aligned", False)

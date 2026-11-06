@@ -72,11 +72,18 @@ def validate_query(query):
         transport, call["block_limit"], call["submode"], call["active_blocks"]
     )
     if transport in ("selected_ring", "selected_recursive") and (
-        query.world_size != 16 or call["threads"] != 128
+        query.world_size not in (8, 16) or call["threads"] != 128
     ):
         raise ValueError(
-            "ring and recursive gathers require TP16 with 128 threads per CTA"
+            "ring and recursive gathers require TP8/TP16 with 128 threads per CTA"
         )
+    if transport in ("selected_ring", "selected_recursive"):
+        # Pairwise generations use the complete native signal plane, including
+        # both padded flag banks. Legacy extension metadata can be smaller.
+        from .pcie_dcp_a2a import _SIGNAL_BYTES
+
+        if query.setup.get("signal_bytes", 0) < _SIGNAL_BYTES:
+            raise ValueError("pairwise gather requires the complete native signal allocation")
     if (
         call["threads"] not in (32, 64, 128, 256, 512)
         or row_bytes % 16
@@ -174,6 +181,10 @@ def plan(query, *, runtime, invocation, override):
     from ._runtime_gather_cute import compile_selected_gather
 
     validate_query(query)
+    if query.call["gather_transport"] in ("selected_ring", "selected_recursive") and (
+        query.setup["signal_bytes"] != getattr(runtime, "_signal_bytes", 0)
+    ):
+        raise ValueError("pairwise gather signal allocation differs from its runtime owner")
     if invocation:
         raise ValueError("selected gather invocation semantics belong in its query")
     for field in (

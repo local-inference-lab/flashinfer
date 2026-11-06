@@ -7,6 +7,7 @@ import pytest
 
 from b12x.comm.pcie._gather_preparation import plan, selected_gather_profile
 from b12x.comm.pcie._tuning import PcieQuery, TUNING
+from b12x.comm.pcie.pcie_dcp_a2a import _SIGNAL_BYTES
 from b12x.preparation import FrozenMapping
 
 
@@ -41,6 +42,7 @@ def query():
                 exchange_offset=131072,
                 slot_bytes=262144,
                 exchange_counter_offset=524288,
+                signal_bytes=_SIGNAL_BYTES,
             )
         ),
     )
@@ -202,12 +204,13 @@ def test_selected_calls_preserve_the_channel_bank_origin(origin, entered, transp
 
 
 @pytest.mark.parametrize("transport", ["selected_ring", "selected_recursive"])
-def test_pairwise_gather_requires_its_explicit_geometry(transport):
+@pytest.mark.parametrize("world", [8, 16])
+def test_pairwise_gather_requires_its_explicit_geometry(transport, world):
     q = query()
     q = replace(
         q,
-        world_size=16,
-        setup=FrozenMapping(dict(q.setup, total_heads=16)),
+        world_size=world,
+        setup=FrozenMapping(dict(q.setup, total_heads=world)),
         call=FrozenMapping(
             dict(
                 q.call,
@@ -215,8 +218,8 @@ def test_pairwise_gather_requires_its_explicit_geometry(transport):
                 threads=128,
                 block_limit=8,
                 active_blocks=8,
-                out_shape=(64, 16, 64),
-                out_stride=(1024, 64, 1),
+                out_shape=(64, world, 64),
+                out_stride=(64 * world, 64, 1),
             )
         ),
     )
@@ -233,6 +236,6 @@ def test_pairwise_gather_requires_its_explicit_geometry(transport):
             TUNING.validate_query(
                 replace(q, call=FrozenMapping(dict(q.call, **change))), None
             )
-    for world in (2, 4, 8, 12):
+    for world in (2, 4, 12):
         with pytest.raises(ValueError):
             TUNING.validate_query(replace(q, world_size=world), None)

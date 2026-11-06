@@ -10,7 +10,7 @@ from b12x.comm.pcie import _preparation
 from b12x.comm.pcie._benchmark import _DcpInputs, _dcp_reference
 from b12x.comm.pcie._collective_tuning import CollectiveConfig, TUNING
 from b12x.comm.pcie._tuning import PcieConfig, TUNING as NATIVE
-from b12x.comm.pcie.pcie_dcp_a2a import PCIeDCPA2A
+from b12x.comm.pcie.pcie_dcp_a2a import PCIeDCPA2A, _SIGNAL_BYTES
 from b12x.preparation import DeviceIdentity, FrozenMapping, autotune_effort
 from b12x.preparation.device import DetectedDevice
 from b12x.preparation.types import CandidateResourceIneligibleError
@@ -42,6 +42,7 @@ def native_query(*, world=16, rank=0, rows=3, dtype=torch.bfloat16, pins=(0, 0))
         _exchange_offset=16384,
         _exchange_counter_offset=2 << 20,
         _signal_ptrs=tuple(range(world)),
+        _signal_bytes=_SIGNAL_BYTES,
         _threads_override=pins[0],
         _block_limit_override=pins[1],
         _owned_buffers=(SimpleNamespace(nbytes=2 << 20),),
@@ -91,6 +92,26 @@ def test_static_tp16_gather_races_native_geometry_and_complete_phase_clusters():
     )
     assert any(value.implementation == "dcp" for value in values)
     assert "selected_phased_push" not in repr(plan.query.alternatives)
+
+
+def test_static_tp8_admits_pairwise_gathers_but_not_phased_cluster():
+    query, runtime = native_query(world=8)
+    plan = _preparation.plan(query, runtime=runtime)
+    assert set(plan.query.alternatives) == {"dcp", "dcp_ring", "dcp_recursive"}
+    selected = [c for c in configs(plan) if c.implementation != "dcp"]
+    assert {c.implementation for c in selected} == {"dcp_ring", "dcp_recursive"}
+    assert all((c.threads, c.blocks, c.active_blocks) == (128, 8, 8) for c in selected)
+    native_only = replace(plan.query, alternatives=FrozenMapping({"dcp": plan.query.alternatives["dcp"]}))
+    assert TUNING.collective_signature(plan.query) != TUNING.collective_signature(native_only)
+
+
+@pytest.mark.parametrize("world", [8, 16])
+def test_pairwise_gathers_require_enough_signal_storage(world):
+    query, runtime = native_query(world=world)
+    query = replace(query, setup=FrozenMapping(dict(query.setup, signal_bytes=4096)))
+    plan = _preparation.plan(query, runtime=runtime)
+    assert "dcp_ring" not in plan.query.alternatives
+    assert "dcp_recursive" not in plan.query.alternatives
 
 
 @pytest.mark.parametrize("pins", [(512, 8), (128, 8), (256, 0), (0, 8)])

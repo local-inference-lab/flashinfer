@@ -523,6 +523,10 @@ class PCIeDCPA2A:
         self._ipc = ipc
         self._owned_buffers = list(owned_buffers or ())
         self._legacy_ext_module = ext_module
+        metadata_size = getattr(ext_module, "meta_size", None)
+        self._signal_bytes = (
+            _SIGNAL_BYTES if ext_module is None else int(metadata_size()) if callable(metadata_size) else 0
+        )
         self._staging_ptrs = (
             tuple(int(ptr) for ptr in staging0_ptrs),
             tuple(int(ptr) for ptr in staging1_ptrs),

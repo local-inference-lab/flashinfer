@@ -90,6 +90,7 @@ def query_from_runtime(runtime, *, surface, call) -> PcieQuery:
             "exchange_offset": getattr(runtime, "_exchange_offset", 0),
             "exchange_counter_offset": getattr(runtime, "_exchange_counter_offset", 0),
             "signal_words": len(runtime._signal_ptrs),
+            "signal_bytes": int(getattr(runtime, "_signal_bytes", 0)),
             "threads_override": int(runtime._threads_override),
             "blocks_override": int(runtime._block_limit_override),
         }
