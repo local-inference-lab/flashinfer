@@ -121,6 +121,7 @@ def plan(
             ("dcp_phased", "selected_phased_barrier", (128, 256, 512)),
             ("dcp_ring", "selected_ring", (128,)),
             ("dcp_recursive", "selected_recursive", (128,)),
+            ("dcp_recursive_ready", "selected_recursive_ready", (128,)),
         ):
             selected = _selected_gather_query(query, transport, threads)
             if selected is not None:

@@ -22,8 +22,18 @@ from ._runtime_gather_cute import SelectedGather
 
 
 class RecursiveGather(SelectedGather):
-    def __init__(self, world, rank, row_words, threads, blocks, chunks):
+    def __init__(
+        self,
+        world,
+        rank,
+        row_words,
+        threads,
+        blocks,
+        chunks,
+        acknowledge_consumption=True,
+    ):
         super().__init__(world, rank, row_words, threads, blocks, chunks, "barrier")
+        self.acknowledge_consumption = acknowledge_consumption
         if world != 16 or threads != 128 or blocks != 8:
             raise ValueError(
                 "recursive gather requires TP16 with eight 128-thread CTAs"
@@ -136,11 +146,14 @@ class RecursiveGather(SelectedGather):
                                 output + out_pack * Int64(4),
                             )
                         tile += step
-                # Ready and consumed acknowledgements use distinct generations.
-                # The same peer sends and receives, so one flag cannot mean both.
+                # With consumption acknowledgements, READY and ACK use separate
+                # paired generations. Otherwise the two receive banks protect
+                # staging: completing the intervening collective requires every
+                # rank to enter it, hence finish this kernel before bank reuse.
                 _threadfence_sys()
                 cute.arch.sync_threads()
-                self._pair_barrier(signals, peer, block, tid)
+                if cutlass.const_expr(self.acknowledge_consumption):
+                    self._pair_barrier(signals, peer, block, tid)
             if Int32(tid) == Int32(0):
                 _a2a_graph_epoch_arrive(
                     (signals[self._rank] + Int64(_GRAPH_EPOCH_INDEX)).toint(),

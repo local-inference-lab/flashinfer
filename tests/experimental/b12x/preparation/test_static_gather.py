@@ -78,6 +78,7 @@ def test_static_tp16_gather_races_native_geometry_and_complete_phase_clusters():
         "dcp_phased",
         "dcp_ring",
         "dcp_recursive",
+        "dcp_recursive_ready",
     }
     assert plan.query.default == CollectiveConfig(
         implementation="dcp", threads=256, blocks=16
@@ -100,7 +101,7 @@ def test_environment_geometry_overrides_constrain_both_implementations(pins):
     values = configs(plan)
     expected = {"dcp", "dcp_phased"}
     if pins[0] in (0, 128):
-        expected.update(("dcp_ring", "dcp_recursive"))
+        expected.update(("dcp_ring", "dcp_recursive", "dcp_recursive_ready"))
     assert {value.implementation for value in values} == expected
     if pins[0]:
         assert {value.threads for value in values} == {pins[0]}
