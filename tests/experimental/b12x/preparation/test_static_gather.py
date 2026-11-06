@@ -79,6 +79,7 @@ def test_static_tp16_gather_races_native_geometry_and_complete_phase_clusters():
         "dcp_phased",
         "dcp_ring",
         "dcp_recursive",
+        "dcp_recursive_ready",
     }
     assert plan.query.default == CollectiveConfig(
         implementation="dcp", threads=256, blocks=16
@@ -97,9 +98,9 @@ def test_static_tp16_gather_races_native_geometry_and_complete_phase_clusters():
 def test_static_tp8_admits_pairwise_gathers_but_not_phased_cluster():
     query, runtime = native_query(world=8)
     plan = _preparation.plan(query, runtime=runtime)
-    assert set(plan.query.alternatives) == {"dcp", "dcp_ring", "dcp_recursive"}
+    assert set(plan.query.alternatives) == {"dcp", "dcp_ring", "dcp_recursive", "dcp_recursive_ready"}
     selected = [c for c in configs(plan) if c.implementation != "dcp"]
-    assert {c.implementation for c in selected} == {"dcp_ring", "dcp_recursive"}
+    assert {c.implementation for c in selected} == {"dcp_ring", "dcp_recursive", "dcp_recursive_ready"}
     assert all((c.threads, c.blocks, c.active_blocks) == (128, 8, 8) for c in selected)
     native_only = replace(plan.query, alternatives=FrozenMapping({"dcp": plan.query.alternatives["dcp"]}))
     assert TUNING.collective_signature(plan.query) != TUNING.collective_signature(native_only)
@@ -112,6 +113,7 @@ def test_pairwise_gathers_require_enough_signal_storage(world):
     plan = _preparation.plan(query, runtime=runtime)
     assert "dcp_ring" not in plan.query.alternatives
     assert "dcp_recursive" not in plan.query.alternatives
+    assert "dcp_recursive_ready" not in plan.query.alternatives
 
 
 @pytest.mark.parametrize("pins", [(512, 8), (128, 8), (256, 0), (0, 8)])
@@ -121,7 +123,7 @@ def test_environment_geometry_overrides_constrain_both_implementations(pins):
     values = configs(plan)
     expected = {"dcp", "dcp_phased"}
     if pins[0] in (0, 128):
-        expected.update(("dcp_ring", "dcp_recursive"))
+        expected.update(("dcp_ring", "dcp_recursive", "dcp_recursive_ready"))
     assert {value.implementation for value in values} == expected
     if pins[0]:
         assert {value.threads for value in values} == {pins[0]}

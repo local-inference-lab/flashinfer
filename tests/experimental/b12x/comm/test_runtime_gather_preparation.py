@@ -203,7 +203,7 @@ def test_selected_calls_preserve_the_channel_bank_origin(origin, entered, transp
         assert runtime._device_slot_selection and runtime._graph_base_slot == origin
 
 
-@pytest.mark.parametrize("transport", ["selected_ring", "selected_recursive"])
+@pytest.mark.parametrize("transport", ["selected_ring", "selected_recursive", "selected_recursive_ready"])
 @pytest.mark.parametrize("world", [8, 16])
 def test_pairwise_gather_requires_its_explicit_geometry(transport, world):
     q = query()

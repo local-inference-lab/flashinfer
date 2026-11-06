@@ -217,10 +217,18 @@ class SelectedGather(_AllGatherHeadsLaunch):
 
 @program_cache
 def compile_selected_gather(world, rank, row_words, threads, blocks, chunks, transport):
-    if transport == "recursive":
+    if transport in ("recursive", "recursive_ready"):
         from ._recursive_gather_cute import RecursiveGather
 
-        operation = RecursiveGather(world, rank, row_words, threads, blocks, chunks)
+        operation = RecursiveGather(
+            world,
+            rank,
+            row_words,
+            threads,
+            blocks,
+            chunks,
+            acknowledge_consumption=transport == "recursive",
+        )
     elif transport == "ring":
         from ._ring_gather_cute import RingGather
 
@@ -271,7 +279,14 @@ def compile_selected_gather(world, rank, row_words, threads, blocks, chunks, tra
             raise ValueError("gather requires one staging and signal address per rank")
         if rows <= 0 or (
             transport
-            not in ("barrier", "phased_barrier", "phased_push", "ring", "recursive")
+            not in (
+                "barrier",
+                "phased_barrier",
+                "phased_push",
+                "ring",
+                "recursive",
+                "recursive_ready",
+            )
             and rows * row_words > chunks * 64
         ):
             raise ValueError("gather exceeds its declared word exchange capacity")

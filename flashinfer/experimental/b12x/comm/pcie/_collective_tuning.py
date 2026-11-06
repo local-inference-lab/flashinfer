@@ -41,7 +41,7 @@ def _configs(query, device=None):
         call = payload["call"]
         blocks = int(call.get("blocks", call.get("block_limit", 16)))
         threads = int(call["threads"])
-        if name in ("dcp_phased", "dcp_ring", "dcp_recursive"):
+        if name in ("dcp_phased", "dcp_ring", "dcp_recursive", "dcp_recursive_ready"):
             # Automatic admission covers the supported SM120 geometry. Phased
             # kernels also have to pass the native cluster occupancy check.
             if (
@@ -55,7 +55,9 @@ def _configs(query, device=None):
                 (threads,)
                 if payload["setup"].get("threads_override", 0)
                 else (
-                    (128,) if name in ("dcp_ring", "dcp_recursive") else (128, 256, 512)
+                    (128,)
+                    if name in ("dcp_ring", "dcp_recursive", "dcp_recursive_ready")
+                    else (128, 256, 512)
                 )
             )
             for count in counts:
@@ -286,14 +288,20 @@ def _validate_query(query, device):
         NATIVE.validate_query(native, device)
         if (native.world_size, native.rank) != (query.world_size, query.rank):
             raise ValueError("native alternatives must use the same rank group")
-        if name in ("dcp_phased", "dcp_ring", "dcp_recursive") and (
+        if name in (
+            "dcp_phased",
+            "dcp_ring",
+            "dcp_recursive",
+            "dcp_recursive_ready",
+        ) and (
             query.operation != "all_gather_heads"
-            or query.world_size not in ((8, 16) if name in ("dcp_ring", "dcp_recursive") else (16,))
+            or query.world_size not in ((16,) if name == "dcp_phased" else (8, 16))
             or not native.surface.endswith(".all_gather_heads")
             or native.call.get("gather_transport")
             != {
                 "dcp_ring": "selected_ring",
                 "dcp_recursive": "selected_recursive",
+                "dcp_recursive_ready": "selected_recursive_ready",
                 "dcp_phased": "selected_phased_barrier",
             }[name]
         ):
@@ -481,6 +489,7 @@ def plan(
                 "dcp_phased",
                 "dcp_ring",
                 "dcp_recursive",
+                "dcp_recursive_ready",
             ):
                 call.update(submode=config.submode, active_blocks=config.active_blocks)
             q = replace(q, call=FrozenMapping(call))

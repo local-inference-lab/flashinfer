@@ -49,7 +49,12 @@ def _selected_gather_query(query, transport, thread_counts):
 
     call, setup = query.call, query.setup
     if (
-        query.world_size not in ((8, 16) if transport in ("selected_ring", "selected_recursive") else (16,))
+        query.world_size
+        not in (
+            (8, 16)
+            if transport in ("selected_ring", "selected_recursive", "selected_recursive_ready")
+            else (16,)
+        )
         or not query.surface.endswith(".all_gather_heads")
         or not call.get("disjoint_output", False)
         or not call.get("pack_aligned", False)
@@ -89,8 +94,9 @@ def plan(
     """Declare native work; neither topology nor a communicator is constructed.
 
     DCP head gather and LSE reduce-scatter expose launch candidates on TP2–8.
-    TP16 head gather also races phased, ring, and recursive-doubling profiles. Other low-level
-    declarations retain their explicit native configuration.
+    TP8/TP16 head gather also races ring and recursive-doubling profiles; phased
+    profiles require TP16. Other low-level declarations retain their explicit
+    native configuration.
     ``AllReduce.plan`` composes eligible one-shot and two-shot transports.
     """
     if not isinstance(query, PcieQuery):
@@ -121,6 +127,7 @@ def plan(
             ("dcp_phased", "selected_phased_barrier", (128, 256, 512)),
             ("dcp_ring", "selected_ring", (128,)),
             ("dcp_recursive", "selected_recursive", (128,)),
+            ("dcp_recursive_ready", "selected_recursive_ready", (128,)),
         ):
             selected = _selected_gather_query(query, transport, threads)
             if selected is not None:

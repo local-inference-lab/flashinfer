@@ -19,6 +19,7 @@ GATHER_MODES = {
     "selected_word_exchange": ("word_exchange",),
     "selected_ring": ("barrier",),
     "selected_recursive": ("barrier",),
+    "selected_recursive_ready": ("barrier",),
 }
 
 
@@ -35,9 +36,11 @@ def selected_gather_profile(transport, blocks, mode, active):
         blocks != 8 or active != 8
     ):
         raise ValueError("phased gather requires one complete eight-CTA cluster")
-    if transport in ("selected_ring", "selected_recursive") and (
-        blocks != 8 or active != 8
-    ):
+    if transport in (
+        "selected_ring",
+        "selected_recursive",
+        "selected_recursive_ready",
+    ) and (blocks != 8 or active != 8):
         raise ValueError(
             "ring and recursive gathers require eight active and physical CTAs"
         )
@@ -71,13 +74,15 @@ def validate_query(query):
     selected_gather_profile(
         transport, call["block_limit"], call["submode"], call["active_blocks"]
     )
-    if transport in ("selected_ring", "selected_recursive") and (
-        query.world_size not in (8, 16) or call["threads"] != 128
-    ):
+    if transport in (
+        "selected_ring",
+        "selected_recursive",
+        "selected_recursive_ready",
+    ) and (query.world_size not in (8, 16) or call["threads"] != 128):
         raise ValueError(
             "ring and recursive gathers require TP8/TP16 with 128 threads per CTA"
         )
-    if transport in ("selected_ring", "selected_recursive"):
+    if transport in ("selected_ring", "selected_recursive", "selected_recursive_ready"):
         # Pairwise generations use the complete native signal plane, including
         # both padded flag banks. Legacy extension metadata can be smaller.
         from .pcie_dcp_a2a import _SIGNAL_BYTES
@@ -105,6 +110,7 @@ def validate_query(query):
         "selected_phased_push",
         "selected_ring",
         "selected_recursive",
+        "selected_recursive_ready",
     ):
         chunks = query.setup["exchange_chunks"]
         if (
@@ -181,9 +187,9 @@ def plan(query, *, runtime, invocation, override):
     from ._runtime_gather_cute import compile_selected_gather
 
     validate_query(query)
-    if query.call["gather_transport"] in ("selected_ring", "selected_recursive") and (
-        query.setup["signal_bytes"] != getattr(runtime, "_signal_bytes", 0)
-    ):
+    if query.call["gather_transport"] in (
+        "selected_ring", "selected_recursive", "selected_recursive_ready"
+    ) and query.setup["signal_bytes"] != getattr(runtime, "_signal_bytes", 0):
         raise ValueError("pairwise gather signal allocation differs from its runtime owner")
     if invocation:
         raise ValueError("selected gather invocation semantics belong in its query")
