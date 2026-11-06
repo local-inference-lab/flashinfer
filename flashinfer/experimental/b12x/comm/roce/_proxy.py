@@ -24,7 +24,7 @@ _LIB: ctypes.CDLL | None = None
 BLOB_STRUCT_ERR = "roce proxy blob size mismatch"
 # Region layout, doorbell protocol and connection blob of ``_roce_proxy.c``; native runtimes vendor
 # the same file.
-ABI_VERSION = 13
+ABI_VERSION = 14
 # Reliable queue pairs per rail (``ROCE_MAX_LANES``): consecutive chunks of one peer and rail use
 # separate lanes.
 MAX_LANES = 4

@@ -57,9 +57,21 @@
 // phase-0 chunks only, and its kernel keeps the reduced shard; a shard gather
 // (ctrl kind[slot] = 4) stages this rank's shard of the message into pipe_send
 // and posts the phase-1 chunks only.  Each releases pipe_send through pipe_done
-// like a complete two-shot op, and the single-copy argument above holds for any
-// sequence of the three kinds: a rank's kernel N finishes only on peers' chunks
-// of N, and every peer posts N + 1 after its kernel N + 1 started.
+// like a complete two-shot op.  The single-copy argument above covers two-shot ops following any
+// kind, a reduce-scatter following anything but a reduce-scatter, and a shard gather following a
+// one-shot, variable-length or reduce-scatter op: in each case some write of op N + 1 that a peer
+// needs before finishing N + 1 (or the predecessor's own completion) depends on that peer having
+// started N + 1.  Two transitions lack that dependency.  After a reduce-scatter, our next
+// reduce-scatter or two-shot posts phase-0 chunks as soon as our kernel staged them, while a peer's
+// kernel may still be reducing the previous op from the same rows; after a two-shot or shard
+// gather, our next shard gather posts phase-1 chunks while a peer may still be gathering.  Either
+// write could replace a flag before the peer saw it (a wait timeout) or the rows it is reading
+// (silent corruption).  For those transitions every rank writes a start-of-op credit, the op's
+// seq, into ctrl credit[rank] of every peer as it begins the op (our kernel N + 1 rang, so our
+// kernel N finished), and holds the hazardous phase until every peer's credit reached the op.  No
+// other op posts or waits for credits, so one-shot and back-to-back two-shot traffic is unchanged.
+// On the ring transports a credit to a rank that is not a neighbor travels as an empty mailbox
+// write, whose flag lands on every rail; only rail 0's credit word is read.
 //
 // A cabled fabric can relay the all-gather chunks (phase 1 of a two-shot op or a shard gather)
 // when its ranks form pairs joined by direct cables (roce_set_relay).  A rank then sends its
@@ -110,7 +122,7 @@
 #define ROCE_FLAG_STRIDE 128
 #define ROCE_PORT 1
 #define ROCE_SEND_DEPTH 512
-#define ROCE_ABI_VERSION 13
+#define ROCE_ABI_VERSION 14
 #define ROCE_MAX_CHUNKS 64
 #define ROCE_VARLEN_MAX_CHUNKS 512
 #define ROCE_CTRL_BYTES 4096
@@ -126,6 +138,17 @@
 #define CTRL_READY_RS 64
 #define CTRL_READY_AG 128
 #define CTRL_READY_VL 256
+// Start-of-op credits written by peers (one word per source rank), after the variable-length
+// all-gather's ready words.
+#define CTRL_CREDIT 768
+_Static_assert(CTRL_CREDIT >= CTRL_READY_VL + ROCE_VARLEN_MAX_CHUNKS &&
+                   (CTRL_CREDIT + ROCE_MAX_PEERS) * 4 + (ROCE_MAX_RAILS - 1) * ROCE_FLAG_STRIDE <=
+                       ROCE_CTRL_BYTES,
+               "credit words (one per rail for relayed credits) must fit the ctrl page after the "
+               "variable-length ready words");
+// Phases of a pipelined op that must wait for every peer's start-of-op credit.
+#define CREDIT_RS 1u
+#define CREDIT_AG 2u
 #define KIND_ONESHOT 0
 #define KIND_TWOSHOT 1
 #define KIND_VARLEN 2
@@ -236,6 +259,7 @@ typedef struct {
   atomic_int running;
   atomic_int failed;
   uint32_t last_seq;
+  uint32_t last_kind;  // kind of op last_seq (KIND_ONESHOT before the first op)
   uint64_t ops_posted;
   uint64_t writes_completed;
   uint8_t* ring;
@@ -1198,12 +1222,76 @@ static int forward_pipe_chunk(roce_ctx_t* c, uint32_t seq, int s, uint32_t chunk
   return 0;
 }
 
+// The phases of an op of `kind` following an op of `prev` that must wait for peers' credits (see
+// the header): phase 0 after a reduce-scatter, phase 1 of a shard gather after an op that gathers.
+static uint32_t credit_phases(uint32_t prev, uint32_t kind) {
+  uint32_t need = 0;
+  if (prev == KIND_REDUCE_SCATTER && (kind == KIND_REDUCE_SCATTER || kind == KIND_TWOSHOT)) {
+    need |= CREDIT_RS;
+  }
+  if (kind == KIND_GATHER_SHARDS && (prev == KIND_TWOSHOT || prev == KIND_GATHER_SHARDS)) {
+    need |= CREDIT_AG;
+  }
+  return need;
+}
+
+// Tell every peer that we began op seq, so our kernel finished the previous op: one inline 4-byte
+// write of seq into the peer's ctrl credit[our rank], on rail 0 and lane 0, or an empty mailbox
+// write through the ring for a rank that is not a neighbor.
+static int post_credits(roce_ctx_t* c, uint32_t seq) {
+  uint32_t value = seq;
+  uint64_t credit_off = c->ctrl_off + 4ull * (CTRL_CREDIT + c->rank);
+  for (int p = 0; p < c->world; p++) {
+    if (p == c->rank) {
+      continue;
+    }
+    if (ring_relayed(c, p)) {
+      if (ring_post(c, p, c->region, 0, 0, credit_off, seq) != 0) {
+        return -1;
+      }
+      continue;
+    }
+    int h = c->rail_hca[p][0];
+    if (reserve(c, h, p, 0) != 0) {
+      return -1;
+    }
+    struct ibv_sge sge = {.addr = (uint64_t)(uintptr_t)&value, .length = 4, .lkey = 0};
+    struct ibv_send_wr wr, *bad = NULL;
+    memset(&wr, 0, sizeof(wr));
+    wr.wr_id = (uint64_t)p;
+    wr.sg_list = &sge;
+    wr.num_sge = 1;
+    wr.opcode = IBV_WR_RDMA_WRITE;
+    wr.send_flags = IBV_SEND_SIGNALED | IBV_SEND_INLINE;
+    wr.wr.rdma.remote_addr = c->peer_addr[p] + credit_off;
+    wr.wr.rdma.rkey = c->peer_rkey[0][p];
+    int rc = ibv_post_send(c->hca[h].qp[p][0], &wr, &bad);
+    if (rc != 0) {
+      set_err(c, "ibv_post_send(credit)", rc);
+      return -1;
+    }
+    c->hca[h].outstanding[p][0] += 1;
+  }
+  return 0;
+}
+
+// True once every peer's credit reached seq.
+static int credits_arrived(const roce_ctx_t* c, uint32_t seq) {
+  const uint32_t* credit = (const uint32_t*)(c->region + c->ctrl_off) + CTRL_CREDIT;
+  for (int p = 0; p < c->world; p++) {
+    if (p != c->rank && (int32_t)(__atomic_load_n(&credit[p], __ATOMIC_ACQUIRE) - seq) < 0) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
 // Run pipelined op seq over the phases in `phases`: post each reduce-scatter
 // chunk once the kernel staged it and each all-gather chunk once the kernel
 // reduced (or, for a shard gather, staged) it.  With the relay, also forward each relayed source's
 // all-gather chunk as it arrives.
 static int run_pipe_op(roce_ctx_t* c, uint32_t seq, uint32_t nbytes, uint32_t chunk_packs,
-                       uint32_t chunks, uint32_t phases) {
+                       uint32_t chunks, uint32_t phases, uint32_t credit) {
   volatile uint32_t* ctrl = (volatile uint32_t*)(c->region + c->ctrl_off);
   uint32_t total = nbytes / 16;
   uint32_t widest = (total + (uint32_t)c->world - 1) / (uint32_t)c->world;
@@ -1228,21 +1316,26 @@ static int run_pipe_op(roce_ctx_t* c, uint32_t seq, uint32_t nbytes, uint32_t ch
   uint64_t idle = 0;
   while (rs < chunks || ag < chunks || forwarding > 0) {
     int posted = 0;
-    if (rs < chunks && __atomic_load_n(&ctrl[CTRL_READY_RS + rs], __ATOMIC_ACQUIRE) == seq) {
+    if (credit != 0 && credits_arrived(c, seq)) {
+      credit = 0;  // every peer began this op: no phase can overrun a peer's previous op
+    }
+    if (rs < chunks && !(credit & CREDIT_RS) &&
+        __atomic_load_n(&ctrl[CTRL_READY_RS + rs], __ATOMIC_ACQUIRE) == seq) {
       if (post_pipe_chunk(c, seq, 0, rs, total, chunk_packs) != 0) {
         return -1;
       }
       rs++;
       posted = 1;
     }
-    if (ag < chunks && __atomic_load_n(&ctrl[CTRL_READY_AG + ag], __ATOMIC_ACQUIRE) == seq) {
+    if (ag < chunks && !(credit & CREDIT_AG) &&
+        __atomic_load_n(&ctrl[CTRL_READY_AG + ag], __ATOMIC_ACQUIRE) == seq) {
       if (post_pipe_chunk(c, seq, 1, ag, total, chunk_packs) != 0) {
         return -1;
       }
       ag++;
       posted = 1;
     }
-    for (int s = 0; forwarding > 0 && s < c->world; s++) {
+    for (int s = 0; forwarding > 0 && !(credit & CREDIT_AG) && s < c->world; s++) {
       if (forwarded[s] < chunks && pipe_chunk_arrived(c, seq, s, forwarded[s])) {
         if (forward_pipe_chunk(c, seq, s, forwarded[s], total, chunk_packs) != 0) {
           return -1;
@@ -1438,8 +1531,13 @@ static void* proxy_main(void* arg) {
         uint32_t phases = kind == KIND_TWOSHOT          ? (PIPE_PHASE_RS | PIPE_PHASE_AG)
                           : kind == KIND_REDUCE_SCATTER ? PIPE_PHASE_RS
                                                         : PIPE_PHASE_AG;
-        rc = run_pipe_op(c, s, nbytes, ctrl[CTRL_SLOT_CHUNK_PACKS + slot],
-                         ctrl[CTRL_SLOT_CHUNKS + slot], phases);
+        // Every rank runs the same op sequence, so all of them post and await the same credits.
+        uint32_t credit = credit_phases(c->last_kind, kind);
+        rc = credit != 0 ? post_credits(c, s) : 0;
+        if (rc == 0) {
+          rc = run_pipe_op(c, s, nbytes, ctrl[CTRL_SLOT_CHUNK_PACKS + slot],
+                           ctrl[CTRL_SLOT_CHUNKS + slot], phases, credit);
+        }
       } else if (kind == KIND_VARLEN) {
         rc = run_varlen_op(c, s, nbytes, ctrl[CTRL_SLOT_CHUNK_PACKS + slot],
                            ctrl[CTRL_SLOT_CHUNKS + slot]);
@@ -1452,6 +1550,7 @@ static void* proxy_main(void* arg) {
         return NULL;
       }
       c->last_seq = s;
+      c->last_kind = kind;
     }
   }
   return NULL;
