@@ -102,6 +102,19 @@ def main():
     )
     parser.add_argument("--hca-names", default="roceP2p1s0f0,rocep1s0f0")
     parser.add_argument("--gid-index", type=int, default=3)
+    parser.add_argument(
+        "--scatter-gather",
+        action="store_true",
+        help="mix reduce-scatter and shard-gather ops into the schedule, in every order a "
+        "model can issue them",
+    )
+    parser.add_argument(
+        "--consume-delay-ms",
+        type=float,
+        default=0.0,
+        help="on --skew-rank, wait this long after publishing an op's contribution before "
+        "reading peers' rows, like a slow kernel",
+    )
     parser.add_argument("--source", type=Path)
     args = parser.parse_args()
     if args.source is None:
@@ -184,7 +197,12 @@ def main():
 
     def wait(offset, value):
         until = time.monotonic() + 20
-        while atomics.__atomic_load_4(address + offset, 2) != value:
+        while (seen := atomics.__atomic_load_4(address + offset, 2)) != value:
+            if seen != 0 and ((seen - value) & 0xFFFFFFFF) < 0x80000000:
+                # A later op's write replaced this one's before it was read.
+                raise RuntimeError(
+                    f"rank {args.rank}: offset {offset} expected {value}, overrun by {seen}"
+                )
             if proxy.failed():
                 raise RuntimeError(proxy.error())
             if time.monotonic() > until:
@@ -192,11 +210,33 @@ def main():
                     f"rank {args.rank}: offset {offset} expected {value}, stats {proxy.stats()}"
                 )
 
+    # Kinds in schedule order: one-shot, two-shot, variable-length, reduce-scatter (3) and shard
+    # gather (4). The scatter-gather schedule includes all nine transitions between the pipelined
+    # kinds 1, 3 and 4.
+    schedule = (
+        (0, 1, 2, 3, 1, 4, 4, 3, 3, 4, 1, 1, 3) if args.scatter_gather else (0, 1, 2)
+    )
+
+    def lag():
+        if args.rank == args.skew_rank and args.consume_delay_ms:
+            time.sleep(args.consume_delay_ms / 1000)
+
+    def pipe_geometry(size):
+        total_packs = size // 16
+        chunk_bytes = 65536
+        chunks = (
+            (total_packs + world - 1) // world * 16 + chunk_bytes - 1
+        ) // chunk_bytes
+        return total_packs, chunk_bytes, chunks
+
+    def shard_bytes(src, total_packs):
+        return ((src + 1) * total_packs // world - src * total_packs // world) * 16
+
     try:
         for seq in range(1, args.iterations + 1):
             if args.rank == args.skew_rank:
                 time.sleep(0.001 * (seq % 4))
-            mode = (seq - 1) % 3
+            mode = schedule[(seq - 1) % len(schedule)]
             slot = seq & 1
             pattern = (seq + 17 * args.rank) % 256
             if mode == 0:
@@ -259,6 +299,7 @@ def main():
                     start = layout.pipe_send_off + first + chunk * chunk_bytes
                     memory[start : start + length] = bytes([reduced]) * length
                     put(layout.ctrl_off + 4 * (128 + chunk), seq)
+                lag()
                 for src in range(world):
                     if src == args.rank:
                         continue
@@ -275,6 +316,75 @@ def main():
                             )
                     start = layout.pipe_recv_off + (src * 2 + 1) * layout.shard_cap
                     assert memory[start : start + length] == bytes([reduced]) * length
+                wait(layout.ctrl_off + 4 * 48, seq)
+            elif mode == 3:
+                # Reduce-scatter: every peer's rows of our shard arrive in phase 0.
+                size = (2 << 20, (1 << 20) + 48)[((seq - 1) // 5) % 2]
+                total_packs, chunk_bytes, chunks = pipe_geometry(size)
+                start = layout.pipe_send_off
+                memory[start : start + size] = bytes([pattern]) * size
+                ctrl[4 + slot], ctrl[8 + slot] = size, 3
+                ctrl[10 + slot], ctrl[12 + slot] = chunk_bytes // 16, chunks
+                for chunk in range(chunks):
+                    put(layout.ctrl_off + 4 * (64 + chunk), seq)
+                put(layout.ctrl_off, seq)
+                lag()
+                first = args.rank * total_packs // world * 16
+                end = (args.rank + 1) * total_packs // world * 16
+                for chunk in range(chunks):
+                    length = min(chunk_bytes, max(0, end - first - chunk * chunk_bytes))
+                    for src in range(world):
+                        if src == args.rank:
+                            continue
+                        for rail in range(2):
+                            wait(
+                                layout.pipe_flag_off
+                                + ((src * 64 + chunk) * 2 + rail) * layout.flag_stride,
+                                seq,
+                            )
+                        start = (
+                            layout.pipe_recv_off
+                            + src * 2 * layout.shard_cap
+                            + chunk * chunk_bytes
+                        )
+                        assert (
+                            memory[start : start + length]
+                            == bytes([(seq + 17 * src) % 256]) * length
+                        ), (
+                            f"rank {args.rank} reduce-scatter {seq} from {src} chunk {chunk}"
+                        )
+                wait(layout.ctrl_off + 4 * 48, seq)
+            elif mode == 4:
+                # Shard gather: every peer's shard arrives in phase 1.
+                size = (2 << 20, (1 << 20) + 48)[((seq - 1) // 5) % 2]
+                total_packs, chunk_bytes, chunks = pipe_geometry(size)
+                first = args.rank * total_packs // world * 16
+                own = shard_bytes(args.rank, total_packs)
+                start = layout.pipe_send_off + first
+                memory[start : start + own] = bytes([(pattern + 101) % 256]) * own
+                ctrl[4 + slot], ctrl[8 + slot] = size, 4
+                ctrl[10 + slot], ctrl[12 + slot] = chunk_bytes // 16, chunks
+                for chunk in range(chunks):
+                    put(layout.ctrl_off + 4 * (128 + chunk), seq)
+                put(layout.ctrl_off, seq)
+                lag()
+                for src in range(world):
+                    if src == args.rank:
+                        continue
+                    for chunk in range(chunks):
+                        for rail in range(2):
+                            wait(
+                                layout.pipe_flag_off
+                                + (((world + src) * 64 + chunk) * 2 + rail)
+                                * layout.flag_stride,
+                                seq,
+                            )
+                    length = shard_bytes(src, total_packs)
+                    start = layout.pipe_recv_off + (src * 2 + 1) * layout.shard_cap
+                    assert (
+                        memory[start : start + length]
+                        == bytes([(seq + 17 * src + 101) % 256]) * length
+                    ), f"rank {args.rank} shard gather {seq} from {src}"
                 wait(layout.ctrl_off + 4 * 48, seq)
             else:
                 sizes = tuple((0, 16, 131088, 1 << 20)[r % 4] for r in range(world))
@@ -331,6 +441,7 @@ def main():
                     "rank": args.rank,
                     "world": world,
                     "iterations": args.iterations,
+                    "scatter_gather": args.scatter_gather,
                     "routes": routes,
                     "stats": stats,
                 }
