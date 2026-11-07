@@ -309,6 +309,11 @@ def _projection_workspace_bytes(query, config, device):
             slices * query.num_tokens * query.out_features * 4 if slices > 1 else 0
         )
         if mxfp8_a16_dequant(query, config):
+            if query.output_partition is not None:
+                logical = query.output_partition[0]
+                weight_bytes = logical * query.padded_in_features * 2
+                output_offset = triton.cdiv(weight_bytes, 256) * 256
+                return output_offset + query.num_tokens * logical * 2
             return max(partials, query.out_features * query.padded_in_features * 2)
         return partials
     if functional_mxfp8_quantization(query, config):
@@ -419,6 +424,8 @@ class _PackedExecutionState:
         if source.ndim < 2 or source.shape[-1] != source_width:
             raise ValueError("packed source logical K differs from preparation")
         m = source.numel() // source_width
+        if q.output_partition is not None and m != q.num_tokens:
+            raise ValueError("output partition execution requires its exact prepared M")
         if m and (m > q.num_tokens or (q.expected_m is not None and m != q.num_tokens)):
             raise ValueError(
                 "packed execution exceeds its capacity or differs from its exact M"
@@ -516,6 +523,10 @@ class _PackedExecutionState:
                 raise ValueError("output must not overlap packed inputs")
             if workspace is not None:
                 _check_tensor("workspace", workspace, self.device, torch.uint8)
+                if q.output_partition is not None and workspace.ndim != 1:
+                    raise ValueError(
+                        "output partition workspace must be one-dimensional"
+                    )
                 if workspace.numel() < self.required_workspace:
                     raise ValueError(
                         "workspace is smaller than the prepared requirement"
@@ -562,19 +573,34 @@ class _PackedExecutionState:
                 from ._dequant import DEQUANT_BLOCK_K
 
                 k = q.padded_in_features
-                weight = (
-                    workspace[: q.out_features * k * 2]
-                    .view(torch.bfloat16)
-                    .view(q.out_features, k)
+                logical, first, end = (
+                    (q.out_features, 0, q.out_features)
+                    if q.output_partition is None
+                    else q.output_partition
                 )
+                weight_bytes = logical * k * 2
+                weight = workspace[:weight_bytes].view(torch.bfloat16).view(logical, k)
+                destination = out.view(m, q.out_features)
+                if q.output_partition is not None:
+                    # Scratch is shared across serial operators. Padding must be
+                    # overwritten on every invocation, not only during preparation.
+                    weight.zero_()
+                    output_offset = triton.cdiv(weight_bytes, 256) * 256
+                    destination = (
+                        workspace[output_offset : output_offset + m * logical * 2]
+                        .view(torch.bfloat16)
+                        .view(m, logical)
+                    )
                 self.programs["dequant"][
                     (q.out_features, triton.cdiv(k, DEQUANT_BLOCK_K), 1)
-                ](values, scale_bytes, weight, k, DEQUANT_BLOCK_K)
+                ](values, scale_bytes, weight[first:end], k, DEQUANT_BLOCK_K)
                 torch.mm(
                     source.view(m, q.in_features),
                     weight.t(),
-                    out=out.view(m, q.out_features),
+                    out=destination,
                 )
+                if q.output_partition is not None:
+                    out.view(m, q.out_features).copy_(destination[:, first:end])
                 return out
             if config.mode == "a16":
                 import cutlass
@@ -883,6 +909,7 @@ def _query_bf16_from_call(
     out=None,
     workspace=None,
     expected_m=None,
+    output_partition=None,
 ):
     from ._a16 import MXFP4LinearWeight, _weight_parts
     from ._iq2_xs import IQ2XSLinearWeight
@@ -930,6 +957,7 @@ def _query_bf16_from_call(
         workspace_form="owned" if workspace is None else "provided",
         workspace_nbytes=None if workspace is None else workspace.numel(),
         expected_m=expected_m,
+        output_partition=output_partition,
     )
 
 
@@ -1558,13 +1586,31 @@ def query_from_call(
     expected_m=None,
     out_dtype=None,
     alpha=None,
+    output_partition=None,
     **options,
 ):
+    """Describe a packed projection, optionally preserving a global output extent.
+
+    ``output_partition=(logical_rows, first, end)`` declares the local weight's
+    contiguous output-row range. It requires an exact ``expected_m >= 128``,
+    MXFP8 weights, BF16 A16 arithmetic and caller-owned output/workspace. The
+    plan expands only stored rows into zero-filled full-N scratch, computes
+    the full-N BF16 GEMM and extracts the local output. Storage and execution
+    reject packed-A16 or dynamic-row substitutes for that arithmetic contract.
+    """
     from ._a16 import MXFP4LinearWeight, NVFP4LinearWeight
     from ._iq2_xs import IQ2XSLinearWeight
     from ._linear import MXFP8LinearWeight, TensorFP8LinearWeight
     from ._tuning import FixedBlockscaledQuery
 
+    if output_partition is not None and not (
+        isinstance(weight, MXFP8LinearWeight)
+        and isinstance(source, torch.Tensor)
+        and source.dtype == torch.bfloat16
+    ):
+        raise ValueError(
+            "output partitions require packed MXFP8 weights and BF16 source"
+        )
     if isinstance(
         weight, (NVFP4LinearWeight, MXFP4LinearWeight, IQ2XSLinearWeight)
     ) or (
@@ -1585,6 +1631,7 @@ def query_from_call(
             out=out,
             workspace=workspace,
             expected_m=expected_m,
+            output_partition=output_partition,
         )
     if source_activation != "identity":
         raise ValueError("source activation requires a packed BF16 NVFP4 projection")

@@ -42,8 +42,12 @@ class BlockscaledQuery:
     expected_m: int | None = None
     codegen: FrozenMapping | None = None
     autotune_effort: str = field(default_factory=capture_autotune_effort)
+    # (logical output rows, first stored row, exclusive end of stored rows).
+    output_partition: tuple[int, int, int] | None = None
 
     def __post_init__(self):
+        if isinstance(self.output_partition, list):
+            object.__setattr__(self, "output_partition", tuple(self.output_partition))
         object.__setattr__(
             self, "autotune_effort", AutotuneEffort(self.autotune_effort).value
         )
@@ -230,6 +234,39 @@ def _validate_query(query, device):
         raise ValueError("workspace limit must be nonnegative or None")
     if query.codegen != _codegen_snapshot():
         raise ValueError("packed declaration code-generation snapshot changed")
+    if query.output_partition is not None:
+        partition = query.output_partition
+        if (
+            not isinstance(partition, tuple)
+            or len(partition) != 3
+            or any(type(value) is not int for value in partition)
+        ):
+            raise ValueError("output partition requires three integer row bounds")
+        logical, first, end = partition
+        if (
+            not 0 <= first < end <= logical
+            or end - first != query.out_features
+            or logical % 8
+        ):
+            raise ValueError(
+                "output partition must cover the stored rows within logical N8"
+            )
+        if (
+            query.recipe != "mxfp8"
+            or query.activation_mode != "a16"
+            or query.source_activation != "identity"
+            or query.output_mode != "provided"
+            or query.workspace_form != "provided"
+            or not query.source_contiguous
+            or not query.source_aligned
+            or query.in_features != query.padded_in_features
+            or query.num_tokens < MXFP8_A16_DEQUANT_MIN_ROWS
+            or query.expected_m != query.num_tokens
+        ):
+            raise ValueError(
+                "output partitions require exact-M MXFP8 A16 with M>=128, unpadded K, "
+                "contiguous aligned BF16 source and caller-provided output/workspace"
+            )
 
 
 def _automatic_a16(query, device):
@@ -353,7 +390,14 @@ def mxfp8_a16_dequant(query, config):
         and query.workspace_form == "provided"
         and query.num_tokens >= MXFP8_A16_DEQUANT_MIN_ROWS
         and query.in_features == query.padded_in_features
-        and query.out_features * query.padded_in_features * 2 <= limit
+        and (
+            query.out_features
+            if query.output_partition is None
+            else query.output_partition[0]
+        )
+        * query.padded_in_features
+        * 2
+        <= limit
     )
 
 
@@ -389,6 +433,18 @@ def _validate_config(query, config, device):
         )
     if query.activation_mode != "auto" and config.mode != query.activation_mode:
         raise ValueError("configuration conflicts with caller activation precision")
+    if query.output_partition is not None:
+        if not mxfp8_a16_dequant(query, config):
+            raise ValueError(
+                "output partitions require the expanded BF16 MXFP8 A16 lowering"
+            )
+        if query.workspace_nbytes is not None:
+            from ._preparation import _workspace_bytes
+
+            if query.workspace_nbytes < _workspace_bytes(query, config, device):
+                raise ValueError(
+                    "caller workspace is too small for the logical output extent"
+                )
     if config.a16_backend not in ("auto", "packed") or (
         config.a16_backend != "auto"
         and (config.mode != "a16" or query.recipe != "mxfp8")
@@ -470,7 +526,7 @@ def _validate_config(query, config, device):
             raise ValueError("A16 requires SM120/SM121")
         if not query.source_contiguous or not query.source_aligned:
             raise ValueError("A16 requires contiguous 16-byte-aligned source storage")
-        if query.workspace_nbytes is not None:
+        if query.workspace_nbytes is not None and query.output_partition is None:
             split = effective_a16_config(query, config)[2]
             needed = (
                 split * query.num_tokens * query.out_features * 4 if split > 1 else 0
@@ -613,7 +669,9 @@ def _tuning_parameters(query, device):
             "fuse_swiglu": (False, True)
             if query.source_activation == "swiglu_bf16"
             else (False,),
-            "a16_backend": ("auto", "packed") if expanded else ("auto",),
+            "a16_backend": ("auto", "packed")
+            if expanded and query.output_partition is None
+            else ("auto",),
         },
         predicates=(
             eligible,
@@ -663,7 +721,9 @@ TUNING = TuningContract(
     query_fields=frozenset(BlockscaledQuery.__dataclass_fields__),
     config_fields=frozenset(BlockscaledConfig.__dataclass_fields__),
     encode_query=lambda query: {
-        name: getattr(query, name) for name in query.__dataclass_fields__
+        name: getattr(query, name)
+        for name in query.__dataclass_fields__
+        if name != "output_partition" or query.output_partition is not None
     },
     encode_config=BlockscaledConfig.to_dict,
     decode_config=BlockscaledConfig.from_config,

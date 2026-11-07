@@ -57,6 +57,14 @@ before durable binding. Concurrent owners use disjoint buffers. Functional
 forms retain their output allocation contract, while graph replay uses fixed
 captured addresses. Concurrent executions sharing a heuristic plan must be
 serialized; independent owners should prepare separate plans.
+
+For a contiguous output-row shard, ``query_from_call(...,
+output_partition=(logical_rows, first, end), expected_m=M)`` preserves the
+full-output BF16 GEMM geometry while storing only local MXFP8 rows. This
+contract requires A16, exact M>=128 and caller-owned output/workspace. Each
+call expands local weights into zero-filled full-N scratch, computes full-N
+BF16 output and extracts the local columns; packed and dynamic-row substitutes
+are rejected. Ordinary queries leave ``output_partition=None``.
 """
 
 from __future__ import annotations
