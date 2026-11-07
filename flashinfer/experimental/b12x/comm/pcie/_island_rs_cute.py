@@ -446,6 +446,34 @@ class _IslandRSLaunch:
             dtype=Uint32,
         )
         index = start
+        # Read four independent stride positions before consuming peer values.
+        # Each block retains the residue classes covered by its arrival flag.
+        while index + Int64(3) * stride < mine_length:
+            words = ()
+            for p in cutlass.range_constexpr(_ISLAND_SIZE):
+                peer = self._island * _ISLAND_SIZE + p
+                peer_stage = cute.recast_ptr(
+                    cute.make_ptr(
+                        cutlass.BFloat16,
+                        Int64(slabs[peer].toint()) + stage_offset,
+                        cute.AddressSpace.gmem,
+                        assumed_align=16,
+                    ).align(4),
+                    dtype=Uint32,
+                )
+                for item in cutlass.range_constexpr(4):
+                    words += (peer_stage[mine_begin + index + Int64(item) * stride],)
+            for item in cutlass.range_constexpr(4):
+                total_lo = Float32(0.0)
+                total_hi = Float32(0.0)
+                for p in cutlass.range_constexpr(_ISLAND_SIZE):
+                    lo, hi = unpack_bf16x2(words[p * 4 + item])
+                    total_lo += lo
+                    total_hi += hi
+                self_part[index + Int64(item) * stride] = pack_f32x2_to_bf16x2(
+                    total_lo, total_hi
+                )
+            index += Int64(4) * stride
         while index < mine_length:
             total_lo = Float32(0.0)
             total_hi = Float32(0.0)
@@ -502,6 +530,34 @@ class _IslandRSLaunch:
             dtype=Uint32,
         )
         index = start
+        # Read four independent stride positions before consuming peer values.
+        # Each block retains the residue classes covered by its arrival flag.
+        while index + Int64(3) * stride < mine_length:
+            words = ()
+            for p in cutlass.range_constexpr(_ISLAND_SIZE):
+                partner = p * _ISLAND_SIZE + self._lane
+                partner_part = cute.recast_ptr(
+                    cute.make_ptr(
+                        cutlass.BFloat16,
+                        Int64(slabs[partner].toint()) + part_offset,
+                        cute.AddressSpace.gmem,
+                        assumed_align=16,
+                    ).align(4),
+                    dtype=Uint32,
+                )
+                for item in cutlass.range_constexpr(4):
+                    words += (partner_part[index + Int64(item) * stride],)
+            for item in cutlass.range_constexpr(4):
+                total_lo = Float32(0.0)
+                total_hi = Float32(0.0)
+                for p in cutlass.range_constexpr(_ISLAND_SIZE):
+                    lo, hi = unpack_bf16x2(words[p * 4 + item])
+                    total_lo += lo
+                    total_hi += hi
+                value = pack_f32x2_to_bf16x2(total_lo, total_hi)
+                self_final[mine_begin + index + Int64(item) * stride] = value
+                output_words[mine_begin + index + Int64(item) * stride] = value
+            index += Int64(4) * stride
         while index < mine_length:
             total_lo = Float32(0.0)
             total_hi = Float32(0.0)
