@@ -55,6 +55,8 @@ _TRITON_HOOK = None
 _RESIDENT_PROGRAMS = weakref.WeakValueDictionary()
 _LIVE_RETAINED_PROGRAMS = weakref.WeakSet()
 _NATIVE_JITS = weakref.WeakSet()
+# Every JIT that planning handed a deferred kernel, whatever its module.
+_PLANNED_JITS = weakref.WeakSet()
 
 
 def retained_program_keys():
@@ -126,7 +128,7 @@ def evict_planning_artifacts(programs: Iterable[ProgramKey] | None = None) -> in
                 for mirror in mirrors:
                     mirror.pop(key, None)
             removed += len(obsolete)
-    for jit in tuple(_NATIVE_JITS):
+    for jit in tuple({*_NATIVE_JITS, *_PLANNED_JITS}):
         for kernel_cache, key_cache, *_ in jit.device_caches.values():
             obsolete = {key for key, kernel in kernel_cache.items() if stale(kernel)}
             for key in obsolete:
@@ -605,6 +607,7 @@ def _ensure_triton_hook():
             )
         previous = self.compile
         if planning():
+            _PLANNED_JITS.add(self)
             self.compile = _plan_triton
         elif _FORBID_LOWERING.get():
             self.compile = _load_triton_only

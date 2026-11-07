@@ -21,6 +21,7 @@ __b12x_source_dependencies__ = ()
 
 from .compile_plan import (
     ProgramKey,
+    _planning_artifacts,
     observe_programs,
     plan_compilations,
     program_keys,
@@ -409,15 +410,21 @@ def _run_job(payload: bytes, expected: tuple[ProgramKey, ...]):
     job = pickle.loads(payload)
     before_cute = int(compile_cache_info()["compile_misses"])
     before_triton = _WORKER_TRITON_COMPILES
+
+    def descriptions(keys):
+        return sorted(f"{key.dialect}:{key.name} ({key.key})" for key in keys)
+
     try:
         with observe_programs() as observed, serialized_compilations():
             result = job.invoke()
+            stubs = tuple(_planning_artifacts(result))
+            if stubs:
+                raise RuntimeError(
+                    "compile factory returned unresolved planning stubs "
+                    f"{descriptions(stubs)}; a stale in-memory kernel cache served the plan"
+                )
             actual = set(program_keys(result))
         if not observed <= actual or actual != set(expected):
-
-            def descriptions(keys):
-                return sorted(f"{key.dialect}:{key.name} ({key.key})" for key in keys)
-
             raise RuntimeError(
                 f"factory program keys changed between planning and compilation: {job.factory}; "
                 f"planned-only {descriptions(set(expected) - actual)}, "
