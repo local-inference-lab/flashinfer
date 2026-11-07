@@ -10,6 +10,8 @@ import torch
 
 TUNING_WORKLOAD_VERSION = "statistical_shared_mix_v1"
 ROUTING_MIX = ("diffuse", "skewed", "correlated")
+WHOLE_BATCH_REUSE_MIX = ("shared_100",)
+TUNING_ROUTING_WORKLOADS = (ROUTING_MIX, WHOLE_BATCH_REUSE_MIX)
 ROUTING_WORKLOADS = (
     *ROUTING_MIX,
     "disjoint",
@@ -152,7 +154,8 @@ def make_tuning_routes(
                 seed=seed + tokens + 1009 * index,
                 device=device,
             )
-            for workload in (*ROUTING_MIX, "shared_100")
+            for workload_mix in TUNING_ROUTING_WORKLOADS
+            for workload in workload_mix
             for index in range(samples_per_workload)
         ]
     )

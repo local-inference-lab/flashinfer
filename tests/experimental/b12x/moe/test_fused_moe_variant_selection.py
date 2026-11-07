@@ -206,11 +206,11 @@ def test_tuning_routes_preserve_statistical_cases_and_cover_whole_batch_sharing(
                 workload=workload,
                 seed=seed + tokens + 1009 * index,
             )
-            for workload in ("diffuse", "skewed", "correlated")
+            for workload in ("diffuse", "skewed", "correlated", "shared_100")
             for index in range(samples)
         ]
     )
-    torch.testing.assert_close(actual[: 3 * samples], expected, rtol=0, atol=0)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     shared = actual[3 * samples :]
     assert shared.shape == (samples, tokens, topk)
     for routes in shared:
