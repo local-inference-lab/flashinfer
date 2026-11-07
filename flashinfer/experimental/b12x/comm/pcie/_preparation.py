@@ -104,20 +104,33 @@ def plan(
     ):
         from ._collective_tuning import plan as collective_plan
 
-        scattered = bool(query.call.get("cross_island_rsag", False))
-        default = "island_rsag" if scattered else "island_rs"
+        from ._collective_tuning import ISLAND_VARIANTS
+
+        flags = (
+            query.call.get("local_push", False),
+            query.call.get("cross_island_rsag", False),
+        )
+        if any(type(value) is not bool for value in flags):
+            raise TypeError("island protocol choices must be booleans")
+        default = next(
+            name for name, value in ISLAND_VARIANTS.items() if value == flags
+        )
         alternatives = {default: (query, runtime)}
         if not query.setup.get("threads_override", False):
-            other = "island_rs" if scattered else "island_rsag"
-            alternatives[other] = (
-                replace(
-                    query,
-                    call=FrozenMapping(
-                        {**query.call, "cross_island_rsag": not scattered}
+            for name, (push, scattered) in ISLAND_VARIANTS.items():
+                alternatives[name] = (
+                    replace(
+                        query,
+                        call=FrozenMapping(
+                            {
+                                **query.call,
+                                "local_push": push,
+                                "cross_island_rsag": scattered,
+                            }
+                        ),
                     ),
-                ),
-                runtime,
-            )
+                    runtime,
+                )
         return collective_plan(
             alternatives,
             default=default,

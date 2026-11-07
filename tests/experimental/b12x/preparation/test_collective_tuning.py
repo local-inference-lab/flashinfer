@@ -152,7 +152,12 @@ def test_island_native_override_preserves_fixed_declaration():
     native = PcieQuery(**_island_query().alternatives["island_rs"])
     prepared = plan(native, runtime=owner)
     assert prepared.contract is COLLECTIVE
-    assert set(prepared.query.alternatives) == {"island_rs", "island_rsag"}
+    assert set(prepared.query.alternatives) == {
+        "island_rs",
+        "island_rsag",
+        "island_push",
+        "island_push_rsag",
+    }
     assert (
         prepared.query.alternatives["island_rsag"]["call"]["cross_island_rsag"] is True
     )
@@ -167,7 +172,7 @@ def test_island_native_override_preserves_fixed_declaration():
                 COLLECTIVE.configure(prepared.query, device=None)
             )
         ]
-    assert len(configs) == 10
+    assert len(configs) == 20
     assert {c.submode for c in configs} == {""}
     fixed = plan(native, runtime=owner, override=BackendConfig(backend="native"))
     assert fixed.contract is NATIVE

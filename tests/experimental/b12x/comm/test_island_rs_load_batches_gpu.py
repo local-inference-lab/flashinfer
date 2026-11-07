@@ -69,7 +69,7 @@ def _seed_generation(owner, generation):
     stream.synchronize()
 
 
-def _worker(rank, rendezvous, cross_scatter=False):
+def _worker(rank, rendezvous, cross_scatter=False, local_push=False):
     from dataclasses import replace
 
     from b12x.comm.pcie import _owner_preparation as preparation
@@ -88,6 +88,15 @@ def _worker(rank, rendezvous, cross_scatter=False):
         timeout=timedelta(minutes=10),
     )
     capacity = 1024 * 7168
+    protocols = (
+        ((False, False), (False, True), (True, False), (True, True))
+        if local_push
+        else (
+            ((False, False), (False, True), (False, True))
+            if cross_scatter
+            else ((False, False),) * 3
+        )
+    )
     try:
         # Use a separate fixed-grid owner for each geometry. Changing the
         # physical grid would stop advancing some per-CTA generation counters.
@@ -124,23 +133,27 @@ def _worker(rank, rendezvous, cross_scatter=False):
                         elements + 2, dtype=torch.bfloat16, device=device
                     )
                     source = storage[2:]
-                    inputs = [_input(elements, rank, n, device) for n in range(3)]
+                    inputs = [
+                        _input(elements, rank, n, device) for n in range(len(protocols))
+                    ]
                     expected = [
-                        _ordered_reference(elements, n, device) for n in range(3)
+                        _ordered_reference(elements, n, device)
+                        for n in range(len(protocols))
                     ]
                     if cross_scatter:
-                        if rank == 0:
-                            inputs[2][0] = float("nan")
-                            inputs[2][1] = float("inf")
-                        expected[2][0] = float("nan")
-                        expected[2][1] = float("inf")
-                        if elements > 2:
-                            if rank in (0, 4):
-                                inputs[2][2] = (
-                                    float("inf") if rank == 0 else -float("inf")
-                                )
-                            expected[2][2] = float("nan")
-                    outputs = [torch.empty_like(source) for _ in range(3)]
+                        for sample in sorted({2, len(protocols) - 1}):
+                            if rank == 0:
+                                inputs[sample][0] = float("nan")
+                                inputs[sample][1] = float("inf")
+                            expected[sample][0] = float("nan")
+                            expected[sample][1] = float("inf")
+                            if elements > 2:
+                                if rank in (0, 4):
+                                    inputs[sample][2] = (
+                                        float("inf") if rank == 0 else -float("inf")
+                                    )
+                                expected[sample][2] = float("nan")
+                    outputs = [torch.empty_like(source) for _ in range(len(protocols))]
                     plans = []
                     for index, output in enumerate(outputs):
                         query = preparation.query_from_runtime(
@@ -153,7 +166,8 @@ def _worker(rank, rendezvous, cross_scatter=False):
                                 {
                                     **query.call,
                                     "threads": threads,
-                                    "cross_island_rsag": cross_scatter and index != 0,
+                                    "cross_island_rsag": protocols[index][1],
+                                    "local_push": protocols[index][0],
                                 }
                             ),
                         )
@@ -238,7 +252,7 @@ def _worker(rank, rendezvous, cross_scatter=False):
                     )
                     stream.synchronize()
                     expected_generation = (
-                        0xFFFFFFFE + len(shapes) * 3 * 5
+                        0xFFFFFFFE + len(shapes) * len(protocols) * 5
                     ) & 0xFFFFFFFF
                     assert tuple(counters) == (expected_generation,) * blocks
                 dist.barrier()
@@ -272,4 +286,16 @@ def test_island_cross_scatter_mixed_protocols_and_rollover():
     with tempfile.TemporaryDirectory(prefix="island-scatter-test-") as directory:
         mp.spawn(
             _worker, args=(Path(directory, "gloo").as_uri(), True), nprocs=16, join=True
+        )
+
+
+def test_island_local_push_mixed_protocols_and_rollover():
+    if torch.cuda.device_count() != 16:
+        pytest.skip("requires exactly sixteen visible GPUs")
+    with tempfile.TemporaryDirectory(prefix="island-push-test-") as directory:
+        mp.spawn(
+            _worker,
+            args=(Path(directory, "gloo").as_uri(), True, True),
+            nprocs=16,
+            join=True,
         )

@@ -231,6 +231,7 @@ class _IslandRSLaunch:
         threads: int = 128,
         wait_nanosleep_cycles: int = 24,
         cross_island_rsag: bool = False,
+        local_push: bool = False,
     ) -> None:
         if world_size != _MAX_WORLD_SIZE:
             raise ValueError(f"unsupported world size {world_size}")
@@ -240,6 +241,9 @@ class _IslandRSLaunch:
             raise ValueError("threads must be a multiple of 32 in [32, 1024]")
         if type(cross_island_rsag) is not bool:
             raise TypeError("cross_island_rsag must be a boolean")
+        if type(local_push) is not bool:
+            raise TypeError("local_push must be a boolean")
+        self._local_push = local_push
         self._cross_island_rsag = cross_island_rsag
         self._world_size = int(world_size)
         self._rank = int(rank)
@@ -385,11 +389,8 @@ class _IslandRSLaunch:
         input_words = cute.recast_ptr(input_ptr.align(4), dtype=Uint32)
         output_words = cute.recast_ptr(output_ptr.align(4), dtype=Uint32)
 
-        # Every remote transfer is a read. The equal-quarter ownership keeps
-        # any rank from moving the complete vector on behalf of its island.
-
-        # Phase 1 -- publish my whole input locally, then reduce my quarter by
-        # pulling it out of the four island stages.
+        # Each rank reduces one quarter. Local push delivers that quarter's
+        # four input contributions into its staging plane before the reduction.
         self_stage = cute.recast_ptr(
             cute.make_ptr(
                 cutlass.BFloat16,
@@ -409,9 +410,26 @@ class _IslandRSLaunch:
             if stop > pairs:
                 stop = pairs
             index = start
-            while index < stop - begin:
-                self_stage[begin + index] = input_words[begin + index]
-                index += stride
+            if cutlass.const_expr(self._local_push):
+                destination = self._island * _ISLAND_SIZE + lane
+                destination_stage = cute.recast_ptr(
+                    cute.make_ptr(
+                        cutlass.BFloat16,
+                        Int64(slabs[destination].toint()) + stage_offset,
+                        cute.AddressSpace.gmem,
+                        assumed_align=16,
+                    ).align(4),
+                    dtype=Uint32,
+                )
+                while index < stop - begin:
+                    destination_stage[Int64(self._lane) * quarter + index] = (
+                        input_words[begin + index]
+                    )
+                    index += stride
+            else:
+                while index < stop - begin:
+                    self_stage[begin + index] = input_words[begin + index]
+                    index += stride
         cute.arch.barrier()
         if tidx == Int32(0):
             _fence_sc_sys()
@@ -458,17 +476,22 @@ class _IslandRSLaunch:
             words = ()
             for p in cutlass.range_constexpr(_ISLAND_SIZE):
                 peer = self._island * _ISLAND_SIZE + p
-                peer_stage = cute.recast_ptr(
-                    cute.make_ptr(
-                        cutlass.BFloat16,
-                        Int64(slabs[peer].toint()) + stage_offset,
-                        cute.AddressSpace.gmem,
-                        assumed_align=16,
-                    ).align(4),
-                    dtype=Uint32,
-                )
+                if cutlass.const_expr(self._local_push):
+                    peer_stage = self_stage
+                    peer_begin = Int64(p) * quarter
+                else:
+                    peer_begin = mine_begin
+                    peer_stage = cute.recast_ptr(
+                        cute.make_ptr(
+                            cutlass.BFloat16,
+                            Int64(slabs[peer].toint()) + stage_offset,
+                            cute.AddressSpace.gmem,
+                            assumed_align=16,
+                        ).align(4),
+                        dtype=Uint32,
+                    )
                 for item in cutlass.range_constexpr(4):
-                    words += (peer_stage[mine_begin + index + Int64(item) * stride],)
+                    words += (peer_stage[peer_begin + index + Int64(item) * stride],)
             for item in cutlass.range_constexpr(4):
                 total_lo = Float32(0.0)
                 total_hi = Float32(0.0)
@@ -485,16 +508,21 @@ class _IslandRSLaunch:
             total_hi = Float32(0.0)
             for p in cutlass.range_constexpr(_ISLAND_SIZE):
                 peer = self._island * _ISLAND_SIZE + p
-                peer_stage = cute.recast_ptr(
-                    cute.make_ptr(
-                        cutlass.BFloat16,
-                        Int64(slabs[peer].toint()) + stage_offset,
-                        cute.AddressSpace.gmem,
-                        assumed_align=16,
-                    ).align(4),
-                    dtype=Uint32,
-                )
-                lo, hi = unpack_bf16x2(peer_stage[mine_begin + index])
+                if cutlass.const_expr(self._local_push):
+                    peer_stage = self_stage
+                    peer_begin = Int64(p) * quarter
+                else:
+                    peer_begin = mine_begin
+                    peer_stage = cute.recast_ptr(
+                        cute.make_ptr(
+                            cutlass.BFloat16,
+                            Int64(slabs[peer].toint()) + stage_offset,
+                            cute.AddressSpace.gmem,
+                            assumed_align=16,
+                        ).align(4),
+                        dtype=Uint32,
+                    )
+                lo, hi = unpack_bf16x2(peer_stage[peer_begin + index])
                 total_lo += lo
                 total_hi += hi
             self_part[index] = pack_f32x2_to_bf16x2(total_lo, total_hi)
@@ -638,8 +666,28 @@ class _IslandRSLaunch:
                         index += cross_stride
             cute.arch.barrier()
 
-        # Phase 3 -- island all-gather, pulling the three quarters I do not own
-        # straight into my output.
+        # Publish completed quarters. Pushed quarters occupy disjoint ranges
+        # in each recipient's existing final plane and are copied locally.
+        if cutlass.const_expr(self._local_push):
+            for p in cutlass.range_constexpr(_ISLAND_SIZE):
+                if cutlass.const_expr(p != self._lane):
+                    push_peer = self._island * _ISLAND_SIZE + p
+                    destination_final = cute.recast_ptr(
+                        cute.make_ptr(
+                            cutlass.BFloat16,
+                            Int64(slabs[push_peer].toint()) + final_offset,
+                            cute.AddressSpace.gmem,
+                            assumed_align=16,
+                        ).align(4),
+                        dtype=Uint32,
+                    )
+                    index = start
+                    while index < mine_length:
+                        destination_final[mine_begin + index] = self_final[
+                            mine_begin + index
+                        ]
+                        index += stride
+            cute.arch.barrier()
         if tidx == Int32(0):
             _fence_sc_sys()
             for p in cutlass.range_constexpr(_ISLAND_SIZE):
@@ -666,15 +714,18 @@ class _IslandRSLaunch:
         for p in cutlass.range_constexpr(_ISLAND_SIZE):
             if cutlass.const_expr(p != self._lane):
                 peer = self._island * _ISLAND_SIZE + p
-                peer_final = cute.recast_ptr(
-                    cute.make_ptr(
-                        cutlass.BFloat16,
-                        Int64(slabs[peer].toint()) + final_offset,
-                        cute.AddressSpace.gmem,
-                        assumed_align=16,
-                    ).align(4),
-                    dtype=Uint32,
-                )
+                if cutlass.const_expr(self._local_push):
+                    peer_final = self_final
+                else:
+                    peer_final = cute.recast_ptr(
+                        cute.make_ptr(
+                            cutlass.BFloat16,
+                            Int64(slabs[peer].toint()) + final_offset,
+                            cute.AddressSpace.gmem,
+                            assumed_align=16,
+                        ).align(4),
+                        dtype=Uint32,
+                    )
                 begin = Int64(p) * quarter
                 stop = begin + quarter
                 if stop > pairs:
@@ -694,6 +745,7 @@ def get_island_rs_launcher(
     threads: int = 128,
     wait_nanosleep_cycles: int = 24,
     cross_island_rsag: bool = False,
+    local_push: bool = False,
 ) -> Callable[..., None]:
     """Return the rank-specialized TP16 island reduce-scatter launcher."""
 
@@ -704,6 +756,7 @@ def get_island_rs_launcher(
         threads=threads,
         wait_nanosleep_cycles=wait_nanosleep_cycles,
         cross_island_rsag=cross_island_rsag,
+        local_push=local_push,
     )
     cache_key = (
         int(world_size),
@@ -711,6 +764,7 @@ def get_island_rs_launcher(
         int(threads),
         int(wait_nanosleep_cycles),
         bool(cross_island_rsag),
+        bool(local_push),
     )
     raise_if_kernel_resolution_frozen(
         "cute.compile", target=launch, cache_key=cache_key
@@ -743,6 +797,7 @@ def get_island_rs_launcher(
                 "threads",
                 "wait_nanosleep_cycles",
                 "cross_island_rsag",
+                "local_push",
             ),
         ),
     )

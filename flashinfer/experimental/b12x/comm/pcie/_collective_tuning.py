@@ -17,6 +17,15 @@ from ._tuning import PcieQuery, TUNING as NATIVE
 from ._joint_profile import JOINT_FAMILIES, profile_records
 
 
+# Compiled transport specializations: (local push, cross-island scatter/gather).
+ISLAND_VARIANTS = {
+    "island_rs": (False, False),
+    "island_rsag": (False, True),
+    "island_push": (True, False),
+    "island_push_rsag": (True, True),
+}
+
+
 @dataclass(frozen=True, kw_only=True)
 class CollectiveConfig:
     implementation: str
@@ -41,7 +50,7 @@ def _configs(query, device=None):
         call = payload["call"]
         blocks = int(call.get("blocks", call.get("block_limit", 16)))
         threads = int(call["threads"])
-        if name in ("island_rs", "island_rsag"):
+        if name in ISLAND_VARIANTS:
             # Physical blocks own persistent generation counters. Race thread
             # counts without changing their participation or scratch layout.
             counts = (
@@ -301,18 +310,19 @@ def _validate_query(query, device):
         NATIVE.validate_query(native, device)
         if (native.world_size, native.rank) != (query.world_size, query.rank):
             raise ValueError("native alternatives must use the same rank group")
-        if name in ("island_rs", "island_rsag") and (
+        if name in ISLAND_VARIANTS and (
             query.operation != "all_reduce"
             or query.world_size != 16
             or native.surface != "PCIeIslandRSAllReduce.all_reduce"
         ):
             raise ValueError("island launch tuning requires its TP16 reduction owner")
-        if name in ("island_rs", "island_rsag"):
+        if name in ISLAND_VARIANTS:
             from ._island_rs_cute import island_rs_peers
 
-            if bool(native.call.get("cross_island_rsag", False)) != (
-                name == "island_rsag"
-            ):
+            if (
+                bool(native.call.get("local_push", False)),
+                bool(native.call.get("cross_island_rsag", False)),
+            ) != ISLAND_VARIANTS[name]:
                 raise ValueError(
                     "island implementation differs from its compiled protocol"
                 )
@@ -385,7 +395,7 @@ def _collective_signature(query):
         del native["rank"]
         for section in ("call", "setup"):
             native[section].pop("device_index", None)
-        if name in ("island_rs", "island_rsag"):
+        if name in ISLAND_VARIANTS:
             # These peers are determined by the validated rank and TP16 topology.
             native["setup"].pop("peer_ranks")
         alternatives[name] = native
@@ -400,7 +410,7 @@ def _collective_signature(query):
 def _family_bucket(query):
     if query.operation != "all_reduce":
         return None
-    if any(name in query.alternatives for name in ("island_rs", "island_rsag")):
+    if any(name in query.alternatives for name in ISLAND_VARIANTS):
         # Retain independent measurements for each message shape and fixed grid.
         return None
     from math import prod
