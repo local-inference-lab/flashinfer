@@ -306,6 +306,11 @@ class W4A16FusedMoeKernel:
         # suh tables hold one row shared by every expert: index them with a
         # zero expert stride.
         self.broadcast_suh = bool(broadcast_suh)
+        # A shared scale row makes the complete input transform independent
+        # of expert selection. FC1 can reuse one transformed row per token.
+        self.shared_input_rotation = (
+            self.full_rotation and self.intermediate_hadamard and self.broadcast_suh
+        )
         self.rotation_input_dtype = str(rotation_input_dtype)
         self.rotation_input_is_fp16 = self.rotation_input_dtype == "fp16"
         if self.full_rotation:
@@ -370,7 +375,7 @@ class W4A16FusedMoeKernel:
             single_token_route_fast_path=size_m == 1 and not self.direct_topk_routes,
             direct_topk_routes=self.direct_topk_routes,
             dual_a=self.dual_a,
-            route_major_a=self.full_rotation,
+            route_major_a=self.full_rotation and not self.shared_input_rotation,
             schedule_whole_tiles=self.schedule_whole_tiles,
             dynamic_num_experts=self.dynamic_num_experts,
             pipeline_stages=fc1_pipeline_stages
@@ -670,6 +675,7 @@ class W4A16FusedMoeKernel:
             self.full_rotation,
             self.intermediate_hadamard,
             self.broadcast_suh,
+            self.shared_input_rotation,
             self.rotation_input_dtype,
             self.lut_e4m3_smem,
             self.trellis_direct_lut,
@@ -936,7 +942,7 @@ class W4A16FusedMoeKernel:
             ),
         )
         a_rows = Int64(active_m)
-        if cutlass.const_expr(self.full_rotation):
+        if cutlass.const_expr(self.full_rotation and not self.shared_input_rotation):
             a_rows = Int64(active_m) * Int64(self.top_k)
         a_bf16_flat = cute.make_tensor(
             a_bf16_ptr,
@@ -1891,6 +1897,8 @@ class W4A16FusedMoeKernel:
         route_count = packed_route_count[Int32(0)].to(Int32)
         if cutlass.const_expr(self.direct_topk_routes):
             route_count = live_routes
+        if cutlass.const_expr(self.shared_input_rotation):
+            route_count = active_m
         gwarp = cta * warps_per_cta + warp_in_cta
         gw_stride = grid_x * warps_per_cta
         total_units = route_count * nblk
@@ -1899,16 +1907,25 @@ class W4A16FusedMoeKernel:
         while unit < total_units:
             route_pos = unit // nblk
             blk = unit - route_pos * nblk
-            route = packed_route_indices[route_pos].to(Int32)
-            expert = block_expert_ids[route_pos // Int32(self.moe_block_size)].to(Int32)
-            if cutlass.const_expr(self.direct_topk_routes):
-                route = route_pos
-                expert = packed_route_indices[route_pos].to(Int32)
-                if cutlass.const_expr(self.use_expert_map):
-                    global_expert = expert
-                    expert = Int32(-1)
-                    if global_expert >= Int32(0) and global_expert < route_num_experts:
-                        expert = expert_map_flat[global_expert].to(Int32)
+            if cutlass.const_expr(self.shared_input_rotation):
+                route = route_pos * Int32(self.top_k)
+                expert = Int32(0)
+            else:
+                route = packed_route_indices[route_pos].to(Int32)
+                expert = block_expert_ids[route_pos // Int32(self.moe_block_size)].to(
+                    Int32
+                )
+                if cutlass.const_expr(self.direct_topk_routes):
+                    route = route_pos
+                    expert = packed_route_indices[route_pos].to(Int32)
+                    if cutlass.const_expr(self.use_expert_map):
+                        global_expert = expert
+                        expert = Int32(-1)
+                        if (
+                            global_expert >= Int32(0)
+                            and global_expert < route_num_experts
+                        ):
+                            expert = expert_map_flat[global_expert].to(Int32)
             if (
                 route >= Int32(0)
                 and route < live_routes
@@ -2098,7 +2115,10 @@ class W4A16FusedMoeKernel:
                     s_base = col0
                 else:
                     s_base = expert * Int32(self.hidden_size) + col0
-                out_base = route * Int32(self.hidden_size) + col0
+                output_row = (
+                    token if cutlass.const_expr(self.shared_input_rotation) else route
+                )
+                out_base = output_row * Int32(self.hidden_size) + col0
                 for group in cutlass.range_constexpr(4):
                     offset = Int32(group * 128)
                     if cutlass.const_expr(group == 0):
