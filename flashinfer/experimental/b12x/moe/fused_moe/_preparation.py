@@ -200,6 +200,7 @@ def _query(
     invocation: FrozenMapping,
 ) -> MoeDecodeQuery:
     plan = experts.plan._impl
+    trellis_input_scale_rows = None
     quant_modes = tuple(sorted(plan.quant_modes))
     quant_mode = quant_modes[0] if len(quant_modes) == 1 else "multi"
     cutoff = experts.plan.activation.a16_max_tokens
@@ -211,6 +212,13 @@ def _query(
                 experts.plan.source, experts.plan.activation.mode
             )
             quant_modes = (quant_mode,)
+    if (
+        quant_mode == "w4a16"
+        and plan.intermediate_hadamard
+        and plan.w4a16_weight_layout == "trellis_t256"
+    ):
+        prepared = experts._impl.representation_for("w4a16")
+        trellis_input_scale_rows = int(prepared.gate_suh.shape[0])
     deterministic_output = routing.deterministic_output
     if deterministic_output is None:
         from ._impl import _dynamic_deterministic_output_enabled
@@ -260,6 +268,7 @@ def _query(
         csf_inline_scales=plan.csf_inline_scales,
         a4_prefill=invocation.get("a4_prefill"),
         autotune_effort=capture_autotune_effort().value,
+        trellis_input_scale_rows=trellis_input_scale_rows,
     )
 
 
@@ -387,6 +396,7 @@ def _lower_caps(
             query.controls.get("w4a16_skip_empty_m_blocks", True)
         ),
         swiglu_beta=_decode_scalar(query.swiglu_beta),
+        trellis_input_scale_rows=query.trellis_input_scale_rows,
     )
 
 

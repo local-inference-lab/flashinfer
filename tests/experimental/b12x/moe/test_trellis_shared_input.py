@@ -104,4 +104,13 @@ def test_shared_input_matches_expanded_scale_rows(tmp_path, rows, dtype):
     ):
         assert not reference.binding.fused_launch.broadcast_suh
         assert candidate.binding.fused_launch.broadcast_suh
-        helper.qualify_pair(reference, candidate, x, ids, routes, 17, seed=9813 + rows)
+        helper.qualify_pair(
+            reference,
+            candidate,
+            x,
+            ids,
+            routes,
+            17,
+            seed=9813 + rows,
+            scratch_saving_bytes=rows * 3 * 512 * 2,
+        )

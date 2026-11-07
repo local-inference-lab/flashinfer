@@ -835,7 +835,8 @@ def run_w4a16_moe(
                     f"got {tuple(table.shape)}/{table.dtype}/{table.device}/"
                     f"contiguous={table.is_contiguous()}"
                 )
-        required_a = m * topk * hidden_size
+        shared_input = intermediate_hadamard and suh_gate_table.numel() == hidden_size
+        required_a = m * (1 if shared_input else topk) * hidden_size
         for name, scratch in (
             ("rotation_a_gate", rotation_a_gate),
             ("rotation_a_up", rotation_a_up),

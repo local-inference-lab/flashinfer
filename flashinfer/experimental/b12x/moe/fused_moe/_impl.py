@@ -286,6 +286,7 @@ class TPW4A16Workspace:
     rotation_a_up: torch.Tensor | None = None
     kernel_workspace: torch.Tensor | None = None
     full_rotation: bool = False
+    trellis_input_scale_rows: int | None = None
     trellis_bits: int = 3
     trellis_tile_config: tuple[int, int, int, int] | None = None
     trellis_pair_kinds: frozenset[str] | None = None
@@ -765,6 +766,7 @@ class _TPCoreWorkspacePlan:
     dynamic_tile_n: int | None = None
     dynamic_route_mode: str | None = None
     full_rotation: bool = False
+    trellis_input_scale_rows: int | None = None
     projection_mixed_trellis: bool = False
     trellis_bits: int = 3
     trellis_tile_config: tuple[int, int, int, int] | None = None
@@ -853,6 +855,8 @@ class TPMoEScratchCaps:
     w4a16_a4_prefill_terms: int = 1
     w4a16_a4_prefill_warps: int = 8
     frozen: bool = True
+    # None preserves the generic envelope that accepts either physical scale layout.
+    trellis_input_scale_rows: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "max_tokens", max(int(self.max_tokens), 1))
@@ -871,6 +875,17 @@ class TPMoEScratchCaps:
                 f"quant_mode={quant_mode!r} is absent from the weight plan"
             )
         object.__setattr__(self, "quant_mode", quant_mode)
+        rows = self.trellis_input_scale_rows
+        if rows is not None and (
+            type(rows) is not int
+            or rows not in (1, self.weight_E)
+            or quant_mode != "w4a16"
+            or self.weight_plan.w4a16_weight_layout != "trellis_t256"
+            or not self.weight_plan.intermediate_hadamard
+        ):
+            raise ValueError(
+                "frozen input scale rows require coupled full-rotation Trellis geometry"
+            )
         if type(self.swiglu_clamp_after_silu) is not bool:
             raise TypeError("swiglu_clamp_after_silu must be a boolean")
         if self.swiglu_clamp_after_silu and (
@@ -968,6 +983,22 @@ class TPMoEScratchCaps:
         return self.weight_plan.w4a16_scale_format
 
 
+def _validate_trellis_input_scale_rows(
+    experts, expected_rows: int | None, hidden_size: int
+) -> None:
+    if expected_rows is None:
+        return
+    prepared = experts.representation_for("w4a16")
+    table = prepared.gate_suh
+    if table.dtype != torch.float16 or tuple(table.shape) != (
+        expected_rows,
+        hidden_size,
+    ):
+        raise ValueError(
+            "Trellis input scale rows differ from the frozen scratch layout"
+        )
+
+
 @dataclass(frozen=True)
 class TPMoEScratchPlan:
     caps: TPMoEScratchCaps
@@ -1034,6 +1065,9 @@ class TPMoEScratchPlan:
             raise ValueError(
                 "experts do not match the plan used to size TP MoE scratch"
             )
+        _validate_trellis_input_scale_rows(
+            experts, self.caps.trellis_input_scale_rows, self.caps.k
+        )
         if int(a.shape[0]) > int(self.caps.max_tokens):
             raise ValueError(
                 f"input tokens {int(a.shape[0])} exceed TP MoE scratch capacity "
@@ -3393,6 +3427,7 @@ def _plan_core_workspace(
     trellis_codebook: str | None = None,
     intermediate_hadamard: bool = False,
     projection_mixed_trellis: bool = False,
+    trellis_input_scale_rows: int | None = None,
     apply_router_weight_on_input: bool = False,
     collect_activation_amax: bool = False,
     deterministic_output: bool = False,
@@ -3409,6 +3444,8 @@ def _plan_core_workspace(
     quant_mode = _normalize_quant_mode_for_source(quant_mode, source_format)
     activation = normalize_moe_activation(activation)
     deterministic_output = bool(deterministic_output and implementation == "dynamic")
+    if trellis_input_scale_rows is not None and implementation != "w4a16":
+        raise ValueError("frozen Trellis input scale rows require W4A16 execution")
     swiglu_limit, swiglu_alpha, swiglu_beta = _normalize_swiglu_params(
         activation,
         swiglu_limit,
@@ -3447,6 +3484,16 @@ def _plan_core_workspace(
         )
         requested_route_E = int(route_num_experts or weight_E)
         full_rotation = weight_layout == "trellis_t256"
+        if trellis_input_scale_rows is not None and (
+            type(trellis_input_scale_rows) is not int
+            or trellis_input_scale_rows not in (1, weight_E)
+            or not full_rotation
+            or not intermediate_hadamard
+            or projection_mixed_trellis
+        ):
+            raise ValueError(
+                "frozen input scale rows require coupled full-rotation Trellis geometry"
+            )
         # Route metadata must address every physical weight and every global
         # router ID accepted through route_expert_map.
         route_E = max(int(weight_E), requested_route_E)
@@ -3822,7 +3869,12 @@ def _plan_core_workspace(
                     ),
                     _TensorAllocSpec(
                         "rotation_a_gate",
-                        (routed_capacity, int(k)),
+                        (
+                            token_capacity
+                            if trellis_input_scale_rows == 1
+                            else routed_capacity,
+                            int(k),
+                        ),
                         torch.float16,
                     ),
                     _TensorAllocSpec("kernel_workspace", (sms * 4 + 2,), torch.int32),
@@ -3856,6 +3908,7 @@ def _plan_core_workspace(
             dtype=dtype,
             deterministic_output=False,
             full_rotation=full_rotation,
+            trellis_input_scale_rows=trellis_input_scale_rows,
             trellis_bits=int(trellis_bits),
             trellis_tile_config=trellis_tile_config,
             trellis_pair_kinds=trellis_pair_kinds,
@@ -4373,6 +4426,7 @@ def _materialize_workspace_from_core_arena(
             ),
             kernel_workspace=tensors.get("kernel_workspace"),
             full_rotation=plan.full_rotation,
+            trellis_input_scale_rows=plan.trellis_input_scale_rows,
             trellis_bits=plan.trellis_bits,
             trellis_tile_config=plan.trellis_tile_config,
             trellis_pair_kinds=plan.trellis_pair_kinds,
@@ -8325,6 +8379,7 @@ def plan_tp_moe_arena_layout(
     w4a16_block_size_m: int | None = None,
     w4a16_prefill_fused_sum: bool | None = None,
     decode_config: MoeDecodeConfig,
+    trellis_input_scale_rows: int | None = None,
 ) -> TPMoEArenaLayout:
     """Compute the byte layout needed by one lane-owned MoE pool."""
     if not isinstance(weight_plan, MoEWeightPreparationPlan):
@@ -8432,6 +8487,7 @@ def plan_tp_moe_arena_layout(
             ),
             intermediate_hadamard=weight_plan.intermediate_hadamard,
             projection_mixed_trellis=_uses_projection_mixed_trellis(weight_plan),
+            trellis_input_scale_rows=trellis_input_scale_rows,
             apply_router_weight_on_input=apply_router_weight_on_input,
             collect_activation_amax=collect_activation_amax,
             deterministic_output=plan.deterministic_output,
@@ -8585,7 +8641,11 @@ def _plan_full_rotation_w4a16_launches(
         fused_launches = tuple(
             (token_count, compile_fused(token_count, broadcast_suh))
             for token_count in fused_token_counts
-            for broadcast_suh in (False, True)
+            for broadcast_suh in (
+                (False, True)
+                if caps.trellis_input_scale_rows is None
+                else (caps.trellis_input_scale_rows == 1,)
+            )
         )
         topk_sum_launches = tuple(
             (
@@ -9058,6 +9118,7 @@ def _plan_tp_moe_arena_layout_from_caps(
         w4a16_block_size_m=_resolve_trellis_route_block_size(caps),
         w4a16_prefill_fused_sum=caps.w4a16_prefill_fused_sum,
         decode_config=caps.decode_config,
+        trellis_input_scale_rows=caps.trellis_input_scale_rows,
     )
 
 
@@ -9126,6 +9187,7 @@ def plan_tp_moe_scratch(
         ),
         intermediate_hadamard=caps.weight_plan.intermediate_hadamard,
         projection_mixed_trellis=_uses_projection_mixed_trellis(caps.weight_plan),
+        trellis_input_scale_rows=caps.trellis_input_scale_rows,
         apply_router_weight_on_input=caps.apply_router_weight_on_input,
         collect_activation_amax=caps.collect_activation_amax,
         deterministic_output=launch_plan.deterministic_output,
@@ -9664,9 +9726,20 @@ def materialize_tp_moe_arena_workspaces(
     *,
     caps: TPMoEScratchCaps,
 ) -> None:
-    """Materialize graph-sensitive pool state from one authoritative plan."""
+    """Materialize conservative legacy pools from one authoritative plan.
+
+    Compact shared Trellis inputs require caller-owned ``plan_tp_moe_scratch``
+    bindings. Per-expert frozen layouts use the unchanged generic envelope here.
+    """
     if not isinstance(caps, TPMoEScratchCaps):
         raise TypeError("caps must be a TPMoEScratchCaps")
+    if caps.trellis_input_scale_rows == 1:
+        raise NotImplementedError(
+            "legacy workspace pools do not support frozen shared Trellis input storage; "
+            "use plan_tp_moe_scratch caller-owned bindings"
+        )
+    if caps.trellis_input_scale_rows is not None:
+        caps = replace(caps, trellis_input_scale_rows=None)
     t0 = time.perf_counter() if _B12X_TIMING else 0.0
     weight_plan = caps.weight_plan
     max_tokens = caps.max_tokens
@@ -9753,6 +9826,7 @@ def materialize_tp_moe_arena_workspaces(
             ),
             intermediate_hadamard=weight_plan.intermediate_hadamard,
             projection_mixed_trellis=_uses_projection_mixed_trellis(weight_plan),
+            trellis_input_scale_rows=caps.trellis_input_scale_rows,
             apply_router_weight_on_input=apply_router_weight_on_input,
             collect_activation_amax=collect_activation_amax,
             deterministic_output=plan.deterministic_output,
@@ -9791,6 +9865,8 @@ def materialize_tp_moe_arena_workspaces(
                 if isinstance(existing, TPW4A16Workspace) and (
                     not set(core_token_counts).issubset(existing.planned_token_counts)
                     or existing.intermediate_hadamard != core_plan.intermediate_hadamard
+                    or existing.trellis_input_scale_rows
+                    != core_plan.trellis_input_scale_rows
                     or existing.planned_apply_router_weight_on_input
                     != bool(apply_router_weight_on_input)
                     or existing.planned_swiglu_limit != plan.swiglu_limit
@@ -10087,6 +10163,9 @@ def build_tp_moe_fp4_binding(
         output_expert_map=output_expert_map,
     )
     if isinstance(workspace, TPW4A16Workspace):
+        _validate_trellis_input_scale_rows(
+            experts, workspace.trellis_input_scale_rows, k
+        )
         if quant_mode != "w4a16":
             raise ValueError(
                 f"TPW4A16Workspace cannot bind non-W4A16 quant_mode {quant_mode!r}"

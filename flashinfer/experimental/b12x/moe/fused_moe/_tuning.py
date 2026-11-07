@@ -57,9 +57,11 @@ class MoeDecodeQuery:
     swiglu_clamp_after_silu: bool = False
     a4_prefill: bool | None = None
     autotune_effort: str = "default"
+    # Effective physical rows after scale gains; None leaves the layout unfrozen.
+    trellis_input_scale_rows: int | None = None
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        result = {
             "output_layout": self.output_layout,
             "split_fc1_scales": self.split_fc1_scales,
             "a4_prefill": self.a4_prefill,
@@ -95,6 +97,9 @@ class MoeDecodeQuery:
             "fast_math": self.fast_math,
             "weight_layouts": self.weight_layouts,
         }
+        if self.trellis_input_scale_rows is not None:
+            result["trellis_input_scale_rows"] = self.trellis_input_scale_rows
+        return result
 
 
 @dataclass(frozen=True)
@@ -351,6 +356,14 @@ def _validate_query(query: MoeDecodeQuery, _device: DeviceIdentity | None) -> No
         raise TypeError("shared_input_scales must be boolean")
     if type(query.csf_inline_scales) is not bool:
         raise TypeError("csf_inline_scales must be boolean")
+    if query.trellis_input_scale_rows is not None and (
+        type(query.trellis_input_scale_rows) is not int
+        or query.trellis_input_scale_rows not in (1, query.num_experts)
+        or query.w4a16_weight_layout != "trellis_t256"
+    ):
+        raise ValueError(
+            "frozen Trellis input scales require one or num_experts physical rows"
+        )
     if not query.weight_layouts:
         raise ValueError("MoE query requires declared weight layouts")
 

@@ -62,6 +62,7 @@ class Runner:
     output: torch.Tensor
     scratch: tuple
     graph: torch.cuda.CUDAGraph | None = None
+    scratch_plan: object = None
 
     def run(self):
         return fused_moe.run(binding=self.binding)
@@ -84,16 +85,64 @@ class Runner:
 
 @contextmanager
 def prepared_runner(
-    experts, x, ids, weights, kernel_class=None, *, output_dtype=None, output_offset=0
+    experts,
+    x,
+    ids,
+    weights,
+    kernel_class=None,
+    *,
+    output_dtype=None,
+    output_offset=0,
+    freeze_transform=True,
 ):
     original = fused_launch.W4A16FusedMoeKernel
     if kernel_class is not None:
         fused_launch.W4A16FusedMoeKernel = kernel_class
-    session = PreparationSession(device=x.device, autotune=False, compile_workers=0)
     output = torch.empty(
         x.numel() + output_offset, dtype=output_dtype or x.dtype, device=x.device
     )
     output = output[output_offset:].view_as(x)
+    if kernel_class is not None or not freeze_transform:
+        from b12x.moe.fused_moe import _impl
+        from b12x.moe.fused_moe._tuning import MoeDecodeConfig
+
+        try:
+            plan = _impl.plan_tp_moe_scratch(
+                _impl.TPMoEScratchCaps(
+                    max_tokens=x.shape[0],
+                    num_topk=ids.shape[1],
+                    device=x.device,
+                    weight_plan=experts._impl.plan,
+                    quant_mode="w4a16",
+                    core_token_counts=(x.shape[0],),
+                    decode_config=MoeDecodeConfig(
+                        backend="w4a16",
+                        route_planner="internal",
+                        max_active_clusters=None,
+                        w4a16_route_mode="packed",
+                    ),
+                )
+            )
+            scratch = tuple(
+                torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+                for spec in plan.scratch_specs()
+            )
+            binding = plan.bind(
+                scratch=scratch,
+                a=x,
+                experts=experts._impl,
+                topk_ids=ids,
+                topk_weights=weights,
+                output=output,
+                input_scales_static=True,
+            )
+            fused_launch.W4A16FusedMoeKernel = original
+            yield Runner(binding, output, scratch, scratch_plan=plan)
+        finally:
+            fused_launch.W4A16FusedMoeKernel = original
+            torch.cuda.synchronize()
+        return
+    session = PreparationSession(device=x.device, autotune=False, compile_workers=0)
     declaration = fused_moe.plan_execution(
         experts=experts,
         capacity=fused_moe.ExecutionCapacity(max_tokens=x.shape[0], top_k=ids.shape[1]),
@@ -141,7 +190,7 @@ def prepared_runner(
         )
         assert binding.fused_launch.full_rotation
         fused_launch.W4A16FusedMoeKernel = original
-        yield Runner(binding, output, scratch)
+        yield Runner(binding, output, scratch, scratch_plan=state.scratch)
     finally:
         fused_launch.W4A16FusedMoeKernel = original
         torch.cuda.synchronize()
@@ -161,10 +210,14 @@ def inputs(rows, hidden, experts, topk, dtype, *, seed, clustered=False):
     return x, ids, weights
 
 
-def qualify_pair(control, candidate, x, ids, weights, experts, *, seed):
-    assert [tensor.nbytes for tensor in control.scratch] == [
-        tensor.nbytes for tensor in candidate.scratch
-    ]
+def qualify_pair(
+    control, candidate, x, ids, weights, experts, *, seed, scratch_saving_bytes=0
+):
+    assert (
+        sum(t.nbytes for t in control.scratch)
+        - sum(t.nbytes for t in candidate.scratch)
+        == scratch_saving_bytes
+    )
     control.capture()
     candidate.capture()
     initial = (x.clone(), ids.clone(), weights.clone())
@@ -329,6 +382,11 @@ def main():
                     route_weights,
                     geometry.num_experts,
                     seed=31007 + rows,
+                    scratch_saving_bytes=(
+                        rows * 15 * geometry.hidden_size * 2
+                        if candidate.scratch_plan.caps.trellis_input_scale_rows == 1
+                        else 0
+                    ),
                 )
                 record = dict(
                     rows=rows,
