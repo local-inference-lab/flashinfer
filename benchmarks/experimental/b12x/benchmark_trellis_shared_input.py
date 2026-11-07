@@ -83,12 +83,17 @@ class Runner:
 
 
 @contextmanager
-def prepared_runner(experts, x, ids, weights, kernel_class=None):
+def prepared_runner(
+    experts, x, ids, weights, kernel_class=None, *, output_dtype=None, output_offset=0
+):
     original = fused_launch.W4A16FusedMoeKernel
     if kernel_class is not None:
         fused_launch.W4A16FusedMoeKernel = kernel_class
     session = PreparationSession(device=x.device, autotune=False, compile_workers=0)
-    output = torch.empty_like(x)
+    output = torch.empty(
+        x.numel() + output_offset, dtype=output_dtype or x.dtype, device=x.device
+    )
+    output = output[output_offset:].view_as(x)
     declaration = fused_moe.plan_execution(
         experts=experts,
         capacity=fused_moe.ExecutionCapacity(max_tokens=x.shape[0], top_k=ids.shape[1]),

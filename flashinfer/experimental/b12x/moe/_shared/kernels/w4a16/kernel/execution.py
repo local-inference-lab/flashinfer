@@ -613,9 +613,9 @@ def run_w4a16_moe(
         element_dtype = _normalize_element_dtype(prepared_dtype)
         if element_dtype != "fp16":
             raise TypeError("full_rotation requires fp16 prepared weights/scratch")
-        if output.dtype != torch.float32:
+        if output.dtype not in (torch.float32, a_input.dtype):
             raise TypeError(
-                f"full_rotation output must be torch.float32, got {output.dtype}"
+                f"full_rotation output must be FP32 or the public input dtype, got {output.dtype}"
             )
     else:
         element_dtype = rotation_input_dtype

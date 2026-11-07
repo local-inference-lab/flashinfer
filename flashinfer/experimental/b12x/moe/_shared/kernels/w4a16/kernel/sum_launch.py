@@ -28,6 +28,17 @@ _SUM_CACHE: dict[tuple, W4A16TopKSumCompileResult] = {}
 register_program_cache(_SUM_CACHE)
 
 
+def _output_pointer_dtype(dtype: torch.dtype):
+    types = {
+        torch.float32: cutlass.Float32,
+        torch.float16: cutlass.Float16,
+        torch.bfloat16: cutlass.BFloat16,
+    }
+    if dtype not in types:
+        raise TypeError("top-k sum output requires FP32, FP16 or BF16 storage")
+    return types[dtype]
+
+
 def compile_w4a16_topk_sum(
     *,
     m: int,
@@ -43,8 +54,22 @@ def compile_w4a16_topk_sum(
     broadcast_svh: bool = False,
     float32_output: bool = False,
     apply_topk_weights: bool | None = None,
+    output_dtype: torch.dtype | None = None,
 ) -> W4A16TopKSumCompileResult:
     cutlass_dtype = _cutlass_element_dtype(element_dtype)
+    default_output = (
+        torch.float32
+        if full_rotation or float32_output
+        else torch.float16
+        if element_dtype == "fp16"
+        else torch.bfloat16
+    )
+    output_dtype = default_output if output_dtype is None else output_dtype
+    output_pointer_dtype = _output_pointer_dtype(output_dtype)
+    if not full_rotation and output_dtype != default_output:
+        raise ValueError(
+            "ordinary top-k sum output must preserve its accumulation contract"
+        )
     if route_ids_dtype not in (torch.int32, torch.int64):
         raise TypeError("top-k route expert ids must be int32 or int64")
     if apply_topk_weights is None:
@@ -67,6 +92,7 @@ def compile_w4a16_topk_sum(
         bool(broadcast_svh),
         bool(float32_output),
         apply_topk_weights,
+        str(output_dtype),
     )
     cached = _SUM_CACHE.get(cache_key)
     if cached is not None:
@@ -80,8 +106,11 @@ def compile_w4a16_topk_sum(
         )
 
     fc2_fake = make_ptr(cutlass_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
-    output_dtype = cutlass.Float32 if full_rotation or float32_output else cutlass_dtype
-    output_fake = make_ptr(output_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
+    # Typed caller outputs may be contiguous slices with only element alignment.
+    output_alignment = 2 if full_rotation and output_dtype != torch.float32 else 16
+    output_fake = make_ptr(
+        output_pointer_dtype, 16, cute.AddressSpace.gmem, assumed_align=output_alignment
+    )
     topk_weights_fake = make_ptr(
         cutlass.Float32, 4, cute.AddressSpace.gmem, assumed_align=4
     )
@@ -126,7 +155,7 @@ def compile_w4a16_topk_sum(
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "moe.w4a16.topk_sum",
-            4,
+            5,
             cache_key,
         ),
     )
@@ -143,6 +172,7 @@ def compile_w4a16_topk_sum(
         use_expert_map=bool(use_expert_map),
         broadcast_svh=bool(broadcast_svh),
         apply_topk_weights=apply_topk_weights,
+        output_dtype=output_dtype,
     )
     attach_programs(result, compiled)
     _SUM_CACHE[cache_key] = result
@@ -176,6 +206,12 @@ def _w4a16_topk_sum_launch_flat(
         raise ValueError("top-k sum with an expert count requires route expert IDs")
     if launcher is not None and launcher.route_ids_dtype != route_ids_dtype:
         raise ValueError("prepared top-k sum route-ID dtype differs from its binding")
+    if launcher is not None:
+        expected_output_dtype = launcher.output_dtype
+        if expected_output_dtype is None and launcher.full_rotation:
+            expected_output_dtype = torch.float32
+        if expected_output_dtype is not None and expected_output_dtype != output.dtype:
+            raise ValueError("prepared top-k sum output dtype differs from its binding")
     route_num_experts = 0 if expert_map is None else int(expert_map.numel())
     broadcast_svh = (
         full_rotation and svh_table is not None and svh_table.numel() == hidden_size
@@ -207,8 +243,11 @@ def _w4a16_topk_sum_launch_flat(
         use_expert_map=expert_map is not None,
         broadcast_svh=broadcast_svh,
         float32_output=output.dtype == torch.float32,
+        output_dtype=output.dtype if full_rotation else None,
     )
-    dummy_addr = output.data_ptr()
+    # Disabled metadata operands still require their pointer type's alignment.
+    # Route storage is aligned even when the caller's typed output is a slice.
+    dummy_addr = fc2_out.data_ptr()
     weights_addr = dummy_addr if topk_weights is None else topk_weights.data_ptr()
     route_ids_addr = (
         dummy_addr if route_expert_ids is None else route_expert_ids.data_ptr()
@@ -227,12 +266,10 @@ def _w4a16_topk_sum_launch_flat(
             assumed_align=16,
         ),
         make_ptr(
-            cutlass.Float32
-            if full_rotation or output.dtype == torch.float32
-            else _cutlass_element_dtype(element_dtype),
+            _output_pointer_dtype(output.dtype),
             output.data_ptr(),
             cute.AddressSpace.gmem,
-            assumed_align=16,
+            assumed_align=2 if full_rotation and output.dtype != torch.float32 else 16,
         ),
         make_ptr(
             cutlass.Float32,

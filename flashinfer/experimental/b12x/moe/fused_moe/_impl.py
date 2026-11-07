@@ -1155,6 +1155,12 @@ class TPMoEScratchPlan:
                     and mapped
                     == (output_expert_map is not None or route_expert_map is not None)
                     and launch.broadcast_svh == broadcast_svh
+                    and launch.output_dtype
+                    == (
+                        a.dtype
+                        if output is not None and output.dtype == a.dtype
+                        else torch.float32
+                    )
                 ),
                 None,
             )
@@ -3173,7 +3179,9 @@ def _build_tp_moe_fp4_binding_from_views(
                 "full-rotation Trellis output must be a contiguous live or "
                 "capacity buffer in FP32 or the input dtype on the input device"
             )
-        if output.dtype == a.dtype:
+        if output.dtype == a.dtype and (
+            topk_sum_launch is None or topk_sum_launch.output_dtype != output.dtype
+        ):
             output_cast_target = output[:m]
             output = tensors["full_rotation_output"][:m]
         else:
@@ -8595,11 +8603,13 @@ def _plan_full_rotation_w4a16_launches(
                     route_ids_dtype=ids_dtype,
                     use_expert_map=mapped,
                     broadcast_svh=broadcast_svh,
+                    output_dtype=output_dtype,
                 ),
             )
             for ids_dtype in (torch.int32, torch.int64)
             for mapped in (False, True)
             for broadcast_svh in (False, True)
+            for output_dtype in dict.fromkeys((torch.float32, core_plan.dtype))
         )
     return fused_launches, topk_sum_launches
 
@@ -13748,9 +13758,12 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             raise ValueError(
                 f"output must have shape {(m, k)}, got {tuple(scatter_output.shape)}"
             )
-        if scatter_output.dtype != output_dtype:
+        valid_output_dtypes = (
+            (torch.float32, a.dtype) if full_rotation else (output_dtype,)
+        )
+        if scatter_output.dtype not in valid_output_dtypes:
             raise ValueError(
-                f"output must have dtype {output_dtype}, got {scatter_output.dtype}"
+                f"output must have dtype in {valid_output_dtypes}, got {scatter_output.dtype}"
             )
         if scatter_output.device != device:
             raise ValueError(

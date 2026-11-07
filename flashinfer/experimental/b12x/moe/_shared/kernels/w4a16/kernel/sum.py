@@ -258,10 +258,18 @@ class W4A16TopKSumKernel:
                             reduced[off + Int32(384)],
                         )
                         out_base = token * Int32(self.hidden_size) + block_col + off
-                        output_flat[out_base + Int32(0)] = o0
-                        output_flat[out_base + Int32(128)] = o1
-                        output_flat[out_base + Int32(256)] = o2
-                        output_flat[out_base + Int32(384)] = o3
+                        output_flat[out_base + Int32(0)] = o0.to(
+                            output_flat.element_type
+                        )
+                        output_flat[out_base + Int32(128)] = o1.to(
+                            output_flat.element_type
+                        )
+                        output_flat[out_base + Int32(256)] = o2.to(
+                            output_flat.element_type
+                        )
+                        output_flat[out_base + Int32(384)] = o3.to(
+                            output_flat.element_type
+                        )
             return
         if cutlass.const_expr(self.intermediate_hadamard):
             tid = Int32(tidx)
@@ -381,10 +389,18 @@ class W4A16TopKSumKernel:
                             route_values[off + Int32(384)],
                         )
                         out_base = token * Int32(self.hidden_size) + block_col + off
-                        output_flat[out_base + Int32(0)] = o0
-                        output_flat[out_base + Int32(128)] = o1
-                        output_flat[out_base + Int32(256)] = o2
-                        output_flat[out_base + Int32(384)] = o3
+                        output_flat[out_base + Int32(0)] = o0.to(
+                            output_flat.element_type
+                        )
+                        output_flat[out_base + Int32(128)] = o1.to(
+                            output_flat.element_type
+                        )
+                        output_flat[out_base + Int32(256)] = o2.to(
+                            output_flat.element_type
+                        )
+                        output_flat[out_base + Int32(384)] = o3.to(
+                            output_flat.element_type
+                        )
             return
         if cutlass.const_expr(self.full_rotation):
             tid = Int32(tidx)
@@ -475,10 +491,10 @@ class W4A16TopKSumKernel:
                         acc2 += route_values[value_base + Int32(2)] * weight
                         acc3 += route_values[value_base + Int32(3)] * weight
                     out_base = token * Int32(self.hidden_size) + col0
-                    output_flat[out_base + Int32(0)] = acc0
-                    output_flat[out_base + Int32(1)] = acc1
-                    output_flat[out_base + Int32(2)] = acc2
-                    output_flat[out_base + Int32(3)] = acc3
+                    output_flat[out_base + Int32(0)] = acc0.to(output_flat.element_type)
+                    output_flat[out_base + Int32(1)] = acc1.to(output_flat.element_type)
+                    output_flat[out_base + Int32(2)] = acc2.to(output_flat.element_type)
+                    output_flat[out_base + Int32(3)] = acc3.to(output_flat.element_type)
             return
         idx = Int32(bidx) * Int32(self.cta_threads) + Int32(tidx)
         total = active_m * Int32(self.hidden_size)

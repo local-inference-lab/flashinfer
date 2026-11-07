@@ -52,6 +52,7 @@ class W4A16TopKSumCompileResult:
     use_expert_map: bool = False
     broadcast_svh: bool = False
     apply_topk_weights: bool = False
+    output_dtype: torch.dtype | None = None
 
 
 @dataclass(frozen=True)
