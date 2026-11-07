@@ -10,6 +10,7 @@ from __future__ import annotations
 import math
 import operator
 import os
+import queue
 import sys
 import threading
 from contextlib import contextmanager, suppress
@@ -20,8 +21,120 @@ import torch
 if TYPE_CHECKING:
     from cuda.bindings import runtime as cudart
 
+# Poison pill handed to the prefetch worker's queue by ``close`` to unblock and
+# stop its daemon thread. Distinct by identity from any id list a job may hold.
+_PREFETCH_SENTINEL = object()
+# Pool size applied when the cache is enabled through the environment but no
+# size is given: 1 GiB of pool bytes, rounded down to whole rows by
+# ``_resolve_row_cache_size`` (11,930,464 rows at the shipped 90 B/row PLE
+# geometry). The row-cache knobs are the only way to enable the cache from a
+# shell or manifest; the shipped implementation is one host-tier C S3-FIFO
+# (``row_cache.S3FifoRowCache``; SIEVE and W-TinyLFU were retired as branch-
+# local experiments, rationale in ``docs/DESIGN.md`` §1 "Policy selection").
+# ``B12X_ROW_CACHE_TIER`` accepts only ``host`` (or unset); else it raises.
+_ROW_CACHE_DEFAULT_BYTES = 1 << 30
+
+
+# Suffixes accepted by ``B12X_ROW_CACHE_BYTES``, as multipliers of the decimal
+# amount. A bare number is plain bytes.
+_ROW_CACHE_SIZE_SUFFIXES = {
+    "": 1,
+    "K": 1 << 10,
+    "M": 1 << 20,
+    "G": 1 << 30,
+    "T": 1 << 40,
+}
+
+
+def _parse_row_cache_size(text: str, row_bytes: int) -> int:
+    """Return ``text`` (e.g. ``"8.6MiB"``, ``"1GiB"``, ``"900000"``) as a row count.
+
+    ``B12X_ROW_CACHE_BYTES`` lets an operator size the pool in the unit that
+    appears in the ``row_cache_bytes`` stat and the design docs, instead of
+    counting rows. A bare number is plain bytes; a decimal amount takes an
+    optional ``KiB``/``MiB``/``GiB``/``TiB`` suffix (the ``i`` and ``B`` are
+    optional, case-insensitive). The value rounds *down* to whole rows, so a
+    request below one row, and malformed, non-finite or negative input, are
+    construction errors rather than a silently disabled cache.
+    """
+    import re
+
+    match = re.fullmatch(
+        r"\s*(\d+(?:\.\d*)?)\s*(?:([KMGT])i?B?|B)?\s*", text, flags=re.IGNORECASE
+    )
+    if match is None:
+        raise ValueError(
+            "B12X_ROW_CACHE_BYTES must be a byte count, optionally with a "
+            "KiB/MiB/GiB/TiB suffix (e.g. '8.6MiB'), "
+            f"got {text!r}"
+        )
+    suffix = (match.group(2) or "").upper().rstrip("B").rstrip("I")
+    if suffix not in _ROW_CACHE_SIZE_SUFFIXES:
+        raise ValueError(f"B12X_ROW_CACHE_BYTES has an unknown multiplier in {text!r}")
+    size = float(match.group(1)) * _ROW_CACHE_SIZE_SUFFIXES[suffix]
+    if not math.isfinite(size) or size < row_bytes:
+        raise ValueError(
+            f"B12X_ROW_CACHE_BYTES={text!r} rounds to zero rows at {row_bytes} B/row"
+        )
+    return int(size) // row_bytes
+
+
+def _resolve_row_cache_size(
+    size_env: str | None, rows_env: str | None, tier_env: str | None, row_bytes: int
+) -> tuple[int, bool]:
+    """Return ``(cache_rows, size_defaulted)`` for the environment size knobs.
+
+    Precedence: ``B12X_ROW_CACHE_BYTES`` > ``B12X_ROW_CACHE_ROWS`` > the 1 GiB
+    default > 0 (off). The cache counts as *enabled* when any of
+    ``B12X_ROW_CACHE_BYTES``, ``B12X_ROW_CACHE_ROWS`` or
+    ``B12X_ROW_CACHE_TIER`` is set to a non-empty value; enabled without a
+    size selects ``_ROW_CACHE_DEFAULT_BYTES`` of pool bytes, rounded *down*
+    to whole rows, so a 1 GiB budget costs ``(1 << 30) // row_bytes *
+    row_bytes`` bytes. ``B12X_ROW_CACHE_ROWS=0`` is an explicit size and keeps
+    the historical off-by-default behaviour. A default that would round to
+    zero rows (a row larger than the budget) is a construction error, never a
+    silently disabled cache.
+    """
+    # An empty value is unset (matches the docstring's "non-empty" and the
+    # TIER normaliser): a manifest that exports B12X_ROW_CACHE_BYTES= must not
+    # raise or collide with a set ROWS.
+    size_env = size_env if size_env else None
+    rows_env = rows_env if rows_env else None
+    if size_env is not None and rows_env is not None:
+        raise ValueError("set only one of B12X_ROW_CACHE_ROWS / B12X_ROW_CACHE_BYTES")
+    if size_env is not None:
+        return _parse_row_cache_size(size_env, row_bytes), False
+    if rows_env is not None:
+        return int(rows_env), False
+    enabled = any(
+        value is not None and value != "" for value in (size_env, rows_env, tier_env)
+    )
+    if not enabled:
+        return 0, False
+    rows = _ROW_CACHE_DEFAULT_BYTES // row_bytes
+    if rows <= 0:
+        raise ValueError(
+            f"1 GiB row-cache default rounds to zero rows at {row_bytes} "
+            "B/row; set B12X_ROW_CACHE_BYTES explicitly"
+        )
+    return rows, True
+
+
+def _validate_row_cache_tier(cache_tier: str | None) -> str:
+    """Normalise the cache tier.
+
+    The row cache has a single ``host`` tier; ``B12X_ROW_CACHE_TIER`` accepts
+    only ``host`` (or unset), and any other value is a construction error.
+    """
+    if cache_tier is None or cache_tier.strip() == "":
+        return "host"
+    if cache_tier.strip().lower() == "host":
+        return "host"
+    raise ValueError(f"B12X_ROW_CACHE_TIER={cache_tier!r} is invalid: use 'host'")
+
 
 def _check_cuda(error: cudart.cudaError_t, operation: str) -> None:
+    """Raise ``RuntimeError`` naming ``operation`` unless ``error`` is success."""
     from cuda.bindings import runtime as cudart
 
     if error != cudart.cudaError_t.cudaSuccess:
@@ -29,6 +142,7 @@ def _check_cuda(error: cudart.cudaError_t, operation: str) -> None:
 
 
 def _contiguous_strides(shape: tuple[int, ...]) -> tuple[int, ...]:
+    """Row-major element strides for ``shape``, computed without torch."""
     stride = 1
     result = []
     for extent in reversed(shape):
@@ -45,6 +159,12 @@ def _tensor_from_pointer(
     device: torch.device,
     nbytes: int,
 ) -> torch.Tensor:
+    """Wrap an external host or device pointer as a contiguous torch tensor.
+
+    Builds a storage over ``pointer`` without copying, then reshapes it to
+    ``shape``/``dtype`` on ``device``. Raises ``RuntimeError`` when the
+    installed torch lacks the private storage constructor.
+    """
     constructor = getattr(torch._C, "_construct_storage_from_data_pointer", None)
     if constructor is None:
         raise RuntimeError(
@@ -62,6 +182,12 @@ class MappedHostAllocation:
     def __init__(
         self, shape: tuple[int, ...], dtype: torch.dtype, device: torch.device
     ) -> None:
+        """Allocate ``shape``/``dtype`` as mapped, write-combined pinned host memory.
+
+        ``device`` must be an indexed CUDA device. Both the CPU and CUDA
+        tensor aliases are built eagerly; any failure frees the allocation
+        before propagating.
+        """
         from cuda.bindings import runtime as cudart
 
         self._host_pointer = 0
@@ -108,6 +234,10 @@ class MappedHostAllocation:
                 raise
 
     def close(self) -> None:
+        """Synchronize the owning device and release the pinned allocation.
+
+        Idempotent: a second call is a no-op.
+        """
         from cuda.bindings import runtime as cudart
 
         if self._closed:
@@ -118,6 +248,7 @@ class MappedHostAllocation:
         self._closed = True
 
     def __del__(self) -> None:
+        """Free the allocation if it is still open, unless the interpreter is exiting."""
         if (
             self._closed
             or self._host_pointer == 0
@@ -130,12 +261,55 @@ class MappedHostAllocation:
 
 
 class DiskRowCache:
-    """Read immutable row planes into a reusable, batch-sized cache.
+    """Read immutable row planes into a reusable, batch-sized staging buffer.
 
     Source rows have one weight byte plane and an optional independent scale
-    byte plane. Neither file data nor full table allocations are retained.
-    Hold ``transaction`` across ID production, ``read_rows`` and GPU decoding.
-    Downstream graphs consume the decoder's fixed device output, not disk I/O.
+    byte plane. Hold ``transaction`` across ID production, ``read_rows`` and
+    GPU decoding. Downstream graphs consume the decoder's fixed device output,
+    not disk I/O.
+
+    Rows come from checkpoint shards via io_uring/GDS, or from ``host_rows``:
+    CPU tensors holding this shard's rows ``[shard_start, shard_end)`` in id
+    order. The optional row cache (``cache_rows`` > 0) ships a single
+    implementation, the host-tier C S3-FIFO
+    (``row_cache.S3FifoRowCache``): recently read rows stay in host RAM so
+    repeated n-grams skip the source, and a cached batch performs no
+    per-request Python work (the plan, counters, ghost bookkeeping and row
+    copies all run inside the extension; the io_uring fetch and the CUDA
+    transaction/fence discipline are unchanged around it).
+
+    Configuration (read at construction; the ``cache_rows`` argument wins
+    over the environment):
+
+    * ``B12X_ROW_CACHE_ROWS`` — pool capacity in rows. ``0`` keeps the cache
+      off, the historical default when nothing else is set.
+    * ``B12X_ROW_CACHE_BYTES`` — the same knob in pool bytes, rounded down to
+      whole rows: ``8.6MiB`` == 100000 rows at 90 B/row. Mutually exclusive
+      with ``B12X_ROW_CACHE_ROWS``.
+    * Enabled without a size — any of ``B12X_ROW_CACHE_BYTES``,
+      ``B12X_ROW_CACHE_ROWS`` or ``B12X_ROW_CACHE_TIER`` set to a non-empty
+      value, none naming a size — the pool defaults to 1 GiB:
+      ``(1 << 30) // row_bytes`` rows (11,930,464 at the shipped 90 B/row PLE
+      geometry; the row count rounds down to whole rows, so the pool costs
+      at most 1 GiB).
+    * ``B12X_ROW_CACHE_TIER`` — only ``host`` (or unset); the cache has a
+      single tier, so any other value raises and names the knob.
+    * The cache has a single implementation: the host-tier C S3-FIFO
+      (``row_cache.S3FifoRowCache``). Construction raises if the extension
+      fails to build — there is no silent fallback. The A/B arm for "cache
+      off" is ``B12X_ROW_CACHE_ROWS=0``; the pre-port Python-path cost model
+      is in ``docs/DESIGN.md`` §1.
+
+    The GDS backend stages on the device itself and is not cached.
+
+    ``prefetch(ids)`` warms the cache ahead of the read path from a background
+    worker that starts on the first call. Reserved rows sit
+    in a loading slot that a lookup never hits and eviction never reclaims;
+    only a confirmed row becomes a ready hit. The synchronous read path treats
+    an in-flight prefetch as a plain miss and takes its own fetch, so the same
+    row can be written by both the worker and the batch, always with identical
+    bytes (last write wins). Both the disk and ``host_rows`` sources are
+    prefetchable through the same ``_fetch`` primitive.
     """
 
     def __init__(
@@ -150,7 +324,19 @@ class DiskRowCache:
         weight_row_bytes: int,
         scale_row_bytes: int = 0,
         queue_depth: int = 64,
+        cache_rows: int | None = None,
+        cache_tier: str | None = None,
+        host_rows: tuple[torch.Tensor, torch.Tensor | None] | None = None,
     ) -> None:
+        """Bind one TP shard's row planes, staging buffers, and optional cache.
+
+        Resolves the backend (``host_rows``, else ``B12X_DISK_BACKEND`` for
+        io_uring or GDS) and the pool size from ``cache_rows`` or the
+        ``B12X_ROW_CACHE_*`` environment knobs, then allocates the pinned id
+        buffer and mapped host staging planes the C index binds zero-copy.
+        Non-GDS construction on an integrated part is host-RAM only. The
+        prefetch worker is left unstarted; ``prefetch`` creates it lazily.
+        """
         from b12x.loader._native import load
 
         device = torch.device(device)
@@ -169,13 +355,42 @@ class DiskRowCache:
         queue_depth = operator.index(queue_depth)
         if not 0 < self.shard_rows <= (1 << 63) - 1:
             raise ValueError("shard_rows must be a positive signed int64")
-        self._backend = os.environ.get("B12X_DISK_BACKEND", "io_uring")
-        if self._backend not in ("io_uring", "gds"):
-            raise ValueError("B12X_DISK_BACKEND must be io_uring or gds")
+        if host_rows is not None:
+            self._backend = "host"
+        else:
+            self._backend = os.environ.get("B12X_DISK_BACKEND", "io_uring")
+            if self._backend not in ("io_uring", "gds"):
+                raise ValueError("B12X_DISK_BACKEND must be io_uring or gds")
+        row_bytes = self.weight_row_bytes + self.scale_row_bytes
+        tier_env = os.environ.get("B12X_ROW_CACHE_TIER")
+        if cache_rows is None:
+            # ``B12X_ROW_CACHE_BYTES`` is the same knob in pool bytes (the
+            # unit ``stats()['row_cache_bytes']`` reports), because an
+            # operator reasons about a host-RAM budget in MiB, not in rows of
+            # 90 B. With no size given at all, an enabled cache takes the
+            # 1 GiB default; nothing set keeps the historical off-by-default.
+            size_env = os.environ.get("B12X_ROW_CACHE_BYTES")
+            rows_env = os.environ.get("B12X_ROW_CACHE_ROWS")
+            cache_rows = _resolve_row_cache_size(
+                size_env, rows_env, tier_env, row_bytes
+            )[0]
+        cache_rows = operator.index(cache_rows)
+        if cache_rows < 0:
+            raise ValueError("cache_rows must be nonnegative")
+        cache_tier = _validate_row_cache_tier(
+            tier_env if cache_tier is None else cache_tier
+        )
+        if cache_rows and self._backend == "gds":
+            raise ValueError("the GDS backend does not support a row cache")
+        self.cache_rows = cache_rows
+        self.cache_tier = cache_tier if cache_rows else None
         self._gds = None
         self._native = None
         self._reader = None
-        if self._backend == "io_uring":
+        self._host_weight = self._host_scale = None
+        if self._backend == "host":
+            self._host_weight, self._host_scale = self._check_host_rows(host_rows)
+        elif self._backend == "io_uring":
             self._native = load()
             self._reader = self._native.ple_reader(
                 self.shard_rows,
@@ -195,22 +410,23 @@ class DiskRowCache:
         self._weight_allocation = self._scale_allocation = None
         self.weight_host = self.scale_host = None
         self._weight_buffer = self._scale_buffer = None
+        self.scale = None
         if self._backend == "gds":
             from ._gds import GdsRows
 
             self._gds = GdsRows(self, queue_depth)
             self.weight, self.scale = self._gds.weight, self._gds.scale
         else:
+            # Host staging through the mapped, page-locked buffer is the only
+            # non-GDS layout: the cache pool lives in host RAM next to the
+            # staging buffer, so on integrated parts it is the only copy and a
+            # cached batch skips both the source read and the H2D hop.
             self._weight_allocation = MappedHostAllocation(
                 (self.max_lookups, self.weight_row_bytes), torch.uint8, device
             )
             self.weight = self._weight_allocation.device_view
             self.weight_host = self._weight_allocation.host_view
             self._weight_buffer = memoryview(self.weight_host.numpy())
-            self._scale_allocation = None
-            self.scale = None
-            self.scale_host = None
-            self._scale_buffer = None
             if self.scale_row_bytes:
                 self._scale_allocation = MappedHostAllocation(
                     (self.max_lookups, self.scale_row_bytes), torch.uint8, device
@@ -218,6 +434,10 @@ class DiskRowCache:
                 self.scale = self._scale_allocation.device_view
                 self.scale_host = self._scale_allocation.host_view
                 self._scale_buffer = memoryview(self.scale_host.numpy())
+        self._index = None
+        self._row_cache_failed = False
+        if cache_rows:
+            self._init_row_cache()
         self._sources: set[tuple[bool, int]] = set()
         self._frozen = False
         self._lock = threading.RLock()
@@ -227,37 +447,435 @@ class DiskRowCache:
         self._cache_done = torch.cuda.Event()
         self._cache_used = False
         self._closed = False
+        self._init_prefetch_state()
+
+    def _init_prefetch_state(self) -> None:
+        """Set the prefetch worker and its telemetry to their idle values.
+
+        The worker thread and its bounded queue are created lazily on the first
+        enabled ``prefetch`` so a disabled cache never spawns a thread; both
+        stay ``None`` until then. Caller-side counters are updated under
+        ``_lock``, because ``prefetch`` is public and several model threads may
+        call it at once; the worker-side ones have the single prefetch worker as
+        their only writer, and ``stats`` reads them all under the same lock.
+        """
+        self._prefetch_thread: threading.Thread | None = None
+        self._prefetch_queue: queue.Queue | None = None
+        self._prefetch_stop = False
+        self._prefetch_requests = 0
+        self._prefetch_rows = 0
+        self._prefetch_rows_already_cached = 0
+        self._prefetch_rows_queued = 0
+        self._prefetch_rows_dropped = 0
+        self._prefetch_jobs = 0
+        self._prefetch_rows_reserved = 0
+        self._prefetch_rows_loaded = 0
+        self._prefetch_rows_cancelled = 0
+        self._prefetch_source_errors = 0
+        self._prefetch_job_errors = 0
+
+    def _check_host_rows(self, host_rows):
+        """Validate the host-resident source planes and return them as numpy views.
+
+        Each plane must be a contiguous CPU ``uint8`` tensor shaped
+        ``(shard_end - shard_start, row_bytes)``; raises ``ValueError``
+        otherwise, or when a scale plane arrives with ``scale_row_bytes`` 0.
+        """
+        weight, scale = host_rows
+        rows = self.shard_end - self.shard_start
+        planes = [(weight, self.weight_row_bytes, "weight")]
+        if self.scale_row_bytes:
+            planes.append((scale, self.scale_row_bytes, "scale"))
+        elif scale is not None:
+            raise ValueError("host_rows has a scale plane but scale_row_bytes is 0")
+        for tensor, width, name in planes:
+            if (
+                tensor is None
+                or tensor.device.type != "cpu"
+                or tensor.dtype != torch.uint8
+                or tuple(tensor.shape) != (rows, width)
+                or not tensor.is_contiguous()
+            ):
+                raise ValueError(
+                    f"host_rows {name} must be a contiguous CPU uint8 tensor of "
+                    f"shape ({rows}, {width})"
+                )
+        return weight.numpy(), (scale.numpy() if self.scale_row_bytes else None)
+
+    def _init_row_cache(self) -> None:
+        """Allocate the pinned miss buffers, the host pool, and the C index.
+
+        Every buffer the extension binds is allocated here and kept
+        referenced by this object for its lifetime. Raises ``ValueError`` if
+        an id or miss buffer is not page-locked, and ``RuntimeError`` when the
+        native build fails -- there is no Python fallback.
+        """
+        from .row_cache import S3FifoRowCache
+
+        rows = self.cache_rows
+        widths = [self.weight_row_bytes] + (
+            [self.scale_row_bytes] if self.scale_row_bytes else []
+        )
+        # vLLM constructs models under an ambient torch.device context (meta at
+        # initialize_model time), so every CPU allocation here names the device
+        # explicitly; a bare torch.empty(pin_memory=True) would build a meta
+        # tensor and fail "Only dense CPU tensors can be pinned".
+        # Miss rows land here first; the CPU reads them back, so they are
+        # plain pinned memory rather than write-combined.
+        self._miss_ids = torch.empty(
+            (self.max_lookups,), dtype=torch.int64, device="cpu", pin_memory=True
+        )
+        self._miss_planes = [
+            torch.empty(
+                (self.max_lookups, width),
+                dtype=torch.uint8,
+                device="cpu",
+                pin_memory=True,
+            )
+            for width in widths
+        ]
+        # Host tier: the pool is plain host RAM and the stage planes are views
+        # of the mapped-host weight/scale buffers. The C index binds all of
+        # them (zero-copy) for the index's lifetime, so they are allocated
+        # before the index and kept referenced by this object.
+        self._pool = [
+            torch.empty((rows, width), dtype=torch.uint8, device="cpu").numpy()
+            for width in widths
+        ]
+        self._stage_host = [self.weight_host.numpy()] + (
+            [self.scale_host.numpy()] if self.scale_row_bytes else []
+        )
+        for pinned in (self.ids_host, self._miss_ids, *self._miss_planes):
+            if not pinned.is_pinned():
+                raise ValueError(
+                    "row cache id and miss buffers must be page-locked before "
+                    "binding them to the C index"
+                )
+        self._miss_ids_view = memoryview(self._miss_ids.numpy())
+        self._miss_weight_view = memoryview(self._miss_planes[0].numpy())
+        self._miss_scale_view = (
+            memoryview(self._miss_planes[1].numpy()) if self.scale_row_bytes else None
+        )
+        # Raises RuntimeError if the C extension cannot be built; the cache
+        # never silently degrades to a Python path (there is none left).
+        self._index = S3FifoRowCache(
+            rows,
+            self.max_lookups,
+            self._ids_buffer,
+            self._miss_ids_view,
+            [
+                memoryview(plane)
+                for plane in (self._miss_weight_view, self._miss_scale_view)
+                if plane is not None
+            ],
+            [memoryview(array) for array in self._stage_host],
+            [memoryview(array) for array in self._pool],
+        )
 
     def _require_open(self):
+        """Raise ``RuntimeError`` if ``close`` has already run."""
         if self._closed:
             raise RuntimeError("disk row cache is closed")
 
     def __del__(self):
+        """Close the cache on garbage collection if it was never closed."""
         if not getattr(self, "_closed", True):
             with suppress(Exception):
                 self.close()
 
     def close(self):
+        """Release owned resources and request that the prefetch worker stop.
+
+        Refuses to run mid-transaction and waits for the transaction's
+        ``_cache_done`` fence before dropping bound buffers. Joins the worker
+        outside ``_lock`` for up to two seconds; prefetch work can still be
+        running when that timeout expires. Idempotent.
+        """
         with self._lock:
             if self._closed:
                 return
             if self._transaction_thread is not None:
                 raise RuntimeError("cannot close a disk row cache during a transaction")
+            self._prefetch_stop = True
+            worker = self._prefetch_thread
+            jobs = self._prefetch_queue
             if self._cache_used:
                 with torch.cuda.device(self.device):
                     self._cache_done.synchronize()
             if self._gds is not None:
                 self._gds.close()
+            # Drop the capsule (and the buffers it holds) before the mapped
+            # host allocations are freed underneath it.
+            if self._index is not None:
+                self._index.close()
+                self._index = None
             for allocation in (self._scale_allocation, self._weight_allocation):
                 if allocation is not None:
                     allocation.close()
             self._reader = self._native = None
             self._closed = True
+        # Drain the worker outside the lock: a running job reacquires it in its
+        # reserve/confirm sections, so joining while holding it would deadlock.
+        if worker is not None and jobs is not None:
+            with suppress(queue.Full):
+                jobs.put_nowait(_PREFETCH_SENTINEL)
+            worker.join(timeout=2)
+
+    def prefetch(self, ids) -> bool:
+        """Speculatively fetch ``ids`` into the row cache without blocking.
+
+        Advisory only: it never touches the staging buffer, never raises, and
+        hands the work to a single lazily-started daemon worker over a bounded
+        queue, so callers are never stalled behind disk I/O. Returns ``False``
+        when the row cache is disabled (``cache_rows == 0``), closed, or on the
+        GDS backend; otherwise ``True``. Calling it is the opt-in; there is no
+        separate enable flag. ``ids`` may be a list of ints, a CPU int64 tensor,
+        or a numpy array; duplicate, out-of-shard, and already-handled ids are
+        no-ops. When the queue is saturated the newest request is dropped and
+        counted, so a prefetch that cannot keep up is visible rather than
+        silently discarded; see ``stats``.
+        """
+        if not self._prefetch_ok():
+            return False
+        job = self._normalize_prefetch_ids(ids)
+        if job is None:
+            return False
+        self._ensure_prefetch_worker()
+        # Counted under ``_lock``, the lock ``stats`` holds to read them:
+        # ``prefetch`` is public and more than one model thread may call it, so
+        # an unguarded read-modify-write could drop an increment, and the
+        # queued-plus-dropped equals rows invariant would not hold across the
+        # interleaving.
+        with self._lock:
+            # Re-check the gate under the lock: ``close`` drops the index and
+            # stops the worker while holding it, so a close that wins after the
+            # check above would leave rows queued behind a dead worker while
+            # this still returned True.
+            if not self._prefetch_ok():
+                return False
+            self._prefetch_requests += 1
+            self._prefetch_rows += len(job)
+            pending = self._prefetch_queue
+            if job and pending is not None:
+                for start in range(0, len(job), self.max_lookups):
+                    chunk = job[start : start + self.max_lookups]
+                    try:
+                        pending.put_nowait(chunk)
+                        self._prefetch_rows_queued += len(chunk)
+                    except queue.Full:
+                        self._prefetch_rows_dropped += len(job) - start
+                        break
+        return True
+
+    def _prefetch_ok(self) -> bool:
+        """Gate speculative prefetch: open cache with rows, disk/host backend.
+
+        Returns ``False`` for a disabled cache (``cache_rows == 0``), a closed
+        or failed one, or the GDS backend, so no worker is ever spawned for a
+        cache that cannot hold rows.
+        """
+        if (
+            self._closed
+            or self._row_cache_failed
+            or not self.cache_rows
+            or self._index is None
+        ):
+            return False
+        if self._backend == "gds":
+            return False
+        return True
+
+    def _normalize_prefetch_ids(self, ids) -> list[int] | None:
+        """Coerce ``ids`` to the distinct in-shard, not-yet-cached row ids.
+
+        Accepts a list of ints, a CPU int64 tensor, or a numpy array; every
+        element is converted with ``int``. Duplicates collapse to first
+        occurrence, out-of-shard ids are dropped (nothing to prefetch), and
+        ids already committed are dropped as no-ops. Rows merely loading are
+        left in: their ``reserve`` returns ``None`` in the worker, so they cost
+        a cheap no-op rather than a second fetch.
+
+        The index handle is read under ``_lock``, the same lock ``close``
+        holds while it drops the index, so a ``close`` that wins the race
+        makes this return ``None`` rather than calling ``is_ready`` on a
+        closed cache.
+        """
+        import numpy as np
+
+        if isinstance(ids, torch.Tensor):
+            if ids.numel() == 0:
+                return []
+            ids = ids.detach().cpu()
+            if ids.dtype != torch.int64:
+                ids = ids.to(torch.int64)
+            raw = ids.reshape(-1).tolist()
+        elif isinstance(ids, np.ndarray):
+            if ids.size == 0:
+                return []
+            raw = ids.reshape(-1).tolist()
+        else:
+            raw = list(ids)
+        with self._lock:
+            if self._index is None:
+                return None
+            index = self._index
+            low, high = self.shard_start, self.shard_end
+            seen: set[int] = set()
+            result: list[int] = []
+            for value in raw:
+                key = int(value)
+                if key in seen:
+                    continue
+                seen.add(key)
+                if not low <= key < high:
+                    continue
+                if index.is_ready(key):
+                    self._prefetch_rows_already_cached += 1
+                    continue
+                result.append(key)
+        return result
+
+    def _ensure_prefetch_worker(self) -> None:
+        """Start the bounded prefetch queue and daemon worker on first use.
+
+        Start and publish under ``_lock`` so close cannot observe an unstarted
+        thread. No-ops when the worker already exists or the cache is closed.
+        """
+        with self._lock:
+            if self._prefetch_thread is not None or self._closed:
+                return
+            self._prefetch_queue = queue.Queue(maxsize=64)
+            self._prefetch_stop = False
+            worker = threading.Thread(
+                target=self._prefetch_loop,
+                name="b12x-ple-prefetch",
+                daemon=True,
+            )
+            worker.start()
+            self._prefetch_thread = worker
+
+    def _prefetch_loop(self) -> None:
+        """Drain the prefetch queue until stopped or handed the close sentinel.
+
+        Each job runs through ``_run_prefetch_job``; errors are counted and
+        swallowed because prefetching is advisory and must never destabilize a
+        caller or the worker.
+        """
+        while not self._prefetch_stop:
+            try:
+                job = self._prefetch_queue.get(timeout=0.05)
+            except queue.Empty:
+                continue
+            if job is _PREFETCH_SENTINEL:
+                break
+            self._prefetch_jobs += 1
+            try:
+                self._run_prefetch_job(job)
+            except Exception:
+                # Prefetch is advisory: a source/transport error must never
+                # surface to, or destabilize, the caller or the worker.
+                self._prefetch_job_errors += 1
+
+    def _run_prefetch_job(self, ids) -> None:
+        """Reserve loading slots for ``ids``, fetch their rows, and publish them.
+
+        Reservation and the pool writes plus ``confirm`` run under ``_lock``;
+        only the source ``_fetch`` runs unlocked. Slots the synchronous path
+        already adopted or cancelled are skipped, and a failed fetch cancels
+        every reservation so uninitialized rows never become hits.
+        """
+        import numpy as np
+
+        index = self._index
+        reserved: list[tuple[int, int]] = []
+        with self._lock:
+            if self._closed or self._row_cache_failed:
+                return
+            for key in ids:
+                slot = index.reserve(key)
+                if slot is not None:
+                    reserved.append((key, slot))
+            self._prefetch_rows_reserved += len(reserved)
+        if not reserved:
+            return
+        count = len(reserved)
+        weight_np = np.zeros((count, self.weight_row_bytes), dtype=np.uint8)
+        scale_np = (
+            np.zeros((count, self.scale_row_bytes), dtype=np.uint8)
+            if self.scale_row_bytes
+            else None
+        )
+        ids_np = np.fromiter((key for key, _ in reserved), dtype=np.int64, count=count)
+        try:
+            self._fetch(
+                memoryview(ids_np),
+                memoryview(weight_np),
+                memoryview(scale_np) if scale_np is not None else None,
+                count,
+            )
+            fetched = True
+        except Exception:
+            fetched = False
+            self._prefetch_source_errors += 1
+        planes = [weight_np] + ([scale_np] if scale_np is not None else [])
+        with self._lock:
+            if self._closed:
+                # ``close`` dropped the index, and with it every reservation:
+                # asking the closed cache to release them again would only
+                # raise, and the worker would log a spurious job error.
+                return
+            if self._row_cache_failed or not fetched:
+                self._prefetch_rows_cancelled += self._cancel_reservations(
+                    index, reserved
+                )
+                return
+            # Write the fetched bytes into the reserved
+            # slots (skipping any the synchronous path already adopted or
+            # cancelled) and publish them, all under _lock. confirm() is
+            # idempotent, so adopting a slot the batch already committed is a
+            # no-op, exactly as with the Python index.
+            published = 0
+            for row, (_, slot) in enumerate(reserved):
+                if not index.is_loading(slot):
+                    continue
+                for plane, pool in zip(planes, self._pool):
+                    pool[slot] = plane[row]
+                published += 1
+            for _, slot in reserved:
+                index.confirm(slot)
+            # Only rows this worker actually wrote count as loaded: a slot the
+            # synchronous path adopted first is a hit someone else published.
+            self._prefetch_rows_loaded += published
+
+    @staticmethod
+    def _cancel_reservations(index, reserved: list[tuple[int, int]]) -> int:
+        """Release every still-loading reservation and report how many fell to us.
+
+        A slot the synchronous path adopted or cancelled first is not ours to
+        release, so counting it would credit the prefetch worker with work it
+        never did — the same rule ``loaded`` follows.
+        """
+        cancelled = 0
+        for _, slot in reserved:
+            if not index.is_loading(slot):
+                continue
+            index.cancel(slot)
+            cancelled += 1
+        return cancelled
 
     def add_shard(
         self, shard_index: int, path: str, offset: int, *, scale: bool = False
     ) -> None:
+        """Register one checkpoint shard file with the io_uring or GDS reader.
+
+        ``offset`` is the byte position of this shard's rows inside ``path``;
+        ``scale`` selects the scale plane instead of the weight plane.
+        Shards that miss this TP shard's row range are a no-op, duplicates
+        raise, and registration must finish before ``freeze``.
+        """
         self._require_open()
+        if self._backend == "host":
+            raise RuntimeError("host-sourced rows have no checkpoint shards")
         with self._lock:
             if self._frozen:
                 raise RuntimeError("cannot change disk shards after binding")
@@ -287,8 +905,15 @@ class DiskRowCache:
             self._sources.add(key)
 
     def require_complete(self) -> None:
+        """Raise ``ValueError`` unless every shard this range needs is registered.
+
+        A host-sourced cache has no checkpoint shards, so the check is
+        skipped there.
+        """
         self._require_open()
         with self._lock:
+            if self._backend == "host":
+                return
             first = self.shard_start // self.shard_rows
             last = (self.shard_end + self.shard_rows - 1) // self.shard_rows
             for shard in range(first, last):
@@ -298,12 +923,20 @@ class DiskRowCache:
                     raise ValueError(f"missing disk scale shard {shard}")
 
     def freeze(self) -> None:
+        """Verify completeness and forbid further shard registration."""
         with self._lock:
             self.require_complete()
             self._frozen = True
 
     @contextmanager
     def transaction(self) -> Iterator[DiskRowCache]:
+        """Context manager owning one batch: ID production through decoding.
+
+        Must run on one thread outside ``torch.compile`` and CUDA graph
+        capture, and cannot nest. On exit it records the ``_cache_done``
+        fence so the next transaction waits until this batch's decoder has
+        finished with the staging buffers.
+        """
         self._require_open()
         if torch.compiler.is_compiling():
             raise RuntimeError("disk table preparation cannot run under torch.compile")
@@ -329,10 +962,21 @@ class DiskRowCache:
                     self._transaction_thread = None
 
     def read_rows(self, ids: torch.Tensor, count: int) -> None:
+        """Stage ``ids[:count]`` and fill the staging planes from the source.
+
+        Convenience over ``_stage_ids`` plus ``_read_staged``; requires an
+        active ``transaction`` on the calling thread.
+        """
         self._stage_ids(ids, count)
         self._read_staged(count)
 
     def _stage_ids(self, ids: torch.Tensor, count: int) -> None:
+        """Copy the first ``count`` device row ids into the pinned host buffer.
+
+        Rejects a count over ``max_lookups`` and any tensor that is not
+        contiguous CUDA ``int64`` on the cache device, then records
+        ``_ids_ready`` on the transaction stream.
+        """
         if self._transaction_thread != threading.get_ident():
             raise RuntimeError("read_rows requires an active disk row transaction")
         count = operator.index(count)
@@ -352,28 +996,99 @@ class DiskRowCache:
         self._ids_ready.record(self._transaction_stream)
 
     def _read_staged(self, count: int) -> None:
+        """Read the staged ids into the staging planes through the active backend.
+
+        Waits for ``_ids_ready`` so ID production completes before any host
+        write, then dispatches to GDS, the plain source ``_fetch``, or the
+        cached path. Raises once a failed miss fetch has poisoned the cache.
+        """
+        if self._row_cache_failed:
+            raise RuntimeError("disk row cache is unusable after a failed miss fetch")
         # Completes ID production and all prior cache readers before host writes.
         with torch.cuda.device(self.device):
             self._ids_ready.synchronize()
             if self._gds is not None:
                 self._gds.read(self._ids_buffer, count, self._transaction_stream)
                 return
-            self._native.ple_reader_run(
-                self._reader,
-                self._ids_buffer,
-                self._weight_buffer,
-                self._scale_buffer,
-                count,
-            )
+            if self._index is None:
+                self._fetch(
+                    self._ids_buffer, self._weight_buffer, self._scale_buffer, count
+                )
+            elif count:
+                self._read_cached(count)
+
+    def _fetch(self, ids, weights, scales, count: int) -> None:
+        """Write source rows for ``ids[:count]`` into C-contiguous row buffers."""
+        if self._backend == "io_uring":
+            self._native.ple_reader_run(self._reader, ids, weights, scales, count)
+            return
+        import numpy as np
+
+        ids = np.frombuffer(ids, dtype=np.int64, count=count)
+        valid = np.flatnonzero((ids >= self.shard_start) & (ids < self.shard_end))
+        rows = ids[valid] - self.shard_start
+        planes = [(weights, self._host_weight)]
+        if self.scale_row_bytes:
+            planes.append((scales, self._host_scale))
+        for out, table in planes:
+            out = np.frombuffer(out, dtype=np.uint8).reshape(-1, table.shape[1])
+            out[:count] = 0
+            out[valid] = table[rows]
+
+    def _read_cached(self, count: int) -> None:
+        """Resolve the batch in the C index, fetching only its misses.
+
+        ``index.read`` stages the hits and reports the distinct miss ids;
+        ``_fetch`` fills the bound miss planes from the source and
+        ``index.store`` commits them. Hits precede any store of the same
+        batch, so this batch's admissions cannot clobber a row it still
+        reads. Any failure marks the cache unusable and stops the prefetch
+        worker rather than serving uninitialized slots.
+        """
+        if self._row_cache_failed:
+            raise RuntimeError("disk row cache is unusable after a failed miss fetch")
+        # One C call resolves the batch: lookups, counter/ghost/queue
+        # mutation, admission evictions, and the hit copies from pool into the
+        # bound staging planes. Miss ids land in the bound pinned buffer; the
+        # io_uring fetch (unchanged, still through _fetch) reads the distinct
+        # miss wave into the bound miss planes; store() then stages misses and
+        # writes pool stores. Hits are staged before any store of the same
+        # batch, so an eviction made for this batch never clobbers a row the
+        # batch still reads (RowPlan; docs/DESIGN.md §3), and the transaction's
+        # _cache_done fence still gates pool reuse across the decode.
+        _, misses = self._index.read(count)
+        try:
+            if misses:
+                self._fetch(
+                    self._miss_ids_view,
+                    self._miss_weight_view,
+                    self._miss_scale_view,
+                    misses,
+                )
+            self._index.store()
+        except BaseException:
+            # Admission precedes fetching bytes. Keep the index alive for an
+            # in-flight prefetch job, but never serve its uninitialized slots.
+            self._row_cache_failed = True
+            self._prefetch_stop = True
+            raise
 
     def stats(self) -> dict[str, int | float]:
+        """Byte budgets plus backend and row-cache counters in one snapshot.
+
+        Combines reader or GDS stats with this object's pinned and pool
+        allocations, folds in the index hit/miss, residency, and queue-depth
+        counters when a row cache is active, and always carries the advisory
+        prefetch counters and the live prefetch queue depth.
+        """
         self._require_open()
         with self._lock:
-            result = dict(
-                self._gds.native.stats(self._gds.reader)
-                if self._gds is not None
-                else self._native.ple_reader_stats(self._reader)
-            )
+            if self._gds is not None:
+                result = dict(self._gds.native.stats(self._gds.reader))
+            elif self._native is not None:
+                result = dict(self._native.ple_reader_stats(self._reader))
+            else:
+                result = {"staging_bytes": 0, "metadata_bytes": 0}
             result["ids_host_bytes"] = (
                 self.ids_host.numel() * self.ids_host.element_size()
             )
@@ -395,17 +1110,60 @@ class DiskRowCache:
             )
             descriptors = result.get("descriptor_bytes", 0)
             result["gds_enabled"] = int(self._gds is not None)
+            device_staged = self._gds is not None
             result["device_staging_bytes"] = (
                 (result["staging_bytes"] + result["cache_bytes"] + descriptors)
-                if self._gds
+                if device_staged
                 else 0
             )
             result["owned_host_bytes"] = (
                 result["ids_host_bytes"] + descriptors + result["metadata_bytes"]
             )
-            if self._gds is None:
+            if not device_staged:
                 result["owned_host_bytes"] += (
                     result["staging_bytes"] + result["cache_bytes"]
                 )
             result["owned_staging_bytes"] += 2 * descriptors
+            if self._index is not None:
+                pool_bytes = self.cache_rows * (
+                    self.weight_row_bytes + self.scale_row_bytes
+                )
+                index_stats = self._index.stats()
+                index_metadata_bytes = index_stats["metadata_bytes"]
+                result["metadata_bytes"] += index_metadata_bytes
+                result["owned_host_bytes"] += index_metadata_bytes
+                lookups = index_stats["hits"] + index_stats["misses"]
+                result.update(
+                    row_cache_tier=self.cache_tier,
+                    row_cache_rows=self.cache_rows,
+                    row_cache_resident=index_stats["resident"],
+                    row_cache_bytes=pool_bytes,
+                    row_cache_metadata_bytes=index_metadata_bytes,
+                    row_cache_hits=index_stats["hits"],
+                    row_cache_misses=index_stats["misses"],
+                    row_cache_hit_rate=(
+                        index_stats["hits"] / lookups if lookups else 0.0
+                    ),
+                    row_cache_small=index_stats["s"],
+                    row_cache_main=index_stats["m"],
+                    row_cache_ghost=index_stats["g"],
+                )
+            result.update(
+                prefetch_requests=self._prefetch_requests,
+                prefetch_rows=self._prefetch_rows,
+                prefetch_rows_already_cached=self._prefetch_rows_already_cached,
+                prefetch_rows_queued=self._prefetch_rows_queued,
+                prefetch_rows_dropped=self._prefetch_rows_dropped,
+                prefetch_jobs=self._prefetch_jobs,
+                prefetch_rows_reserved=self._prefetch_rows_reserved,
+                prefetch_rows_loaded=self._prefetch_rows_loaded,
+                prefetch_rows_cancelled=self._prefetch_rows_cancelled,
+                prefetch_source_errors=self._prefetch_source_errors,
+                prefetch_job_errors=self._prefetch_job_errors,
+                prefetch_queue_depth=(
+                    self._prefetch_queue.qsize() if self._prefetch_queue else 0
+                ),
+                prefetch_worker_started=int(self._prefetch_thread is not None),
+                prefetch_enabled=int(self._prefetch_ok()),
+            )
             return result
