@@ -175,11 +175,13 @@ def query_from_runtime(
             "threads": int(runtime.threads),
             "wait_nanosleep_cycles": int(runtime.wait_nanosleep_cycles),
             "blocks": blocks,
+            "inplace": out is not None and out.data_ptr() == inp.data_ptr(),
             "inp": _tensor_call(inp),
             "output": None if out is None else _tensor_call(out),
         }
         setup = {
             "max_elements": int(runtime.max_elements),
+            "threads_override": bool(getattr(runtime, "threads_override", False)),
             "quarter_capacity": int(runtime.quarter_capacity),
             "stage_offset": int(runtime.stage_offset),
             "part_offset": int(runtime.part_offset),

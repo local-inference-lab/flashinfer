@@ -41,6 +41,19 @@ def _configs(query, device=None):
         call = payload["call"]
         blocks = int(call.get("blocks", call.get("block_limit", 16)))
         threads = int(call["threads"])
+        if name == "island_rs":
+            # Physical blocks own persistent generation counters. Race thread
+            # counts without changing their participation or scratch layout.
+            counts = (
+                (threads,)
+                if payload["setup"].get("threads_override", False)
+                else tuple(dict.fromkeys((threads, 128, 256, 512, 768, 1024)))
+            )
+            for count in counts:
+                yield CollectiveConfig(
+                    implementation=name, threads=count, blocks=blocks
+                )
+            continue
         if name in ("dcp_phased", "dcp_ring", "dcp_recursive", "dcp_recursive_ready"):
             # Automatic admission covers the qualified TP16 hardware. Phased
             # kernels also have to pass the native cluster occupancy check.
@@ -288,6 +301,21 @@ def _validate_query(query, device):
         NATIVE.validate_query(native, device)
         if (native.world_size, native.rank) != (query.world_size, query.rank):
             raise ValueError("native alternatives must use the same rank group")
+        if name == "island_rs" and (
+            query.operation != "all_reduce"
+            or query.world_size != 16
+            or native.surface != "PCIeIslandRSAllReduce.all_reduce"
+        ):
+            raise ValueError("island launch tuning requires its TP16 reduction owner")
+        if name == "island_rs":
+            from ._island_rs_cute import island_rs_peers
+
+            if tuple(native.setup["peer_ranks"]) != island_rs_peers(
+                native.rank, native.world_size
+            ):
+                raise ValueError(
+                    "island tuning peers differ from the rank's reduction topology"
+                )
         if name in (
             "dcp_phased",
             "dcp_ring",
@@ -350,6 +378,9 @@ def _collective_signature(query):
         del native["rank"]
         for section in ("call", "setup"):
             native[section].pop("device_index", None)
+        if name == "island_rs":
+            # These peers are determined by the validated rank and TP16 topology.
+            native["setup"].pop("peer_ranks")
         alternatives[name] = native
     return dict(
         operation=query.operation,
@@ -361,6 +392,9 @@ def _collective_signature(query):
 
 def _family_bucket(query):
     if query.operation != "all_reduce":
+        return None
+    if "island_rs" in query.alternatives:
+        # Retain independent measurements for each message shape and fixed grid.
         return None
     from math import prod
 

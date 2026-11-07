@@ -105,6 +105,7 @@ class PCIeIslandRSAllReduce:
         self.max_elements = int(max_elements)
         self.blocks = None if blocks is None else int(blocks)
         self.threads = _threads_from_env()
+        self.threads_override = "B12X_PCIE_ISLAND_RS_THREADS" in os.environ
         self.wait_nanosleep_cycles = _wait_nanosleep_cycles_from_env()
 
         max_pairs = self.max_elements // 2

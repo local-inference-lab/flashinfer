@@ -192,13 +192,31 @@ class _ReductionInputs:
         query = state.query
         call = query.call
         self.twoshot = query.surface.startswith("PCIeTwoShotBF16.")
+        self.owner = query.surface == "PCIeIslandRSAllReduce.all_reduce"
         self.fused = not query.surface.endswith(".all_reduce")
-        shape = tuple(call["shape"] if self.twoshot else query.setup["shape"])
-        dtype = _DTYPES[call["dtype"]]
+        shape = tuple(
+            call["inp"]["shape"]
+            if self.owner
+            else call["shape"]
+            if self.twoshot
+            else query.setup["shape"]
+        )
+        dtype = _DTYPES[
+            (
+                call["inp"]["dtype"].removeprefix("torch.")
+                if self.owner
+                else call["dtype"]
+            )
+        ]
         device = state.runtime.device
         self.reference = _reduction_reference(query, shape, dtype, device, self.fused)
         self.source = torch.empty(shape, dtype=dtype, device=device)
         self.out = self.source if inplace else torch.empty_like(self.source)
+        self.owner_call = None
+        if self.owner:
+            from ._owner_preparation import prepared_call
+
+            self.owner_call = prepared_call(state, inp=self.source, out=self.out)
         self.residual = self.weight = self.addend = self.group_weights = (
             self.group_ids
         ) = None
@@ -248,6 +266,8 @@ class _ReductionInputs:
 
     def run(self):
         state, call = self.state, self.state.query.call
+        if self.owner:
+            return self.owner_call.run()
         if self.twoshot:
             return state.run(
                 self.source,
@@ -296,12 +316,13 @@ class _ReductionInputs:
     def close(self):
         self.producers = ()
         self.reference = None
+        self.owner_call = None
 
 
 def benchmark_call(state, *, inplace=False):
     dcp = state.query.surface.startswith(("DcpAllToAll.", "DcpAllToAllPool."))
     inputs = _DcpInputs(state) if dcp else _ReductionInputs(state, inplace=inplace)
-    if not dcp and not inputs.twoshot:
+    if not dcp and not inputs.twoshot and not inputs.owner:
         try:
             state.bind_input(inputs.source)
         except BaseException:

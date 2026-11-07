@@ -89,13 +89,28 @@ def plan(
     """Declare native work; neither topology nor a communicator is constructed.
 
     DCP head gather and LSE reduce-scatter expose launch candidates on TP2–8.
-    TP16 head gather also races phased, ring, and recursive-doubling profiles. Other low-level
-    declarations retain their explicit native configuration.
+    TP16 head gather also races phased, ring, and recursive-doubling profiles.
+    IslandRS reductions tune thread counts while retaining their physical grid
+    and resource owner. Other low-level declarations retain their explicit configuration.
     ``AllReduce.plan`` composes eligible one-shot and two-shot transports.
     """
     if not isinstance(query, PcieQuery):
         raise TypeError("query must be PcieQuery")
     TUNING.validate_query(query, None)
+    if (
+        runtime is not None
+        and query.surface == "PCIeIslandRSAllReduce.all_reduce"
+        and not isinstance(override, PcieConfig)
+    ):
+        from ._collective_tuning import plan as collective_plan
+
+        return collective_plan(
+            {"island_rs": (query, runtime)},
+            default="island_rs",
+            inplace=bool(query.call.get("inplace", False)),
+            invocation=invocation,
+            override=override,
+        )
     from ._gather_preparation import GATHER_MODES
 
     if query.surface.endswith(".all_gather_heads") and (
