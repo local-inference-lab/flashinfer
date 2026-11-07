@@ -587,6 +587,94 @@ def test_fused_indexer_preinitialized_state_graph_replay_switches_merge_mode():
 @pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA required for fused indexer"
 )
+@pytest.mark.parametrize("topk", [512, 2048])
+@pytest.mark.parametrize("merge_threshold", [0, 3000])
+@pytest.mark.parametrize("physical_slots", [False, True])
+def test_fused_indexer_graph_live_participants(topk, merge_threshold, physical_slots):
+    """A fixed grid handles mixed growing and shrinking rows without stale state."""
+    device = torch.device("cuda")
+    rows, heads, capacity = 2, 32, 4097
+    q, weights, keys, scales, pages, lengths = _build_case(
+        rows, heads, capacity, topk, seed=581, device=device
+    )
+    pages.copy_(pages.flip(1))
+    ctas = torch.cuda.get_device_properties(device).multi_processor_count // rows
+    pack_capacity, state_words = fused_indexer_scratch_capacity(rows, topk, ctas * rows)
+    pack_values = torch.empty(pack_capacity, dtype=torch.float32, device=device)
+    pack_indices = torch.empty(pack_capacity, dtype=torch.int32, device=device)
+    state = torch.zeros(state_words, dtype=torch.int32, device=device)
+    ids = torch.empty((rows, topk), dtype=torch.int32, device=device)
+    values = torch.empty((rows, topk), dtype=torch.float32, device=device)
+    kwargs = dict(
+        q_bytes=q.view(torch.uint8),
+        weights=weights,
+        k_quant_bytes=keys.view(torch.uint8),
+        k_scales=scales,
+        real_page_table=pages,
+        seqlens=lengths,
+        num_heads=heads,
+        topk=topk,
+        ctas_per_group=ctas,
+        merge_threshold=merge_threshold,
+        out_indices=ids,
+        out_values=values,
+        pack_values=pack_values,
+        pack_indices=pack_indices,
+        merge_state=state,
+        merge_state_preinitialized=True,
+        output_physical_slots=physical_slots,
+    )
+    run_fused_paged_indexer(**kwargs)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run_fused_paged_indexer(**kwargs)
+    references = []
+    positions = torch.arange(capacity, device=device)
+    for row in range(rows):
+        k = keys[pages[row].long()].float().reshape(-1, 128)[:capacity]
+        scale = scales[pages[row].long()].flatten()[:capacity]
+        score = ((q[row].float() @ k.T).relu() * weights[row, :, None]).sum(0) * scale
+        output_ids = (
+            pages[row, positions // 64].long() * 64 + positions % 64
+            if physical_slots
+            else positions
+        )
+        references.append((score, output_ids))
+    boundaries = [0, 1, 63, 64, 65, 127, 128, 129, 300, topk, topk + 1, capacity]
+    for a, b in zip(boundaries + boundaries[::-1], boundaries[::-1] + boundaries):
+        lengths.copy_(torch.tensor([a, b], device=device, dtype=torch.int32))
+        ids.fill_(-999)
+        values.fill_(float("nan"))
+        pack_values.fill_(float("nan"))
+        pack_indices.fill_(-999)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert not torch.any(state)
+        for row, live in enumerate([a, b]):
+            count = min(live, topk)
+            assert (ids[row, :count] >= 0).all()
+            assert (ids[row, count:] == -1).all()
+            assert torch.isneginf(values[row, count:]).all()
+            assert ids[row, :count].unique().numel() == count
+            scores, expected_ids = references[row]
+            expected = torch.topk(scores[:live], count).indices
+            assert set(ids[row, :count].tolist()) == set(
+                expected_ids[expected].tolist()
+            )
+            actual_order = torch.argsort(ids[row, :count])
+            expected_order = torch.argsort(expected_ids[expected])
+            torch.testing.assert_close(
+                values[row, :count][actual_order],
+                scores[expected][expected_order],
+                atol=1e-2,
+                rtol=0,
+            )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA required for fused indexer"
+)
 @pytest.mark.parametrize("rows", [1, 2, 4])
 def test_fused_indexer_mla_matches_reference(rows):
     # FLAT/MLA: contiguous K, per-row [k_start, k_end) windows -> absolute indices.

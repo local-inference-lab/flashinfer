@@ -118,6 +118,22 @@ _THREADS_PER_CTA = 1024
 # Per-CTA K-slice cap; each CTA streams its slice through MMA sub-tiles.
 _MAX_CHUNK_ELEMENTS = 8192
 
+
+@dsl_user_op
+def _exit_thread(*, loc=None, ip=None):
+    llvm.inline_asm(
+        None,
+        [],
+        "exit;",
+        "",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
 # Constexpr K/V-layout specialization (the ONLY contiguous-vs-paged divergence in the
 # fused kernel — everything downstream of the SMEM staging tile is shared).
 KV_LAYOUT_CONTIGUOUS_MLA = 0
@@ -3373,6 +3389,20 @@ class DSAFusedIndexerKernel:
             group_id = bid // ctas_pg
             cta_in_group = bid - group_id * ctas_pg
         q_idx = group_id
+        if cutlass.const_expr(not self.mxfp4):
+            if cutlass.const_expr(self.kv_layout == KV_LAYOUT_PAGED):
+                live_length = Int32(seqlens_per_query[q_idx])
+            else:
+                live_length = Int32(k_end[q_idx]) - Int32(k_start[q_idx])
+            live_pages = (
+                cutlass.max(live_length, Int32(0)) + Int32(_PAGE_SIZE - 1)
+            ) // Int32(_PAGE_SIZE)
+            ctas_pg = cutlass.max(Int32(1), cutlass.min(ctas_pg, live_pages))
+            # Empty slices must not join the merge. Block-to-row addressing and
+            # scratch extents remain capture-static; every live participant uses
+            # the same count for partitioning, barriers, and state reset.
+            if cta_in_group >= ctas_pg:
+                _exit_thread()
         lane = tx % Int32(_WARP_THREADS)
         warp_idx = tx // Int32(_WARP_THREADS)
         topk_static = Int32(self.topk)
@@ -5004,6 +5034,21 @@ class DSAFusedIndexerKernel:
                         i += Int32(self.radix_threads)
                     cute.arch.sync_threads()
                     carry_count = topk_static
+        if cutlass.const_expr(not self.mxfp4 and self.merge_in_kernel):
+            if ctas_pg == Int32(1):
+                single_out = Int32(tx)
+                while single_out < topk_static:
+                    single_valid = single_out < carry_count
+                    out_values[group_id, single_out] = (
+                        Float32(s_c0_values[single_out])
+                        if single_valid
+                        else Float32(float("-inf"))
+                    )
+                    out_indices[group_id, single_out] = (
+                        Int32(s_c0_gindex[single_out]) if single_valid else Int32(-1)
+                    )
+                    single_out += Int32(self.radix_threads)
+                _exit_thread()
         if cutlass.const_expr(not self.merge_in_kernel):
             if cutlass.const_expr(self.mxfp4 and self.ordered_output):
                 _mxfp4_order_output(
@@ -5047,7 +5092,8 @@ class DSAFusedIndexerKernel:
             #     packed slab (no grid barriers; cheaper for few-row/short-K).
             # Both arms index the per-group _COOP_STATE_WORDS state block via
             # _fused_state_offset, so groups taking different arms never collide.
-            ctas_pg = Int32(self.ctas_per_group)
+            if cutlass.const_expr(self.mxfp4):
+                ctas_pg = Int32(self.ctas_per_group)
             barrier_phase = Int32(0)
             cap = Int32(self.pack_cap)
             slab_base = Int64(group_id) * Int64(cap)
@@ -5619,14 +5665,14 @@ def _launch_fused(kernel, cute_args, key_tensors, policy, *, launcher=None):
         # so this keeps its historical key. The suffix keeps the key honest (no trace
         # collision) if a <16-SM device ever oversubscribes a direct-K build.
         variant = (
-            "fused_indexer_v10_directk64"
+            "fused_indexer_v12_live_ctas_directk64"
             if kernel.coop_co_resident
-            else "fused_indexer_v10_directk64_oversub_serial"
+            else "fused_indexer_v12_live_ctas_directk64_oversub_serial"
         )
     elif kernel.coop_co_resident:
-        variant = "fused_indexer_v8_coop"
+        variant = "fused_indexer_v12_live_ctas_coop"
     else:
-        variant = "fused_indexer_v8_oversub_serial"
+        variant = "fused_indexer_v12_live_ctas_oversub_serial"
     cache_key = tuple(_fused_indexer_tensor_key(name, t) for name, t in key_tensors) + (
         (variant,) + tuple(policy),
     )
