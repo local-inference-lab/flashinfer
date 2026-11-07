@@ -124,7 +124,9 @@ def _nanosleep(cycles: Uint32, *, loc=None, ip=None) -> None:
 @cute.jit
 def _wait_for(address: Int64, generation: Uint32, cycles: int) -> None:
     observed = _load_acquire_sys_u32(address)
-    while observed < generation:
+    # A later ready tag also suffices. Signed modular comparison preserves this
+    # ordering across wrap; the two-slot protocol bounds producer advancement.
+    while Int32(observed - generation) < Int32(0):
         if cutlass.const_expr(cycles > 0):
             _nanosleep(Uint32(cycles))
         observed = _load_acquire_sys_u32(address)
@@ -228,6 +230,7 @@ class _IslandRSLaunch:
         *,
         threads: int = 128,
         wait_nanosleep_cycles: int = 24,
+        cross_island_rsag: bool = False,
     ) -> None:
         if world_size != _MAX_WORLD_SIZE:
             raise ValueError(f"unsupported world size {world_size}")
@@ -235,6 +238,9 @@ class _IslandRSLaunch:
             raise ValueError(f"invalid rank {rank} for world size {world_size}")
         if not 32 <= threads <= 1024 or threads % 32:
             raise ValueError("threads must be a multiple of 32 in [32, 1024]")
+        if type(cross_island_rsag) is not bool:
+            raise TypeError("cross_island_rsag must be a boolean")
+        self._cross_island_rsag = cross_island_rsag
         self._world_size = int(world_size)
         self._rank = int(rank)
         self._threads = int(threads)
@@ -495,8 +501,9 @@ class _IslandRSLaunch:
             index += stride
         cute.arch.barrier()
 
-        # Phase 2 -- combine the four island partials for my quarter, again by
-        # pulling, from the same lane in every island.
+        # The XS mailbox publishes partial-ready (2*g), then final-ready (2*g+1)
+        # for scattered stripes. A later tag also certifies the still-live partials.
+        # Both modes sum island partials in the same order before BF16 conversion.
         if tidx == Int32(0):
             _fence_sc_sys()
             for j in cutlass.range_constexpr(_MAX_ISLANDS):
@@ -509,13 +516,13 @@ class _IslandRSLaunch:
                             bidx,
                             Int32(self._island),
                         ),
-                        generation,
+                        generation * Uint32(2),
                     )
             for j in cutlass.range_constexpr(_MAX_ISLANDS):
                 if cutlass.const_expr(j != self._island):
                     _wait_for(
                         _flag_address(self_base, _XS_ARRIVED, bidx, Int32(j)),
-                        generation,
+                        generation * Uint32(2),
                         self._wait_nanosleep_cycles,
                     )
         cute.arch.barrier()
@@ -529,10 +536,17 @@ class _IslandRSLaunch:
             ).align(4),
             dtype=Uint32,
         )
+        # Distribute stride positions across islands without changing which
+        # CTA owns their publication flags. The final plane already reserves a
+        # full vector and can hold both partial and assembled final quarters.
+        cross_stride = stride
         index = start
-        # Read four independent stride positions before consuming peer values.
+        if cutlass.const_expr(self._cross_island_rsag):
+            index += Int64(self._island) * stride
+            cross_stride *= Int64(_MAX_ISLANDS)
+        # Read four independent cross_stride positions before consuming peer values.
         # Each block retains the residue classes covered by its arrival flag.
-        while index + Int64(3) * stride < mine_length:
+        while index + Int64(3) * cross_stride < mine_length:
             words = ()
             for p in cutlass.range_constexpr(_ISLAND_SIZE):
                 partner = p * _ISLAND_SIZE + self._lane
@@ -546,7 +560,7 @@ class _IslandRSLaunch:
                     dtype=Uint32,
                 )
                 for item in cutlass.range_constexpr(4):
-                    words += (partner_part[index + Int64(item) * stride],)
+                    words += (partner_part[index + Int64(item) * cross_stride],)
             for item in cutlass.range_constexpr(4):
                 total_lo = Float32(0.0)
                 total_hi = Float32(0.0)
@@ -555,9 +569,9 @@ class _IslandRSLaunch:
                     total_lo += lo
                     total_hi += hi
                 value = pack_f32x2_to_bf16x2(total_lo, total_hi)
-                self_final[mine_begin + index + Int64(item) * stride] = value
-                output_words[mine_begin + index + Int64(item) * stride] = value
-            index += Int64(4) * stride
+                self_final[mine_begin + index + Int64(item) * cross_stride] = value
+                output_words[mine_begin + index + Int64(item) * cross_stride] = value
+            index += Int64(4) * cross_stride
         while index < mine_length:
             total_lo = Float32(0.0)
             total_hi = Float32(0.0)
@@ -578,8 +592,51 @@ class _IslandRSLaunch:
             value = pack_f32x2_to_bf16x2(total_lo, total_hi)
             self_final[mine_begin + index] = value
             output_words[mine_begin + index] = value
-            index += stride
+            index += cross_stride
         cute.arch.barrier()
+
+        if cutlass.const_expr(self._cross_island_rsag):
+            if tidx == Int32(0):
+                _fence_sc_sys()
+                for j in cutlass.range_constexpr(_MAX_ISLANDS):
+                    if cutlass.const_expr(j != self._island):
+                        partner = j * _ISLAND_SIZE + self._lane
+                        _store_release_sys_u32(
+                            _flag_address(
+                                Int64(slabs[partner].toint()),
+                                _XS_ARRIVED,
+                                bidx,
+                                Int32(self._island),
+                            ),
+                            generation * Uint32(2) + Uint32(1),
+                        )
+                for j in cutlass.range_constexpr(_MAX_ISLANDS):
+                    if cutlass.const_expr(j != self._island):
+                        _wait_for(
+                            _flag_address(self_base, _XS_ARRIVED, bidx, Int32(j)),
+                            generation * Uint32(2) + Uint32(1),
+                            self._wait_nanosleep_cycles,
+                        )
+            cute.arch.barrier()
+            for j in cutlass.range_constexpr(_MAX_ISLANDS):
+                if cutlass.const_expr(j != self._island):
+                    partner = j * _ISLAND_SIZE + self._lane
+                    partner_final = cute.recast_ptr(
+                        cute.make_ptr(
+                            cutlass.BFloat16,
+                            Int64(slabs[partner].toint()) + final_offset,
+                            cute.AddressSpace.gmem,
+                            assumed_align=16,
+                        ).align(4),
+                        dtype=Uint32,
+                    )
+                    index = start + Int64(j) * stride
+                    while index < mine_length:
+                        value = partner_final[mine_begin + index]
+                        self_final[mine_begin + index] = value
+                        output_words[mine_begin + index] = value
+                        index += cross_stride
+            cute.arch.barrier()
 
         # Phase 3 -- island all-gather, pulling the three quarters I do not own
         # straight into my output.
@@ -636,6 +693,7 @@ def get_island_rs_launcher(
     *,
     threads: int = 128,
     wait_nanosleep_cycles: int = 24,
+    cross_island_rsag: bool = False,
 ) -> Callable[..., None]:
     """Return the rank-specialized TP16 island reduce-scatter launcher."""
 
@@ -645,12 +703,14 @@ def get_island_rs_launcher(
         rank,
         threads=threads,
         wait_nanosleep_cycles=wait_nanosleep_cycles,
+        cross_island_rsag=cross_island_rsag,
     )
     cache_key = (
         int(world_size),
         int(rank),
         int(threads),
         int(wait_nanosleep_cycles),
+        bool(cross_island_rsag),
     )
     raise_if_kernel_resolution_frozen(
         "cute.compile", target=launch, cache_key=cache_key
@@ -682,6 +742,7 @@ def get_island_rs_launcher(
                 "rank",
                 "threads",
                 "wait_nanosleep_cycles",
+                "cross_island_rsag",
             ),
         ),
     )

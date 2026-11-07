@@ -104,9 +104,23 @@ def plan(
     ):
         from ._collective_tuning import plan as collective_plan
 
+        scattered = bool(query.call.get("cross_island_rsag", False))
+        default = "island_rsag" if scattered else "island_rs"
+        alternatives = {default: (query, runtime)}
+        if not query.setup.get("threads_override", False):
+            other = "island_rs" if scattered else "island_rsag"
+            alternatives[other] = (
+                replace(
+                    query,
+                    call=FrozenMapping(
+                        {**query.call, "cross_island_rsag": not scattered}
+                    ),
+                ),
+                runtime,
+            )
         return collective_plan(
-            {"island_rs": (query, runtime)},
-            default="island_rs",
+            alternatives,
+            default=default,
             inplace=bool(query.call.get("inplace", False)),
             invocation=invocation,
             override=override,

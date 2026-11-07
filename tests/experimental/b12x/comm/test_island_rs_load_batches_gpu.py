@@ -1,6 +1,7 @@
 """Exercise TP16 reduction tails and changing inputs through prepared graphs."""
 
 from datetime import timedelta
+import ctypes
 import os
 from pathlib import Path
 import tempfile
@@ -39,7 +40,36 @@ def _ordered_reference(elements, variation, device):
     return result.bfloat16()
 
 
-def _worker(rank, rendezvous):
+def _seed_generation(owner, generation):
+    from b12x.comm.pcie._island_rs_cute import (
+        HEADER_BYTES,
+        MAX_BLOCKS,
+        _RS_ARRIVED,
+        _XS_ARRIVED,
+        _AG_ARRIVED,
+    )
+
+    words = (ctypes.c_uint32 * (HEADER_BYTES // 4))()
+    for block in range(MAX_BLOCKS):
+        words[block] = generation
+        for peer in range(4):
+            offset = (block * 4 + peer) * 128
+            words[(_RS_ARRIVED + offset) // 4] = generation
+            words[(_AG_ARRIVED + offset) // 4] = generation
+            words[(_XS_ARRIVED + offset) // 4] = (2 * generation + 1) & 0xFFFFFFFF
+    stream = torch.cuda.current_stream(owner.device)
+    owner._ipc.cudaMemset(
+        owner._local_ptr + owner.stage_offset,
+        0xFF,
+        owner.slab_bytes - owner.stage_offset,
+    )
+    owner._ipc.cudaMemcpyAsync(
+        owner._local_ptr, ctypes.addressof(words), HEADER_BYTES, stream.cuda_stream
+    )
+    stream.synchronize()
+
+
+def _worker(rank, rendezvous, cross_scatter=False):
     from dataclasses import replace
 
     from b12x.comm.pcie import _owner_preparation as preparation
@@ -98,6 +128,18 @@ def _worker(rank, rendezvous):
                     expected = [
                         _ordered_reference(elements, n, device) for n in range(3)
                     ]
+                    if cross_scatter:
+                        if rank == 0:
+                            inputs[2][0] = float("nan")
+                            inputs[2][1] = float("inf")
+                        expected[2][0] = float("nan")
+                        expected[2][1] = float("inf")
+                        if elements > 2:
+                            if rank in (0, 4):
+                                inputs[2][2] = (
+                                    float("inf") if rank == 0 else -float("inf")
+                                )
+                            expected[2][2] = float("nan")
                     outputs = [torch.empty_like(source) for _ in range(3)]
                     plans = []
                     for index, output in enumerate(outputs):
@@ -107,7 +149,13 @@ def _worker(rank, rendezvous):
                         )
                         query = replace(
                             query,
-                            call=FrozenMapping({**query.call, "threads": threads}),
+                            call=FrozenMapping(
+                                {
+                                    **query.call,
+                                    "threads": threads,
+                                    "cross_island_rsag": cross_scatter and index != 0,
+                                }
+                            ),
                         )
                         plan = preparation.plan(query, runtime=owner)
                         session.prepare(
@@ -116,10 +164,12 @@ def _worker(rank, rendezvous):
                                     name=f"reduce-{elements}-{index}",
                                     prepare_call=lambda state,
                                     source=source,
-                                    output=output: preparation.prepared_call(
-                                        state,
-                                        inp=source,
-                                        out=output,
+                                    output=output: (
+                                        preparation.prepared_call(
+                                            state,
+                                            inp=source,
+                                            out=output,
+                                        )
                                     ),
                                 ),
                             )
@@ -133,7 +183,9 @@ def _worker(rank, rendezvous):
                             owner.all_reduce(source, out=output, plan=plan)
                     torch.cuda.synchronize()
                     for output, reference in zip(outputs, expected, strict=True):
-                        assert torch.equal(output, reference), (rank, elements, "eager")
+                        torch.testing.assert_close(
+                            output, reference, rtol=0, atol=0, equal_nan=True
+                        )
 
                     graph = torch.cuda.CUDAGraph()
                     dist.barrier()
@@ -148,6 +200,10 @@ def _worker(rank, rendezvous):
                     cases.append((elements, source, inputs, outputs, expected))
 
                 torch.cuda.synchronize()
+                if cross_scatter:
+                    dist.barrier()
+                    _seed_generation(owner, 0xFFFFFFFE)
+                    dist.barrier()
                 before = torch.cuda.memory_stats(device)
                 for repetition in range(5):
                     if rank == repetition:
@@ -160,17 +216,31 @@ def _worker(rank, rendezvous):
                 for key in ("allocation.all.allocated", "segment.all.allocated"):
                     assert before[key] == after[key], key
                 for elements, source, inputs, outputs, expected in cases:
-                    assert torch.equal(source, inputs[-1]), (
+                    assert torch.equal(
+                        source.view(torch.int16), inputs[-1].view(torch.int16)
+                    ), (
                         rank,
                         elements,
                         "input mutation",
                     )
                     for output, reference in zip(outputs, expected, strict=True):
-                        assert torch.equal(output, reference), (
-                            rank,
-                            elements,
-                            "queued replay",
+                        torch.testing.assert_close(
+                            output, reference, rtol=0, atol=0, equal_nan=True
                         )
+                if cross_scatter:
+                    counters = (ctypes.c_uint32 * blocks)()
+                    stream = torch.cuda.current_stream(device)
+                    owner._ipc.cudaMemcpyAsync(
+                        ctypes.addressof(counters),
+                        owner._local_ptr,
+                        blocks * 4,
+                        stream.cuda_stream,
+                    )
+                    stream.synchronize()
+                    expected_generation = (
+                        0xFFFFFFFE + len(shapes) * 3 * 5
+                    ) & 0xFFFFFFFF
+                    assert tuple(counters) == (expected_generation,) * blocks
                 dist.barrier()
                 if rank == 0:
                     print(
@@ -193,4 +263,13 @@ def test_island_rs_prepared_graphs_with_load_batch_tails():
     with tempfile.TemporaryDirectory(prefix="island-rs-load-test-") as directory:
         mp.spawn(
             _worker, args=(Path(directory, "gloo").as_uri(),), nprocs=16, join=True
+        )
+
+
+def test_island_cross_scatter_mixed_protocols_and_rollover():
+    if torch.cuda.device_count() != 16:
+        pytest.skip("requires exactly sixteen visible GPUs")
+    with tempfile.TemporaryDirectory(prefix="island-scatter-test-") as directory:
+        mp.spawn(
+            _worker, args=(Path(directory, "gloo").as_uri(), True), nprocs=16, join=True
         )

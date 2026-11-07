@@ -116,6 +116,7 @@ def test_island_tunes_threads_without_changing_counter_participation():
             config for _, config in TUNING.iterate(TUNING.configure(query, device=None))
         ]
     assert {config.threads for config in configs} == {128, 256, 512, 768, 1024}
+    assert {config.submode for config in configs} == {""}
     assert {config.blocks for config in configs} == {16}
     assert _family_bucket(query) is None
     with autotune_effort("off"):
@@ -143,13 +144,31 @@ def test_island_native_override_preserves_fixed_declaration():
     from b12x.comm.pcie._tuning import PcieQuery, TUNING as NATIVE
     from b12x.comm.pcie._collective_tuning import TUNING as COLLECTIVE
     from b12x.comm.pcie.pcie_island_rs import PCIeIslandRSAllReduce
-    from b12x.preparation import BackendConfig
+    from b12x.preparation import BackendConfig, ParameterBinding, autotune_effort
 
     # Declaration only: no allocator, process group, or CUDA context is needed.
     owner = object.__new__(PCIeIslandRSAllReduce)
     owner.device, owner.rank, owner.world_size = torch.device("cuda", 0), 0, 16
     native = PcieQuery(**_island_query().alternatives["island_rs"])
-    assert plan(native, runtime=owner).contract is COLLECTIVE
+    prepared = plan(native, runtime=owner)
+    assert prepared.contract is COLLECTIVE
+    assert set(prepared.query.alternatives) == {"island_rs", "island_rsag"}
+    assert (
+        prepared.query.alternatives["island_rsag"]["call"]["cross_island_rsag"] is True
+    )
+    assert (
+        next(k for k in COLLECTIVE.knobs if k.name == "implementation").binding
+        is ParameterBinding.COMPILE
+    )
+    with autotune_effort("default"):
+        configs = [
+            c
+            for _, c in COLLECTIVE.iterate(
+                COLLECTIVE.configure(prepared.query, device=None)
+            )
+        ]
+    assert len(configs) == 10
+    assert {c.submode for c in configs} == {""}
     fixed = plan(native, runtime=owner, override=BackendConfig(backend="native"))
     assert fixed.contract is NATIVE
 

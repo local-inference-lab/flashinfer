@@ -176,6 +176,7 @@ def query_from_runtime(
             "wait_nanosleep_cycles": int(runtime.wait_nanosleep_cycles),
             "blocks": blocks,
             "inplace": out is not None and out.data_ptr() == inp.data_ptr(),
+            "cross_island_rsag": False,
             "inp": _tensor_call(inp),
             "output": None if out is None else _tensor_call(out),
         }
@@ -258,6 +259,7 @@ def compile_owner_surface(query_payload, ordinal):
                 ordinal,
                 threads=call["threads"],
                 wait_nanosleep_cycles=call["wait_nanosleep_cycles"],
+                cross_island_rsag=call.get("cross_island_rsag", False),
             )
     raise ValueError(f"unsupported PCIe owner surface {query.surface!r}")
 

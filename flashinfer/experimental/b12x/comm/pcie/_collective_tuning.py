@@ -41,7 +41,7 @@ def _configs(query, device=None):
         call = payload["call"]
         blocks = int(call.get("blocks", call.get("block_limit", 16)))
         threads = int(call["threads"])
-        if name == "island_rs":
+        if name in ("island_rs", "island_rsag"):
             # Physical blocks own persistent generation counters. Race thread
             # counts without changing their participation or scratch layout.
             counts = (
@@ -301,14 +301,21 @@ def _validate_query(query, device):
         NATIVE.validate_query(native, device)
         if (native.world_size, native.rank) != (query.world_size, query.rank):
             raise ValueError("native alternatives must use the same rank group")
-        if name == "island_rs" and (
+        if name in ("island_rs", "island_rsag") and (
             query.operation != "all_reduce"
             or query.world_size != 16
             or native.surface != "PCIeIslandRSAllReduce.all_reduce"
         ):
             raise ValueError("island launch tuning requires its TP16 reduction owner")
-        if name == "island_rs":
+        if name in ("island_rs", "island_rsag"):
             from ._island_rs_cute import island_rs_peers
+
+            if bool(native.call.get("cross_island_rsag", False)) != (
+                name == "island_rsag"
+            ):
+                raise ValueError(
+                    "island implementation differs from its compiled protocol"
+                )
 
             if tuple(native.setup["peer_ranks"]) != island_rs_peers(
                 native.rank, native.world_size
@@ -378,7 +385,7 @@ def _collective_signature(query):
         del native["rank"]
         for section in ("call", "setup"):
             native[section].pop("device_index", None)
-        if name == "island_rs":
+        if name in ("island_rs", "island_rsag"):
             # These peers are determined by the validated rank and TP16 topology.
             native["setup"].pop("peer_ranks")
         alternatives[name] = native
@@ -393,7 +400,7 @@ def _collective_signature(query):
 def _family_bucket(query):
     if query.operation != "all_reduce":
         return None
-    if "island_rs" in query.alternatives:
+    if any(name in query.alternatives for name in ("island_rs", "island_rsag")):
         # Retain independent measurements for each message shape and fixed grid.
         return None
     from math import prod
