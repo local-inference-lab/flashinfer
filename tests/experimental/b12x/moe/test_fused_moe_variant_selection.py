@@ -175,7 +175,7 @@ def test_tuning_routes_cover_distinct_valid_scenarios(tokens, topk, experts):
     from b12x.moe.fused_moe.workloads import make_tuning_routes
 
     ids = make_tuning_routes(tokens, topk, experts, device="cpu")
-    assert ids.shape == (6, tokens, topk)
+    assert ids.shape == (8, tokens, topk)
     assert ids.dtype == torch.int32
     assert ids.min() >= 0 and ids.max() < experts
     assert (ids.sort(dim=-1).values.diff(dim=-1) > 0).all()
@@ -185,6 +185,41 @@ def test_tuning_routes_cover_distinct_valid_scenarios(tokens, topk, experts):
     assert not torch.equal(
         ids, make_tuning_routes(tokens, topk, experts, device="cpu", seed=999)
     )
+
+
+@pytest.mark.parametrize("samples", (1, 2, 3))
+def test_tuning_routes_preserve_statistical_cases_and_cover_whole_batch_sharing(
+    samples,
+):
+    from b12x.moe.fused_moe.workloads import make_routing_ids, make_tuning_routes
+
+    tokens, topk, experts, seed = 41, 6, 384, 104729
+    actual = make_tuning_routes(
+        tokens, topk, experts, device="cpu", seed=seed, samples_per_workload=samples
+    )
+    expected = torch.stack(
+        [
+            make_routing_ids(
+                tokens,
+                topk,
+                experts,
+                workload=workload,
+                seed=seed + tokens + 1009 * index,
+            )
+            for workload in ("diffuse", "skewed", "correlated", "shared_100")
+            for index in range(samples)
+        ]
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    shared = actual[3 * samples :]
+    assert shared.shape == (samples, tokens, topk)
+    for routes in shared:
+        assert routes.unique().numel() == topk
+        assert torch.equal(
+            routes.sort(dim=-1).values, routes[0].sort().values.expand_as(routes)
+        )
+    if samples > 1:
+        assert not torch.equal(shared[0].sort().values, shared[1].sort().values)
 
 
 def test_statistical_routes_separate_popularity_and_token_correlation():
