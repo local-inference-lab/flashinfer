@@ -34,7 +34,6 @@ def _worker(rank, directory):
         exchange_group=dist.group.WORLD,
         device=device,
         max_elements=1024 * 7168,
-        blocks=16,
     )
     assert not owner.threads_override, "run without B12X_PCIE_ISLAND_RS_THREADS"
     try:
@@ -42,7 +41,7 @@ def _worker(rank, directory):
             session = PreparationSession(
                 device=device,
                 cache_dir=Path(directory) / f"rank{rank}",
-                namespace={"test": "island-thread-tuning"},
+                namespace={"test": "island-active-tuning"},
                 cache_only=cached,
                 compile_workers=4,
                 rounds=2,
@@ -80,12 +79,18 @@ def _worker(rank, directory):
             for source, output, seed, prepared, inplace in cases:
                 assert prepared.selection.source == ("cached" if cached else "tuned")
                 config = prepared.selection.config
-                assert config.blocks == 16
+                assert config.blocks == owner.blocks
+                assert 1 <= config.active_blocks <= config.blocks
                 peers = [None] * 16
                 dist.all_gather_object(peers, asdict(config))
                 assert all(value == peers[0] for value in peers)
                 source.zero_()
-                owner.all_reduce(source, out=output, plan=prepared)
+                owner.all_reduce(
+                    source,
+                    out=output,
+                    plan=prepared,
+                    active_blocks=config.active_blocks,
+                )
             torch.cuda.synchronize()
             graphs = []
             for order in (cases, list(reversed(cases))):
@@ -133,7 +138,7 @@ def _worker(rank, directory):
     os.getenv("B12X_RUN_COLLECTIVE_TUNING_TEST") != "1",
     reason="requires sixteen peer-accessible SM120 GPUs",
 )
-def test_island_rs_thread_tuning_and_cached_replay(tmp_path):
+def test_island_rs_participation_tuning_and_cached_replay(tmp_path):
     import torch
     import torch.multiprocessing as mp
 

@@ -43,6 +43,7 @@ def _ordered_reference(elements, variation, device):
 def _seed_generation(owner, generation):
     from b12x.comm.pcie._island_rs_cute import (
         HEADER_BYTES,
+        _ACTIVE_EPOCH_OFFSET,
         MAX_BLOCKS,
         _RS_ARRIVED,
         _XS_ARRIVED,
@@ -52,6 +53,7 @@ def _seed_generation(owner, generation):
     words = (ctypes.c_uint32 * (HEADER_BYTES // 4))()
     for block in range(MAX_BLOCKS):
         words[block] = generation
+        words[_ACTIVE_EPOCH_OFFSET // 4 + block] = generation
         for peer in range(4):
             offset = (block * 4 + peer) * 128
             words[(_RS_ARRIVED + offset) // 4] = generation

@@ -162,19 +162,22 @@ def query_from_runtime(
         inp, out = raw["inp"], raw.get("out")
         from .pcie_island_rs import _pick_blocks
 
-        blocks = (
-            int(raw["blocks"])
-            if raw.get("blocks") is not None
-            else (
-                runtime.blocks
-                if runtime.blocks is not None
-                else _pick_blocks(inp.numel())
+        blocks = int(runtime.blocks)
+        if raw.get("blocks") is not None and int(raw["blocks"]) != blocks:
+            raise ValueError(
+                "the island owner's physical grid cannot change between calls"
             )
-        )
+        blocks_override = runtime.blocks_override or raw.get("blocks") is not None
+        active = raw.get("active_blocks")
+        if active is None:
+            active = (
+                blocks if blocks_override else min(blocks, _pick_blocks(inp.numel()))
+            )
         controls = {
             "threads": int(runtime.threads),
             "wait_nanosleep_cycles": int(runtime.wait_nanosleep_cycles),
             "blocks": blocks,
+            "active_blocks": int(active),
             "inplace": out is not None and out.data_ptr() == inp.data_ptr(),
             "cross_island_rsag": False,
             "local_push": False,
@@ -184,6 +187,8 @@ def query_from_runtime(
         setup = {
             "max_elements": int(runtime.max_elements),
             "threads_override": bool(getattr(runtime, "threads_override", False)),
+            "blocks_override": bool(blocks_override),
+            "active_blocks_override": raw.get("active_blocks") is not None,
             "quarter_capacity": int(runtime.quarter_capacity),
             "stage_offset": int(runtime.stage_offset),
             "part_offset": int(runtime.part_offset),
@@ -420,6 +425,7 @@ def prepared_call(state, **actual):
                 out,
                 query.call["blocks"],
                 actual.get("stream"),
+                active_blocks=query.call["active_blocks"],
             ),
             output=out,
             capture_safe=True,

@@ -90,8 +90,8 @@ def plan(
 
     DCP head gather and LSE reduce-scatter expose launch candidates on TP2–8.
     TP16 head gather also races phased, ring, and recursive-doubling profiles.
-    IslandRS reductions tune thread counts while retaining their physical grid
-    and resource owner. Other low-level declarations retain their explicit configuration.
+    IslandRS reductions tune threads and active CTA counts while retaining a
+    fixed physical grid and resource owner. Other low-level declarations retain their explicit configuration.
     ``AllReduce.plan`` composes eligible one-shot and two-shot transports.
     """
     if not isinstance(query, PcieQuery):

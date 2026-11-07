@@ -88,7 +88,8 @@ def _island_query(rank=0, *, threads=512, override=False, inplace=False):
         topology="pcie_ipc",
         call=dict(
             threads=threads,
-            blocks=16,
+            blocks=64,
+            active_blocks=16,
             inplace=inplace,
             inp=dict(shape=(1024, 7168), dtype="torch.bfloat16"),
         ),
@@ -101,12 +102,12 @@ def _island_query(rank=0, *, threads=512, override=False, inplace=False):
         alternatives=FrozenMapping({"island_rs": native}),
         inplace=inplace,
         default=CollectiveConfig(
-            implementation="island_rs", threads=threads, blocks=16
+            implementation="island_rs", threads=threads, blocks=64, active_blocks=16
         ),
     )
 
 
-def test_island_tunes_threads_without_changing_counter_participation():
+def test_island_tunes_threads_and_participation_on_a_fixed_grid():
     from b12x.comm.pcie._collective_tuning import TUNING, _family_bucket
     from b12x.preparation import autotune_effort
 
@@ -117,7 +118,8 @@ def test_island_tunes_threads_without_changing_counter_participation():
         ]
     assert {config.threads for config in configs} == {128, 256, 512, 768, 1024}
     assert {config.submode for config in configs} == {""}
-    assert {config.blocks for config in configs} == {16}
+    assert {config.blocks for config in configs} == {64}
+    assert {config.active_blocks for config in configs} == {1, 2, 4, 8, 16, 32, 64}
     assert _family_bucket(query) is None
     with autotune_effort("off"):
         configs = [
@@ -136,6 +138,38 @@ def test_island_explicit_thread_setting_remains_fixed():
             config for _, config in TUNING.iterate(TUNING.configure(query, device=None))
         ]
     assert configs == [query.default]
+
+
+@pytest.mark.parametrize("active", (0, 65, True))
+def test_island_rejects_invalid_participation(active):
+    from b12x.comm.pcie._tuning import PcieQuery, TUNING as NATIVE
+
+    payload = _island_query().alternatives["island_rs"].to_dict()
+    payload["call"]["active_blocks"] = active
+    with pytest.raises(ValueError, match="participation"):
+        NATIVE.validate_query(PcieQuery(**payload), None)
+
+
+def test_island_explicit_grid_preserves_participation():
+    from b12x.comm.pcie._collective_tuning import TUNING
+    from b12x.preparation import autotune_effort
+
+    query = _island_query()
+    payload = query.alternatives["island_rs"].to_dict()
+    payload["setup"]["blocks_override"] = True
+    query = replace(query, alternatives=FrozenMapping({"island_rs": payload}))
+    with autotune_effort("default"):
+        configs = [c for _, c in TUNING.iterate(TUNING.configure(query, device=None))]
+    assert {c.active_blocks for c in configs} == {16}
+    assert {c.blocks for c in configs} == {64}
+    assert len(configs) == 5
+
+
+def test_island_non_power_of_two_participation_is_legal():
+    from b12x.comm.pcie._collective_tuning import TUNING
+
+    query = _island_query()
+    TUNING.validate_config(query, replace(query.default, active_blocks=3), None)
 
 
 def test_island_native_override_preserves_fixed_declaration():
@@ -172,7 +206,7 @@ def test_island_native_override_preserves_fixed_declaration():
                 COLLECTIVE.configure(prepared.query, device=None)
             )
         ]
-    assert len(configs) == 20
+    assert len(configs) == 140
     assert {c.submode for c in configs} == {""}
     fixed = plan(native, runtime=owner, override=BackendConfig(backend="native"))
     assert fixed.contract is NATIVE

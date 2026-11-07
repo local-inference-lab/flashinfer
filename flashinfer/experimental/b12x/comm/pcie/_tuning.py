@@ -72,6 +72,16 @@ def _validate_query(query: PcieQuery, device) -> None:
         raise ValueError(f"{query.surface} supports world sizes {worlds}")
     if not 0 <= query.rank < query.world_size:
         raise ValueError("rank must belong to the caller's process group")
+    if query.surface == "PCIeIslandRSAllReduce.all_reduce":
+        from ._island_rs_cute import MAX_BLOCKS
+
+        blocks, active = query.call["blocks"], query.call["active_blocks"]
+        if (
+            type(blocks) is not int
+            or type(active) is not int
+            or not 1 <= active <= blocks <= MAX_BLOCKS
+        ):
+            raise ValueError("island participation must fit the fixed physical grid")
     if "joint_cluster_size" in query.call:
         from ._joint_profile import profile_index, validate_cluster_geometry
 
@@ -139,6 +149,6 @@ def _validate_query(query: PcieQuery, device) -> None:
         )
 
 
-TUNING = replace(TUNING, query_schema_version=42, validate_query=_validate_query)
+TUNING = replace(TUNING, query_schema_version=43, validate_query=_validate_query)
 
 __all__ = ["PcieQuery", "PcieConfig", "SURFACES", "TUNING"]

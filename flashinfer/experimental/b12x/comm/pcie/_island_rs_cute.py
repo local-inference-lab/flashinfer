@@ -199,12 +199,13 @@ _ISLAND_SIZE = 4
 _MAX_ISLANDS = 4
 _MAX_WORLD_SIZE = _ISLAND_SIZE * _MAX_ISLANDS
 
-# One 128-byte line per (block, slot); 32 blocks x 4 slots per region.
-_RS_ARRIVED = 256
-_XS_ARRIVED = 16_640
-_AG_ARRIVED = 33_024
-HEADER_BYTES = 49_408
-MAX_BLOCKS = 32
+# Generation counters precede three regions with one cache line per CTA and peer.
+MAX_BLOCKS = 64
+_ACTIVE_EPOCH_OFFSET = MAX_BLOCKS * 4
+_RS_ARRIVED = ((_ACTIVE_EPOCH_OFFSET + MAX_BLOCKS * 4 + 255) // 256) * 256
+_XS_ARRIVED = _RS_ARRIVED + MAX_BLOCKS * _ISLAND_SIZE * 128
+_AG_ARRIVED = _XS_ARRIVED + MAX_BLOCKS * _ISLAND_SIZE * 128
+HEADER_BYTES = _AG_ARRIVED + MAX_BLOCKS * _ISLAND_SIZE * 128
 
 
 def island_rs_peers(rank: int, world_size: int) -> tuple[int, ...]:
@@ -279,6 +280,7 @@ class _IslandRSLaunch:
         quarter_capacity: Int64,
         elements: Int64,
         blocks: Int32,
+        active_blocks: Int32,
         stream: cuda.CUstream,
     ) -> None:
         self.kernel(
@@ -305,6 +307,7 @@ class _IslandRSLaunch:
             final_offset,
             quarter_capacity,
             elements,
+            active_blocks,
         ).launch(
             grid=(blocks, 1, 1),
             block=[self._threads, 1, 1],
@@ -338,6 +341,7 @@ class _IslandRSLaunch:
         final_offset: Int64,
         quarter_capacity: Int64,
         elements: Int64,
+        active_blocks: Int32,
     ) -> None:
         slabs = (
             slab0,
@@ -359,22 +363,67 @@ class _IslandRSLaunch:
         )
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
-        gdim, _, _ = cute.arch.grid_dim()
         self_base = Int64(slabs[self._rank].toint())
 
         allocator = cutlass.utils.SmemAllocator()
         shared_generation = allocator.allocate_tensor(
             element_type=cutlass.Uint32,
-            layout=cute.make_layout((1,)),
+            layout=cute.make_layout((2,)),
             byte_alignment=4,
         )
         if tidx == Int32(0):
             shared_generation[0] = _atomic_add_global_u32(
                 self_base + Int64(bidx) * Int64(4), Uint32(1)
             ) + Uint32(1)
+            epoch = Uint32(0)
+            if bidx < active_blocks:
+                epoch = _atomic_add_global_u32(
+                    self_base + Int64(_ACTIVE_EPOCH_OFFSET) + Int64(bidx) * Int64(4),
+                    Uint32(1),
+                ) + Uint32(1)
+            shared_generation[1] = epoch
         cute.arch.barrier()
-        generation = Uint32(shared_generation[0])
-        if generation % Uint32(2) != Uint32(0):
+        data_generation = Uint32(shared_generation[0])
+        # Every physical CTA advances buffer parity. Communication epochs advance
+        # only for participating CTAs, keeping their last flags within one epoch
+        # even when a CTA has been inactive across a global counter rollover.
+        if bidx < active_blocks:
+            self._participate(
+                slabs,
+                input_ptr,
+                output_ptr,
+                stage_offset,
+                part_offset,
+                final_offset,
+                quarter_capacity,
+                elements,
+                data_generation,
+                Uint32(shared_generation[1]),
+                self_base,
+                tidx,
+                bidx,
+                active_blocks,
+            )
+
+    @cute.jit
+    def _participate(
+        self,
+        slabs,
+        input_ptr,
+        output_ptr,
+        stage_offset,
+        part_offset,
+        final_offset,
+        quarter_capacity,
+        elements,
+        data_generation,
+        generation,
+        self_base,
+        tidx,
+        bidx,
+        gdim,
+    ):
+        if data_generation % Uint32(2) != Uint32(0):
             stage_offset += quarter_capacity * Int64(_ISLAND_SIZE * 4)
             part_offset += quarter_capacity * Int64(4)
             final_offset += quarter_capacity * Int64(_ISLAND_SIZE * 4)
@@ -786,6 +835,7 @@ def get_island_rs_launcher(
         1,
         1,
         1,
+        1,
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "comm.pcie.island_rs.bf16",
@@ -813,6 +863,7 @@ def get_island_rs_launcher(
         elements: int,
         blocks: int,
         stream: object = None,
+        active_blocks: int | None = None,
     ) -> None:
         """Launch the compiled island reduce-scatter with runtime arguments."""
         if len(slab_addresses) != world_size:
@@ -821,6 +872,9 @@ def get_island_rs_launcher(
             )
         if not 1 <= int(blocks) <= MAX_BLOCKS:
             raise ValueError(f"blocks must be in [1, {MAX_BLOCKS}], got {blocks}")
+        active_blocks = blocks if active_blocks is None else active_blocks
+        if not 1 <= int(active_blocks) <= int(blocks):
+            raise ValueError("active blocks must fit the fixed physical grid")
         raw(
             *(
                 make_ptr(
@@ -849,6 +903,7 @@ def get_island_rs_launcher(
             quarter_capacity,
             elements,
             blocks,
+            active_blocks,
             cuda_stream_from_int_or_current(cuda_stream_to_int(stream)),
         )
 

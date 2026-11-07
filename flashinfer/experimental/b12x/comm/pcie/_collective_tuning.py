@@ -51,17 +51,32 @@ def _configs(query, device=None):
         blocks = int(call.get("blocks", call.get("block_limit", 16)))
         threads = int(call["threads"])
         if name in ISLAND_VARIANTS:
-            # Physical blocks own persistent generation counters. Race thread
-            # counts without changing their participation or scratch layout.
+            # Physical CTAs keep buffer parity synchronized. Only participating
+            # CTAs advance communication epochs, so active counts can vary safely.
             counts = (
                 (threads,)
                 if payload["setup"].get("threads_override", False)
                 else tuple(dict.fromkeys((threads, 128, 256, 512, 768, 1024)))
             )
-            for count in counts:
-                yield CollectiveConfig(
-                    implementation=name, threads=count, blocks=blocks
+            fixed = any(
+                payload["setup"].get(key, False)
+                for key in (
+                    "threads_override",
+                    "blocks_override",
+                    "active_blocks_override",
                 )
+            )
+            active_counts = (
+                (int(call["active_blocks"]),) if fixed else range(1, blocks + 1)
+            )
+            for count in counts:
+                for active in active_counts:
+                    yield CollectiveConfig(
+                        implementation=name,
+                        threads=count,
+                        blocks=blocks,
+                        active_blocks=active,
+                    )
             continue
         if name in ("dcp_phased", "dcp_ring", "dcp_recursive", "dcp_recursive_ready"):
             # Automatic admission covers the qualified TP16 hardware. Phased
@@ -285,6 +300,11 @@ def _parameters(query, device):
         # Plain reductions measure pull alongside the payload-ready transports.
         efficiency_predicates=(
             lambda value: (
+                value["implementation"] not in ISLAND_VARIANTS
+                or value["active_blocks"] == query.default.active_blocks
+                or value["active_blocks"] & (value["active_blocks"] - 1) == 0
+            ),
+            lambda value: (
                 value["implementation"] != "pull"
                 or query.default.implementation == "pull"
                 or query.operation == "all_reduce"
@@ -464,7 +484,7 @@ def _family_bucket(query):
 
 TUNING = TuningContract(
     component_id="comm.pcie",
-    query_schema_version=7,
+    query_schema_version=8,
     candidate_contract_version=5,
     config_schema_version=2,
     query_fields=frozenset(
@@ -536,6 +556,8 @@ def plan(
             call = dict(q.call)
             call["threads"] = config.threads
             call["blocks" if "blocks" in call else "block_limit"] = config.blocks
+            if config.implementation in ISLAND_VARIANTS:
+                call["active_blocks"] = config.active_blocks
             if config.implementation in JOINT_FAMILIES or config.implementation in (
                 "dcp_phased",
                 "dcp_ring",
