@@ -267,21 +267,29 @@ class _TwoShotBf16Launch:
         self,
         accumulator: cute.Tensor,
         words,
+        initialize: cutlass.Constexpr = False,
     ) -> None:
         for word_index in cutlass.range_constexpr(4):
             lo, hi = unpack_bf16x2(words[word_index])
             element = word_index * 2
-            accumulator[element] = accumulator[element] + lo
-            accumulator[element + 1] = accumulator[element + 1] + hi
+            if cutlass.const_expr(initialize):
+                # An ordered sum starts with its first input, not an implicit
+                # positive zero. Preserve negative zero when every input is -0.
+                accumulator[element] = lo
+                accumulator[element + 1] = hi
+            else:
+                accumulator[element] = accumulator[element] + lo
+                accumulator[element + 1] = accumulator[element + 1] + hi
 
     @cute.jit
     def _load_accumulate_pack_global_nc(
         self,
         accumulator: cute.Tensor,
         address: Int64,
+        initialize: cutlass.Constexpr = False,
     ) -> None:
         words = ld_global_nc_v4_u32(address)
-        self._accumulate_words(accumulator, words)
+        self._accumulate_words(accumulator, words, initialize)
 
     @cute.jit
     def _load_accumulate_pack_generic(
@@ -468,6 +476,7 @@ class _TwoShotBf16Launch:
                     self._load_accumulate_pack_global_nc(
                         accumulator,
                         payload_address + local_pack * Int64(16),
+                        True,
                     )
 
                     for peer_index in cutlass.range(
@@ -641,7 +650,7 @@ def get_twoshot_bf16_launcher(
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             f"comm.pcie.twoshot_bf16.{operation}",
-            2,
+            3,
             cache_key,
         ),
     )
@@ -997,7 +1006,7 @@ class _TwoShotPullAllReduceLaunch(_TwoShotBf16Launch):
                         self._select_address(staging, source_rank) + staging_slot_offset
                     )
                     peer_words.append(ld_global_v4_u32(peer_base + pack_offset))
-                self._accumulate_words(accumulator, local_words)
+                self._accumulate_words(accumulator, local_words, True)
                 for peer_index in cutlass.range_constexpr(self._world_size - 1):
                     self._accumulate_words(accumulator, peer_words[peer_index])
                 self._store_pack(
@@ -1119,7 +1128,7 @@ def get_twoshot_bf16_allreduce_launcher(
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "comm.pcie.twoshot_bf16.all_reduce_pull",
-            4,
+            5,
             cache_key,
         ),
     )

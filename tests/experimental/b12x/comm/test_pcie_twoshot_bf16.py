@@ -421,6 +421,8 @@ def _check_packed_tails(
                 inp.mul_(2**-100)
             elif not exact_inputs and step == 3:
                 inp.fill_(-1 if rank % 2 else 1)
+            elif not exact_inputs and step == 4:
+                inp.fill_(-0.0)
             expected = _reference(inp)
             out.fill_(float("nan"))
             torch.cuda.synchronize()
@@ -436,6 +438,8 @@ def _check_packed_tails(
             assert _epoch(pool) == epoch
             assert pool._push_shard.data_ptr() == shard_address
             torch.testing.assert_close(out, expected, rtol=0, atol=0)
+            if not exact_inputs and step == 4:
+                assert torch.equal(out.view(torch.int16), inp.view(torch.int16))
             assert torch.all(storage[:8] == 123) and torch.all(storage[-8:] == 123)
     for *_, graph in cases:
         graph.reset()
