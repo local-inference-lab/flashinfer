@@ -125,6 +125,10 @@ TUNING_COMPONENTS = (
         variant="default",
     ),
     KernelTuningRegistration(
+        op_qualname="norm.torch_rmsnorm",
+        contract_ref="b12x.norm._torch_rmsnorm_preparation:TUNING",
+    ),
+    KernelTuningRegistration(
         op_qualname="quantization.nvfp4",
         contract_ref="b12x.quantization.nvfp4._tuning:TUNING",
         variant="default",
