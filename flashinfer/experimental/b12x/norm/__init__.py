@@ -3,6 +3,7 @@
 - ``hyperconnection``: learned low-rank multi-stream residual mixing.
 - ``mhc``: fused RMSNorm + hyper-connection residual mixing + projection
   (DeepSeek-style mHC), pre/post/post-pre phases.
+- ``torch_rmsnorm``: caller-owned BF16 RMSNorm with Torch's vectorized FP32 reduction order.
 """
 
 from __future__ import annotations
@@ -10,7 +11,7 @@ from __future__ import annotations
 import importlib
 from typing import Any
 
-_OP_MODULES = ("hyperconnection", "mhc")
+_OP_MODULES = ("hyperconnection", "mhc", "torch_rmsnorm")
 
 
 def __getattr__(name: str) -> Any:
