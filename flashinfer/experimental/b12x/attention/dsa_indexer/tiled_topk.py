@@ -234,7 +234,11 @@ def _emit_global_index_virtual(
 @cute.jit
 def _convert_to_uint8(x: Float32) -> Uint32:
     h_bits = _cvt_rn_f16_f32(x)
-    bits16 = h_bits & Uint32(0xFFFF)
+    # FP16 conversion canonicalizes NaNs. Preserve the FP32 sign so the
+    # coarse bucket order agrees with full-width radix refinement.
+    bits16 = (h_bits & Uint32(0x7FFF)) | (
+        (_float_as_uint32(x) >> Uint32(16)) & Uint32(0x8000)
+    )
     sign = bits16 & Uint32(0x8000)
     key16 = Uint32(0)
     if sign != Uint32(0):
@@ -247,7 +251,11 @@ def _convert_to_uint8(x: Float32) -> Uint32:
 @cute.jit
 def _convert_to_coarse_bin(x: Float32) -> Uint32:
     h_bits = _cvt_rn_f16_f32(x)
-    bits16 = h_bits & Uint32(0xFFFF)
+    # FP16 conversion canonicalizes NaNs. Preserve the FP32 sign so the
+    # coarse bucket order agrees with full-width radix refinement.
+    bits16 = (h_bits & Uint32(0x7FFF)) | (
+        (_float_as_uint32(x) >> Uint32(16)) & Uint32(0x8000)
+    )
     sign = bits16 & Uint32(0x8000)
     key16 = Uint32(0)
     if sign != Uint32(0):
