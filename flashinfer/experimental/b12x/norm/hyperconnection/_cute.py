@@ -64,6 +64,41 @@ def _float_bits(value: Float32, *, loc=None, ip=None) -> Uint32:
     )
 
 
+@dsl_user_op
+def _pack_f32x2_to_bfloat2_rn(
+    low: Float32, high: Float32, *, loc=None, ip=None
+) -> Uint32:
+    """Round two FP32 values to BF16 without saturation, low value first.
+
+    This is the conversion a scalar FP32 to BF16 cast performs, so packed and
+    scalar stores of the same value agree on overflow and NaN.
+    """
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                Float32(low).ir_value(loc=loc, ip=ip),
+                Float32(high).ir_value(loc=loc, ip=ip),
+            ],
+            "cvt.rn.bf16x2.f32 $0, $2, $1;",
+            "=r,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@cute.jit
+def _bf16_low_to_f32(word: Uint32) -> Float32:
+    return u32_as_f32(word << Uint32(16))
+
+
+@cute.jit
+def _bf16_high_to_f32(word: Uint32) -> Float32:
+    return u32_as_f32(word & Uint32(0xFFFF0000))
+
+
 class _GroupedRmsNorm:
     def __init__(
         self, streams: int, hidden_size: int, zero_centered: bool = True
@@ -294,7 +329,16 @@ class _ScaledSilu:
 
 
 class _Pointwise:
-    """Unscaled activation/residual tails with one final destination cast."""
+    """Unscaled activation/residual tails with one final destination cast.
+
+    ``vector=8`` makes each thread produce eight consecutive SwiGLU outputs from
+    16-byte loads of the gate and up halves and one 16-byte store. Each element
+    uses the scalar path's arithmetic and BF16 conversion. Rows start at
+    16-byte boundaries because the width is a multiple of eight, so the caller
+    supplies 16-byte-aligned operands.
+    """
+
+    _SWIGLU_PACK_ELEMENTS = 8
 
     def __init__(
         self,
@@ -308,7 +352,19 @@ class _Pointwise:
         gate_stride: int = 0,
         swiglu_alpha: float = 1.0,
         swiglu_beta: float = 0.0,
+        vector: int = 1,
     ) -> None:
+        self.vector = int(vector)
+        if self.vector not in (1, self._SWIGLU_PACK_ELEMENTS):
+            raise ValueError("pointwise vector width must be 1 or 8")
+        if self.vector > 1 and (
+            operation != "swiglu"
+            or output_dtype is not BFloat16
+            or int(width) % self._SWIGLU_PACK_ELEMENTS
+        ):
+            raise ValueError(
+                "vectorized pointwise requires BF16 SwiGLU with a width divisible by 8"
+            )
         self.operation = operation
         self.output_dtype = output_dtype
         self.width = int(width)
@@ -328,10 +384,32 @@ class _Pointwise:
         stream: cuda.CUstream,
     ) -> None:
         self.kernel(left, right, output, elements).launch(
-            grid=((elements + Int64(_THREADS - 1)) // Int64(_THREADS), 1, 1),
+            grid=(
+                (elements + Int64(self.vector * _THREADS - 1))
+                // Int64(self.vector * _THREADS),
+                1,
+                1,
+            ),
             block=(_THREADS, 1, 1),
             stream=stream,
         )
+
+    @cute.jit
+    def _swiglu(self, gate: Float32, up: Float32) -> Float32:
+        if cutlass.const_expr(not self.clamp_after_silu):
+            if gate > Float32(self.limit):
+                gate = Float32(self.limit)
+        if up > Float32(self.limit):
+            up = Float32(self.limit)
+        if up < Float32(-self.limit):
+            up = Float32(-self.limit)
+        activated = gate * _sigmoid(Float32(self.swiglu_alpha) * gate)
+        if cutlass.const_expr(self.clamp_after_silu):
+            if activated > Float32(self.limit):
+                activated = Float32(self.limit)
+        if cutlass.const_expr(self.round_silu):
+            activated = Float32(BFloat16(activated))
+        return activated * (up + Float32(self.swiglu_beta))
 
     @cute.kernel
     def kernel(
@@ -343,44 +421,74 @@ class _Pointwise:
     ) -> None:
         block, _, _ = cute.arch.block_idx()
         thread, _, _ = cute.arch.thread_idx()
-        offset = Int64(block) * Int64(_THREADS) + Int64(thread)
-        if offset < elements:
-            if cutlass.const_expr(self.operation == "swiglu"):
-                source = (offset // Int64(self.width)) * Int64(2 * self.width)
-                source += offset % Int64(self.width)
-                gate = Float32(left[source])
-                up = Float32(left[source + Int64(self.width)])
-                if cutlass.const_expr(not self.clamp_after_silu):
-                    if gate > Float32(self.limit):
-                        gate = Float32(self.limit)
-                if up > Float32(self.limit):
-                    up = Float32(self.limit)
-                if up < Float32(-self.limit):
-                    up = Float32(-self.limit)
-                activated = gate * _sigmoid(Float32(self.swiglu_alpha) * gate)
-                if cutlass.const_expr(self.clamp_after_silu):
-                    if activated > Float32(self.limit):
-                        activated = Float32(self.limit)
-                if cutlass.const_expr(self.round_silu):
-                    activated = Float32(BFloat16(activated))
-                value = activated * (up + Float32(self.swiglu_beta))
-            elif cutlass.const_expr(self.operation == "add"):
-                value = Float32(left[offset]) + Float32(right[offset])
-            elif cutlass.const_expr(self.operation == "relu2"):
-                activated = Float32(left[offset])
-                if activated < Float32(0):
-                    activated = Float32(0)
-                value = activated * activated
-            elif cutlass.const_expr(self.operation == "head_gate"):
-                row = offset // Int64(self.width * self.heads)
-                head = (offset // Int64(self.width)) % Int64(self.heads)
-                gate = BFloat16(
-                    _sigmoid(Float32(right[row * Int64(self.gate_stride) + head]))
+        if cutlass.const_expr(self.vector > 1):
+            pack = Int64(block) * Int64(_THREADS) + Int64(thread)
+            if pack < elements // Int64(self.vector):
+                offset = pack * Int64(self.vector)
+                row = offset // Int64(self.width)
+                column = offset - row * Int64(self.width)
+                gate_address = Int64(left.toint()) + (
+                    row * Int64(2 * self.width) + column
+                ) * Int64(2)
+                gate_words = ld_global_v4_u32(gate_address)
+                up_words = ld_global_v4_u32(gate_address + Int64(2 * self.width))
+                packed = cute.make_rmem_tensor((4,), Uint32)
+                for word in cutlass.range_constexpr(4):
+                    low = self._swiglu(
+                        _bf16_low_to_f32(gate_words[word]),
+                        _bf16_low_to_f32(up_words[word]),
+                    )
+                    high = self._swiglu(
+                        _bf16_high_to_f32(gate_words[word]),
+                        _bf16_high_to_f32(up_words[word]),
+                    )
+                    packed[word] = _pack_f32x2_to_bfloat2_rn(low, high)
+                st_global_v4_u32(
+                    Int64(output.toint()) + offset * Int64(2),
+                    packed[0],
+                    packed[1],
+                    packed[2],
+                    packed[3],
                 )
-                value = Float32(left[offset]) * Float32(gate)
-            else:
-                value = _sigmoid(Float32(left[offset]))
-            output[offset] = value.to(self.output_dtype)
+        else:
+            offset = Int64(block) * Int64(_THREADS) + Int64(thread)
+            if offset < elements:
+                if cutlass.const_expr(self.operation == "swiglu"):
+                    source = (offset // Int64(self.width)) * Int64(2 * self.width)
+                    source += offset % Int64(self.width)
+                    gate = Float32(left[source])
+                    up = Float32(left[source + Int64(self.width)])
+                    if cutlass.const_expr(not self.clamp_after_silu):
+                        if gate > Float32(self.limit):
+                            gate = Float32(self.limit)
+                    if up > Float32(self.limit):
+                        up = Float32(self.limit)
+                    if up < Float32(-self.limit):
+                        up = Float32(-self.limit)
+                    activated = gate * _sigmoid(Float32(self.swiglu_alpha) * gate)
+                    if cutlass.const_expr(self.clamp_after_silu):
+                        if activated > Float32(self.limit):
+                            activated = Float32(self.limit)
+                    if cutlass.const_expr(self.round_silu):
+                        activated = Float32(BFloat16(activated))
+                    value = activated * (up + Float32(self.swiglu_beta))
+                elif cutlass.const_expr(self.operation == "add"):
+                    value = Float32(left[offset]) + Float32(right[offset])
+                elif cutlass.const_expr(self.operation == "relu2"):
+                    activated = Float32(left[offset])
+                    if activated < Float32(0):
+                        activated = Float32(0)
+                    value = activated * activated
+                elif cutlass.const_expr(self.operation == "head_gate"):
+                    row = offset // Int64(self.width * self.heads)
+                    head = (offset // Int64(self.width)) % Int64(self.heads)
+                    gate = BFloat16(
+                        _sigmoid(Float32(right[row * Int64(self.gate_stride) + head]))
+                    )
+                    value = Float32(left[offset]) * Float32(gate)
+                else:
+                    value = _sigmoid(Float32(left[offset]))
+                output[offset] = value.to(self.output_dtype)
 
 
 class _GateMean:

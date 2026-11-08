@@ -5,11 +5,38 @@ from contextlib import contextmanager
 import pytest
 import torch
 import torch.nn.functional as F
-from b12x.preparation import PreparationSession, PreparedCall
+from b12x.preparation import DeviceIdentity, PreparationSession, PreparedCall
 from b12x.sequence import short_conv
-from b12x.sequence.short_conv._tuning import ShortConvQuery
+from b12x.sequence.short_conv._tuning import TUNING, ShortConvQuery
 
 from ..conftest import require_b12x
+
+
+# The tile space does not depend on the architecture.
+_TACTIC_DEVICE = DeviceIdentity("nvidia", (12, 0), 188, "tactic enumeration")
+
+
+def tactics():
+    """Every tile geometry the preparation race considers for a 4-tap prefill."""
+    query = ShortConvQuery(
+        mode="prefill",
+        channels=24576,
+        kernel_size=4,
+        dilation=1,
+        max_tokens=4096,
+        max_seqs=4,
+        max_state_slots=6,
+        max_speculative_tokens=0,
+        autotune_effort="default",
+    )
+    return tuple(
+        config for _, config in TUNING.eligible_plan(query, _TACTIC_DEVICE).candidates
+    )
+
+
+def tactic_id(config):
+    width = "i64" if config.wide_index else "i32"
+    return f"t{config.block_t}c{config.block_c}w{config.num_warps}{width}"
 
 
 def test_gdn_raw_projection_geometry_is_metadata_only():
@@ -76,8 +103,11 @@ class _Case:
         weight_dtype=torch.bfloat16,
         bias_dtype=None,
         round_before_silu=True,
+        max_seqs=4,
+        state_slots=6,
     ):
         device = require_b12x()
+        self.max_seqs, self.state_slots = max_seqs, state_slots
         self.caps = short_conv.Caps(
             device=device,
             mode=mode,
@@ -85,8 +115,8 @@ class _Case:
             kernel_size=kernel_size,
             dilation=dilation,
             max_tokens=max_tokens,
-            max_seqs=4,
-            max_state_slots=6,
+            max_seqs=max_seqs,
+            max_state_slots=state_slots,
             max_speculative_tokens=speculative_tokens,
             round_before_silu=round_before_silu,
         )
@@ -94,10 +124,10 @@ class _Case:
         capacity = self.length + speculative_tokens
         stride = channels * capacity + 32
         self.storage = torch.full(
-            (6 * stride,), 17, dtype=torch.bfloat16, device=device
+            (state_slots * stride,), 17, dtype=torch.bfloat16, device=device
         )
         self.state = self.storage.as_strided(
-            (6, channels, capacity), (stride, capacity, 1)
+            (state_slots, channels, capacity), (stride, capacity, 1)
         )
         self.input_storage = torch.randn(
             (max_tokens, channels + input_padding), device=device
@@ -111,16 +141,18 @@ class _Case:
             conv_weight=self.weight,
             conv_state=self.state,
             out=torch.full_like(self.x, float("nan")),
-            query_start_loc=torch.zeros(5, dtype=torch.int32, device=device),
-            state_slot_ids=torch.full((4,), -1, dtype=torch.int64, device=device),
-            state_is_fresh=torch.zeros(4, dtype=torch.bool, device=device),
-            num_accepted_tokens=torch.ones(4, dtype=torch.int32, device=device),
+            query_start_loc=torch.zeros(max_seqs + 1, dtype=torch.int32, device=device),
+            state_slot_ids=torch.full(
+                (max_seqs,), -1, dtype=torch.int64, device=device
+            ),
+            state_is_fresh=torch.zeros(max_seqs, dtype=torch.bool, device=device),
+            num_accepted_tokens=torch.ones(max_seqs, dtype=torch.int32, device=device),
             num_seqs=torch.zeros(1, dtype=torch.int32, device=device),
             num_tokens=torch.zeros(1, dtype=torch.int32, device=device),
         )
         if mode == "mixed":
             self.args["request_is_prefill"] = torch.zeros(
-                4, dtype=torch.bool, device=device
+                max_seqs, dtype=torch.bool, device=device
             )
         if bias_dtype is not None:
             self.args["conv_bias"] = torch.randn(
@@ -151,7 +183,7 @@ class _Case:
         if prefill is not None:
             self.args["request_is_prefill"].copy_(
                 torch.tensor(
-                    prefill + [False] * (4 - n),
+                    prefill + [False] * (self.max_seqs - n),
                     dtype=torch.bool,
                     device=self.x.device,
                 )
@@ -201,10 +233,29 @@ class _Case:
         return expected, state
 
 
+def tactic_is_legal(case, tactic):
+    """Whether the current device and query admit the pinned tile."""
+    if tactic is None:
+        return True
+    from b12x.preparation import detect_device
+
+    query = short_conv.plan(case.caps).query
+    try:
+        TUNING.validate_config(query, tactic, detect_device(case.x.device).identity)
+    except ValueError:
+        return False
+    return True
+
+
 @contextmanager
-def _prepared(case):
+def _prepared(case, tactic=None):
+    """Prepare ``case`` with its default geometry, or pin the tile ``tactic``."""
+    if not tactic_is_legal(case, tactic):
+        pytest.skip("tile is outside this device's tactic space")
     plan = short_conv.plan(
-        case.caps, invocation=short_conv.invocation_from_tensors(**case.args)
+        case.caps,
+        invocation=short_conv.invocation_from_tensors(**case.args),
+        override=tactic,
     )
     box = []
 
@@ -314,6 +365,7 @@ def test_prefill_chunks_match_one_canonical_convolution(dilation):
         )
 
 
+@pytest.mark.parametrize("tactic", tactics(), ids=tactic_id)
 @pytest.mark.parametrize("dilation", [1, 3])
 @pytest.mark.parametrize(
     "channels,input_padding,weight_dtype",
@@ -325,9 +377,9 @@ def test_prefill_chunks_match_one_canonical_convolution(dilation):
     ],
 )
 def test_tiled_prefill_matches_canonical_convolution_across_tiles(
-    dilation, channels, input_padding, weight_dtype
+    tactic, dilation, channels, input_padding, weight_dtype
 ):
-    """Capacities that tile tokens keep requests crossing tile boundaries exact."""
+    """Every tile geometry keeps requests crossing tile boundaries exact."""
     case = _Case(
         "prefill",
         channels=channels,
@@ -336,7 +388,7 @@ def test_tiled_prefill_matches_canonical_convolution_across_tiles(
         dilation=dilation,
         max_tokens=300,
     )
-    with _prepared(case) as binding:
+    with _prepared(case, tactic) as binding:
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             short_conv.run(binding)

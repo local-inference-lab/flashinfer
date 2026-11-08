@@ -105,6 +105,89 @@ def _route_topk_values(
     return topk_logits, topk_ids, topk_weights
 
 
+@triton.jit
+def _route_topk_row(
+    logits_ptr,
+    topk_logits_ptr,
+    topk_ids_ptr,
+    topk_weights_ptr,
+    correction_bias_ptr,
+    image_correction_bias_ptr,
+    image_mask_ptr,
+    logits_row_stride,
+    topk_row_stride,
+    ids_row_stride,
+    weights_row_stride,
+    correction_bias_stride,
+    image_correction_bias_stride,
+    image_mask_stride,
+    routed_scaling_factor,
+    num_experts,
+    num_valid_tokens_ptr,
+    pid,
+    BLOCK_E: tl.constexpr,
+    TOP_K: tl.constexpr,
+    TOPK_BLOCK: tl.constexpr,
+    RENORMALIZE: tl.constexpr,
+    SCORE_FUNC: tl.constexpr,
+    HAS_CORRECTION_BIAS: tl.constexpr,
+    HAS_IMAGE_BIAS: tl.constexpr,
+    HAS_VALID_TOKENS: tl.constexpr,
+):
+    topk_offsets = tl.arange(0, TOPK_BLOCK)
+    topk_mask = topk_offsets < TOP_K
+
+    if HAS_VALID_TOKENS:
+        valid = pid < tl.load(num_valid_tokens_ptr)
+    else:
+        valid = True
+
+    if valid:
+        topk_logits, topk_ids, topk_weights = _route_topk_values(
+            logits_ptr,
+            correction_bias_ptr,
+            image_correction_bias_ptr,
+            image_mask_ptr,
+            pid,
+            logits_row_stride,
+            correction_bias_stride,
+            image_correction_bias_stride,
+            image_mask_stride,
+            routed_scaling_factor,
+            num_experts,
+            BLOCK_E,
+            TOP_K,
+            TOPK_BLOCK,
+            RENORMALIZE,
+            SCORE_FUNC,
+            HAS_CORRECTION_BIAS,
+            HAS_IMAGE_BIAS,
+        )
+        tl.store(
+            topk_logits_ptr + pid * topk_row_stride + topk_offsets,
+            topk_logits,
+            mask=topk_mask,
+        )
+        tl.store(
+            topk_ids_ptr + pid * ids_row_stride + topk_offsets,
+            topk_ids,
+            mask=topk_mask,
+        )
+        tl.store(
+            topk_weights_ptr + pid * weights_row_stride + topk_offsets,
+            topk_weights,
+            mask=topk_mask,
+        )
+    else:
+        tl.store(topk_logits_ptr + pid * topk_row_stride + topk_offsets, 0.0, topk_mask)
+        tl.store(topk_ids_ptr + pid * ids_row_stride + topk_offsets, -1, topk_mask)
+        tl.store(
+            topk_weights_ptr + pid * weights_row_stride + topk_offsets,
+            0.0,
+            topk_mask,
+        )
+
+
 @triton.jit(do_not_specialize=["num_experts"])
 def _route_topk_kernel(
     logits_ptr,
@@ -183,6 +266,80 @@ def _route_topk_kernel(
     )
 
 
+@triton.jit(do_not_specialize=["num_experts", "num_tokens"])
+def _route_topk_rows_kernel(
+    logits_ptr,
+    topk_logits_ptr,
+    topk_ids_ptr,
+    topk_weights_ptr,
+    correction_bias_ptr,
+    image_correction_bias_ptr,
+    image_mask_ptr,
+    logits_row_stride,
+    topk_row_stride,
+    ids_row_stride,
+    weights_row_stride,
+    correction_bias_stride,
+    image_correction_bias_stride,
+    image_mask_stride,
+    routed_scaling_factor,
+    num_experts,
+    num_valid_tokens_ptr,
+    num_tokens,
+    BLOCK_E: tl.constexpr,
+    TOP_K: tl.constexpr,
+    TOPK_BLOCK: tl.constexpr,
+    RENORMALIZE: tl.constexpr,
+    SCORE_FUNC: tl.constexpr,
+    HAS_CORRECTION_BIAS: tl.constexpr,
+    HAS_IMAGE_BIAS: tl.constexpr,
+    HAS_VALID_TOKENS: tl.constexpr,
+    ROWS_PER_PROGRAM: tl.constexpr,
+):
+    """Route ``ROWS_PER_PROGRAM`` consecutive rows, one after another.
+
+    Every row runs the same single-row program, so a program's rows are
+    bitwise identical to launching each row alone with the same warp count.
+    """
+    first_row = tl.program_id(0).to(tl.int64) * ROWS_PER_PROGRAM
+    for local_row in tl.static_range(ROWS_PER_PROGRAM):
+        pid = first_row + local_row
+        if pid < num_tokens:
+            _route_topk_row(
+                logits_ptr,
+                topk_logits_ptr,
+                topk_ids_ptr,
+                topk_weights_ptr,
+                correction_bias_ptr,
+                image_correction_bias_ptr,
+                image_mask_ptr,
+                logits_row_stride,
+                topk_row_stride,
+                ids_row_stride,
+                weights_row_stride,
+                correction_bias_stride,
+                image_correction_bias_stride,
+                image_mask_stride,
+                routed_scaling_factor,
+                num_experts,
+                num_valid_tokens_ptr,
+                pid,
+                BLOCK_E,
+                TOP_K,
+                TOPK_BLOCK,
+                RENORMALIZE,
+                SCORE_FUNC,
+                HAS_CORRECTION_BIAS,
+                HAS_IMAGE_BIAS,
+                HAS_VALID_TOKENS,
+            )
+
+
+def default_route_num_warps(num_experts: int) -> int:
+    """Warp count of the original one-row program."""
+    return 4 if triton.next_power_of_2(num_experts) <= 256 else 8
+
+
 def route_topk(
     router_logits: torch.Tensor,
     topk_logits: torch.Tensor,
@@ -197,6 +354,8 @@ def route_topk(
     num_valid_tokens: torch.Tensor | None = None,
     routed_scaling_factor: float = 1.0,
     _launcher=None,
+    _rows_per_program: int = 1,
+    _num_warps: int | None = None,
 ) -> None:
     """Select experts into caller-owned buffers, breaking ties by larger expert ID.
 
@@ -205,7 +364,9 @@ def route_topk(
     Rows at or beyond the device-side valid-token count receive ID -1 and zero
     logits and weights without reading their input logits. A slot with no
     selectable expert, because every remaining selection score is NaN, receives
-    ID -1, a NaN logit and zero weight.
+    ID -1, a NaN logit and zero weight. The private
+    ``_rows_per_program`` and ``_num_warps`` select the launch geometry of the
+    prepared program; ``_launcher`` must have been compiled for the same values.
     """
     if router_logits.ndim != 2:
         raise ValueError(
@@ -268,8 +429,18 @@ def route_topk(
         raise ValueError(f"top_k={top_k} exceeds num_experts={num_experts}")
     if num_tokens == 0:
         return
+    if type(_rows_per_program) is not int or _rows_per_program <= 0:
+        raise ValueError("rows per program must be a positive integer")
     block_e = triton.next_power_of_2(num_experts)
     topk_block = triton.next_power_of_2(top_k)
+    num_warps = (
+        default_route_num_warps(num_experts) if _num_warps is None else _num_warps
+    )
+    # One row per program runs the original kernel; several rows per program run
+    # the multi-row kernel, which exists only as a launch-geometry candidate.
+    multi_row = _rows_per_program > 1
+    kernel = _route_topk_rows_kernel if multi_row else _route_topk_kernel
+    grid = (triton.cdiv(num_tokens, _rows_per_program), 1, 1)
     args = (
         router_logits,
         topk_logits,
@@ -288,10 +459,11 @@ def route_topk(
         float(routed_scaling_factor),
         num_experts,
         num_valid_tokens,
+        *((num_tokens,) if multi_row else ()),
     )
     if _launcher is not None:
         # Compiled Triton launchers take the full positional source signature.
-        _launcher[(num_tokens, 1, 1)](
+        _launcher[grid](
             *args,
             block_e,
             top_k,
@@ -301,9 +473,10 @@ def route_topk(
             correction_bias is not None,
             image_correction_bias is not None and image_mask is not None,
             num_valid_tokens is not None,
+            *((_rows_per_program,) if multi_row else ()),
         )
         return
-    _route_topk_kernel[(num_tokens,)](
+    kernel[grid](
         *args,
         BLOCK_E=block_e,
         TOP_K=top_k,
@@ -313,7 +486,8 @@ def route_topk(
         HAS_CORRECTION_BIAS=correction_bias is not None,
         HAS_IMAGE_BIAS=image_correction_bias is not None and image_mask is not None,
         HAS_VALID_TOKENS=num_valid_tokens is not None,
-        num_warps=4 if block_e <= 256 else 8,
+        **({"ROWS_PER_PROGRAM": _rows_per_program} if multi_row else {}),
+        num_warps=num_warps,
     )
 
 

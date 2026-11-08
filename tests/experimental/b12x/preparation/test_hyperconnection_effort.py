@@ -81,9 +81,7 @@ def test_fp32_input_reduction_exposes_geometry():
     assert len(configurations) == 8
 
 
-@pytest.mark.parametrize(
-    "operation", ["grouped_rmsnorm", "engram_mix", "swiglu", "add"]
-)
+@pytest.mark.parametrize("operation", ["grouped_rmsnorm", "engram_mix", "add"])
 def test_native_geometry_is_canonical(operation):
     q = (
         query(operation, zero_centered=False)
@@ -181,3 +179,140 @@ def test_combine_norm_cta_candidates_require_packed_width(rows, hidden, warps):
                 _tuning.TUNING.validate_config(
                     q, replace(default, reduction_num_warps=larger), None
                 )
+
+
+@pytest.mark.parametrize("effort", ["default", "audit"])
+@pytest.mark.parametrize("hidden", [8, 768, 12288, 24576])
+def test_swiglu_races_scalar_against_eight_element_vectors(effort, hidden):
+    q = query("swiglu", hidden=hidden, effort=effort)
+    configurations = [
+        dict(choice)
+        for choice in _tuning.TUNING.parameter_space(q, None).configurations()
+    ]
+    assert {choice["pointwise_vector"] for choice in configurations} == {1, 8}
+    assert len(configurations) == 2
+    default = _tuning.TUNING.default_config(q, None)
+    assert default.pointwise_vector == 1
+    _tuning.TUNING.validate_config(q, replace(default, pointwise_vector=8), None)
+
+
+@pytest.mark.parametrize("hidden", [1, 4, 12, 2052, 12289])
+def test_swiglu_width_not_divisible_by_eight_is_scalar_only(hidden):
+    q = query("swiglu", hidden=hidden)
+    configurations = list(_tuning.TUNING.parameter_space(q, None).configurations())
+    assert {choice["pointwise_vector"] for choice in configurations} == {1}
+    default = _tuning.TUNING.default_config(q, None)
+    assert default.pointwise_vector == 1
+    with pytest.raises(ValueError, match="pointwise_vector"):
+        _tuning.TUNING.validate_config(q, replace(default, pointwise_vector=8), None)
+
+
+@pytest.mark.parametrize("operation", ["relu2", "add", "sigmoid", "head_gate"])
+def test_other_pointwise_operations_have_no_vector_candidates(operation):
+    options = {"gate_stride": 4, "streams": 4} if operation == "head_gate" else {}
+    q = query(operation, hidden=2048, **options)
+    configurations = list(_tuning.TUNING.parameter_space(q, None).configurations())
+    assert {choice["pointwise_vector"] for choice in configurations} == {1}
+    default = _tuning.TUNING.default_config(q, None)
+    with pytest.raises(ValueError, match="pointwise_vector"):
+        _tuning.TUNING.validate_config(q, replace(default, pointwise_vector=8), None)
+
+
+def test_swiglu_vector_requires_bfloat16_operands():
+    q = query("swiglu", hidden=2048)
+    q = replace(q, output_dtype="float32")
+    # The query validator rejects non-BF16 SwiGLU before a vector config exists.
+    with pytest.raises(ValueError):
+        _tuning.TUNING.validate_query(q, None)
+    assert not _tuning.supports_vector_swiglu(q)
+
+
+def test_off_effort_selects_the_scalar_default():
+    q = query("swiglu", hidden=2048, effort="off")
+    configuration = _tuning.TUNING.configure(q, device=None)
+    assert [
+        config.pointwise_vector for _, config in _tuning.TUNING.iterate(configuration)
+    ] == [1]
+
+
+def test_config_payload_carries_the_vector_width():
+    q = query("swiglu", hidden=2048)
+    config = _tuning.TUNING.default_config(q, None)
+    payload = _tuning.TUNING.config_payload(config)
+    assert payload["pointwise_vector"] == 1
+    vector = replace(config, pointwise_vector=8)
+    assert _tuning.TUNING.decode_config(_tuning.TUNING.config_payload(vector)) == vector
+    assert _tuning.TUNING.decode_config(payload) == config
+    without_vector = FrozenMapping(
+        {key: value for key, value in payload.items() if key != "pointwise_vector"}
+    )
+    with pytest.raises(ValueError, match="config fields"):
+        _tuning.TUNING.decode_config(without_vector)
+
+
+def test_vector_swiglu_candidates_do_not_depend_on_the_device():
+    from b12x.preparation import DeviceIdentity
+
+    q = query("swiglu", hidden=2048)
+    devices = (
+        None,
+        DeviceIdentity(
+            vendor="nvidia",
+            compute_capability=(10, 3),
+            sm_count=152,
+            product_name="GB300",
+        ),
+        DeviceIdentity(
+            vendor="nvidia",
+            compute_capability=(12, 0),
+            sm_count=188,
+            product_name="RTX PRO 6000",
+        ),
+        DeviceIdentity(
+            vendor="nvidia",
+            compute_capability=(12, 1),
+            sm_count=48,
+            product_name="GB10",
+        ),
+    )
+    for device in devices:
+        space = _tuning.TUNING.parameter_space(q, device)
+        assert {c["pointwise_vector"] for c in space.configurations()} == {1, 8}
+        assert _tuning.TUNING.default_config(q, device).pointwise_vector == 1
+
+
+@pytest.mark.parametrize("operand", ["left_alignment", "output_alignment"])
+@pytest.mark.parametrize("alignment", [1, 2, 4, 8])
+def test_misaligned_swiglu_operand_removes_the_vector_candidate(operand, alignment):
+    q = query("swiglu", hidden=2048, **{operand: alignment})
+    configurations = list(_tuning.TUNING.parameter_space(q, None).configurations())
+    assert {choice["pointwise_vector"] for choice in configurations} == {1}
+    default = _tuning.TUNING.default_config(q, None)
+    assert default.pointwise_vector == 1
+    with pytest.raises(ValueError, match="pointwise_vector"):
+        _tuning.TUNING.validate_config(q, replace(default, pointwise_vector=8), None)
+    assert not _tuning.supports_vector_swiglu(q)
+
+
+def test_aligned_swiglu_operands_keep_the_vector_candidate():
+    q = query("swiglu", hidden=2048, left_alignment=16, output_alignment=16)
+    assert _tuning.supports_vector_swiglu(q)
+    assert _tuning.supports_vector_swiglu(query("swiglu", hidden=2048))
+
+
+@pytest.mark.parametrize("alignment", [0, 3, 32, True])
+def test_operand_alignment_must_be_a_supported_byte_count(alignment):
+    q = query("swiglu", hidden=2048, left_alignment=alignment)
+    with pytest.raises(ValueError, match="alignments"):
+        _tuning.TUNING.validate_query(q, None)
+
+
+def test_alignments_select_candidates_but_not_the_compiled_program():
+    aligned = query("swiglu", hidden=2048)
+    misaligned = query("swiglu", hidden=2048, left_alignment=2)
+    assert _tuning.TUNING.encode_query(aligned) != _tuning.TUNING.encode_query(
+        misaligned
+    )
+    assert _preparation._program_query_payload(
+        _tuning.TUNING.encode_query(aligned)
+    ) == _preparation._program_query_payload(_tuning.TUNING.encode_query(misaligned))
