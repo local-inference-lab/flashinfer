@@ -72,11 +72,14 @@ class MXFP8Rows:
     is the strided `[32, 4, ceil(M/128), 4, ceil(K/128), L]` view consumed by
     the CuTe kernel. `values_tiled`, when present, is an additional load-time
     packed copy for a specialized dense-GEMM RHS; `values` remains the logical
-    operand used by every fallback path.
+    operand used by every fallback path. Immutable matrix weights may omit
+    `scale_rows` when their kernels consume `scale_mma`; preparation/reference
+    consumers can recover compact bytes with `materialize_mxfp8_scale_rows`.
+    Activation quantization destinations still require both scale buffers.
     """
 
     values: torch.Tensor
-    scale_rows: torch.Tensor
+    scale_rows: torch.Tensor | None
     scale_mma: torch.Tensor
     values_tiled: torch.Tensor | None = None
 
@@ -1597,6 +1600,8 @@ def _check_mxfp8_rows_storage(
     k: int,
     num_groups: int,
 ) -> None:
+    if out.scale_rows is None:
+        raise ValueError("MXFP8 quantization destinations require compact row scales")
     _check_gpu_tensor("out.values", out.values)
     _check_gpu_tensor("out.scale_rows", out.scale_rows)
     _check_gpu_tensor("out.scale_mma", out.scale_mma)
@@ -2246,13 +2251,18 @@ def quantize_wo_b_input_mxfp8(
     return out
 
 
-def quantize_mxfp8_rows_torch(source: torch.Tensor) -> MXFP8Rows:
+def quantize_mxfp8_rows_torch(
+    source: torch.Tensor, *, retain_scale_rows: bool = True
+) -> MXFP8Rows:
     """Quantize `[M,K]` or `[M,K,L]` rows to MXFP8 on GPU.
 
     This is a graph-capturable GPU Torch prep/reference helper. It is not the
-    final production activation-quant kernel for WO-A/WO-B.
+    final production activation-quant kernel for WO-A/WO-B. Immutable weights
+    may set `retain_scale_rows=False` to retain only the MMA scale layout.
     """
 
+    if type(retain_scale_rows) is not bool:
+        raise TypeError("retain_scale_rows must be a boolean")
     grouped, m, k, num_groups = _as_grouped_mkl(source)
     _check_mxfp8_k(k)
 
@@ -2280,7 +2290,40 @@ def quantize_mxfp8_rows_torch(source: torch.Tensor) -> MXFP8Rows:
         k=k,
         num_groups=num_groups,
     )
-    return MXFP8Rows(values=values, scale_rows=scale_rows, scale_mma=scale_mma)
+    return MXFP8Rows(
+        values=values,
+        scale_rows=scale_rows if retain_scale_rows else None,
+        scale_mma=scale_mma,
+    )
+
+
+def materialize_mxfp8_scale_rows(rows: MXFP8Rows) -> torch.Tensor:
+    """Recover compact UE8M0 bytes without changing any represented scale.
+
+    This preparation/reference helper allocates only when the compact layout
+    was omitted. Serving kernels continue to consume the retained MMA layout.
+    """
+    if rows.scale_rows is not None:
+        return rows.scale_rows
+    if rows.values.ndim not in (2, 3):
+        raise ValueError("MXFP8 values must have two or three logical dimensions")
+    m, k = rows.values.shape[:2]
+    groups = 1 if rows.values.ndim == 2 else rows.values.shape[2]
+    if k % MXFP8_SCALE_VEC_SIZE or rows.scale_mma.shape != (
+        32,
+        4,
+        math.ceil(m / 128),
+        4,
+        math.ceil(k / 128),
+        groups,
+    ):
+        raise ValueError("MXFP8 MMA scales do not match the logical operand geometry")
+    padded = (
+        rows.scale_mma.permute(5, 2, 1, 0, 4, 3)
+        .contiguous()
+        .view(groups, math.ceil(m / 128) * 128, math.ceil(k / 128) * 4)
+    )
+    return padded[:, :m, : k // MXFP8_SCALE_VEC_SIZE].contiguous()
 
 
 def dequantize_mxfp8_rows_torch(
