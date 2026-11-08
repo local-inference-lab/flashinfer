@@ -44,6 +44,7 @@ class BlockscaledQuery:
     autotune_effort: str = field(default_factory=capture_autotune_effort)
     # (logical output rows, first stored row, exclusive end of stored rows).
     output_partition: tuple[int, int, int] | None = None
+    reference_rows: int | None = None
 
     def __post_init__(self):
         if isinstance(self.output_partition, list):
@@ -234,6 +235,22 @@ def _validate_query(query, device):
         raise ValueError("workspace limit must be nonnegative or None")
     if query.codegen != _codegen_snapshot():
         raise ValueError("packed declaration code-generation snapshot changed")
+    if query.reference_rows is not None and (
+        type(query.reference_rows) is not int
+        or query.reference_rows < query.num_tokens
+        or query.recipe != "mxfp8"
+        or query.activation_mode != "a16"
+        or query.source_activation != "identity"
+        or query.output_partition is not None
+        or query.output_mode != "provided"
+        or query.workspace_form != "provided"
+        or not query.source_contiguous
+        or not query.source_aligned
+        or query.in_features != query.padded_in_features
+        or query.num_tokens < MXFP8_A16_DEQUANT_MIN_ROWS
+        or query.expected_m != query.num_tokens
+    ):
+        raise ValueError("reference rows require exact expanded MXFP8 A16 geometry and caller storage")
     if query.output_partition is not None:
         partition = query.output_partition
         if (
@@ -433,7 +450,7 @@ def _validate_config(query, config, device):
         )
     if query.activation_mode != "auto" and config.mode != query.activation_mode:
         raise ValueError("configuration conflicts with caller activation precision")
-    if query.output_partition is not None:
+    if query.output_partition is not None or query.reference_rows is not None:
         if not mxfp8_a16_dequant(query, config):
             raise ValueError(
                 "output partitions require the expanded BF16 MXFP8 A16 lowering"
@@ -723,7 +740,8 @@ TUNING = TuningContract(
     encode_query=lambda query: {
         name: getattr(query, name)
         for name in query.__dataclass_fields__
-        if name != "output_partition" or query.output_partition is not None
+        if (name != "output_partition" or query.output_partition is not None)
+        and (name != "reference_rows" or query.reference_rows is not None)
     },
     encode_config=BlockscaledConfig.to_dict,
     decode_config=BlockscaledConfig.from_config,

@@ -84,7 +84,7 @@ def test_output_partition_preserves_default_query_identity_and_freezes_geometry(
     expected = {
         name: getattr(plain, name)
         for name in plain.__dataclass_fields__
-        if name != "output_partition"
+        if name not in ("output_partition", "reference_rows")
     }
     assert _tuning.TUNING.encode_query(plain) == expected
     assert (

@@ -309,6 +309,11 @@ def _projection_workspace_bytes(query, config, device):
             slices * query.num_tokens * query.out_features * 4 if slices > 1 else 0
         )
         if mxfp8_a16_dequant(query, config):
+            if query.reference_rows is not None:
+                from b12x.gemm._shared.reference_matmul import MAX_WORKSPACE_BYTES
+
+                weight_bytes = query.out_features * query.padded_in_features * 2
+                return triton.cdiv(weight_bytes, 256) * 256 + MAX_WORKSPACE_BYTES
             if query.output_partition is not None:
                 logical = query.output_partition[0]
                 weight_bytes = logical * query.padded_in_features * 2
@@ -363,6 +368,7 @@ class _PackedExecutionState:
     mxfp8_bases: tuple | None = None
     short_dense: object | None = None
     iq2_lut: torch.Tensor | None = None
+    reference_matmul: object | None = None
 
     @property
     def owned_nbytes(self) -> int:
@@ -424,7 +430,7 @@ class _PackedExecutionState:
         if source.ndim < 2 or source.shape[-1] != source_width:
             raise ValueError("packed source logical K differs from preparation")
         m = source.numel() // source_width
-        if q.output_partition is not None and m != q.num_tokens:
+        if (q.output_partition is not None or q.reference_rows is not None) and m != q.num_tokens:
             raise ValueError("output partition execution requires its exact prepared M")
         if m and (m > q.num_tokens or (q.expected_m is not None and m != q.num_tokens)):
             raise ValueError(
@@ -523,7 +529,7 @@ class _PackedExecutionState:
                 raise ValueError("output must not overlap packed inputs")
             if workspace is not None:
                 _check_tensor("workspace", workspace, self.device, torch.uint8)
-                if q.output_partition is not None and workspace.ndim != 1:
+                if (q.output_partition is not None or q.reference_rows is not None) and workspace.ndim != 1:
                     raise ValueError(
                         "output partition workspace must be one-dimensional"
                     )
@@ -594,11 +600,12 @@ class _PackedExecutionState:
                 self.programs["dequant"][
                     (q.out_features, triton.cdiv(k, DEQUANT_BLOCK_K), 1)
                 ](values, scale_bytes, weight[first:end], k, DEQUANT_BLOCK_K)
-                torch.mm(
-                    source.view(m, q.in_features),
-                    weight.t(),
-                    out=destination,
-                )
+                if self.reference_matmul is None:
+                    torch.mm(source.view(m, q.in_features), weight.t(), out=destination)
+                else:
+                    scratch_offset = triton.cdiv(weight_bytes, 256) * 256
+                    self.reference_matmul(source.view(m, q.in_features), weight, destination,
+                                          workspace[scratch_offset:])
                 if q.output_partition is not None:
                     out.view(m, q.out_features).copy_(destination[:, first:end])
                 return out
@@ -868,6 +875,13 @@ def _plan_bf16(query: BlockscaledQuery, *, invocation=FrozenMapping(), override=
             lut = iq2_xs_execution_lut(
                 resolved_device, prepare=True, codec=query.recipe
             )
+        reference_matmul = None
+        if query.reference_rows is not None:
+            from b12x.gemm._shared.reference_matmul import ReferenceMatmul
+
+            reference_matmul = ReferenceMatmul(rows=query.num_tokens, columns=query.out_features,
+                inner=query.in_features, logical_rows=query.reference_rows,
+                logical_columns=query.out_features, device=resolved_device)
         return _PackedExecutionState(
             query,
             config,
@@ -884,6 +898,7 @@ def _plan_bf16(query: BlockscaledQuery, *, invocation=FrozenMapping(), override=
             bases,
             short_core,
             lut,
+            reference_matmul,
         )
 
     return Plan(
@@ -910,6 +925,7 @@ def _query_bf16_from_call(
     workspace=None,
     expected_m=None,
     output_partition=None,
+    reference_rows=None,
 ):
     from ._a16 import MXFP4LinearWeight, _weight_parts
     from ._iq2_xs import IQ2XSLinearWeight
@@ -958,6 +974,7 @@ def _query_bf16_from_call(
         workspace_nbytes=None if workspace is None else workspace.numel(),
         expected_m=expected_m,
         output_partition=output_partition,
+        reference_rows=reference_rows,
     )
 
 
@@ -1587,6 +1604,7 @@ def query_from_call(
     out_dtype=None,
     alpha=None,
     output_partition=None,
+    reference_rows=None,
     **options,
 ):
     """Describe a packed projection, optionally preserving a global output extent.
@@ -1597,13 +1615,17 @@ def query_from_call(
     plan expands only stored rows into zero-filled full-N scratch, computes
     the full-N BF16 GEMM and extracts the local output. Storage and execution
     reject packed-A16 or dynamic-row substitutes for that arithmetic contract.
+    ``reference_rows`` retains the cuBLASLt algorithm selected for an enclosing
+    row count while executing only the supplied independent rows. To preserve
+    bitwise output, the caller must retain each row's placement within the MMA
+    tile; retaining an arbitrary unaligned suffix at row zero does not do that.
     """
     from ._a16 import MXFP4LinearWeight, NVFP4LinearWeight
     from ._iq2_xs import IQ2XSLinearWeight
     from ._linear import MXFP8LinearWeight, TensorFP8LinearWeight
     from ._tuning import FixedBlockscaledQuery
 
-    if output_partition is not None and not (
+    if (output_partition is not None or reference_rows is not None) and not (
         isinstance(weight, MXFP8LinearWeight)
         and isinstance(source, torch.Tensor)
         and source.dtype == torch.bfloat16
@@ -1632,6 +1654,7 @@ def query_from_call(
             workspace=workspace,
             expected_m=expected_m,
             output_partition=output_partition,
+            reference_rows=reference_rows,
         )
     if source_activation != "identity":
         raise ValueError("source activation requires a packed BF16 NVFP4 projection")

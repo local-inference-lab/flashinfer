@@ -16,6 +16,7 @@
 
 #include <cuda_bf16.h>
 #include <driver_types.h>
+#include <limits>
 
 #include <flashinfer/gemm/mm_bf16_cublaslt.cuh>
 
@@ -138,3 +139,49 @@ void mm_bf16_cublaslt_run_with_algo(TensorView mat1, TensorView mat2,
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(mm_bf16_cublaslt_get_algos, mm_bf16_cublaslt_get_algos);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(mm_bf16_cublaslt_run_with_algo, mm_bf16_cublaslt_run_with_algo);
+
+// Algorithm lookup needs logical dimensions, not an allocation containing the
+// logical matrix. Output shards and compact row batches can retain that lookup.
+int64_t mm_bf16_cublaslt_get_algos_geometry(int64_t m, int64_t n, int64_t k,
+                                         int64_t workspace_bytes, int64_t cublas_handle,
+                                         TensorView algo_buffer) {
+  CHECK_CPU(algo_buffer);
+  CHECK_CONTIGUOUS(algo_buffer);
+  TVM_FFI_ICHECK(m > 0 && m <= std::numeric_limits<int>::max());
+  TVM_FFI_ICHECK(n > 0 && n <= std::numeric_limits<int>::max());
+  TVM_FFI_ICHECK(k > 0 && k <= std::numeric_limits<int>::max());
+  TVM_FFI_ICHECK(workspace_bytes >= 0);
+  const int count = static_cast<int>(algo_buffer.numel() * get_element_size(algo_buffer) /
+                                     flashinfer::mm_bf16_cublaslt::kAlgoBytes);
+  TVM_FFI_ICHECK(count > 0);
+  return flashinfer::mm_bf16_cublaslt::get_algorithms(
+      static_cast<int>(m), static_cast<int>(n), static_cast<int>(k), CUDA_R_16BF, nullptr,
+      static_cast<size_t>(workspace_bytes), reinterpret_cast<cublasLtHandle_t>(cublas_handle),
+      algo_buffer.data_ptr(), count);
+}
+
+int64_t mm_bf16_cublaslt_algo_workspace(int64_t m, int64_t n, int64_t k,
+                                     int64_t cublas_handle, TensorView algo_buffer) {
+  CHECK_CPU(algo_buffer);
+  CHECK_CONTIGUOUS(algo_buffer);
+  TVM_FFI_ICHECK(m > 0 && m <= std::numeric_limits<int>::max());
+  TVM_FFI_ICHECK(n > 0 && n <= std::numeric_limits<int>::max());
+  TVM_FFI_ICHECK(k > 0 && k <= std::numeric_limits<int>::max());
+  TVM_FFI_ICHECK(algo_buffer.numel() * get_element_size(algo_buffer) >= sizeof(cublasLtMatmulAlgo_t));
+  flashinfer::mm_bf16_cublaslt::GemmDescriptors desc(
+      static_cast<int>(m), static_cast<int>(n), static_cast<int>(k), CUDA_R_16BF);
+  cublasLtMatmulAlgo_t algo;
+  std::memcpy(&algo, algo_buffer.data_ptr(), sizeof(algo));
+  cublasLtMatmulHeuristicResult_t result{};
+  auto status = cublasLtMatmulAlgoCheck(reinterpret_cast<cublasLtHandle_t>(cublas_handle),
+      desc.matmul_desc.descriptor(), desc.a_layout.descriptor(), desc.b_layout.descriptor(),
+      desc.d_layout.descriptor(), desc.d_layout.descriptor(), &algo, &result);
+  TVM_FFI_ICHECK(status == CUBLAS_STATUS_SUCCESS && result.state == CUBLAS_STATUS_SUCCESS)
+      << "logical-geometry cuBLASLt algorithm does not support the physical shape";
+  return static_cast<int64_t>(result.workspaceSize);
+}
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(mm_bf16_cublaslt_get_algos_geometry,
+                             mm_bf16_cublaslt_get_algos_geometry);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(mm_bf16_cublaslt_algo_workspace,
+                             mm_bf16_cublaslt_algo_workspace);
