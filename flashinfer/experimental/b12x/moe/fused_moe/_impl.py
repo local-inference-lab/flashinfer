@@ -4291,12 +4291,53 @@ def _allocate_arena_tensor(
     return tensor, offset + nbytes
 
 
-def _core_workspace_nbytes(plan: _TPCoreWorkspacePlan) -> int:
+def _core_workspace_offsets(plan: _TPCoreWorkspacePlan) -> tuple[dict[str, int], int]:
+    """Map scratch by lifetime for the serial full-rotation Trellis phases."""
+    sizes = {
+        spec.name: _tensor_numel(spec.shape) * _dtype_nbytes(spec.dtype)
+        for spec in plan.tensor_specs
+    }
+    phase_names = (
+        {"fc1_c_tmp", "fc2_c_tmp", "rotation_a_gate", "full_rotation_output"}
+        if (
+            plan.implementation == "w4a16"
+            and plan.full_rotation
+            and plan.intermediate_hadamard
+            and not plan.projection_mixed_trellis
+            and not plan.trellis_pair_kinds
+        )
+        else set()
+    )
+    offsets: dict[str, int] = {}
     arena_nbytes = 0
     for spec in plan.tensor_specs:
+        if spec.name in offsets:
+            continue
         arena_nbytes = align_up(arena_nbytes, max(16, _dtype_nbytes(spec.dtype)))
-        arena_nbytes += _tensor_numel(spec.shape) * _dtype_nbytes(spec.dtype)
-    return int(arena_nbytes)
+        if spec.name in phase_names:
+            # Input rotation and FC1 partial sums coexist. The fused kernel's
+            # grid barrier retires both before FC2; the separate top-k reduction
+            # writes the reconstructed output after the fused kernel completes.
+            fc1_bytes = align_up(sizes["fc1_c_tmp"], 16)
+            offsets.update(
+                fc1_c_tmp=arena_nbytes,
+                fc2_c_tmp=arena_nbytes,
+                full_rotation_output=arena_nbytes,
+                rotation_a_gate=arena_nbytes + fc1_bytes,
+            )
+            arena_nbytes += max(
+                fc1_bytes + sizes["rotation_a_gate"],
+                sizes["fc2_c_tmp"],
+                sizes["full_rotation_output"],
+            )
+        else:
+            offsets[spec.name] = arena_nbytes
+            arena_nbytes += sizes[spec.name]
+    return offsets, int(arena_nbytes)
+
+
+def _core_workspace_nbytes(plan: _TPCoreWorkspacePlan) -> int:
+    return _core_workspace_offsets(plan)[1]
 
 
 def _emit_core_workspace_stats(
@@ -4328,17 +4369,16 @@ def _map_core_workspace_views(
         raise ValueError(
             f"MoE core arena requires {arena_nbytes} bytes, but only {capacity_nbytes} are available"
         )
-    relative_offset = 0
+    offsets, _ = _core_workspace_offsets(plan)
     tensors: Dict[str, torch.Tensor] = {}
     for spec in plan.tensor_specs:
-        tensor, absolute_next = _allocate_arena_tensor(
+        tensor, _ = _allocate_arena_tensor(
             shared_arena,
-            offset_bytes + relative_offset,
+            offset_bytes + offsets[spec.name],
             spec,
             do_init=do_init,
         )
         tensors[spec.name] = tensor
-        relative_offset = absolute_next - offset_bytes
     return tensors
 
 

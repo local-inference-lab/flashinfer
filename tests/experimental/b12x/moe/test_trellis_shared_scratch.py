@@ -2,6 +2,7 @@
 
 from dataclasses import replace
 import importlib.util
+import math
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -67,6 +68,24 @@ def _caps(rows, experts=896, topk=16, frozen=None):
     )
 
 
+def _phase_saving(plan):
+    sizes = {s.name: math.prod(s.shape) * s.dtype.itemsize for s in plan.tensor_specs}
+    before = sum(
+        sizes[name]
+        for name in (
+            "fc1_c_tmp",
+            "fc2_c_tmp",
+            "rotation_a_gate",
+            "full_rotation_output",
+        )
+    )
+    return before - max(
+        sizes["fc1_c_tmp"] + sizes["rotation_a_gate"],
+        sizes["fc2_c_tmp"],
+        sizes["full_rotation_output"],
+    )
+
+
 @pytest.mark.parametrize("rows", [1, 8, 128, 1024])
 @pytest.mark.parametrize("experts,topk", [(1, 1), (1, 4), (17, 4), (896, 16)])
 def test_compact_size_changes_only_input_transform_storage(
@@ -80,9 +99,10 @@ def test_compact_size_changes_only_input_transform_storage(
         for frozen in (None, 1, experts)
     ]
     generic, shared, per_expert = plans
-    assert (
-        generic.layout.total_nbytes - shared.layout.total_nbytes
-        == rows * (topk - 1) * 3584 * 2
+    assert generic.layout.total_nbytes - shared.layout.total_nbytes == rows * (
+        topk - 1
+    ) * 3584 * 2 - _phase_saving(generic._core_workspace_plan) + _phase_saving(
+        shared._core_workspace_plan
     )
     assert (
         per_expert.layout.total_nbytes
@@ -222,7 +242,11 @@ def test_frozen_and_generic_bindings_preserve_shapes_and_values(
             routes,
             experts,
             seed=4409,
-            scratch_saving_bytes=128 * (topk - 1) * 512 * 2,
+            scratch_saving_bytes=(
+                128 * (topk - 1) * 512 * 2
+                - _phase_saving(generic.scratch_plan._core_workspace_plan)
+                + _phase_saving(compact.scratch_plan._core_workspace_plan)
+            ),
         )
         graphs = []
         for rows in (3, 128, 1, 17, 125, 8):
