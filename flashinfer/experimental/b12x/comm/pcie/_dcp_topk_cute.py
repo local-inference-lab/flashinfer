@@ -17,7 +17,7 @@ from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils.device import current_cuda_stream
 from b12x._lib.utils.pointers import make_ptr
 
-from ._dcp_cute_common import block_pair_barrier
+from ._dcp_cute_common import block_pair_barrier, _membar_sys
 
 
 _MAX_BLOCKS = 128
@@ -351,6 +351,16 @@ class _TopKOwnerStageLaunch:
                             + runtime_output_offset * Int64(4),
                         )
                     runtime_pack += Int64(self._threads)
+                if cutlass.const_expr(self._world_size == 16):
+                    if (Int64(rows) > owner_rows) & (
+                        Int64(runtime_destination) * owner_rows < Int64(rows)
+                    ):
+                        # Order this CTA's peer batches before its warps target
+                        # another GPU. Single-owner rows use the final peer barrier.
+                        cute.arch.sync_threads()
+                        if tidx == 0:
+                            _membar_sys()
+                        cute.arch.sync_threads()
                 runtime_step += Int32(1)
 
         block_pair_barrier(
@@ -403,7 +413,7 @@ def _get_compiled_topk_stage(
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "comm.pcie.dcp_topk.owner_stage",
-            5,
+            7,
             key,
             labels=("world_size", "rank", "topk", "threads"),
         ),
