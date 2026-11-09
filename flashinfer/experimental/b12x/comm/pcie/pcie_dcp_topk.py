@@ -27,7 +27,7 @@ from .pcie_oneshot import (
 )
 
 
-SUPPORTED_WORLD_SIZES = (2, 3, 4, 6, 8)
+SUPPORTED_WORLD_SIZES = (2, 3, 4, 6, 8, 16)
 _MAX_BLOCKS = 128
 _SIGNAL_BYTES = signal_bytes(_MAX_BLOCKS)
 
@@ -60,12 +60,12 @@ def _candidate_staging_layout(
         raise ValueError("signal_bytes must be positive")
     if world_size not in SUPPORTED_WORLD_SIZES:
         raise ValueError(f"unsupported world size {world_size}")
-    if max_rows <= 0 or max_rows % world_size != 0:
-        raise ValueError("max_rows must be positive and divisible by world_size")
+    if max_rows <= 0:
+        raise ValueError("max_rows must be positive")
     if topk <= 0 or topk % 4 != 0:
         raise ValueError("topk must be a positive multiple of 4")
 
-    max_owner_rows = max_rows // world_size
+    max_owner_rows = -(-max_rows // world_size)
     plane_bytes = max_owner_rows * world_size * topk * 4
     slot_bytes = _align_up(plane_bytes * 2, IPC_SLAB_ALIGNMENT)
     staging0_offset = _align_up(signal_bytes, IPC_SLAB_ALIGNMENT)
@@ -124,16 +124,25 @@ def owner_stage_reference(
             "rank candidates must have matching [world, rows, topk] shapes"
         )
     world_size, rows, _ = rank_indices.shape
-    if rows % world_size != 0:
-        raise ValueError("rows must be divisible by world size")
+    if rows <= 0:
+        raise ValueError("rows must be positive")
     if not 0 <= owner_rank < world_size:
         raise ValueError("invalid owner rank")
-    owner_rows = rows // world_size
-    row_slice = slice(owner_rank * owner_rows, (owner_rank + 1) * owner_rows)
-    return (
-        rank_indices[:, row_slice].transpose(0, 1).flatten(1).contiguous(),
-        rank_scores[:, row_slice].transpose(0, 1).flatten(1).contiguous(),
+    owner_rows = -(-rows // world_size)
+    start = owner_rank * owner_rows
+    valid = max(0, min(owner_rows, rows - start))
+    indices = rank_indices.new_full(
+        (owner_rows, world_size * rank_indices.shape[2]), -1
     )
+    scores = rank_scores.new_full(indices.shape, -float("inf"))
+    if valid:
+        indices[:valid].copy_(
+            rank_indices[:, start : start + valid].transpose(0, 1).flatten(1)
+        )
+        scores[:valid].copy_(
+            rank_scores[:, start : start + valid].transpose(0, 1).flatten(1)
+        )
+    return indices, scores
 
 
 class _IPCChannel:
@@ -220,10 +229,13 @@ class _IPCChannel:
 class PCIeDCPTopKOwnerExchange(_IPCChannel):
     """Write exact DCP candidates directly into each row owner's IPC slab.
 
-    CUDA graphs captured from one instance share a device epoch and must be
-    replayed serially. Use a separate instance for independently replayable
-    graphs. Returned candidate views alias channel-owned staging and their
-    consumers must be enqueued on the capture stream before the next replay.
+    Rank r receives the contiguous row partition beginning at
+    r*ceil(rows/world_size), with (-1,-inf) padding for missing rows. IDs and
+    FP32 score words retain their exact bits and rank-major candidate order.
+
+    Captured calls or explicit graph-view reservation bind one staging slot.
+    They must replay serially, with consumers on the capture stream before
+    the next call. Use separate instances for independently replayable graphs.
     """
 
     def __init__(
@@ -249,8 +261,8 @@ class PCIeDCPTopKOwnerExchange(_IPCChannel):
             raise ValueError(f"unsupported world size {world_size}")
         if not 0 <= rank < world_size:
             raise ValueError(f"invalid rank {rank} for world size {world_size}")
-        if max_rows <= 0 or max_rows % world_size != 0:
-            raise ValueError("max_rows must be positive and divisible by world_size")
+        if max_rows <= 0:
+            raise ValueError("max_rows must be positive")
         if topk <= 0 or topk % 4 != 0:
             raise ValueError("topk must be a positive multiple of 4")
         if not (
@@ -268,7 +280,7 @@ class PCIeDCPTopKOwnerExchange(_IPCChannel):
         self.rank = int(rank)
         self.world_size = int(world_size)
         self.max_rows = int(max_rows)
-        self.max_owner_rows = self.max_rows // self.world_size
+        self.max_owner_rows = -(-self.max_rows // self.world_size)
         self.topk = int(topk)
         self._signal_ptrs = tuple(int(ptr) for ptr in signal_ptrs)
         self._staging_ptrs = (
@@ -313,13 +325,15 @@ class PCIeDCPTopKOwnerExchange(_IPCChannel):
         topk: int,
         ext_module=None,
         stream_affine: bool = True,
+        ipc=None,
     ) -> "PCIeDCPTopKOwnerExchange":
+        """Allocate peer staging through the caller's recording allocator when supplied."""
         rank = dist.get_rank(group=exchange_group)
         world_size = dist.get_world_size(group=exchange_group)
         device_obj = _normalize_device(device)
         if device_obj.type != "cuda":
             raise ValueError("DCP top-k owner exchange requires a CUDA device")
-        ipc = CudaRTLibrary()
+        ipc = CudaRTLibrary() if ipc is None else ipc
         ipc.cudaSetDevice(device_obj.index or 0)
         layout = _candidate_staging_layout(
             signal_bytes=_SIGNAL_BYTES,
@@ -369,6 +383,7 @@ class PCIeDCPTopKOwnerExchange(_IPCChannel):
         topk: int,
         ext_module=None,
         stream_affine: bool = True,
+        ipc=None,
     ) -> "PCIeDCPTopKOwnerExchange":
         return cls.from_exchange_group(
             exchange_group=process_group,
@@ -377,6 +392,7 @@ class PCIeDCPTopKOwnerExchange(_IPCChannel):
             topk=topk,
             ext_module=ext_module,
             stream_affine=stream_affine,
+            ipc=ipc,
         )
 
     def stage_candidates(
@@ -409,10 +425,34 @@ class PCIeDCPTopKOwnerExchange(_IPCChannel):
                 block_limit=prepared_limit,
             )
 
+    def graph_candidate_views(self, rows: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Reserve stable outputs for serial captured calls without running a kernel.
+
+        Each owner retains ceil(rows/world) slots; rows beyond the input are
+        (-1, -inf) padding. Consumers must finish on the same stream before
+        another captured call reuses these channel-owned views.
+        """
+        if not 0 < rows <= self.max_rows:
+            raise ValueError("graph rows must fit the owner exchange capacity")
+        if self._closed or not self._candidate_views:
+            raise RuntimeError("graph candidate views require an open CUDA channel")
+        if self._graph_slot is None:
+            self._graph_slot = self._next_slot
+        owner_rows = -(-rows // self.world_size)
+        return tuple(
+            view[:owner_rows] for view in self._candidate_views[self._graph_slot]
+        )
+
     @contextmanager
     def capture(self, *, plan: Plan):
         """Serialize capture for an already-prepared owner exchange."""
         state = require_prepared(plan, "comm.pcie", self.device)
+        with self._capture_prepared(state):
+            yield self
+
+    @contextmanager
+    def _capture_prepared(self, state):
+        """Capture a materialized candidate before its owning plan is selected."""
         state.require_runtime(self)
         if self._capture_context_depth:
             raise RuntimeError("overlapping DCP top-k capture contexts are not allowed")
@@ -442,10 +482,8 @@ class PCIeDCPTopKOwnerExchange(_IPCChannel):
         if local_indices.shape != local_scores.shape or local_indices.ndim != 2:
             raise ValueError("inputs must have matching [rows, topk] shapes")
         rows, topk = (int(value) for value in local_indices.shape)
-        if rows <= 0 or rows > self.max_rows or rows % self.world_size != 0:
-            raise ValueError(
-                f"rows must be in (0, {self.max_rows}] and divisible by world_size"
-            )
+        if rows <= 0 or rows > self.max_rows:
+            raise ValueError(f"rows must be in (0, {self.max_rows}]")
         if topk != self.topk:
             raise ValueError(f"topk {topk} does not match configured topk {self.topk}")
         if not local_indices.is_contiguous() or not local_scores.is_contiguous():
@@ -456,7 +494,7 @@ class PCIeDCPTopKOwnerExchange(_IPCChannel):
             world_size=self.world_size,
         )
         self._bind_stream()
-        owner_packs = (rows // self.world_size) * (self.topk // 4)
+        owner_packs = (-(-rows // self.world_size)) * (self.topk // 4)
         blocks = max(1, min(int(block_limit), (owner_packs + threads - 1) // threads))
         capturing = _is_current_stream_capturing(self.device)
         if capturing:
@@ -487,10 +525,10 @@ class PCIeDCPTopKOwnerExchange(_IPCChannel):
         candidate_views = self._candidate_views[slot] if self._candidate_views else ()
         if not candidate_views:
             raise RuntimeError("DCP top-k candidate views require a CUDA device")
-        owner_rows = rows // self.world_size
+        owner_rows = -(-rows // self.world_size)
         candidate_indices = candidate_views[0][:owner_rows]
         candidate_scores = candidate_views[1][:owner_rows]
-        expected = (rows // self.world_size, self.world_size * self.topk)
+        expected = (owner_rows, self.world_size * self.topk)
         _validate_candidate_view(
             candidate_indices,
             expected=expected,

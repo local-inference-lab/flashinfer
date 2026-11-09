@@ -385,7 +385,11 @@ def prepared_call(state, **actual):
                 block_limit=query.call["block_limit"],
             )
 
-        return PreparedCall(run=run, capture_safe=True)
+        return PreparedCall(
+            run=run,
+            capture_safe=True,
+            capture_context=lambda: runtime._capture_prepared(state),
+        )
     if query.surface == "VocabParallelArgmax.fused_add_argmax":
         out = actual.get("out")
         if out is None:
