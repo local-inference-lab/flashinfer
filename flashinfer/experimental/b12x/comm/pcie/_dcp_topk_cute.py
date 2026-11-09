@@ -17,11 +17,11 @@ from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils.device import current_cuda_stream
 from b12x._lib.utils.pointers import make_ptr
 
-from ._dcp_cute_common import block_pair_barrier
+from ._dcp_cute_common import block_pair_barrier, _membar_sys
 
 
 _MAX_BLOCKS = 128
-_MAX_PEERS = 8
+_MAX_PEERS = 16
 
 
 @cute.jit
@@ -50,6 +50,14 @@ class _TopKOwnerStageLaunch:
         candidate5: cute.Pointer,
         candidate6: cute.Pointer,
         candidate7: cute.Pointer,
+        candidate8: cute.Pointer,
+        candidate9: cute.Pointer,
+        candidate10: cute.Pointer,
+        candidate11: cute.Pointer,
+        candidate12: cute.Pointer,
+        candidate13: cute.Pointer,
+        candidate14: cute.Pointer,
+        candidate15: cute.Pointer,
         signal0: cute.Pointer,
         signal1: cute.Pointer,
         signal2: cute.Pointer,
@@ -58,6 +66,14 @@ class _TopKOwnerStageLaunch:
         signal5: cute.Pointer,
         signal6: cute.Pointer,
         signal7: cute.Pointer,
+        signal8: cute.Pointer,
+        signal9: cute.Pointer,
+        signal10: cute.Pointer,
+        signal11: cute.Pointer,
+        signal12: cute.Pointer,
+        signal13: cute.Pointer,
+        signal14: cute.Pointer,
+        signal15: cute.Pointer,
         rows: Int32,
         candidate_plane_elems: Int64,
         grid_x: Int32,
@@ -75,6 +91,14 @@ class _TopKOwnerStageLaunch:
             candidate5,
             candidate6,
             candidate7,
+            candidate8,
+            candidate9,
+            candidate10,
+            candidate11,
+            candidate12,
+            candidate13,
+            candidate14,
+            candidate15,
             signal0,
             signal1,
             signal2,
@@ -83,6 +107,14 @@ class _TopKOwnerStageLaunch:
             signal5,
             signal6,
             signal7,
+            signal8,
+            signal9,
+            signal10,
+            signal11,
+            signal12,
+            signal13,
+            signal14,
+            signal15,
             rows,
             candidate_plane_elems,
             wait_for_prior_consumer,
@@ -106,6 +138,14 @@ class _TopKOwnerStageLaunch:
         candidate5: cute.Pointer,
         candidate6: cute.Pointer,
         candidate7: cute.Pointer,
+        candidate8: cute.Pointer,
+        candidate9: cute.Pointer,
+        candidate10: cute.Pointer,
+        candidate11: cute.Pointer,
+        candidate12: cute.Pointer,
+        candidate13: cute.Pointer,
+        candidate14: cute.Pointer,
+        candidate15: cute.Pointer,
         signal0: cute.Pointer,
         signal1: cute.Pointer,
         signal2: cute.Pointer,
@@ -114,6 +154,14 @@ class _TopKOwnerStageLaunch:
         signal5: cute.Pointer,
         signal6: cute.Pointer,
         signal7: cute.Pointer,
+        signal8: cute.Pointer,
+        signal9: cute.Pointer,
+        signal10: cute.Pointer,
+        signal11: cute.Pointer,
+        signal12: cute.Pointer,
+        signal13: cute.Pointer,
+        signal14: cute.Pointer,
+        signal15: cute.Pointer,
         rows: Int32,
         candidate_plane_elems: Int64,
         wait_for_prior_consumer: Int32,
@@ -127,6 +175,14 @@ class _TopKOwnerStageLaunch:
             candidate5,
             candidate6,
             candidate7,
+            candidate8,
+            candidate9,
+            candidate10,
+            candidate11,
+            candidate12,
+            candidate13,
+            candidate14,
+            candidate15,
         )
         signals = (
             signal0,
@@ -137,12 +193,22 @@ class _TopKOwnerStageLaunch:
             signal5,
             signal6,
             signal7,
+            signal8,
+            signal9,
+            signal10,
+            signal11,
+            signal12,
+            signal13,
+            signal14,
+            signal15,
         )
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
         gdim, _, _ = cute.arch.grid_dim()
 
-        owner_rows = Int64(rows) // Int64(self._world_size)
+        owner_rows = (Int64(rows) + Int64(self._world_size - 1)) // Int64(
+            self._world_size
+        )
         packs_per_row = Int64(self._topk // 4)
         owner_packs = owner_rows * packs_per_row
         output_row_packs = Int64(self._world_size) * packs_per_row
@@ -162,6 +228,39 @@ class _TopKOwnerStageLaunch:
             )
 
         candidate_plane_words = candidate_plane_elems
+        # Ragged partitions retain fixed owner-row capacity. Dummy rows are
+        # initialized locally; producers neither read absent rows nor send them.
+        padding_pack = begin + Int64(tidx)
+        while padding_pack < end:
+            owner_row = padding_pack // packs_per_row
+            if Int64(self._rank) * owner_rows + owner_row >= Int64(rows):
+                column_pack = padding_pack - owner_row * packs_per_row
+                destination = candidates[self._rank]
+                peer = Int32(0)
+                while peer < Int32(self._world_size):
+                    offset = (
+                        owner_row * output_row_packs
+                        + Int64(peer) * packs_per_row
+                        + column_pack
+                    )
+                    st_global_v4_u32(
+                        (destination + offset * Int64(4)).toint(),
+                        Uint32(0xFFFFFFFF),
+                        Uint32(0xFFFFFFFF),
+                        Uint32(0xFFFFFFFF),
+                        Uint32(0xFFFFFFFF),
+                    )
+                    st_global_v4_u32(
+                        (
+                            destination + candidate_plane_words + offset * Int64(4)
+                        ).toint(),
+                        Uint32(0xFF800000),
+                        Uint32(0xFF800000),
+                        Uint32(0xFF800000),
+                        Uint32(0xFF800000),
+                    )
+                    peer += Int32(1)
+            padding_pack += Int64(self._threads)
         if cutlass.const_expr(self._world_size in (2, 4)):
             # Scalar runtime pointer selection costs TP2/TP4 an occupancy tier.
             # Retain their smaller proven specializations while keeping the
@@ -184,22 +283,26 @@ class _TopKOwnerStageLaunch:
                         + Int64(self._rank) * packs_per_row
                         + unrolled_column_pack
                     )
-                    _copy_16b(
-                        local_indices
-                        + (unrolled_input_offset + unrolled_pack) * Int64(4),
-                        unrolled_destination_indices
-                        + unrolled_output_offset * Int64(4),
-                    )
-                    _copy_16b(
-                        local_scores
-                        + (unrolled_input_offset + unrolled_pack) * Int64(4),
-                        unrolled_destination_scores + unrolled_output_offset * Int64(4),
-                    )
+                    if Int64(
+                        unrolled_destination
+                    ) * owner_rows + unrolled_owner_row < Int64(rows):
+                        _copy_16b(
+                            local_indices
+                            + (unrolled_input_offset + unrolled_pack) * Int64(4),
+                            unrolled_destination_indices
+                            + unrolled_output_offset * Int64(4),
+                        )
+                        _copy_16b(
+                            local_scores
+                            + (unrolled_input_offset + unrolled_pack) * Int64(4),
+                            unrolled_destination_scores
+                            + unrolled_output_offset * Int64(4),
+                        )
                     unrolled_pack += Int64(self._threads)
         else:
             # The candidate pointers remain scalar kernel parameters; select
-            # their address at runtime so TP3/TP6/TP8 do not clone the payload
-            # loop.
+            # their address at runtime to avoid cloning the payload loop for
+            # each peer.
             runtime_step = Int32(0)
             while runtime_step < Int32(self._world_size):
                 runtime_destination = (Int32(self._rank) + runtime_step) % Int32(
@@ -232,16 +335,32 @@ class _TopKOwnerStageLaunch:
                         + Int64(self._rank) * packs_per_row
                         + runtime_column_pack
                     )
-                    _copy_16b(
-                        local_indices
-                        + (runtime_input_offset + runtime_pack) * Int64(4),
-                        runtime_destination_indices + runtime_output_offset * Int64(4),
-                    )
-                    _copy_16b(
-                        local_scores + (runtime_input_offset + runtime_pack) * Int64(4),
-                        runtime_destination_scores + runtime_output_offset * Int64(4),
-                    )
+                    if Int64(
+                        runtime_destination
+                    ) * owner_rows + runtime_owner_row < Int64(rows):
+                        _copy_16b(
+                            local_indices
+                            + (runtime_input_offset + runtime_pack) * Int64(4),
+                            runtime_destination_indices
+                            + runtime_output_offset * Int64(4),
+                        )
+                        _copy_16b(
+                            local_scores
+                            + (runtime_input_offset + runtime_pack) * Int64(4),
+                            runtime_destination_scores
+                            + runtime_output_offset * Int64(4),
+                        )
                     runtime_pack += Int64(self._threads)
+                if cutlass.const_expr(self._world_size == 16):
+                    if (Int64(rows) > owner_rows) & (
+                        Int64(runtime_destination) * owner_rows < Int64(rows)
+                    ):
+                        # Order this CTA's peer batches before its warps target
+                        # another GPU. Single-owner rows use the final peer barrier.
+                        cute.arch.sync_threads()
+                        if tidx == 0:
+                            _membar_sys()
+                        cute.arch.sync_threads()
                 runtime_step += Int32(1)
 
         block_pair_barrier(
@@ -294,7 +413,7 @@ def _get_compiled_topk_stage(
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "comm.pcie.dcp_topk.owner_stage",
-            4,
+            7,
             key,
             labels=("world_size", "rank", "topk", "threads"),
         ),
