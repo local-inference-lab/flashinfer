@@ -135,6 +135,8 @@ def query_from_runtime(runtime, *, surface, call) -> PcieQuery:
             and (out is None or out.data_ptr() % 16 == 0),
         )
     elif surface.endswith("all_gather_pair"):
+        from .pcie_dcp_a2a import _pair_outputs_disjoint
+
         first, second = (
             _call_value(call, "local_first"),
             _call_value(call, "local_second"),
@@ -144,6 +146,10 @@ def query_from_runtime(runtime, *, surface, call) -> PcieQuery:
             second_dtype=str(second.dtype),
             first_shape=tuple(first.shape),
             second_shape=tuple(second.shape),
+            row_blocks=call.get("row_blocks", 1),
+            disjoint_output=_pair_outputs_disjoint(
+                first, second, call.get("out_first"), call.get("out_second")
+            ),
         )
     elif surface.endswith("all_gather_pair_kimi_topk"):
         metadata["threads"] = 512
@@ -227,7 +233,12 @@ def compile_dcp_surface(query_payload, ordinal):
         if surface.endswith("all_gather_pair"):
             return {
                 slot: cute._get_compiled_all_gather_pair(
-                    query.world_size, query.rank, int(call["threads"]), slot, False
+                    query.world_size,
+                    query.rank,
+                    int(call["threads"]),
+                    slot,
+                    False,
+                    int(call.get("row_blocks", 1)),
                 )
                 for slot in (False, True)
             }

@@ -374,3 +374,60 @@ def test_byte_validation_accepts_exact_nan_payloads():
     inputs.out.copy_(inputs.reference.expected[0])
     assert inputs.out.isnan().any()
     inputs.validate()
+
+
+def test_parallel_paired_gather_rejects_overlapping_outputs_before_preparation():
+    from b12x.comm.pcie.pcie_dcp_a2a import _pair_outputs_disjoint
+
+    _, runtime = native_query(rows=4)
+    runtime.query_head_dim = 672
+    first = torch.empty((4, 224), dtype=torch.bfloat16)
+    second = torch.empty((4, 56), dtype=torch.float32)
+    out_first = torch.empty((4, 3584), dtype=torch.bfloat16)
+    out_second = torch.empty((4, 896), dtype=torch.float32)
+    assert _pair_outputs_disjoint(first, second, out_first, out_second)
+    call = dict(
+        local_first=first,
+        local_second=second,
+        out_first=out_first,
+        out_second=out_second,
+        row_blocks=4,
+    )
+    query = _preparation.query_from_runtime(
+        runtime, surface="DcpAllToAll.all_gather_pair", call=call
+    )
+    NATIVE.validate_query(query, SM120)
+    assert query.call["row_blocks"] == 4 and query.call["disjoint_output"]
+    shared = torch.empty((4 * 3584,), dtype=torch.bfloat16)
+    call.update(
+        local_first=shared[: 4 * 224].view(4, 224), out_first=shared.view(4, 3584)
+    )
+    query = _preparation.query_from_runtime(
+        runtime, surface="DcpAllToAll.all_gather_pair", call=call
+    )
+    with pytest.raises(ValueError, match="disjoint"):
+        NATIVE.validate_query(query, SM120)
+    # The one-CTA declaration preserves its existing alias contract.
+    query = replace(query, call=FrozenMapping(dict(query.call, row_blocks=1)))
+    NATIVE.validate_query(query, SM120)
+    assert not _pair_outputs_disjoint(
+        first, second, out_first, out_first.view(torch.float32)
+    )
+
+
+@pytest.mark.parametrize("row_blocks", [True, 2.5, "2"])
+def test_paired_gather_rejects_non_integer_row_blocks(row_blocks):
+    from b12x.comm import pcie
+
+    _, runtime = native_query(rows=4)
+    runtime.query_head_dim = 672
+    call = dict(
+        local_first=torch.empty((4, 224), dtype=torch.bfloat16),
+        local_second=torch.empty((4, 56), dtype=torch.float32),
+        row_blocks=row_blocks,
+    )
+    with pytest.raises(ValueError, match="row blocks"):
+        query = pcie.query_from_runtime(
+            runtime, surface="DcpAllToAll.all_gather_pair", call=call
+        )
+        pcie.plan(query, runtime=runtime)
