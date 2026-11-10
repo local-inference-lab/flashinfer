@@ -413,3 +413,21 @@ def test_parallel_paired_gather_rejects_overlapping_outputs_before_preparation()
     assert not _pair_outputs_disjoint(
         first, second, out_first, out_first.view(torch.float32)
     )
+
+
+@pytest.mark.parametrize("row_blocks", [True, 2.5, "2"])
+def test_paired_gather_rejects_non_integer_row_blocks(row_blocks):
+    from b12x.comm import pcie
+
+    _, runtime = native_query(rows=4)
+    runtime.query_head_dim = 672
+    call = dict(
+        local_first=torch.empty((4, 224), dtype=torch.bfloat16),
+        local_second=torch.empty((4, 56), dtype=torch.float32),
+        row_blocks=row_blocks,
+    )
+    with pytest.raises(ValueError, match="row blocks"):
+        query = pcie.query_from_runtime(
+            runtime, surface="DcpAllToAll.all_gather_pair", call=call
+        )
+        pcie.plan(query, runtime=runtime)

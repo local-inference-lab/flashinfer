@@ -138,14 +138,18 @@ def _worker(rank, world, origin, directory):
                     dtype=torch.uint8,
                     generator=generator,
                 )
-                first_values = first_bits.view(torch.bfloat16).to(device)
-                second_values = second_bits.view(torch.float32).to(device)
-                expected_first = torch.cat(
-                    [first_bits[peer] for peer in range(world)], dim=1
-                ).to(device)
-                expected_second = torch.cat(
-                    [second_bits[peer] for peer in range(world)], dim=1
-                ).to(device)
+                first_values = first_bits.view(torch.bfloat16).squeeze(-1).to(device)
+                second_values = second_bits.view(torch.float32).squeeze(-1).to(device)
+                expected_first = (
+                    torch.cat([first_bits[peer] for peer in range(world)], dim=1)
+                    .flatten(1)
+                    .to(device)
+                )
+                expected_second = (
+                    torch.cat([second_bits[peer] for peer in range(world)], dim=1)
+                    .flatten(1)
+                    .to(device)
+                )
                 variations.append(
                     (
                         first_values[rank],

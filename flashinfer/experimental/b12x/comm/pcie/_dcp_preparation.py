@@ -146,7 +146,7 @@ def query_from_runtime(runtime, *, surface, call) -> PcieQuery:
             second_dtype=str(second.dtype),
             first_shape=tuple(first.shape),
             second_shape=tuple(second.shape),
-            row_blocks=int(call.get("row_blocks", 1)),
+            row_blocks=call.get("row_blocks", 1),
             disjoint_output=_pair_outputs_disjoint(
                 first, second, call.get("out_first"), call.get("out_second")
             ),
