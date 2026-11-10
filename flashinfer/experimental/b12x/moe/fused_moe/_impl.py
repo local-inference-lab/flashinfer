@@ -8537,6 +8537,20 @@ def _plan_full_rotation_w4a16_launches(
             else (capacity_tokens,)
         )
 
+        # Bench-only small-M tuning knobs (plan-time, full-rotation Trellis
+        # only): B12X_TRELLIS_TILE_CONFIG="fc1_k,fc1_n,fc2_k,fc2_n" and
+        # B12X_TRELLIS_PIPELINE_STAGES=2..5 replace the weight plan's fixed
+        # launch geometry. Native t256 storage is tile-independent, so any
+        # tile that divides the projections reads the same bytes.
+        tile_env = os.environ.get("B12X_TRELLIS_TILE_CONFIG", "")
+        tile_config = (
+            tuple(int(v) for v in tile_env.split(","))
+            if tile_env
+            else core_plan.trellis_tile_config
+        )
+        stages_env = os.environ.get("B12X_TRELLIS_PIPELINE_STAGES", "")
+        pipeline_stages = int(stages_env) if stages_env else None
+
         def compile_fused(token_count: int, broadcast_suh: bool) -> object:
             return compile_w4a16_fused_moe(
                 size_m=token_count,
@@ -8567,7 +8581,8 @@ def _plan_full_rotation_w4a16_launches(
                 trellis_decode_table=caps.trellis_decode_table,
                 skip_empty_m_blocks=caps.w4a16_skip_empty_m_blocks,
                 small_m_occupancy=caps.w4a16_small_m_occupancy,
-                force_tile_config=core_plan.trellis_tile_config,
+                force_tile_config=tile_config,
+                pipeline_stages=pipeline_stages,
                 intermediate_rotation=True,
                 full_rotation=True,
                 intermediate_hadamard=core_plan.intermediate_hadamard,
