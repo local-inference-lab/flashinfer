@@ -8570,6 +8570,22 @@ def _plan_full_rotation_w4a16_launches(
         pipeline_stages = int(stages_env) if stages_env else None
 
         def compile_fused(token_count: int, broadcast_suh: bool) -> object:
+            measured_table = (trellis_prefill_launch_shape(token_count) or {}).get(
+                "trellis_decode_table"
+            )
+            try:
+                return _compile_fused(token_count, broadcast_suh, measured_table)
+            except ValueError as exc:
+                # The direct ("full") table needs 1 CTA/SM and 64 KiB of shared
+                # memory beside the staging; fall back to the plan's table when
+                # this geometry cannot hold it (prefill-shape launches only).
+                if measured_table != "full" or "decode table" not in str(exc):
+                    raise
+                return _compile_fused(token_count, broadcast_suh, None)
+
+        def _compile_fused(
+            token_count: int, broadcast_suh: bool, measured_table: str | None
+        ) -> object:
             # Prefill launch shapes (B12X_W4A16_PREFILL_SHAPES, M >= 128 only;
             # ported from tunamitom/flashinfer@2676f2beae6a/@14369ed04566).
             # The route block itself comes from _resolve_trellis_route_block_size
@@ -8581,7 +8597,7 @@ def _plan_full_rotation_w4a16_launches(
                 if pipeline_stages is not None
                 else measured.get("pipeline_stages")
             )
-            launch_table = measured.get("trellis_decode_table") or caps.trellis_decode_table
+            launch_table = measured_table or caps.trellis_decode_table
             launch_tiles = (
                 core_plan.trellis_tile_config
                 if trellis_prefill_native_tile(token_count)
