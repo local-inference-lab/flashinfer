@@ -238,7 +238,7 @@ def compile_owner_surface(query_payload, ordinal):
                 query.rank,
                 call["topk"],
                 call["threads"],
-                length_aware=call["length_aware"],
+                length_aware=call.get("length_aware", False),
             )
         if query.surface == "VocabParallelArgmax.fused_add_argmax":
             from ._vocab_argmax_cute import get_vocab_argmax_launcher

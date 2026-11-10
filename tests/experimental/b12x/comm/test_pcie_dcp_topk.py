@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -415,6 +417,42 @@ def test_counted_prepared_call_requires_counts():
     with pytest.raises(ValueError, match="candidate counts"):
         prepared_call(state, local_indices=ids, local_scores=ids.float()).run()
     assert owner.stage_calls == []
+
+
+def test_owner_compiler_defaults_to_full_width_when_query_omits_count_mode(monkeypatch):
+    from b12x.comm import pcie
+    from b12x.comm.pcie import _dcp_topk_cute, _owner_preparation
+    from b12x.preparation import FrozenMapping
+
+    owner = PCIeDCPTopKOwnerExchange(
+        rank=0,
+        world_size=2,
+        device="cpu",
+        signal_ptrs=(16, 32),
+        staging0_ptrs=(48, 64),
+        staging1_ptrs=(80, 96),
+        max_rows=1,
+        topk=4,
+    )
+    ids = torch.empty((1, 4), dtype=torch.int32)
+    query = pcie.query_from_runtime(
+        owner,
+        surface="DcpTopKOwnerExchange.stage_candidates",
+        call=dict(local_indices=ids, local_scores=ids.float()),
+    )
+    call = dict(query.call)
+    del call["length_aware"]
+    plan = pcie.plan(replace(query, call=FrozenMapping(call)), runtime=owner)
+    launcher = object()
+
+    def compile_stage(world_size, rank, topk, threads, *, length_aware):
+        assert (world_size, rank, topk, threads, length_aware) == (2, 0, 4, 512, False)
+        return launcher
+
+    monkeypatch.setattr(torch.cuda, "device", lambda _: nullcontext())
+    monkeypatch.setattr(_dcp_topk_cute, "_get_compiled_topk_stage", compile_stage)
+    payload = plan.contract.encode_query(plan.query)
+    assert _owner_preparation.compile_owner_surface(payload, 0) is launcher
 
 
 def test_counted_stage_clears_counts_for_missing_owner_rows():
