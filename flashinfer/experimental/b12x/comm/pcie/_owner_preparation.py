@@ -383,6 +383,10 @@ def prepared_call(state, **actual):
     """Build a priming call that invokes the materialized native owner state."""
     runtime, query = state.runtime, state.query
     if query.surface == "DcpTopKOwnerExchange.stage_candidates":
+        if bool(query.call.get("length_aware", False)) != (
+            actual.get("local_counts") is not None
+        ):
+            raise ValueError("candidate counts differ from the prepared DCP top-k plan")
 
         def run():
             return runtime._stage_candidates_on_device(

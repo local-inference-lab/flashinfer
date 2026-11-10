@@ -121,9 +121,10 @@ class _FakeOwner(PCIeDCPTopKOwnerExchange):
             counts = local_counts.clamp(0, self.topk)
             start = self.rank * owner_rows
             owned = counts[start : start + owner_rows]
-            self._count_views[slot][:owner_rows].zero_()
-            self._count_views[slot][:owner_rows] = owned.reshape(-1, 1).expand(
-                -1, self.world_size
+            count_view = self._count_views[slot][:owner_rows]
+            count_view.zero_()
+            count_view[: owned.numel()].copy_(
+                owned[:, None].expand(-1, self.world_size)
             )
         self.stage_calls.append((slot, threads, blocks, wait_for_prior_consumer))
 
@@ -403,3 +404,27 @@ def test_prepared_call_captures_materialized_state_before_plan_selection(monkeyp
         call.run()
     assert owner._capture_context_depth == 0
     assert owner.stage_calls == [(0, 512, 1, True)]
+
+
+def test_counted_prepared_call_requires_counts():
+    from b12x.comm.pcie._owner_preparation import prepared_call
+
+    owner = _make_owner(counted=True)
+    ids = torch.arange(32, dtype=torch.int32).view(8, 4)
+    state = _PreparedCPUState(owner, 8, length_aware=True)
+    with pytest.raises(ValueError, match="candidate counts"):
+        prepared_call(state, local_indices=ids, local_scores=ids.float()).run()
+    assert owner.stage_calls == []
+
+
+def test_counted_stage_clears_counts_for_missing_owner_rows():
+    owner = _make_owner(counted=True)
+    indices = torch.arange(28, dtype=torch.int32).view(7, 4)
+    counts = torch.tensor([4, 4, 4, 4, 3, 2, 1], dtype=torch.int32)
+    count_view = owner.graph_count_views(7)
+    count_view.fill_(4)
+
+    _, _, staged_counts = owner.stage_candidates(indices, indices.float(), counts)
+
+    assert staged_counts.data_ptr() == count_view.data_ptr()
+    assert staged_counts.tolist() == [[3, 3], [2, 2], [1, 1], [0, 0]]

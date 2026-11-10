@@ -533,6 +533,8 @@ def _get_compiled_topk_stage(
         wait_for_prior_consumer: bool,
     ) -> None:
         """Launch the compiled owner top-k staging kernel with runtime arguments."""
+        if length_aware != (local_counts_ptr is not None):
+            raise ValueError("candidate counts differ from the compiled DCP top-k mode")
         candidates = _pad_ptrs(candidate_ptrs, world_size)
         signals = _pad_ptrs(signal_ptrs, world_size)
         raw(

@@ -77,17 +77,119 @@ def _counts(
     return values[indices].to(device)
 
 
-def _canonicalize_staged(indices, scores, counts):
-    """Mirror the consumer's exact mask over untransferred channel tails."""
-    indices, scores = indices.clone(), scores.clone()
-    for row in range(counts.shape[0]):
-        for peer in range(counts.shape[1]):
-            count = max(0, min(int(counts[row, peer]), TOPK))
-            begin = peer * TOPK + count
-            end = (peer + 1) * TOPK
-            indices[row, begin:end] = -1
-            scores[row, begin:end] = -torch.inf
-    return indices, scores
+def _graph_inputs(step, rank, rows, device, pattern):
+    indices, scores = _inputs(step, rank, rows, device)
+    if pattern is None:
+        return indices, scores
+    if pattern == "short":
+        counts = (torch.arange(rows, dtype=torch.int32, device=device) + rank) % 7 + 1
+    else:
+        length = -(rank % 2) if pattern == "zero" else TOPK + rank % 2
+        counts = torch.full((rows,), length, dtype=torch.int32, device=device)
+    if pattern == "exceptional":
+        indices[:, 0] = -1
+        scores[:, 0] = -torch.inf
+        scores.view(torch.int32)[:, -1] = (
+            0x7FC01234,
+            0x7F800000,
+            -8388608,
+            -2147483648,
+        )[rank % 4]
+        if rank % 4 == 2:
+            indices[:, -1] = -2
+    return indices, scores, counts
+
+
+def _assert_staged(staged, peers, owner_rank):
+    expected_indices, expected_scores = owner_stage_reference(
+        torch.stack([item[0] for item in peers]),
+        torch.stack([item[1] for item in peers]),
+        owner_rank,
+    )
+    indices, scores, *counts = staged
+    if counts:
+        expected_counts = torch.zeros_like(counts[0])
+        owner_rows = expected_counts.shape[0]
+        start = owner_rank * owner_rows
+        local_counts = torch.stack(
+            [item[2][start : start + owner_rows] for item in peers]
+        )
+        expected_counts[: local_counts.shape[1]].copy_(local_counts.T.clamp(0, TOPK))
+        assert torch.equal(counts[0], expected_counts)
+        # A vectorized copy can also write extra words in the final pack.
+        # Only the words addressed by the received counts have defined values.
+        columns = torch.arange(TOPK, device=indices.device)
+        live = (columns < expected_counts[..., None]).flatten(1)
+        assert torch.equal(indices[live], expected_indices[live])
+        assert torch.equal(
+            scores.view(torch.int32)[live], expected_scores.view(torch.int32)[live]
+        )
+    else:
+        assert torch.equal(indices, expected_indices)
+        assert torch.equal(scores.view(torch.int32), expected_scores.view(torch.int32))
+
+
+def _check_graph_replay(runtime, plans, session, schedule, rank, group_ranks):
+    device = runtime.device
+    cases = {}
+    try:
+        for rows, pattern in dict(schedule).items():
+            plan = plans[rows]
+            inputs = _graph_inputs(10, rank, rows, device, pattern)
+            reserved = runtime.graph_candidate_views(rows)
+            if pattern is not None:
+                reserved += (runtime.graph_count_views(rows),)
+            consumed = tuple(torch.empty_like(view) for view in reserved)
+            graph = torch.cuda.CUDAGraph(keep_graph=True)
+            cases[rows] = graph, inputs, consumed
+            dist.barrier()
+            with session.capture(), runtime.capture(plan=plan), torch.cuda.graph(graph):
+                staged = runtime.stage_candidates(*inputs, plan=plan)
+                if runtime.rank == 0:
+                    torch.cuda._sleep(20_000_000)
+                for target, source in zip(consumed, staged, strict=True):
+                    target.copy_(source)
+            assert _cuda_graph_kernel_count(graph) == 1 + int(runtime.rank == 0)
+            assert tuple(t.data_ptr() for t in staged) == tuple(
+                t.data_ptr() for t in reserved
+            )
+
+        # Queue graphs with changing capacities and counts. The shared slot
+        # cannot be reused until the slow owner's preceding consumer retires.
+        replay_inputs = [
+            _graph_inputs(20 + step, rank, rows, device, pattern)
+            for step, (rows, pattern) in enumerate(schedule)
+        ]
+        snapshots = [
+            tuple(torch.empty_like(view) for view in cases[rows][2])
+            for rows, _ in schedule
+        ]
+        torch.cuda.synchronize(device)
+        before = torch.cuda.memory_stats(device)["allocation.all.allocated"]
+        for (rows, _), sources, saved in zip(
+            schedule, replay_inputs, snapshots, strict=True
+        ):
+            graph, inputs, consumed = cases[rows]
+            for target, source in zip(inputs, sources, strict=True):
+                target.copy_(source)
+            for target in consumed:
+                target.view(torch.int32).fill_(0x12345678)
+            graph.replay()
+            for target, source in zip(saved, consumed, strict=True):
+                target.copy_(source)
+        torch.cuda.synchronize(device)
+        assert torch.cuda.memory_stats(device)["allocation.all.allocated"] == before
+        for step, ((rows, pattern), saved) in enumerate(
+            zip(schedule, snapshots, strict=True)
+        ):
+            peers = [
+                _graph_inputs(20 + step, source, rows, device, pattern)
+                for source in group_ranks
+            ]
+            _assert_staged(saved, peers, runtime.rank)
+    finally:
+        for graph, *_ in cases.values():
+            graph.reset()
 
 
 def _dcp_groups(tp_world_size: int, dcp_world_size: int):
@@ -195,7 +297,15 @@ def _worker(
             )
             for rows in test_rows
         }
-        reserved = {rows: graph_owner.graph_candidate_views(rows) for rows in test_rows}
+        counted_graph_plans = {
+            rows: prepare(
+                graph_owner,
+                rows,
+                f"topk-counted-graph-{rows}",
+                _counts(0, rank, rows, device),
+            )
+            for rows in test_rows
+        }
         session.freeze()
         eager_output_ptrs = []
         for step, rows in enumerate(test_rows):
@@ -243,118 +353,52 @@ def _worker(
         assert eager_output_ptrs[0] != eager_output_ptrs[1]
         assert eager_output_ptrs[0] == eager_output_ptrs[2]
         assert eager_output_ptrs[1] == eager_output_ptrs[3]
-        for step, rows in enumerate(test_rows):
-            local_indices, local_scores = _inputs(step + 40, rank, rows, device)
-            local_counts = _counts(step + 40, rank, rows, device)
-            staged_indices, staged_scores, staged_counts = owner.stage_candidates(
+        for step, rows in enumerate(test_rows, start=40):
+            local_indices, local_scores = _inputs(step, rank, rows, device)
+            local_counts = _counts(step, rank, rows, device)
+            staged = owner.stage_candidates(
                 local_indices, local_scores, local_counts, plan=counted_plans[rows]
             )
-            candidate_indices, candidate_scores = _canonicalize_staged(
-                staged_indices, staged_scores, staged_counts
-            )
-            rank_inputs = []
-            expected_counts = torch.zeros_like(staged_counts)
-            owner_rows = -(-rows // dcp_world_size)
-            for peer, source in enumerate(dcp_global_ranks):
-                indices, scores = _inputs(step + 40, source, rows, device)
-                counts = _counts(step + 40, source, rows, device).clamp(0, TOPK)
-                for owner_row in range(owner_rows):
-                    global_row = dcp_rank * owner_rows + owner_row
-                    if global_row < rows:
-                        expected_counts[owner_row, peer] = counts[global_row]
-                for owner_row in range(rows):
-                    count = int(counts[owner_row])
-                    indices[owner_row, count:] = -1
-                    scores[owner_row, count:] = -torch.inf
-                rank_inputs.append((indices, scores))
-            assert torch.equal(staged_counts, expected_counts)
-            expected_indices, expected_scores = owner_stage_reference(
-                torch.stack([item[0] for item in rank_inputs]),
-                torch.stack([item[1] for item in rank_inputs]),
-                dcp_rank,
-            )
-            assert torch.equal(candidate_indices, expected_indices)
-            assert torch.equal(
-                candidate_scores.view(torch.int32), expected_scores.view(torch.int32)
-            )
-        graph_cases = {}
-        for graph_rows in test_rows:
-            graph_plan = graph_plans[graph_rows]
-            graph_indices, graph_scores = _inputs(10, rank, graph_rows, device)
-            shape = (-(-graph_rows // dcp_world_size), dcp_world_size * TOPK)
-            consumed_indices = torch.empty(shape, dtype=torch.int32, device=device)
-            consumed_scores = torch.empty(shape, dtype=torch.float32, device=device)
-            graph = torch.cuda.CUDAGraph(keep_graph=True)
-            dist.barrier()
-            with (
-                session.capture(),
-                graph_owner.capture(plan=graph_plan),
-                torch.cuda.graph(graph),
-            ):
-                candidates = graph_owner.stage_candidates(
-                    graph_indices, graph_scores, plan=graph_plan
-                )
-                if dcp_rank == 0:
-                    torch.cuda._sleep(20_000_000)
-                consumed_indices.copy_(candidates[0])
-                consumed_scores.copy_(candidates[1])
-            assert _cuda_graph_kernel_count(graph) == 1 + int(dcp_rank == 0)
-            assert tuple(t.data_ptr() for t in candidates) == tuple(
-                t.data_ptr() for t in reserved[graph_rows]
-            )
-            graph_cases[graph_rows] = (
-                graph,
-                graph_indices,
-                graph_scores,
-                consumed_indices,
-                consumed_scores,
-            )
-
-        # Alternate captured sizes without host/device synchronization. A
-        # fixed-slot write must wait for every preceding consumer, including
-        # peers whose owner partition was empty in the preceding invocation.
-        row_schedule = (max_rows, 1, 8, 3, 17, 4, 6, max_rows - 1, max_rows, 3, 8, 1)
-        replay_inputs = [
-            _inputs(20 + index, rank, rows, device)
-            for index, rows in enumerate(row_schedule)
-        ]
-        snapshots = [
-            (
-                torch.empty_like(graph_cases[rows][3]),
-                torch.empty_like(graph_cases[rows][4]),
-            )
-            for rows in row_schedule
-        ]
-        torch.cuda.synchronize(device)
-        before = torch.cuda.memory_stats(device)["allocation.all.allocated"]
-        for rows, inputs, saved in zip(row_schedule, replay_inputs, snapshots):
-            graph, indices, scores, consumed_indices, consumed_scores = graph_cases[
-                rows
-            ]
-            indices.copy_(inputs[0])
-            scores.copy_(inputs[1])
-            consumed_indices.fill_(-123)
-            consumed_scores.view(torch.int32).fill_(0x12345678)
-            graph.replay()
-            saved[0].copy_(consumed_indices)
-            saved[1].copy_(consumed_scores)
-        torch.cuda.synchronize(device)
-        assert torch.cuda.memory_stats(device)["allocation.all.allocated"] == before
-        for index, (rows, saved) in enumerate(zip(row_schedule, snapshots)):
             peers = [
-                _inputs(20 + index, source, rows, device) for source in dcp_global_ranks
+                (
+                    *_inputs(step, source, rows, device),
+                    _counts(step, source, rows, device),
+                )
+                for source in dcp_global_ranks
             ]
-            expected = owner_stage_reference(
-                torch.stack([item[0] for item in peers]),
-                torch.stack([item[1] for item in peers]),
-                dcp_rank,
-            )
-            assert torch.equal(saved[0], expected[0])
-            assert torch.equal(
-                saved[1].view(torch.int32), expected[1].view(torch.int32)
-            )
-        for graph, *_ in graph_cases.values():
-            graph.reset()
+            _assert_staged(staged, peers, dcp_rank)
+
+        row_schedule = (max_rows, 1, 8, 3, 17, 4, 6, max_rows - 1, max_rows, 3, 8, 1)
+        _check_graph_replay(
+            graph_owner,
+            graph_plans,
+            session,
+            tuple((rows, None) for rows in row_schedule),
+            rank,
+            dcp_global_ranks,
+        )
+        counted_schedule = (
+            (max_rows, "long"),
+            (1, "short"),
+            (max_rows, "zero"),
+            (3, "exceptional"),
+            (8, "long"),
+            (8, "short"),
+            (8, "zero"),
+            (8, "exceptional"),
+            (17, "short"),
+            (max_rows - 1, "long"),
+            (4, "zero"),
+            (6, "exceptional"),
+        )
+        _check_graph_replay(
+            graph_owner,
+            counted_graph_plans,
+            session,
+            counted_schedule,
+            rank,
+            dcp_global_ranks,
+        )
         dist.barrier()
         torch.cuda.synchronize(device)
     finally:

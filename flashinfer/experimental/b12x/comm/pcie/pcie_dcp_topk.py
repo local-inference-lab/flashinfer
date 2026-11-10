@@ -204,6 +204,7 @@ class _IPCChannel:
             return
         self._close_ipc_imports()
         self._candidate_views = ()
+        self._count_views = ()
         if self._ipc is not None:
             for shared in self._owned_buffers:
                 with suppress(Exception):
@@ -427,8 +428,12 @@ class PCIeDCPTopKOwnerExchange(_IPCChannel):
     ) -> tuple[torch.Tensor, ...]:
         """Stage candidates through the session-prepared native launcher.
 
-        Counted calls transfer only live words and their per-peer counts. Their
-        consumers must mask untransferred tails before candidate processing.
+        All ranks must use the same counted or full-width mode. Counted calls
+        clamp each supplied length to [0, topk] and transfer its prefix in
+        four-candidate packs, plus the exact clamped count. The final pack may
+        contain extra words, and untransferred storage retains earlier data.
+        Consumers must mask everything beyond each count before processing.
+        Returned views belong to this channel and expire on reuse or close.
         """
         state = require_prepared(plan, "comm.pcie", self.device)
         state.require_runtime(self)
