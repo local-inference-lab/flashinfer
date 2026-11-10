@@ -32,6 +32,13 @@ _MXFP8_A16_DECODE_MAX_ROWS = max(
     8, min(16, int(os.environ.get("B12X_MXFP8_A16_DECODE_MAX_ROWS", "8")))
 )
 
+# Opt-in (default off): restrict the MXFP8 A16 search space for decode rows (M<=16) to
+# mma_warps=4 and tile_k=64, for autotuned plans as well as the default. On RTX PRO 6000 Max-Q
+# the race picked mma_warps=2 / tile_k=128 for several Kimi K3.1 TP8 projections although
+# back-to-back HBM-streamed calls are slower with them (o_proj 7168x1536: tk128/w2 11.1 us vs
+# tk64/w4 9.3 us). Same split-K and K order, so outputs are unchanged bit for bit.
+_MXFP8_A16_DECODE_W4_TK64 = os.environ.get("B12X_MXFP8_A16_DECODE_W4_TK64", "0") == "1"
+
 
 @dataclass(frozen=True, kw_only=True)
 class BlockscaledQuery:
@@ -571,6 +578,12 @@ def _tuning_parameters(query, device):
             )
 
     expanded = mxfp8_a16_dequant(query, BlockscaledConfig(mode="a16"))
+    decode_w4_tk64 = (
+        _MXFP8_A16_DECODE_W4_TK64
+        and query.recipe == "mxfp8"
+        and query.num_tokens <= 16
+        and not expanded
+    )
 
     def eligible(parameters):
         if (
@@ -650,7 +663,11 @@ def _tuning_parameters(query, device):
             else ("a16", "quantized")
             if query.activation_mode == "auto"
             else (query.activation_mode,),
-            "mma_warps": (2, 4) if query.recipe == "mxfp8" else (None,),
+            "mma_warps": (4,)
+            if decode_w4_tk64
+            else (2, 4)
+            if query.recipe == "mxfp8"
+            else (None,),
             "dense_config": dense_configs,
             "fuse_swiglu": (False, True)
             if query.source_activation == "swiglu_bf16"
@@ -663,6 +680,11 @@ def _tuning_parameters(query, device):
                 parameters["mode"] != "a16"
                 or parameters["tile_n"] != 4
                 or query.num_tokens <= 8
+            ),
+            lambda parameters: (
+                not decode_w4_tk64
+                or parameters["mode"] != "a16"
+                or parameters["tile_k"] == 64
             ),
         ),
         autotune_effort=query.autotune_effort,
