@@ -8579,7 +8579,7 @@ def _plan_full_rotation_w4a16_launches(
                 # The direct ("full") table needs 1 CTA/SM and 64 KiB of shared
                 # memory beside the staging; fall back to the plan's table when
                 # this geometry cannot hold it (prefill-shape launches only).
-                if measured_table != "full" or "decode table" not in str(exc):
+                if measured_table not in ("full", "full1") or "decode table" not in str(exc):
                     raise
                 return _compile_fused(token_count, broadcast_suh, None)
 
@@ -8598,7 +8598,7 @@ def _plan_full_rotation_w4a16_launches(
                 else measured.get("pipeline_stages")
             )
             launch_table = measured_table or caps.trellis_decode_table
-            launch_tiles = (
+            launch_tiles = measured.get("tile_config") or (
                 core_plan.trellis_tile_config
                 if trellis_prefill_native_tile(token_count)
                 else tile_config
@@ -9430,7 +9430,9 @@ def _prewarm_w4a16_planned_launches(
                     trellis_codebook=workspace.trellis_codebook or LUT_E4M3,
                     fc1_trellis_pair_kind=_fc_trellis_pair_kind(workspace),
                     fc2_trellis_pair_kind=_fc_trellis_pair_kind(workspace),
-                    force_tile_config=workspace.trellis_tile_config,
+                    force_tile_config=(
+                        measured.get("tile_config") or workspace.trellis_tile_config
+                    ),
                     pipeline_stages=launch_stages,
                     trellis_decode_table=launch_table,
                     intermediate_rotation=full_rotation,

@@ -24,6 +24,9 @@ import os
 # a forced B12X_TRELLIS_TILE_CONFIG for these (M >= 128) launches.
 def trellis_prefill_launch_shape(m: int) -> dict | None:
     """Measured prefill launch shape for the Trellis fused kernel, or None."""
+    table_shape = trellis_prefill_table_shape(m)
+    if table_shape is not None:
+        return table_shape
     if os.getenv("B12X_W4A16_PREFILL_SHAPES", "0") != "1":
         return None
     m = int(m)
@@ -45,3 +48,35 @@ def trellis_prefill_native_tile(m: int) -> bool:
         and os.getenv("B12X_W4A16_PREFILL_SHAPES_TILE", "") == "native"
     )
 
+
+
+# Direct-table prefill geometry (B12X_W4A16_PREFILL_TABLE=1, default OFF).
+# Consulted only for launch token counts M > 16 (it returns None below 1536),
+# so decode / verify / draft plans never see it. Takes precedence over the
+# prefill-shapes policy where it applies; meant to be used together with
+# B12X_W4A16_PREFILL_SHAPES=1 (which keeps owning the other sizes).
+# "full1" = the 64 KiB direct decode table at one resident CTA per SM, with
+# the GEMM output/reduction tile laid over the dead B/S/A stages (fused.py,
+# gemm.py reduction_over_stages) so the stages fit beside the table.
+# Measured on a Kimi K3.1 TP8 shard (us/layer, vs prefill shapes):
+#   1536 <= M <= 2560: 48-row blocks, 2 stages, tile 128,128,64,256
+#       (2560: 3872 vs 4183; 2048: 3045 vs 3752; 1536: 2742 vs 2880). Same
+#       numerics class as that tile (2048: bit-identical to the shapes
+#       policy in 99.99 % of outputs).
+#   Other M: None (the prefill-shapes policy decides).
+def trellis_prefill_table_shape(m: int) -> dict | None:
+    """Direct-table prefill launch shape (block, stages, table, tile), or None."""
+    mode = os.getenv("B12X_W4A16_PREFILL_TABLE", "0")
+    if mode != "1":
+        return None
+    m = int(m)
+    if m <= 16:
+        return None
+    if 1536 <= m <= 2560:
+        return {
+            "block_size_m": 48,
+            "pipeline_stages": 2,
+            "trellis_decode_table": "full1",
+            "tile_config": (128, 128, 64, 256),
+        }
+    return None
