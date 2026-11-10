@@ -307,3 +307,30 @@ def test_dcp_materialization_resolves_graph_program_before_capture(monkeypatch):
         assert state.launcher(False)() == "dcp-materialize-False"
         assert state.launcher(True)() == "dcp-materialize-True"
     assert len(loaded) == 2
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA compilation")
+@pytest.mark.parametrize("row_blocks", [1, 2, 4, 8])
+def test_paired_gather_compiles_row_partition_geometries(row_blocks):
+    query = PcieQuery(
+        surface="DcpAllToAll.all_gather_pair",
+        world_size=16,
+        rank=0,
+        topology="pcie_ipc",
+        call=FrozenMapping(
+            dict(threads=512, row_blocks=row_blocks, disjoint_output=True)
+        ),
+        setup=FrozenMapping(),
+    )
+    payload = TUNING.encode_query(query)
+    ordinal = torch.cuda.current_device()
+    description = describe_compilation(
+        CompileJob.create(
+            "b12x.comm.pcie._dcp_preparation:compile_dcp_surface", payload, ordinal
+        )
+    )
+    assert len(description.programs) == 2
+    compile_in_process((description,))
+    launchers = compile_dcp_surface(payload, ordinal)
+    assert set(program_keys(launchers)) == set(description.programs)
+    load_programs(launchers)

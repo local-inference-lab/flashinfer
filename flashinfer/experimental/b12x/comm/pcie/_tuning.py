@@ -140,6 +140,12 @@ def _validate_query(query: PcieQuery, device) -> None:
                 raise ValueError(
                     "word exchange requires disjoint aligned data and owned TP2/TP4 state"
                 )
+    if query.surface.endswith(".all_gather_pair"):
+        blocks = query.call.get("row_blocks", 1)
+        if type(blocks) is not int or not 1 <= blocks <= 64:
+            raise ValueError("paired gather row blocks must fit the signal plane")
+        if blocks > 1 and not query.call.get("disjoint_output", False):
+            raise ValueError("parallel paired gather requires disjoint outputs")
     if query.surface == "kimi_topk16":
         if query.topology != "local":
             raise ValueError("stateless kimi_topk16 uses one local device")
