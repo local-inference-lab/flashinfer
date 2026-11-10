@@ -51,6 +51,7 @@ def _runtime_slab_bytes(runtime) -> int:
             max_rows=runtime.max_rows,
             topk=runtime.topk,
             world_size=runtime.world_size,
+            counted=runtime.counted,
         )
         return int(layout.slab_bytes)
     raise ValueError("PCIe runtime does not expose its IPC slab capacity")
@@ -100,7 +101,10 @@ def query_from_runtime(
             "indices": _tensor_call(indices),
             "scores": _tensor_call(scores),
             "rows": int(indices.shape[0]),
+            "length_aware": raw.get("local_counts") is not None,
         }
+        if raw.get("local_counts") is not None:
+            controls["counts"] = _tensor_call(raw["local_counts"])
         setup = {
             "max_rows": int(runtime.max_rows),
             "max_owner_rows": int(runtime.max_owner_rows),
@@ -230,7 +234,11 @@ def compile_owner_surface(query_payload, ordinal):
             from ._dcp_topk_cute import _get_compiled_topk_stage
 
             return _get_compiled_topk_stage(
-                query.world_size, query.rank, call["topk"], call["threads"]
+                query.world_size,
+                query.rank,
+                call["topk"],
+                call["threads"],
+                length_aware=call["length_aware"],
             )
         if query.surface == "VocabParallelArgmax.fused_add_argmax":
             from ._vocab_argmax_cute import get_vocab_argmax_launcher
@@ -380,6 +388,7 @@ def prepared_call(state, **actual):
             return runtime._stage_candidates_on_device(
                 actual["local_indices"],
                 actual["local_scores"],
+                actual.get("local_counts"),
                 launcher=state.launcher(),
                 threads=query.call["threads"],
                 block_limit=query.call["block_limit"],

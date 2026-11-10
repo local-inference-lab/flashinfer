@@ -12,7 +12,12 @@ import cutlass.cute as cute
 from cutlass import Int32, Int64, Uint32
 
 from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
-from b12x._lib.intrinsics.memory import ld_global_v4_u32, st_global_v4_u32
+from b12x._lib.intrinsics.memory import (
+    ld_global_nc_u32,
+    ld_global_v4_u32,
+    st_global_u32,
+    st_global_v4_u32,
+)
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils.device import current_cuda_stream
 from b12x._lib.utils.pointers import make_ptr
@@ -30,18 +35,56 @@ def _copy_16b(source: cute.Pointer, destination: cute.Pointer) -> None:
     st_global_v4_u32(destination.toint(), *values)
 
 
+@cute.jit
+def _candidate_count(local_counts: cute.Pointer, row: Int64, topk: Int32) -> Int32:
+    count = Int32(ld_global_nc_u32((local_counts + row).toint()))
+    if count < Int32(0):
+        count = Int32(0)
+    if count > topk:
+        count = topk
+    return count
+
+
+@cute.jit
+def _copy_candidate(
+    local_indices: cute.Pointer,
+    local_scores: cute.Pointer,
+    source_pack: Int64,
+    destination_indices: cute.Pointer,
+    destination_scores: cute.Pointer,
+    destination_pack: Int64,
+) -> None:
+    _copy_16b(
+        local_indices + source_pack * Int64(4),
+        destination_indices + destination_pack * Int64(4),
+    )
+    _copy_16b(
+        local_scores + source_pack * Int64(4),
+        destination_scores + destination_pack * Int64(4),
+    )
+
+
 class _TopKOwnerStageLaunch:
-    def __init__(self, world_size: int, rank: int, topk: int, threads: int) -> None:
+    def __init__(
+        self,
+        world_size: int,
+        rank: int,
+        topk: int,
+        threads: int,
+        length_aware: bool = False,
+    ) -> None:
         self._world_size = int(world_size)
         self._rank = int(rank)
         self._topk = int(topk)
         self._threads = int(threads)
+        self._length_aware = bool(length_aware)
 
     @cute.jit
     def __call__(
         self,
         local_indices: cute.Pointer,
         local_scores: cute.Pointer,
+        local_counts: cute.Pointer,
         candidate0: cute.Pointer,
         candidate1: cute.Pointer,
         candidate2: cute.Pointer,
@@ -83,6 +126,7 @@ class _TopKOwnerStageLaunch:
         self.kernel(
             local_indices,
             local_scores,
+            local_counts,
             candidate0,
             candidate1,
             candidate2,
@@ -130,6 +174,7 @@ class _TopKOwnerStageLaunch:
         self,
         local_indices: cute.Pointer,
         local_scores: cute.Pointer,
+        local_counts: cute.Pointer,
         candidate0: cute.Pointer,
         candidate1: cute.Pointer,
         candidate2: cute.Pointer,
@@ -259,6 +304,17 @@ class _TopKOwnerStageLaunch:
                         Uint32(0xFF800000),
                         Uint32(0xFF800000),
                     )
+                    if cutlass.const_expr(self._length_aware):
+                        if column_pack == Int64(0):
+                            st_global_u32(
+                                (
+                                    destination
+                                    + 2 * candidate_plane_words
+                                    + owner_row * Int64(self._world_size)
+                                    + Int64(peer)
+                                ).toint(),
+                                Uint32(0),
+                            )
                     peer += Int32(1)
             padding_pack += Int64(self._threads)
         if cutlass.const_expr(self._world_size in (2, 4)):
@@ -283,21 +339,43 @@ class _TopKOwnerStageLaunch:
                         + Int64(self._rank) * packs_per_row
                         + unrolled_column_pack
                     )
-                    if Int64(
-                        unrolled_destination
-                    ) * owner_rows + unrolled_owner_row < Int64(rows):
-                        _copy_16b(
-                            local_indices
-                            + (unrolled_input_offset + unrolled_pack) * Int64(4),
-                            unrolled_destination_indices
-                            + unrolled_output_offset * Int64(4),
-                        )
-                        _copy_16b(
-                            local_scores
-                            + (unrolled_input_offset + unrolled_pack) * Int64(4),
-                            unrolled_destination_scores
-                            + unrolled_output_offset * Int64(4),
-                        )
+                    source_row = (
+                        Int64(unrolled_destination) * owner_rows + unrolled_owner_row
+                    )
+                    if cutlass.const_expr(self._length_aware):
+                        if source_row < Int64(rows):
+                            count = _candidate_count(
+                                local_counts, source_row, Int32(self._topk)
+                            )
+                            if unrolled_column_pack == Int64(0):
+                                st_global_u32(
+                                    (
+                                        unrolled_destination_indices
+                                        + 2 * candidate_plane_words
+                                        + unrolled_owner_row * Int64(self._world_size)
+                                        + Int64(self._rank)
+                                    ).toint(),
+                                    Uint32(count),
+                                )
+                            if unrolled_column_pack * Int64(4) < Int64(count):
+                                _copy_candidate(
+                                    local_indices,
+                                    local_scores,
+                                    unrolled_input_offset + unrolled_pack,
+                                    unrolled_destination_indices,
+                                    unrolled_destination_scores,
+                                    unrolled_output_offset,
+                                )
+                    else:
+                        if source_row < Int64(rows):
+                            _copy_candidate(
+                                local_indices,
+                                local_scores,
+                                unrolled_input_offset + unrolled_pack,
+                                unrolled_destination_indices,
+                                unrolled_destination_scores,
+                                unrolled_output_offset,
+                            )
                     unrolled_pack += Int64(self._threads)
         else:
             # The candidate pointers remain scalar kernel parameters; select
@@ -335,21 +413,43 @@ class _TopKOwnerStageLaunch:
                         + Int64(self._rank) * packs_per_row
                         + runtime_column_pack
                     )
-                    if Int64(
-                        runtime_destination
-                    ) * owner_rows + runtime_owner_row < Int64(rows):
-                        _copy_16b(
-                            local_indices
-                            + (runtime_input_offset + runtime_pack) * Int64(4),
-                            runtime_destination_indices
-                            + runtime_output_offset * Int64(4),
-                        )
-                        _copy_16b(
-                            local_scores
-                            + (runtime_input_offset + runtime_pack) * Int64(4),
-                            runtime_destination_scores
-                            + runtime_output_offset * Int64(4),
-                        )
+                    source_row = (
+                        Int64(runtime_destination) * owner_rows + runtime_owner_row
+                    )
+                    if cutlass.const_expr(self._length_aware):
+                        if source_row < Int64(rows):
+                            count = _candidate_count(
+                                local_counts, source_row, Int32(self._topk)
+                            )
+                            if runtime_column_pack == Int64(0):
+                                st_global_u32(
+                                    (
+                                        runtime_destination_indices
+                                        + 2 * candidate_plane_words
+                                        + runtime_owner_row * Int64(self._world_size)
+                                        + Int64(self._rank)
+                                    ).toint(),
+                                    Uint32(count),
+                                )
+                            if runtime_column_pack * Int64(4) < Int64(count):
+                                _copy_candidate(
+                                    local_indices,
+                                    local_scores,
+                                    runtime_input_offset + runtime_pack,
+                                    runtime_destination_indices,
+                                    runtime_destination_scores,
+                                    runtime_output_offset,
+                                )
+                    else:
+                        if source_row < Int64(rows):
+                            _copy_candidate(
+                                local_indices,
+                                local_scores,
+                                runtime_input_offset + runtime_pack,
+                                runtime_destination_indices,
+                                runtime_destination_scores,
+                                runtime_output_offset,
+                            )
                     runtime_pack += Int64(self._threads)
                 if cutlass.const_expr(self._world_size == 16):
                     if (Int64(rows) > owner_rows) & (
@@ -386,10 +486,11 @@ def _get_compiled_topk_stage(
     rank: int,
     topk: int,
     threads: int,
+    length_aware: bool = False,
 ) -> Callable:
     """Compile and retain one owner top-k staging launcher specialization."""
-    launch = _TopKOwnerStageLaunch(world_size, rank, topk, threads)
-    key = (int(world_size), int(rank), int(topk), int(threads))
+    launch = _TopKOwnerStageLaunch(world_size, rank, topk, threads, length_aware)
+    key = (int(world_size), int(rank), int(topk), int(threads), bool(length_aware))
     raise_if_kernel_resolution_frozen(
         "cute.compile",
         target=launch,
@@ -405,6 +506,7 @@ def _get_compiled_topk_stage(
         launch,
         placeholder,
         placeholder,
+        placeholder,
         *(placeholder for _ in range(2 * _MAX_PEERS)),
         1,
         1,
@@ -413,15 +515,16 @@ def _get_compiled_topk_stage(
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "comm.pcie.dcp_topk.owner_stage",
-            7,
+            8,
             key,
-            labels=("world_size", "rank", "topk", "threads"),
+            labels=("world_size", "rank", "topk", "threads", "length_aware"),
         ),
     )
 
     def run(
         local_indices_ptr: int,
         local_scores_ptr: int,
+        local_counts_ptr: int | None,
         candidate_ptrs: Sequence[int],
         signal_ptrs: Sequence[int],
         rows: int,
@@ -444,6 +547,12 @@ def _get_compiled_topk_stage(
                 int(local_scores_ptr),
                 cute.AddressSpace.gmem,
                 assumed_align=16,
+            ),
+            make_ptr(
+                Uint32,
+                16 if local_counts_ptr is None else int(local_counts_ptr),
+                cute.AddressSpace.gmem,
+                assumed_align=4,
             ),
             *(
                 make_ptr(
