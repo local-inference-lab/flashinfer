@@ -517,7 +517,9 @@ class _W4A16PrimaryLaunches:
         )
 
 
-def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
+def _w4a16_primary_launches(
+    scratch, caps, csf_geometries=None
+) -> _W4A16PrimaryLaunches:
     """Compile capacity launches and exact direct routing from metadata.
 
     This intentionally uses only immutable declaration metadata and compiler
@@ -794,6 +796,9 @@ def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
                 fast_math=bool(caps.w4a16_fast_math),
                 terms=caps.w4a16_a4_prefill_terms,
                 warps=caps.w4a16_a4_prefill_warps,
+                csf_geometries=csf_geometries
+                if caps.decode_config.csf_inline_scales
+                else None,
                 swiglu_limit=core.swiglu_limit,
                 swiglu_clamp_after_silu=core.swiglu_clamp_after_silu,
             )
@@ -1199,7 +1204,7 @@ def compile_csf_packed_routes(first, second, geometry, ordinal):
 
 @program_cache(scope="preparation")
 def compile_fused_moe(
-    query_payload, config_payload, weight_payload, scale_counts, ordinal
+    query_payload, config_payload, weight_payload, scale_counts, csf_geometries, ordinal
 ):
     """Compile and return actual primary native launch carriers from metadata."""
     query = _decode_query(query_payload)
@@ -1212,7 +1217,7 @@ def compile_fused_moe(
     caps = _lower_caps(query, config, weight_plan, torch.device("cuda", ordinal))
     scratch = plan_tp_moe_scratch(caps, prewarm_launches=True)
     w4a16 = (
-        _w4a16_primary_launches(scratch, caps)
+        _w4a16_primary_launches(scratch, caps, csf_geometries)
         if scratch.launch_plan.implementation == "w4a16" and not scratch.full_rotation
         else None
     )
@@ -1670,6 +1675,7 @@ def plan(
                     TUNING.encode_config(config),
                     weight_payload,
                     scale_counts,
+                    lsc_payload[:2] or None,
                     CompileJob.DEVICE_ORDINAL,
                 ),
                 CompileJob.create(
@@ -1717,6 +1723,7 @@ def plan(
                 TUNING.encode_config(selection.config),
                 weight_payload,
                 scale_counts,
+                lsc_payload[:2] or None,
                 device.ordinal,
             )
             scratch = replace(

@@ -226,12 +226,14 @@ def _nvfp4_a16_query(rows=1):
 
 @pytest.mark.parametrize("rows", (4, 32, 4096))
 @pytest.mark.parametrize("capability", (False, True))
-def test_csf_inline_candidates_follow_declared_precision(rows, capability):
+@pytest.mark.parametrize("width", (256, 320))
+def test_csf_inline_candidates_follow_declared_precision(rows, capability, width):
     from b12x.moe.fused_moe._tuning import TUNING
     from b12x.moe.fused_moe._preparation import _decode_query
 
     query = replace(
         _nvfp4_a16_query(rows),
+        intermediate_size=width,
         w4a16_weight_layout="packed",
         csf_inline_scales=True,
         controls=FrozenMapping({"w4a16_a4_prefill_enabled": capability}),
@@ -244,7 +246,9 @@ def test_csf_inline_candidates_follow_declared_precision(rows, capability):
         keys.append(encoded)
         candidates = [c for _, c in TUNING.eligible_plan(declared, DEVICE).candidates]
         assert candidates
-        expected_inline = choice is False or (choice is None and not capability)
+        expected_inline = (
+            width % 128 == 0 or choice is False or (choice is None and not capability)
+        )
         assert {c.csf_inline_scales for c in candidates} == (
             {False, True} if expected_inline else {False}
         )

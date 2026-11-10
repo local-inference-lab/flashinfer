@@ -13830,6 +13830,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
                 intermediate_cache2=intermediate_cache2,
                 output=scatter_output,
                 launches=a4_launches,
+                inline_scales=inline_scales,
             )
         result = run_w4a16_moe(
             a,
