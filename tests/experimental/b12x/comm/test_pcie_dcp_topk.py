@@ -15,11 +15,16 @@ from b12x.comm.pcie._dcp_cute_common import signal_bytes
 
 
 class _PreparedCPUState:
-    def __init__(self, owner, rows, threads=512, block_limit=128):
+    def __init__(self, owner, rows, threads=512, block_limit=128, length_aware=False):
         self.owner = self.runtime = owner
         self.query = SimpleNamespace(
             surface="DcpTopKOwnerExchange.stage_candidates",
-            call=dict(rows=rows, threads=threads, block_limit=block_limit),
+            call=dict(
+                rows=rows,
+                threads=threads,
+                block_limit=block_limit,
+                length_aware=length_aware,
+            ),
         )
 
     def require_runtime(self, owner):
@@ -39,7 +44,7 @@ def prepared_cpu_dispatch(monkeypatch):
 
 
 class _FakeOwner(PCIeDCPTopKOwnerExchange):
-    def __init__(self) -> None:
+    def __init__(self, counted=False) -> None:
         super().__init__(
             rank=1,
             world_size=2,
@@ -49,6 +54,7 @@ class _FakeOwner(PCIeDCPTopKOwnerExchange):
             staging1_ptrs=(62, 72),
             max_rows=8,
             topk=4,
+            counted=counted,
         )
         shape = (self.max_owner_rows, self.world_size * self.topk)
         self._candidate_views = tuple(
@@ -58,17 +64,26 @@ class _FakeOwner(PCIeDCPTopKOwnerExchange):
             )
             for _ in range(2)
         )
+        if counted:
+            self._count_views = tuple(
+                torch.empty((self.max_owner_rows, self.world_size), dtype=torch.int32)
+                for _ in range(2)
+            )
         self.stage_calls: list[tuple] = []
 
     def stage_candidates(
-        self, indices, scores, *, plan=None, threads=None, block_limit=None
+        self, indices, scores, counts=None, *, plan=None, threads=None, block_limit=None
     ):
         if plan is None:
             plan = _PreparedCPUState(
-                self, indices.shape[0], threads or 512, block_limit or 128
+                self,
+                indices.shape[0],
+                threads or 512,
+                block_limit or 128,
+                length_aware=counts is not None,
             )
         return super().stage_candidates(
-            indices, scores, plan=plan, threads=threads, block_limit=block_limit
+            indices, scores, counts, plan=plan, threads=threads, block_limit=block_limit
         )
 
     def capture(self, *, plan=None):
@@ -79,6 +94,7 @@ class _FakeOwner(PCIeDCPTopKOwnerExchange):
         launcher,
         local_indices,
         local_scores,
+        local_counts=None,
         *,
         slot,
         rows,
@@ -87,6 +103,12 @@ class _FakeOwner(PCIeDCPTopKOwnerExchange):
         wait_for_prior_consumer,
     ):
         owner_rows = -(-rows // self.world_size)
+        if local_counts is not None:
+            local_indices = local_indices.clone()
+            local_scores = local_scores.clone()
+            for row, count in enumerate(local_counts.clamp(0, self.topk).tolist()):
+                local_indices[row, count:] = -1
+                local_scores[row, count:] = -torch.inf
         indices, scores = owner_stage_reference(
             torch.stack([local_indices] * self.world_size),
             torch.stack([local_scores] * self.world_size),
@@ -95,11 +117,19 @@ class _FakeOwner(PCIeDCPTopKOwnerExchange):
         views = self._candidate_views[slot]
         views[0][:owner_rows].copy_(indices)
         views[1][:owner_rows].copy_(scores)
+        if local_counts is not None:
+            counts = local_counts.clamp(0, self.topk)
+            start = self.rank * owner_rows
+            owned = counts[start : start + owner_rows]
+            self._count_views[slot][:owner_rows].zero_()
+            self._count_views[slot][:owner_rows] = owned.reshape(-1, 1).expand(
+                -1, self.world_size
+            )
         self.stage_calls.append((slot, threads, blocks, wait_for_prior_consumer))
 
 
-def _make_owner() -> PCIeDCPTopKOwnerExchange:
-    return _FakeOwner()
+def _make_owner(counted=False) -> PCIeDCPTopKOwnerExchange:
+    return _FakeOwner(counted)
 
 
 def test_candidate_staging_layout_is_aligned():
@@ -114,6 +144,22 @@ def test_candidate_staging_layout_is_aligned():
     assert owner.slot_bytes == 256
     assert owner.staging1_offset == 1024
     assert owner.slab_bytes == 1280
+
+
+def test_counted_staging_layout_adds_only_count_planes():
+    owner = _candidate_staging_layout(
+        signal_bytes=513,
+        max_rows=8,
+        topk=4,
+        world_size=2,
+        counted=True,
+    )
+    assert owner.staging0_offset == 768
+    assert owner.plane_bytes == 128
+    assert owner.counts_bytes == 32
+    assert owner.slot_bytes >= 2 * owner.plane_bytes + owner.counts_bytes
+    assert owner.staging1_offset == owner.staging0_offset + owner.slot_bytes
+    assert owner.slab_bytes == owner.staging1_offset + owner.slot_bytes
 
 
 def test_topk_signal_layout_matches_the_shared_barrier_abi():
@@ -163,6 +209,54 @@ def test_owner_dispatches_and_disposes():
 
     owner.close()
     assert owner._closed
+
+
+def test_counted_stage_clamps_counts_and_supports_exact_consumer_masking():
+    owner = _make_owner(counted=True)
+    indices = torch.arange(32, dtype=torch.int32).reshape(8, 4) + 100
+    scores = torch.arange(32, dtype=torch.float32).reshape(8, 4) / 10
+    scores[1, 0] = float("nan")
+    counts = torch.tensor([0, 1, 2, 3, 4, 5, -2, 99], dtype=torch.int32)
+    candidate_indices, candidate_scores, candidate_counts = owner.stage_candidates(
+        indices,
+        scores,
+        counts,
+    )
+
+    expected_indices = indices.clone()
+    expected_scores = scores.clone()
+    for row, count in enumerate(counts.clamp(0, 4).tolist()):
+        expected_indices[row, count:] = -1
+        expected_scores[row, count:] = -torch.inf
+    expected_indices, expected_scores = owner_stage_reference(
+        torch.stack([expected_indices] * 2),
+        torch.stack([expected_scores] * 2),
+        1,
+    )
+    # Consumers mask untransferred tails with the received counts. Raw channel
+    # tails need not be initialized by the counted transport.
+    for row in range(candidate_counts.shape[0]):
+        for peer in range(candidate_counts.shape[1]):
+            count = int(candidate_counts[row, peer])
+            begin = peer * 4 + count
+            end = (peer + 1) * 4
+            candidate_indices[row, begin:end] = -1
+            candidate_scores[row, begin:end] = -torch.inf
+    assert torch.equal(candidate_indices, expected_indices)
+    assert torch.equal(
+        candidate_scores.view(torch.int32), expected_scores.view(torch.int32)
+    )
+    assert torch.equal(
+        candidate_counts, counts.clamp(0, 4)[4:].reshape(-1, 1).expand(-1, 2)
+    )
+    reserved = owner.graph_candidate_views(8)
+    counts_view = owner.graph_count_views(8)
+    assert counts_view.shape == (4, 2)
+    assert counts_view.data_ptr() == owner.graph_count_views(8).data_ptr()
+    assert reserved[0].data_ptr() == owner.graph_candidate_views(8)[0].data_ptr()
+
+    with pytest.raises(ValueError, match="counted owner exchange"):
+        _make_owner().stage_candidates(indices, scores, counts)
 
 
 @pytest.mark.parametrize("eager_calls, expected_slot", [(0, 0), (1, 1), (2, 0)])

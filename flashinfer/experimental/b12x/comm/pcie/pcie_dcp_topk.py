@@ -47,6 +47,7 @@ class _DoubleBufferLayout:
     slot_bytes: int
     slab_bytes: int
     plane_bytes: int = 0
+    counts_bytes: int = 0
 
 
 def _candidate_staging_layout(
@@ -55,6 +56,7 @@ def _candidate_staging_layout(
     max_rows: int,
     topk: int,
     world_size: int,
+    counted: bool = False,
 ) -> _DoubleBufferLayout:
     if signal_bytes <= 0:
         raise ValueError("signal_bytes must be positive")
@@ -67,7 +69,8 @@ def _candidate_staging_layout(
 
     max_owner_rows = -(-max_rows // world_size)
     plane_bytes = max_owner_rows * world_size * topk * 4
-    slot_bytes = _align_up(plane_bytes * 2, IPC_SLAB_ALIGNMENT)
+    counts_bytes = max_owner_rows * world_size * 4 if counted else 0
+    slot_bytes = _align_up(plane_bytes * 2 + counts_bytes, IPC_SLAB_ALIGNMENT)
     staging0_offset = _align_up(signal_bytes, IPC_SLAB_ALIGNMENT)
     staging1_offset = staging0_offset + slot_bytes
     return _DoubleBufferLayout(
@@ -77,6 +80,7 @@ def _candidate_staging_layout(
         slot_bytes=slot_bytes,
         slab_bytes=staging1_offset + slot_bytes,
         plane_bytes=plane_bytes,
+        counts_bytes=counts_bytes,
     )
 
 
@@ -254,6 +258,7 @@ class PCIeDCPTopKOwnerExchange(_IPCChannel):
         owned_buffers: Optional[Sequence[_OwnedSharedBuffer]] = None,
         ext_module=None,
         stream_affine: bool = True,
+        counted: bool = False,
     ) -> None:
         # Compatibility-only: native extension injection was removed.
         del ext_module
@@ -282,6 +287,7 @@ class PCIeDCPTopKOwnerExchange(_IPCChannel):
         self.max_rows = int(max_rows)
         self.max_owner_rows = -(-self.max_rows // self.world_size)
         self.topk = int(topk)
+        self.counted = bool(counted)
         self._signal_ptrs = tuple(int(ptr) for ptr in signal_ptrs)
         self._staging_ptrs = (
             tuple(int(ptr) for ptr in staging0_ptrs),
@@ -314,6 +320,18 @@ class PCIeDCPTopKOwnerExchange(_IPCChannel):
             # CPU construction remains useful for validation-only unit tests;
             # no launch is possible until tests install synthetic views.
             self._candidate_views = ()
+        self._count_views = ()
+        if self.device.type == "cuda" and self.counted:
+            count_shape = (self.max_owner_rows, self.world_size)
+            self._count_views = tuple(
+                _tensor_from_cuda_pointer(
+                    slot_ptrs[self.rank] + 2 * self._candidate_plane_elems * 4,
+                    count_shape,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                for slot_ptrs in self._staging_ptrs
+            )
 
     @classmethod
     def from_exchange_group(
@@ -340,6 +358,7 @@ class PCIeDCPTopKOwnerExchange(_IPCChannel):
             max_rows=max_rows,
             topk=topk,
             world_size=world_size,
+            counted=True,
         )
         owned: list[_OwnedSharedBuffer] = []
         try:
@@ -368,6 +387,7 @@ class PCIeDCPTopKOwnerExchange(_IPCChannel):
                 owned_buffers=owned,
                 ext_module=ext_module,
                 stream_affine=stream_affine,
+                counted=True,
             )
         except Exception:
             _release_failed_allocations(owned, ipc)
@@ -399,12 +419,17 @@ class PCIeDCPTopKOwnerExchange(_IPCChannel):
         self,
         local_indices: torch.Tensor,
         local_scores: torch.Tensor,
+        local_counts: torch.Tensor | None = None,
         *,
         plan: Plan,
         threads: int | None = None,
         block_limit: int | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Stage candidates through the session-prepared native launcher."""
+    ) -> tuple[torch.Tensor, ...]:
+        """Stage candidates through the session-prepared native launcher.
+
+        Counted calls transfer only live words and their per-peer counts. Their
+        consumers must mask untransferred tails before candidate processing.
+        """
         state = require_prepared(plan, "comm.pcie", self.device)
         state.require_runtime(self)
         call = state.query.call
@@ -412,6 +437,8 @@ class PCIeDCPTopKOwnerExchange(_IPCChannel):
         prepared_limit = int(call["block_limit"])
         if int(local_indices.shape[0]) != int(call["rows"]):
             raise ValueError("rows differs from the prepared DCP top-k plan")
+        if bool(call.get("length_aware", False)) != (local_counts is not None):
+            raise ValueError("candidate counts differ from the prepared DCP top-k plan")
         if threads is not None and int(threads) != prepared_threads:
             raise ValueError("threads differs from the prepared DCP top-k plan")
         if block_limit is not None and int(block_limit) != prepared_limit:
@@ -420,6 +447,7 @@ class PCIeDCPTopKOwnerExchange(_IPCChannel):
             return self._stage_candidates_on_device(
                 local_indices,
                 local_scores,
+                local_counts,
                 launcher=state.launcher(),
                 threads=prepared_threads,
                 block_limit=prepared_limit,
@@ -442,6 +470,17 @@ class PCIeDCPTopKOwnerExchange(_IPCChannel):
         return tuple(
             view[:owner_rows] for view in self._candidate_views[self._graph_slot]
         )
+
+    def graph_count_views(self, rows: int) -> torch.Tensor:
+        """Return the stable per-peer valid counts beside the candidate planes."""
+        if not 0 < rows <= self.max_rows:
+            raise ValueError("graph rows must fit the owner exchange capacity")
+        if self._closed or not self._count_views:
+            raise RuntimeError("graph count views require a counted open CUDA channel")
+        if self._graph_slot is None:
+            self._graph_slot = self._next_slot
+        owner_rows = -(-rows // self.world_size)
+        return self._count_views[self._graph_slot][:owner_rows]
 
     @contextmanager
     def capture(self, *, plan: Plan):
@@ -466,11 +505,12 @@ class PCIeDCPTopKOwnerExchange(_IPCChannel):
         self,
         local_indices: torch.Tensor,
         local_scores: torch.Tensor,
+        local_counts: torch.Tensor | None = None,
         *,
         launcher,
         threads: int,
         block_limit: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, ...]:
         if self._closed:
             raise RuntimeError("PCIeDCPTopKOwnerExchange is closed")
         if local_indices.device != self.device or local_scores.device != self.device:
@@ -488,6 +528,18 @@ class PCIeDCPTopKOwnerExchange(_IPCChannel):
             raise ValueError(f"topk {topk} does not match configured topk {self.topk}")
         if not local_indices.is_contiguous() or not local_scores.is_contiguous():
             raise ValueError("inputs must be contiguous")
+        if local_counts is not None:
+            if not self.counted:
+                raise ValueError("candidate counts require a counted owner exchange")
+            if (
+                local_counts.device != self.device
+                or local_counts.dtype != torch.int32
+                or local_counts.shape != (rows,)
+                or not local_counts.is_contiguous()
+            ):
+                raise ValueError(
+                    "local_counts must be contiguous int32 row counts on the runtime device"
+                )
         _validate_launch_config(
             threads=int(threads),
             block_limit=int(block_limit),
@@ -516,6 +568,7 @@ class PCIeDCPTopKOwnerExchange(_IPCChannel):
             launcher,
             local_indices,
             local_scores,
+            local_counts,
             slot=slot,
             rows=rows,
             threads=int(threads),
@@ -543,6 +596,16 @@ class PCIeDCPTopKOwnerExchange(_IPCChannel):
             device=self.device,
             label="score",
         )
+        if local_counts is not None:
+            candidate_counts = self._count_views[slot][:owner_rows]
+            _validate_candidate_view(
+                candidate_counts,
+                expected=(owner_rows, self.world_size),
+                dtype=torch.int32,
+                device=self.device,
+                label="count",
+            )
+            return candidate_indices, candidate_scores, candidate_counts
         return candidate_indices, candidate_scores
 
     def _launch_stage(
@@ -550,6 +613,7 @@ class PCIeDCPTopKOwnerExchange(_IPCChannel):
         launcher,
         local_indices: torch.Tensor,
         local_scores: torch.Tensor,
+        local_counts: torch.Tensor | None = None,
         *,
         slot: int,
         rows: int,
@@ -561,6 +625,7 @@ class PCIeDCPTopKOwnerExchange(_IPCChannel):
             launcher(
                 local_indices.data_ptr(),
                 local_scores.data_ptr(),
+                None if local_counts is None else local_counts.data_ptr(),
                 self._staging_ptrs[slot],
                 self._signal_ptrs,
                 rows,

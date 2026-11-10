@@ -69,6 +69,27 @@ def _inputs(
     return indices, score_bits.to(device).view(torch.float32)
 
 
+def _counts(
+    step: int, global_rank: int, rows: int, device: torch.device
+) -> torch.Tensor:
+    values = torch.tensor([0, 1, 3, 7, 31, 2047, 2048, -4, 4096], dtype=torch.int32)
+    indices = (torch.arange(rows) + step + global_rank).remainder(values.numel())
+    return values[indices].to(device)
+
+
+def _canonicalize_staged(indices, scores, counts):
+    """Mirror the consumer's exact mask over untransferred channel tails."""
+    indices, scores = indices.clone(), scores.clone()
+    for row in range(counts.shape[0]):
+        for peer in range(counts.shape[1]):
+            count = max(0, min(int(counts[row, peer]), TOPK))
+            begin = peer * TOPK + count
+            end = (peer + 1) * TOPK
+            indices[row, begin:end] = -1
+            scores[row, begin:end] = -torch.inf
+    return indices, scores
+
+
 def _dcp_groups(tp_world_size: int, dcp_world_size: int):
     return [
         dist.new_group(
@@ -142,9 +163,9 @@ def _worker(
         collective_barrier=barrier,
     )
 
-    def prepare(runtime, rows, name):
+    def prepare(runtime, rows, name, counts=None):
         indices, scores = _inputs(0, rank, rows, device)
-        call = dict(local_indices=indices, local_scores=scores)
+        call = dict(local_indices=indices, local_scores=scores, local_counts=counts)
         query = preparation.query_from_runtime(runtime, call=call)
         plan = preparation.plan(query, runtime=runtime)
         session.prepare(
@@ -167,6 +188,12 @@ def _worker(
         }
         graph_plans = {
             rows: prepare(graph_owner, rows, f"topk-graph-{rows}") for rows in test_rows
+        }
+        counted_plans = {
+            rows: prepare(
+                owner, rows, f"topk-counted-{rows}", _counts(0, rank, rows, device)
+            )
+            for rows in test_rows
         }
         reserved = {rows: graph_owner.graph_candidate_views(rows) for rows in test_rows}
         session.freeze()
@@ -216,6 +243,40 @@ def _worker(
         assert eager_output_ptrs[0] != eager_output_ptrs[1]
         assert eager_output_ptrs[0] == eager_output_ptrs[2]
         assert eager_output_ptrs[1] == eager_output_ptrs[3]
+        for step, rows in enumerate(test_rows):
+            local_indices, local_scores = _inputs(step + 40, rank, rows, device)
+            local_counts = _counts(step + 40, rank, rows, device)
+            staged_indices, staged_scores, staged_counts = owner.stage_candidates(
+                local_indices, local_scores, local_counts, plan=counted_plans[rows]
+            )
+            candidate_indices, candidate_scores = _canonicalize_staged(
+                staged_indices, staged_scores, staged_counts
+            )
+            rank_inputs = []
+            expected_counts = torch.zeros_like(staged_counts)
+            owner_rows = -(-rows // dcp_world_size)
+            for peer, source in enumerate(dcp_global_ranks):
+                indices, scores = _inputs(step + 40, source, rows, device)
+                counts = _counts(step + 40, source, rows, device).clamp(0, TOPK)
+                for owner_row in range(owner_rows):
+                    global_row = dcp_rank * owner_rows + owner_row
+                    if global_row < rows:
+                        expected_counts[owner_row, peer] = counts[global_row]
+                for owner_row in range(rows):
+                    count = int(counts[owner_row])
+                    indices[owner_row, count:] = -1
+                    scores[owner_row, count:] = -torch.inf
+                rank_inputs.append((indices, scores))
+            assert torch.equal(staged_counts, expected_counts)
+            expected_indices, expected_scores = owner_stage_reference(
+                torch.stack([item[0] for item in rank_inputs]),
+                torch.stack([item[1] for item in rank_inputs]),
+                dcp_rank,
+            )
+            assert torch.equal(candidate_indices, expected_indices)
+            assert torch.equal(
+                candidate_scores.view(torch.int32), expected_scores.view(torch.int32)
+            )
         graph_cases = {}
         for graph_rows in test_rows:
             graph_plan = graph_plans[graph_rows]
