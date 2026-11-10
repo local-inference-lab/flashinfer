@@ -269,12 +269,19 @@ class _TwoShotBf16Launch:
         self,
         accumulator: cute.Tensor,
         words,
+        initialize: cutlass.Constexpr = False,
     ) -> None:
         for word_index in cutlass.range_constexpr(4):
             lo, hi = unpack_bf16x2(words[word_index])
             element = word_index * 2
-            accumulator[element] = accumulator[element] + lo
-            accumulator[element + 1] = accumulator[element + 1] + hi
+            if cutlass.const_expr(initialize):
+                # The island transports start an ordered sum with its first
+                # input instead of adding it to an implicit positive zero.
+                accumulator[element] = lo
+                accumulator[element + 1] = hi
+            else:
+                accumulator[element] = accumulator[element] + lo
+                accumulator[element + 1] = accumulator[element + 1] + hi
 
     @cute.jit
     def _load_accumulate_pack_global_nc(
