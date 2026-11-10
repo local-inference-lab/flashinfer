@@ -257,10 +257,27 @@ def _default_config(query, device):
     return BlockscaledConfig(mode="quantized")
 
 
+def _mxfp8_a16_decode_config(query, device):
+    """Decode-row (M<=8) MXFP8 A16 geometry: 64x64 tiles, split-K only to fill half the SMs.
+
+    The former fixed (tile_n=128, split_k=4) under-filled narrow outputs (N=448: 16 CTAs on
+    188 SMs, 2.1x slower than the best swept config) and over-split wide ones (N=7168, K=1536:
+    1.34x slower). Measured on RTX PRO 6000 Max-Q (188 SMs) at Kimi K3.1 TP8 decode shapes, this
+    choice is within 10% of the best swept A16 configuration on every shape. Each split keeps
+    at least 256 K columns, so tiny-K projections stay unsplit.
+    """
+    tiles = -(-query.out_features // 64)
+    split = 1
+    target = max(1, device.sm_count // 2)
+    while split < 16 and tiles * split < target and query.in_features // (2 * split) >= 256:
+        split *= 2
+    return BlockscaledConfig(mode="a16", tile_n=64, tile_k=64, split_k=split)
+
+
 def _a16_default_config(query, device):
     if query.recipe == "mxfp8" or device is None:
         if _automatic_a16(query, device):
-            return BlockscaledConfig(mode="a16", tile_n=128, tile_k=64, split_k=4)
+            return _mxfp8_a16_decode_config(query, device)
         return BlockscaledConfig(mode="a16", tile_n=64, tile_k=64, split_k=1)
     m, n, k = query.num_tokens, query.out_features, query.in_features
     sms = device.sm_count
