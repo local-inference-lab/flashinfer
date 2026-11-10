@@ -7,7 +7,8 @@ from b12x.comm.pcie._dcp_a2a_cute import kimi_topk16
 
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="requires a CUDA device"
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 0),
+    reason="requires SM80 or newer for warp integer reductions",
 )
 
 
@@ -108,4 +109,38 @@ def test_two_level_topk16_matches_reference_and_graph_replay(rows, threads):
     # the sequential normalization, rather than merely close to the reference.
     assert torch.equal(weights, eager_weights)
     assert torch.equal(ids, eager_ids)
+    graph.reset()
+
+
+@pytest.mark.parametrize("threads", (128, 256, 512))
+@pytest.mark.parametrize(
+    "kind", ("finite_ties", "negative_infinity", "merge_exhaustion", "lane_exhaustion")
+)
+def test_topk16_never_selects_an_exhausted_candidate(kind, threads):
+    logits = torch.zeros((1, 896), dtype=torch.float32, device="cuda")
+    bias = torch.full((896,), -float("inf"), dtype=torch.float32, device="cuda")
+    if kind == "finite_ties":
+        bias.zero_()
+        expected = list(range(16))
+    elif kind == "negative_infinity":
+        expected = list(range(16))
+    elif kind == "merge_exhaustion":
+        bias[0], bias[512] = 0.0, 1.0
+        expected = [512, 0, *range(1, 15)]
+    else:
+        selected = list(range(0, 256, 32))
+        bias[selected] = torch.arange(8, dtype=torch.float32, device="cuda")
+        expected = [*reversed(selected), *range(1, 9)]
+    weights = torch.empty((1, 16), dtype=torch.float32, device="cuda")
+    ids = torch.empty((1, 16), dtype=torch.int32, device="cuda")
+    _launch(logits, bias, weights, ids, 1, threads)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _launch(logits, bias, weights, ids, 1, threads)
+    ids.fill_(-1)
+    weights.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert ids.cpu().tolist() == [expected]
+    assert torch.equal(weights, torch.full_like(weights, 1.0 / 16))
     graph.reset()

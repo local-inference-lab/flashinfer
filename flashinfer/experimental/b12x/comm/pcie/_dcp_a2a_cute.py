@@ -1795,18 +1795,17 @@ class _KimiTopK16Launch:
         if warp < Int32(4):
             for item in cutlass.range_constexpr(8):
                 expert_id = warp * Int32(256) + Int32(item * 32) + lane
-                value = Float32(_KIMI_NEG_INF)
+                # Zero is below every valid packed key, including -infinity.
+                # Reusing an exhausted expert's key would select it again.
+                keys[item] = cutlass.Uint64(0)
                 if expert_id < Int32(896):
-                    value = selection_scores[expert_id]
-                keys[item] = _kimi_pack_key(value, expert_id)
+                    keys[item] = _kimi_pack_key(selection_scores[expert_id], expert_id)
             _kimi_sort_desc(keys, 8)
             previous = cutlass.Uint64(0)
             for selected in cutlass.range_constexpr(16):
                 if cutlass.const_expr(selected > 0):
                     head = keys[0]
-                    tail_key = _kimi_pack_key(
-                        Float32(_KIMI_NEG_INF), _kimi_key_expert(keys[7])
-                    )
+                    tail_key = cutlass.Uint64(0)
                     for item in cutlass.range_constexpr(7):
                         keys[item] = _select_if_eq_u64(
                             previous, head, keys[item + 1], keys[item]
@@ -1833,9 +1832,7 @@ class _KimiTopK16Launch:
             for selected in cutlass.range_constexpr(16):
                 if cutlass.const_expr(selected > 0):
                     head = merge_keys[0]
-                    tail_key = _kimi_pack_key(
-                        Float32(_KIMI_NEG_INF), _kimi_key_expert(merge_keys[1])
-                    )
+                    tail_key = cutlass.Uint64(0)
                     merge_keys[0] = _select_if_eq_u64(
                         previous, head, merge_keys[1], merge_keys[0]
                     )
