@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 from b12x._lib.quant.block_codec import BLOCK_CODECS, block_codec
 
 from dataclasses import asdict, dataclass, field, replace
@@ -20,6 +22,15 @@ from b12x.preparation.tuning import (
 from b12x.gemm._tuning import _codegen_snapshot
 
 MXFP8_PREFILL_MIN_ROWS = 2048
+
+# Opt-in (default 8 = unchanged): largest row count that uses the MXFP8 A16 decode geometry
+# (_mxfp8_a16_decode_config) as the untuned default. Rows 9..16 still fit one 16-row MMA tile,
+# so the decode geometry applies unchanged; the generic fallback (64x64, split_k=1) under-fills
+# narrow/deep-K outputs there (Kimi K3.1 TP8 M=16: N=448/K=7168 24.7 -> 5.5 us, N=1536/K=7168
+# 25.2 -> 10.7 us on RTX PRO 6000 Max-Q). Values above 16 are clamped to 16.
+_MXFP8_A16_DECODE_MAX_ROWS = max(
+    8, min(16, int(os.environ.get("B12X_MXFP8_A16_DECODE_MAX_ROWS", "8")))
+)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -274,9 +285,23 @@ def _mxfp8_a16_decode_config(query, device):
     return BlockscaledConfig(mode="a16", tile_n=64, tile_k=64, split_k=split)
 
 
+def _mxfp8_a16_extended_decode(query, device):
+    if _MXFP8_A16_DECODE_MAX_ROWS <= 8 or query.num_tokens > _MXFP8_A16_DECODE_MAX_ROWS:
+        return False
+    return (
+        device is not None
+        and device.compute_capability in ((12, 0), (12, 1))
+        and query.in_features == query.padded_in_features
+        and query.in_features % 32 == 0
+        and query.out_features % 8 == 0
+        and query.source_contiguous
+        and query.source_aligned
+    )
+
+
 def _a16_default_config(query, device):
     if query.recipe == "mxfp8" or device is None:
-        if _automatic_a16(query, device):
+        if _automatic_a16(query, device) or _mxfp8_a16_extended_decode(query, device):
             return _mxfp8_a16_decode_config(query, device)
         return BlockscaledConfig(mode="a16", tile_n=64, tile_k=64, split_k=1)
     m, n, k = query.num_tokens, query.out_features, query.in_features
