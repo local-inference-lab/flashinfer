@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 from b12x._lib.quant.block_codec import BLOCK_CODECS, block_codec
 
 from dataclasses import asdict, dataclass, field, replace
@@ -20,6 +22,18 @@ from b12x.preparation.tuning import (
 from b12x.gemm._tuning import _codegen_snapshot
 
 MXFP8_PREFILL_MIN_ROWS = 2048
+
+# Opt-in (default off, prefill only): let a K-padded MXFP8 A16 projection (in_features <
+# padded_in_features, e.g. Kimi K3.1 TP8 latent_up 7168x448 stored as K=512) take the
+# expanded-weight lowering at M >= MXFP8_A16_DEQUANT_MIN_ROWS: the weight is expanded at its
+# padded K and the BF16 GEMM reads its logical [:, :in_features] view. Decode rows (M < 128)
+# never reach it. Not bit-identical to the packed tile_m=16 kernel (different K order), same
+# numerics class as every unpadded projection's expanded lowering.
+_MXFP8_A16_DEQUANT_PADDED_K = (
+    os.environ.get("B12X_MXFP8_A16_DEQUANT_PADDED_K", "0") == "1"
+)
+# Measured (latent_up 7168x448): expanded 11.4 us vs packed 11.0 us at M=128, 19.1 vs 34.6 at 512.
+_MXFP8_A16_DEQUANT_PADDED_K_MIN_ROWS = 256
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -352,7 +366,13 @@ def mxfp8_a16_dequant(query, config):
         and config.a16_backend == "auto"
         and query.workspace_form == "provided"
         and query.num_tokens >= MXFP8_A16_DEQUANT_MIN_ROWS
-        and query.in_features == query.padded_in_features
+        and (
+            query.in_features == query.padded_in_features
+            or (
+                _MXFP8_A16_DEQUANT_PADDED_K
+                and query.num_tokens >= _MXFP8_A16_DEQUANT_PADDED_K_MIN_ROWS
+            )
+        )
         and query.out_features * query.padded_in_features * 2 <= limit
     )
 
