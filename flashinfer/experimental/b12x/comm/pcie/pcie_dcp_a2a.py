@@ -52,6 +52,36 @@ _SIGNAL_BYTES = (
 ) * 4
 
 
+PAIR_PUSH_MAX_ROWS = 8  # fused Kimi top-16 rows (one CTA per row)
+# The standalone Kimi top-16 runs one CTA per row (grid = rows) and selects
+# every row independently, so 9..16 rows (for example two concurrent
+# speculative streams) produce the same bytes per row as 1..8 rows. Callers
+# that never pass more than eight rows are unaffected.
+KIMI_TOPK16_MAX_ROWS = 16
+PAIR_PUSH_MAX_BLOCKS = 64  # per-CTA barrier records (_dcp_a2a_cute._MAX_BLOCKS)
+
+
+def _state_pair_push(state) -> bool:
+    """Whether a prepared paired-gather plan was compiled for push transport."""
+    query = getattr(state, "query", None)
+    call = getattr(query, "call", None)
+    return bool(call is not None and call.get("pair_transport") == "push")
+
+
+def _state_gather_acquire(state) -> bool:
+    """Whether a prepared all_gather_heads plan uses the acquire-flag barrier."""
+    query = getattr(state, "query", None)
+    call = getattr(query, "call", None)
+    return bool(call is not None and call.get("gather_sync") == "acquire")
+
+
+def _state_gather_island(state) -> bool:
+    """Whether a prepared all_gather_heads plan uses the two-island transport."""
+    query = getattr(state, "query", None)
+    call = getattr(query, "call", None)
+    return bool(call is not None and call.get("gather_topology") == "island")
+
+
 def _env_int(name: str, fallback: int) -> int:
     raw = os.getenv(name)
     if not raw:
@@ -88,15 +118,17 @@ def kimi_topk16(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Select Kimi-K3's 16 routed experts with prepared native code.
 
-    The operation accepts one to eight assembled FP32 router rows. It launches
+    The operation accepts one to sixteen assembled FP32 router rows. It launches
     on the current CUDA stream and is CUDA-graph safe with caller-owned outputs.
     """
 
     if router_logits.ndim != 2:
         raise ValueError("router_logits must be a contiguous rank-2 tensor")
     rows = int(router_logits.shape[0])
-    if rows < 1 or rows > 8:
-        raise ValueError(f"Kimi top-16 rows {rows} must be between 1 and 8")
+    if rows < 1 or rows > KIMI_TOPK16_MAX_ROWS:
+        raise ValueError(
+            f"Kimi top-16 rows {rows} must be between 1 and {KIMI_TOPK16_MAX_ROWS}"
+        )
     device = router_logits.device
     if device.type != "cuda":
         raise ValueError("Kimi top-16 requires CUDA tensors")
@@ -1100,6 +1132,8 @@ class PCIeDCPA2A:
                 self.rank,
                 threads,
                 True,
+                _state_gather_acquire(state),
+                _state_gather_island(state),
             ):
                 raise RuntimeError(
                     "cold PCIe DCP gather CUDA graph capture is not allowed; "
@@ -1212,6 +1246,8 @@ class PCIeDCPA2A:
             )
         if int(local_second.shape[0]) != batch:
             raise ValueError("paired inputs must have the same batch size")
+        if _state_pair_push(state) and batch > PAIR_PUSH_MAX_BLOCKS:
+            raise ValueError("push paired gather supports at most 64 rows")
         row_bytes = tuple(
             int(value.shape[1]) * value.element_size() for value in inputs
         )
@@ -1261,6 +1297,7 @@ class PCIeDCPA2A:
                 threads,
                 True,
                 False,
+                _state_pair_push(state),
             ):
                 raise RuntimeError(
                     "cold PCIe DCP paired gather CUDA graph capture is not "
@@ -1357,9 +1394,16 @@ class PCIeDCPA2A:
         if self._closed:
             raise RuntimeError("PCIeDCPA2A is closed")
         down_width, router_width = 3584 // self.world_size, 896 // self.world_size
+        rows = 1
+        if _state_pair_push(state):
+            # The push transport runs one CTA per row, so it fuses top-16 for
+            # 1..8 rows; the default pull kernel stays single-row.
+            rows = int(local_down.shape[0]) if local_down.ndim == 2 else 0
+            if rows <= 0 or rows > min(self.max_batch_size, PAIR_PUSH_MAX_ROWS):
+                raise ValueError("Kimi paired gather rows exceed prepared capacity")
         expected = (
-            (local_down, (1, down_width), torch.bfloat16, "local_down"),
-            (local_router, (1, router_width), torch.float32, "local_router"),
+            (local_down, (rows, down_width), torch.bfloat16, "local_down"),
+            (local_router, (rows, router_width), torch.float32, "local_router"),
             (correction_bias, (896,), torch.float32, "correction_bias"),
         )
         for value, shape, dtype, name in expected:
@@ -1373,24 +1417,24 @@ class PCIeDCPA2A:
                     f"{name} must be contiguous {shape} {dtype} on {self.device}"
                 )
         out_down = (
-            torch.empty((1, 3584), device=self.device, dtype=torch.bfloat16)
+            torch.empty((rows, 3584), device=self.device, dtype=torch.bfloat16)
             if out_down is None
             else out_down
         )
         topk_weights = (
-            torch.empty((1, 16), device=self.device, dtype=torch.float32)
+            torch.empty((rows, 16), device=self.device, dtype=torch.float32)
             if topk_weights is None
             else topk_weights
         )
         topk_ids = (
-            torch.empty((1, 16), device=self.device, dtype=torch.int32)
+            torch.empty((rows, 16), device=self.device, dtype=torch.int32)
             if topk_ids is None
             else topk_ids
         )
         for value, shape, dtype, name in (
-            (out_down, (1, 3584), torch.bfloat16, "out_down"),
-            (topk_weights, (1, 16), torch.float32, "topk_weights"),
-            (topk_ids, (1, 16), torch.int32, "topk_ids"),
+            (out_down, (rows, 3584), torch.bfloat16, "out_down"),
+            (topk_weights, (rows, 16), torch.float32, "topk_weights"),
+            (topk_ids, (rows, 16), torch.int32, "topk_ids"),
         ):
             if (
                 value.device != self.device
@@ -1420,6 +1464,7 @@ class PCIeDCPA2A:
             slot=slot,
             device_slot_selection=self._device_slot_selection,
             launcher=state.launcher(self._device_slot_selection),
+            **({"rows": rows} if rows != 1 else {}),
         )
         return out_down, topk_weights, topk_ids
 
@@ -1435,6 +1480,7 @@ class PCIeDCPA2A:
         slot: int,
         device_slot_selection: bool,
         launcher,
+        rows: int = 1,
     ) -> None:
         from ._dcp_a2a_cute import all_gather_pair_kimi_topk
 
@@ -1453,6 +1499,7 @@ class PCIeDCPA2A:
                 device_slot_selection=device_slot_selection,
                 slot_delta_bytes=self._slot_bytes if slot == 0 else -self._slot_bytes,
                 launcher=launcher,
+                **({"rows": rows} if rows != 1 else {}),
             )
 
     def kimi_topk16(
@@ -1487,7 +1534,11 @@ class PCIeDCPA2A:
     ):
         self._check_stream()
         rows = int(router_logits.shape[0]) if router_logits.ndim == 2 else 0
-        if self._closed or rows <= 0 or rows > min(self.max_batch_size, 8):
+        if (
+            self._closed
+            or rows <= 0
+            or rows > min(self.max_batch_size, KIMI_TOPK16_MAX_ROWS)
+        ):
             raise ValueError("Kimi top-16 rows exceed prepared channel capacity")
         for value, shape, dtype, name in (
             (router_logits, (rows, 896), torch.float32, "router_logits"),

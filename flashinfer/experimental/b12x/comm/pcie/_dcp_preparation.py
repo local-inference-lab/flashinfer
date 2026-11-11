@@ -149,6 +149,24 @@ def query_from_runtime(runtime, *, surface, call) -> PcieQuery:
         metadata["threads"] = 512
     elif surface.endswith("kimi_topk16"):
         metadata["threads"] = int(call.get("threads", 256))
+    if surface.endswith(("all_gather_pair", "all_gather_pair_kimi_topk")):
+        from ._dcp_a2a_cute import pair_push_enabled
+
+        # Only present when on, so default (pull) queries keep their identity.
+        if pair_push_enabled():
+            metadata["pair_transport"] = "push"
+    if surface.endswith("all_gather_heads") and metadata.get(
+        "gather_transport"
+    ) == "barrier":
+        from ._dcp_a2a_cute import gather_acquire_enabled
+
+        # Only present when on, so default gather queries keep their identity.
+        if gather_acquire_enabled():
+            metadata["gather_sync"] = "acquire"
+        from ._dcp_a2a_cute import gather_island_enabled
+
+        if gather_island_enabled(int(runtime.world_size)):
+            metadata["gather_topology"] = "island"
     if surface.endswith(("lse_reduce_scatter", "all_gather_heads")):
         out = call.get("out")
         heads = (
@@ -213,21 +231,36 @@ def compile_dcp_surface(query_payload, ordinal):
                 return {False: program, True: program}
             return {
                 slot: cute._get_compiled_all_gather_heads(
-                    query.world_size, query.rank, int(call["threads"]), slot
+                    query.world_size,
+                    query.rank,
+                    int(call["threads"]),
+                    slot,
+                    call.get("gather_sync") == "acquire",
+                    call.get("gather_topology") == "island",
                 )
                 for slot in (False, True)
             }
         if surface.endswith("all_gather_pair_kimi_topk"):
             return {
                 slot: cute._get_compiled_all_gather_pair(
-                    query.world_size, query.rank, 512, slot, True
+                    query.world_size,
+                    query.rank,
+                    512,
+                    slot,
+                    True,
+                    call.get("pair_transport") == "push",
                 )
                 for slot in (False, True)
             }
         if surface.endswith("all_gather_pair"):
             return {
                 slot: cute._get_compiled_all_gather_pair(
-                    query.world_size, query.rank, int(call["threads"]), slot, False
+                    query.world_size,
+                    query.rank,
+                    int(call["threads"]),
+                    slot,
+                    False,
+                    call.get("pair_transport") == "push",
                 )
                 for slot in (False, True)
             }
