@@ -25,6 +25,14 @@ from ._tuning import PcieConfig, PcieQuery, TUNING
 
 _COMPONENT = "comm.pcie"
 
+# Equal-quarter island all-reduce surfaces: TP16 four-island reduce-scatter
+# (island_rs) and L1's TP8 two-island all-reduce (island_ar). Both expose the
+# same owner metadata: runtime module -> surface, via _surface_for_runtime.
+_ISLAND_SURFACES = {
+    "PCIeIslandRSAllReduce.all_reduce": "pcie_island_rs",
+    "PCIeIslandARAllReduce.all_reduce": "pcie_island_ar",
+}
+
 
 def _runtime_device(runtime):
     device = getattr(runtime, "device", None)
@@ -63,6 +71,7 @@ def _surface_for_runtime(runtime) -> str:
         "PCIeVocabParallelArgmax": "VocabParallelArgmax.fused_add_argmax",
         "PCIeHierarchicalAllReduce": "PCIeHierarchicalAllReduce.all_reduce",
         "PCIeIslandRSAllReduce": "PCIeIslandRSAllReduce.all_reduce",
+        "PCIeIslandARAllReduce": "PCIeIslandARAllReduce.all_reduce",
     }.get(name, "")
 
 
@@ -158,44 +167,80 @@ def query_from_runtime(
             "slab_bytes": _runtime_slab_bytes(runtime),
             "peer_ranks": tuple(_selected_peers(runtime)),
         }
-    elif surface == "PCIeIslandRSAllReduce.all_reduce":
-        inp, out = raw["inp"], raw.get("out")
-        from .pcie_island_rs import _pick_blocks
+    elif surface in _ISLAND_SURFACES:
+        from importlib import import_module
 
-        blocks = int(runtime.blocks)
-        if raw.get("blocks") is not None and int(raw["blocks"]) != blocks:
-            raise ValueError(
-                "the island owner's physical grid cannot change between calls"
+        inp, out = raw["inp"], raw.get("out")
+        pick_blocks = import_module(
+            f"{__package__}.{_ISLAND_SURFACES[surface]}"
+        )._pick_blocks
+        if surface == "PCIeIslandARAllReduce.all_reduce":
+            # island_ar keeps the per-call grid resolution contract: its
+            # runtime may run with blocks=None and the effective grid is
+            # chosen from the launched shape at query time.
+            blocks = (
+                int(raw["blocks"])
+                if raw.get("blocks") is not None
+                else (
+                    runtime.blocks
+                    if runtime.blocks is not None
+                    else pick_blocks(inp.numel())
+                )
             )
-        blocks_override = runtime.blocks_override or raw.get("blocks") is not None
-        active = raw.get("active_blocks")
-        if active is None:
-            active = (
-                blocks if blocks_override else min(blocks, _pick_blocks(inp.numel()))
-            )
-        controls = {
-            "threads": int(runtime.threads),
-            "wait_nanosleep_cycles": int(runtime.wait_nanosleep_cycles),
-            "blocks": blocks,
-            "active_blocks": int(active),
-            "inplace": out is not None and out.data_ptr() == inp.data_ptr(),
-            "cross_island_rsag": False,
-            "local_push": False,
-            "inp": _tensor_call(inp),
-            "output": None if out is None else _tensor_call(out),
-        }
-        setup = {
-            "max_elements": int(runtime.max_elements),
-            "threads_override": bool(getattr(runtime, "threads_override", False)),
-            "blocks_override": bool(blocks_override),
-            "active_blocks_override": raw.get("active_blocks") is not None,
-            "quarter_capacity": int(runtime.quarter_capacity),
-            "stage_offset": int(runtime.stage_offset),
-            "part_offset": int(runtime.part_offset),
-            "final_offset": int(runtime.final_offset),
-            "slab_bytes": _runtime_slab_bytes(runtime),
-            "peer_ranks": tuple(runtime.mapped_peers),
-        }
+            controls = {
+                "threads": int(runtime.threads),
+                "wait_nanosleep_cycles": int(runtime.wait_nanosleep_cycles),
+                "blocks": blocks,
+                "inp": _tensor_call(inp),
+                "output": None if out is None else _tensor_call(out),
+            }
+            setup = {
+                "max_elements": int(runtime.max_elements),
+                "quarter_capacity": int(runtime.quarter_capacity),
+                "stage_offset": int(runtime.stage_offset),
+                "part_offset": int(runtime.part_offset),
+                "final_offset": int(runtime.final_offset),
+                "slab_bytes": _runtime_slab_bytes(runtime),
+                "peer_ranks": tuple(runtime.mapped_peers),
+            }
+        else:
+            # island_rs (TP16) keeps the fixed-grid owner contract: the
+            # physical grid is pinned at construction and cannot change
+            # between calls; active_blocks scopes participation per call.
+            blocks = int(runtime.blocks)
+            if raw.get("blocks") is not None and int(raw["blocks"]) != blocks:
+                raise ValueError(
+                    "the island owner's physical grid cannot change between calls"
+                )
+            blocks_override = runtime.blocks_override or raw.get("blocks") is not None
+            active = raw.get("active_blocks")
+            if active is None:
+                active = (
+                    blocks if blocks_override else min(blocks, pick_blocks(inp.numel()))
+                )
+            controls = {
+                "threads": int(runtime.threads),
+                "wait_nanosleep_cycles": int(runtime.wait_nanosleep_cycles),
+                "blocks": blocks,
+                "active_blocks": int(active),
+                "inplace": out is not None and out.data_ptr() == inp.data_ptr(),
+                "cross_island_rsag": False,
+                "local_push": False,
+                "inp": _tensor_call(inp),
+                "output": None if out is None else _tensor_call(out),
+            }
+            setup = {
+                "max_elements": int(runtime.max_elements),
+                "threads_override": bool(getattr(runtime, "threads_override", False)),
+                "blocks_override": bool(blocks_override),
+                "active_blocks_override": raw.get("active_blocks") is not None,
+                "quarter_capacity": int(runtime.quarter_capacity),
+                "stage_offset": int(runtime.stage_offset),
+                "part_offset": int(runtime.part_offset),
+                "final_offset": int(runtime.final_offset),
+                "slab_bytes": _runtime_slab_bytes(runtime),
+                "peer_ranks": tuple(runtime.mapped_peers),
+            }
     else:
         raise ValueError(f"unsupported PCIe owner surface {surface!r}")
     return PcieQuery(
@@ -267,6 +312,16 @@ def compile_owner_surface(query_payload, ordinal):
                 wait_nanosleep_cycles=call["wait_nanosleep_cycles"],
                 cross_island_rsag=call.get("cross_island_rsag", False),
                 local_push=call.get("local_push", False),
+            )
+        if query.surface == "PCIeIslandARAllReduce.all_reduce":
+            from ._island_ar_cute import get_island_ar_launcher
+
+            return get_island_ar_launcher(
+                query.world_size,
+                query.rank,
+                ordinal,
+                threads=call["threads"],
+                wait_nanosleep_cycles=call["wait_nanosleep_cycles"],
             )
     raise ValueError(f"unsupported PCIe owner surface {query.surface!r}")
 
@@ -421,12 +476,19 @@ def prepared_call(state, **actual):
             output=out,
             capture_safe=True,
         )
-    if query.surface == "PCIeIslandRSAllReduce.all_reduce":
+    if query.surface in _ISLAND_SURFACES:
         out = actual.get("out")
         if out is None:
             import torch
 
             out = torch.empty_like(actual["inp"])
+        # island_rs participates with a call-scoped active block count;
+        # island_ar runs its full resolved grid and takes no active_blocks.
+        run_kwargs = (
+            {"active_blocks": query.call["active_blocks"]}
+            if query.surface == "PCIeIslandRSAllReduce.all_reduce"
+            else {}
+        )
         return PreparedCall(
             run=lambda: runtime._run_prepared(
                 state.launcher(),
@@ -434,7 +496,7 @@ def prepared_call(state, **actual):
                 out,
                 query.call["blocks"],
                 actual.get("stream"),
-                active_blocks=query.call["active_blocks"],
+                **run_kwargs,
             ),
             output=out,
             capture_safe=True,
