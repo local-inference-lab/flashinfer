@@ -777,7 +777,7 @@ def _apply_attention_sink_after_lse_scale(
 
 
 @cute.jit
-def _apply_relative_attention_bias(
+def _add_relative_attention_bias(
     frag_s: cute.Tensor,
     mRelativeAttentionBias: cute.Tensor,
     q_row_idx_frag: cute.Tensor,
@@ -815,6 +815,64 @@ def _apply_relative_attention_bias(
                             ]
                         )
                         frag_s[mma_q, mma_kv, reg_id] += bias * inverse_softmax_scale
+
+
+@cute.jit
+def _apply_relative_attention_bias(
+    frag_s: cute.Tensor,
+    mRelativeAttentionBias: cute.Tensor,
+    q_row_idx_frag: cute.Tensor,
+    q_head_idx_frag: cute.Tensor,
+    causal_k_limit: cute.Tensor,
+    tile_key_base: Int32,
+    warp_kv_base: Int32,
+    lane_pair_base: Int32,
+    inverse_softmax_scale: Float32,
+    num_mma_q,
+    num_mma_kv,
+    skip_unbiased_fragments: cutlass.Constexpr,
+):
+    """Add the relative bias to one thread's score fragment.
+
+    Without a window most key tiles of a long context lie at or beyond the
+    bias extent from every row; ``skip_unbiased_fragments`` tests that once
+    per fragment.  A window that fits the extent leaves no such tile.
+    """
+    if const_expr(skip_unbiased_fragments):
+        nearest_limit = causal_k_limit[0, 0]
+        for mma_q in cutlass.range_constexpr(num_mma_q):
+            for row_slot in cutlass.range_constexpr(2):
+                if causal_k_limit[mma_q, row_slot] < nearest_limit:
+                    nearest_limit = causal_k_limit[mma_q, row_slot]
+        last_key = tile_key_base + warp_kv_base + Int32(num_mma_kv * 16 - 1)
+        if nearest_limit - last_key < mRelativeAttentionBias.shape[2]:
+            _add_relative_attention_bias(
+                frag_s,
+                mRelativeAttentionBias,
+                q_row_idx_frag,
+                q_head_idx_frag,
+                causal_k_limit,
+                tile_key_base,
+                warp_kv_base,
+                lane_pair_base,
+                inverse_softmax_scale,
+                num_mma_q,
+                num_mma_kv,
+            )
+    else:
+        _add_relative_attention_bias(
+            frag_s,
+            mRelativeAttentionBias,
+            q_row_idx_frag,
+            q_head_idx_frag,
+            causal_k_limit,
+            tile_key_base,
+            warp_kv_base,
+            lane_pair_base,
+            inverse_softmax_scale,
+            num_mma_q,
+            num_mma_kv,
+        )
 
 
 @dsl_user_op
@@ -6011,6 +6069,7 @@ class PagedForwardKernel:
                             self.inverse_softmax_scale,
                             num_mma_q,
                             num_mma_kv,
+                            self.window_left < 0,
                         )
                     p_frag_scalar = (
                         p_frag_scalar_debug
@@ -6216,6 +6275,7 @@ class PagedForwardKernel:
                             self.inverse_softmax_scale,
                             num_mma_q,
                             num_mma_kv,
+                            self.window_left < 0,
                         )
                     p_frag_scalar = (
                         p_frag_scalar_debug
@@ -6431,6 +6491,7 @@ class PagedForwardKernel:
                             self.inverse_softmax_scale,
                             num_mma_q,
                             num_mma_kv,
+                            self.window_left < 0,
                         )
                     p_frag_scalar = (
                         p_frag_scalar_debug

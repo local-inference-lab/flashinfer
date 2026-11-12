@@ -540,6 +540,56 @@ def test_paged_forward_matches_reference_decode_with_relative_bias() -> None:
     assert _cosine_similarity(output, ref_out) >= 0.99999
 
 
+@pytest.mark.parametrize("relative_extent", [1, 96, 1024])
+@torch.inference_mode()
+def test_paged_forward_extend_biases_only_keys_within_the_extent(
+    relative_extent: int,
+) -> None:
+    """Unwindowed extend skips key fragments at or beyond the extent from
+    every row; the contexts span many such fragments and the biased band."""
+    require_b12x()
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
+        q_seqlens=[40, 24, 1],
+        cache_seqlens=[1200, 700, 97],
+        page_size=128,
+        q_heads=12,
+        kv_heads=2,
+        head_dim_qk=128,
+        head_dim_vo=128,
+        dtype=torch.bfloat16,
+        kv_dtype=torch.bfloat16,
+    )
+    relative_attention_bias = (
+        torch.randn(q.shape[0], q.shape[1], relative_extent, device=q.device) * 2.0
+    ).to(q.dtype)
+    workspace = _make_workspace(q, k_cache, v_cache, mode="extend")
+    workspace.prepare(page_table, cache_seqlens, cu_seqlens_q)
+    output, _ = workspace.run(
+        q,
+        k_cache,
+        v_cache,
+        output=torch.empty_like(q),
+        relative_attention_bias=relative_attention_bias,
+    )
+    torch.cuda.synchronize()
+
+    ref_out, _ = paged_attention_reference(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        cu_seqlens_q,
+        causal=True,
+        relative_attention_bias=relative_attention_bias,
+    )
+    plain_out, _ = paged_attention_reference(
+        q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q, causal=True
+    )
+    assert (output - ref_out).abs().max().item() <= 0.03
+    assert (output - plain_out).abs().max().item() > 0.1
+
+
 @pytest.mark.parametrize(("mode", "q_seqlen"), [("decode", 1), ("extend", 6)])
 @torch.inference_mode()
 def test_paged_forward_large_relative_bias_is_numerically_stable(
