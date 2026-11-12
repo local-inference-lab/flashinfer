@@ -726,6 +726,7 @@ def _apply_attention_sink_after_lse_scale(
     mAttentionSinkBias: cute.Tensor,
     mma_q,
     row_slot,
+    q_row_idx: Int32,
     q_head_idx: Int32,
     row_valid: Int32,
     causal_k_limit: Int32,
@@ -748,7 +749,16 @@ def _apply_attention_sink_after_lse_scale(
                 )
         if sink_owner:
             old_m = m_frag[mma_q, row_slot]
-            sink_m = Float32(mAttentionSinkBias[q_head_idx] * attention_ops.LOG2_E)
+            # One sink logit per head, or per query row and head for a
+            # rank-2 operand.
+            sink_m = Float32(
+                (
+                    mAttentionSinkBias[q_row_idx, q_head_idx]
+                    if const_expr(len(mAttentionSinkBias.shape) == 2)
+                    else mAttentionSinkBias[q_head_idx]
+                )
+                * attention_ops.LOG2_E
+            )
             new_m = _max_nan_f32(old_m, sink_m)
             old_scale = (
                 Float32(0.0)
@@ -7378,6 +7388,7 @@ class PagedForwardKernel:
                         mAttentionSinkBias,
                         mma_q,
                         row_slot,
+                        q_row_idx_frag[mma_q, row_slot],
                         q_head_idx_frag[mma_q, row_slot],
                         row_valid[mma_q, row_slot],
                         causal_k_limit[mma_q, row_slot],

@@ -2820,7 +2820,11 @@ def variant_key(binding: B12XPagedAttentionBinding) -> Hashable:
         binding.q2k_indices is not None,
         binding.k_descale is not None,
         binding.v_descale is not None,
-        binding.attention_sink_bias is not None,
+        # A per-row sink (rank 2) is indexed differently from a per-head one.
+        2
+        if binding.attention_sink_bias is not None
+        and binding.attention_sink_bias.ndim == 2
+        else binding.attention_sink_bias is not None,
         binding.relative_attention_bias is not None,
     )
     layout = (

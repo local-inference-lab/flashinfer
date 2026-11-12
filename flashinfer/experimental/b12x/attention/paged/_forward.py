@@ -955,7 +955,11 @@ def paged_attention_forward(
             )
     elif q2k_indices is not None:
         raise ValueError("q2k_indices can only be supplied for MSA block-sparse plans")
-    has_attention_sink_bias = attention_sink_bias is not None
+    # 0: no sink, 1: one logit per head, 2: one per query row and head.  The
+    # rank selects the kernel's indexing, so it is part of every program key.
+    has_attention_sink_bias = (
+        0 if attention_sink_bias is None else int(attention_sink_bias.ndim)
+    )
     if attention_sink_bias is None:
         attention_sink_bias = (
             workspace._prepared_optional_buffers["attention_sink_bias"]
@@ -963,17 +967,37 @@ def paged_attention_forward(
             else torch.empty(0, dtype=torch.float32, device=q.device)
         )
     else:
-        if attention_sink_bias.ndim != 1:
+        if attention_sink_bias.ndim == 2:
+            if plan.mode != "extend":
+                raise ValueError(
+                    "a per-row attention_sink_bias [total_q, num_q_heads] is "
+                    f"supported by extend plans only, got mode {plan.mode!r}"
+                )
+            if (
+                int(attention_sink_bias.shape[0]) < int(plan.total_q)
+                or int(attention_sink_bias.shape[1]) != plan.num_q_heads
+                or attention_sink_bias.dtype != torch.float32
+                or not attention_sink_bias.is_contiguous()
+            ):
+                raise ValueError(
+                    "a per-row attention_sink_bias must be contiguous float32 "
+                    f"[at least {int(plan.total_q)}, {plan.num_q_heads}], got "
+                    f"{attention_sink_bias.dtype} {tuple(attention_sink_bias.shape)}"
+                )
+        elif attention_sink_bias.ndim != 1:
             raise ValueError(
-                f"attention_sink_bias must be rank-1 [num_q_heads], got {tuple(attention_sink_bias.shape)}"
+                "attention_sink_bias must be [num_q_heads] or "
+                f"[total_q, num_q_heads], got {tuple(attention_sink_bias.shape)}"
             )
-        if int(attention_sink_bias.shape[0]) != plan.num_q_heads:
+        elif int(attention_sink_bias.shape[0]) != plan.num_q_heads:
             raise ValueError(
                 f"attention_sink_bias must have {plan.num_q_heads} elements, got {int(attention_sink_bias.shape[0])}"
             )
         if attention_sink_bias.device != q.device:
             raise ValueError("attention_sink_bias must be on the same CUDA device as q")
-        if _launchers is not None and (
+        if attention_sink_bias.ndim == 2:
+            pass
+        elif _launchers is not None and (
             attention_sink_bias.dtype != torch.float32
             or not attention_sink_bias.is_contiguous()
         ):
@@ -1424,7 +1448,7 @@ def paged_attention_forward(
             bool(use_native_fp8_pv),
             bool(decode_native_fp8_runtime_chunk_guard),
             int(plan.window_left),
-            bool(has_attention_sink_bias),
+            2 if has_attention_sink_bias == 2 else bool(has_attention_sink_bias),
             bool(has_relative_attention_bias),
             bool(plan.msa_block_sparse),
             bool(getattr(plan, "msa_union_tile", False)),
