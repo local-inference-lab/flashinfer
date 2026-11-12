@@ -1,4 +1,4 @@
-"""Byte-exact TP16 gather profiles share replay banks across changing row counts."""
+"""DCP8 and TP16 gather profiles share signal records and replay banks."""
 
 import ctypes
 import gc
@@ -11,11 +11,11 @@ import pytest
 
 pytestmark = pytest.mark.skipif(
     os.getenv("B12X_RUN_PCIE_DCP_A2A_TEST") != "1",
-    reason="requires sixteen explicitly assigned peer-accessible SM120 GPUs",
+    reason="requires explicitly assigned peer-accessible SM120 GPUs",
 )
 
 
-def _worker(rank, directory):
+def _worker(rank, world, directory):
     import torch
     import torch.distributed as dist
     from b12x.comm import pcie
@@ -36,16 +36,18 @@ def _worker(rank, directory):
         "gloo",
         init_method=(Path(directory) / "group").as_uri(),
         rank=rank,
-        world_size=16,
+        world_size=world,
         timeout=timedelta(minutes=10),
     )
     profiles = (
-        ("ordinary", 512),
-        ("selected_phased_barrier", 128),
-        ("selected_phased_barrier", 512),
-        ("selected_ring", 128),
-        ("selected_recursive", 128),
-        ("selected_recursive_ready", 128),
+        ("ordinary", 512, 8),
+        ("ordinary", 128, 2),
+        ("ordinary", 32, 8),
+        ("selected_phased_barrier", 128, 8),
+        ("selected_phased_barrier", 512, 8),
+        ("selected_ring", 128, 8),
+        ("selected_recursive", 128, 8),
+        ("selected_recursive_ready", 128, 8),
     )
     try:
         for origin in (0, 1):
@@ -54,12 +56,12 @@ def _worker(rank, directory):
                 exchange_group=dist.group.WORLD,
                 device=device,
                 max_batch_size=32,
-                total_heads=16,
+                total_heads=world,
                 head_dim=8192,
                 stream_affine=False,
             )
             assert owner._threads_override == 0
-            assert owner._block_limit_override in (0, 8)
+            assert owner._block_limit_override == 0
             session = PreparationSession(
                 device=device, autotune=False, compile_workers=4, prime=False
             )
@@ -70,12 +72,12 @@ def _worker(rank, directory):
                         (rows, 1, 8192), dtype=torch.bfloat16, device=device
                     )
                     guard = torch.full(
-                        (rows * 16 * 8192 * 2 + 32,),
+                        (rows * world * 8192 * 2 + 32,),
                         0xA5,
                         dtype=torch.uint8,
                         device=device,
                     )
-                    output = guard[16:-16].view(torch.bfloat16).view(rows, 16, 8192)
+                    output = guard[16:-16].view(torch.bfloat16).view(rows, world, 8192)
                     operands, expected = [], []
                     columns = torch.arange(rows * 8192 * 2, device=device).view(
                         rows, 1, -1
@@ -92,12 +94,12 @@ def _worker(rank, directory):
                                     ((columns + peer * 37 + variation * 53) % 256).to(
                                         torch.uint8
                                     )
-                                    for peer in range(16)
+                                    for peer in range(world)
                                 ],
                                 dim=1,
-                            ).reshape(rows, 16, -1)
+                            ).reshape(rows, world, -1)
                         )
-                    for transport, threads in profiles:
+                    for transport, threads, blocks in profiles:
                         query = _dcp_preparation.query_from_runtime(
                             owner,
                             surface="DcpAllToAll.all_gather_heads",
@@ -105,9 +107,11 @@ def _worker(rank, directory):
                                 local_input=source,
                                 out=output,
                                 threads=threads,
-                                block_limit=8,
+                                block_limit=blocks,
                             ),
                         )
+                        assert query.call["threads"] == threads
+                        assert query.call["block_limit"] == blocks
                         if transport != "ordinary":
                             query = replace(
                                 query,
@@ -121,22 +125,24 @@ def _worker(rank, directory):
                                 ),
                             )
                         plan = _dcp_preparation.plan(query, runtime=owner)
-                        key = rows, transport, threads
-                        name = f"rows{rows}-{transport}-{threads}"
+                        key = rows, transport, threads, blocks
+                        name = f"rows{rows}-{transport}-{threads}-blocks{blocks}"
                         requests.append(
                             plan.request(
                                 name=name,
                                 prepare_call=lambda state,
                                 source=source,
-                                output=output: PreparedCall(
-                                    run=lambda: state.run(
-                                        local_input=source, out=output
-                                    ),
-                                    output=output,
-                                    owners=(owner, source, output),
+                                output=output: (
+                                    PreparedCall(
+                                        run=lambda: state.run(
+                                            local_input=source, out=output
+                                        ),
+                                        output=output,
+                                        owners=(owner, source, output),
+                                    )
                                 ),
                                 collective=CollectiveRequirement(
-                                    name, tuple(range(16))
+                                    name, tuple(range(world))
                                 ),
                             )
                         )
@@ -149,7 +155,7 @@ def _worker(rank, directory):
                         else None
                     ),
                 )
-                source, output, _, operands, _, plan = cases[1, "ordinary", 512]
+                source, output, _, operands, _, plan = cases[1, "ordinary", 512, 8]
                 source.view(torch.uint8).copy_(operands[0])
                 for _ in range(1 if origin else 2):
                     owner.all_gather_heads(source, out=output, plan=plan)
@@ -162,7 +168,22 @@ def _worker(rank, directory):
                     graphs[key] = graph
                 assert owner._device_slot_selection and owner._graph_base_slot == origin
                 session.freeze()
+                # Two-CTA native calls leave other CTA counters unchanged. Each
+                # selected transport must wait for its own peer publications
+                # while assembling bytes that differ from both native calls.
                 schedule = [
+                    item
+                    for transport in (
+                        "selected_ring",
+                        "selected_recursive",
+                        "selected_recursive_ready",
+                    )
+                    for item in (
+                        ((1, "ordinary", 128, 2), 0),
+                        ((1, "ordinary", 128, 2), 1),
+                        ((1, transport, 128, 8), 2),
+                    )
+                ] + [
                     (key, variation)
                     for variation in range(3)
                     for key in (
@@ -257,10 +278,16 @@ def _worker(rank, directory):
         dist.destroy_process_group()
 
 
-def test_tp16_selected_gather_profiles_queued_replay(tmp_path):
+@pytest.mark.parametrize(
+    "world", [pytest.param(16, id="tp16"), pytest.param(8, id="dcp8")]
+)
+def test_tp16_selected_gather_profiles_queued_replay(tmp_path, world):
     import torch
     import torch.multiprocessing as mp
 
-    if torch.cuda.device_count() != 16 or torch.cuda.get_device_capability() != (12, 0):
-        pytest.skip("requires sixteen assigned SM120 GPUs")
-    mp.spawn(_worker, args=(str(tmp_path),), nprocs=16, join=True)
+    if torch.cuda.device_count() < world or torch.cuda.get_device_capability() != (
+        12,
+        0,
+    ):
+        pytest.skip(f"requires {world} assigned SM120 GPUs")
+    mp.spawn(_worker, args=(world, str(tmp_path)), nprocs=world, join=True)

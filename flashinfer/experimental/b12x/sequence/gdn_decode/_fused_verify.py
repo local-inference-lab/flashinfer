@@ -572,6 +572,141 @@ class _FusedVerify:
                 output[off] = BFloat16(_mul(weighted, _sigmoid_triton(gate_input)))
 
 
+def _scalars(scale, lower_bound, eps):
+    import math
+
+    scale = float(128**-0.5 if scale is None else scale)
+    lower_bound, eps = float(lower_bound), float(eps)
+    if not (
+        math.isfinite(scale)
+        and scale > 0
+        and math.isfinite(eps)
+        and eps > 0
+        and math.isfinite(lower_bound)
+        and lower_bound < 0
+    ):
+        raise ValueError(
+            "fused KDA verify requires finite positive scale/eps and a finite negative lower bound"
+        )
+    return scale, lower_bound, eps
+
+
+def _shared_metadata(binding, conv):
+    for name in ("query_start_loc", "num_accepted_tokens", "num_seqs", "num_tokens"):
+        left, right = getattr(binding, name), getattr(conv, name)
+        if (
+            left.data_ptr() != right.data_ptr()
+            or left.shape != right.shape
+            or left.dtype != right.dtype
+            or left.device != right.device
+            or left.stride() != right.stride()
+        ):
+            raise ValueError(
+                f"fused KDA verify requires shared convolution/recovery {name}"
+            )
+
+
+def _operands(binding, conv):
+    return (
+        conv.x,
+        conv.conv_weight,
+        conv.state_slot_ids,
+        conv.state_is_fresh.view(torch.uint8),
+        conv.num_accepted_tokens,
+        conv.conv_state,
+        binding.raw_g,
+        binding.raw_beta,
+        binding.A_log,
+        binding.dt_bias,
+        binding.recurrent_state,
+        binding.query_start_loc,
+        binding.state_indices,
+        binding.num_seqs,
+        binding.num_tokens,
+        binding.output,
+        binding.z,
+        binding.norm_weight,
+        binding.correction_cache,
+        binding.kg_cache,
+    )
+
+
+_OPERAND_NAMES = (
+    "x",
+    "conv_weight",
+    "state_slot_ids",
+    "state_is_fresh",
+    "num_accepted_tokens",
+    "conv_state",
+    "raw_g",
+    "raw_beta",
+    "A_log",
+    "dt_bias",
+    "recurrent_state",
+    "query_start_loc",
+    "state_indices",
+    "num_seqs",
+    "num_tokens",
+    "output",
+    "z",
+    "norm_weight",
+    "correction_cache",
+    "kg_cache",
+)
+# These strides are launch arguments; all other strides are compiled constants.
+_RUNTIME_STRIDES = {
+    "conv_state": (0,),
+    "raw_beta": (0, 1),
+    "recurrent_state": (0,),
+    "state_indices": (0,),
+    "z": (0, 1),
+    "correction_cache": (0,),
+    "kg_cache": (0,),
+}
+
+
+def _check_operands(tensors, specifications):
+    import math
+
+    from ._impl import _overlaps, _paged_overlaps
+
+    paged = {"conv_state", "recurrent_state", "correction_cache", "kg_cache"}
+    for name, tensor, (shape, dtype, device, strides) in zip(
+        _OPERAND_NAMES, tensors, specifications, strict=True
+    ):
+        if tensor.dtype != dtype:
+            raise TypeError(f"fused KDA {name} must have prepared dtype {dtype}")
+        if tensor.shape != shape or tensor.device != device:
+            raise ValueError(
+                f"fused KDA {name} must have prepared shape {shape} on {device}"
+            )
+        if any(
+            expected is not None and actual != expected
+            for actual, expected in zip(tensor.stride(), strides, strict=True)
+        ):
+            raise ValueError(f"fused KDA {name} differs from its compiled strides")
+        if name in paged and tensor.stride(0) < math.prod(tensor.shape[1:]):
+            raise ValueError(f"fused KDA {name} state slots must not overlap")
+    mutable = {"conv_state", "output", "correction_cache", "kg_cache"}
+    for index, (left_name, left) in enumerate(
+        zip(_OPERAND_NAMES, tensors, strict=True)
+    ):
+        for right_name, right in zip(
+            _OPERAND_NAMES[index + 1 :], tensors[index + 1 :], strict=True
+        ):
+            if left_name not in mutable and right_name not in mutable:
+                continue
+            overlaps = (
+                _paged_overlaps
+                if left_name in paged and right_name in paged
+                else _overlaps
+            )
+            if overlaps(left, right):
+                raise ValueError(
+                    f"fused KDA operands {left_name} and {right_name} must not overlap"
+                )
+
+
 class FusedVerifyBinding:
     """A prepared one-launch verify with static or caller-owned dynamic operands."""
 
@@ -580,6 +715,7 @@ class FusedVerifyBinding:
         self._build_args = build_args
 
     def run(self, *, scale, lower_bound, eps):
+        scale, lower_bound, eps = _scalars(scale, lower_bound, eps)
         if self._args is None:
             raise ValueError(
                 "this fused verify retains no preparation examples; use run_dynamic"
@@ -588,6 +724,7 @@ class FusedVerifyBinding:
 
     def run_dynamic(self, binding, conv, *, scale, lower_bound, eps):
         """Launch with fresh caller-owned tensors; no preparation pointers are retained."""
+        scale, lower_bound, eps = _scalars(scale, lower_bound, eps)
         args = self._build_args(binding, conv)
         self._launch(*args, scale, lower_bound, eps, current_cuda_stream())
 
@@ -632,6 +769,37 @@ def prepare(binding, conv, *, retain_examples=True):
         raise ValueError(
             "fused KDA verify requires a conv window covering the verify window"
         )
+    _shared_metadata(binding, conv)
+    from ._preparation import _kda_strides
+
+    strides = _kda_strides(
+        binding.mixed_qkv,
+        binding.raw_g,
+        binding.raw_beta,
+        binding.dt_bias,
+        binding.recurrent_state,
+        binding.output,
+    )
+    if any(
+        strides[index] != query.kda_strides[index]
+        for index in (0, 1, 2, 5, 7, 8, 9, 10)
+    ):
+        raise ValueError(
+            "fused KDA preparation strides differ from the selected recurrence plan"
+        )
+    if conv.x.stride() != (cq.input_row_stride, 1):
+        raise ValueError(
+            "fused KDA preparation input strides differ from the convolution plan"
+        )
+    for name, dtype in (
+        ("A_log", query.a_log_dtype),
+        ("dt_bias", query.dt_bias_dtype),
+        ("state_indices", query.state_indices_dtype),
+    ):
+        if getattr(binding, name).dtype != getattr(torch, dtype):
+            raise ValueError(
+                f"fused KDA {name} dtype differs from the selected recurrence plan"
+            )
     if binding.mixed_qkv.data_ptr() != conv.out.data_ptr():
         raise ValueError(
             "fused KDA verify requires the conv output to be the recurrence input"
@@ -699,6 +867,28 @@ def prepare(binding, conv, *, retain_examples=True):
         query.state_indices_dtype,
         strides,
     )
+    torch_types = {
+        BFloat16: torch.bfloat16,
+        Float32: torch.float32,
+        Int32: torch.int32,
+        Int64: torch.int64,
+        Uint8: torch.uint8,
+    }
+    examples = _operands(binding, conv)
+    specifications = tuple(
+        (
+            tuple(tensor.shape),
+            torch_types[kind],
+            conv.x.device,
+            tuple(
+                None if axis in _RUNTIME_STRIDES.get(name, ()) else stride
+                for axis, stride in enumerate(tensor.stride())
+            ),
+        )
+        for name, tensor, kind in zip(_OPERAND_NAMES, examples, vtypes, strict=True)
+    )
+    _check_operands(examples, specifications)
+
     kernel = _FusedVerify(query, cq, block_v, conv_strides, weight_type, norm_type)
     launch = b12x_compile(
         kernel,
@@ -716,28 +906,9 @@ def prepare(binding, conv, *, retain_examples=True):
     )
 
     def build_args(binding, conv):
-        tensors = (
-            conv.x,
-            conv.conv_weight,
-            conv.state_slot_ids,
-            conv.state_is_fresh.view(torch.uint8),
-            conv.num_accepted_tokens,
-            conv.conv_state,
-            binding.raw_g,
-            binding.raw_beta,
-            binding.A_log,
-            binding.dt_bias,
-            binding.recurrent_state,
-            binding.query_start_loc,
-            binding.state_indices,
-            binding.num_seqs,
-            binding.num_tokens,
-            binding.output,
-            binding.z,
-            binding.norm_weight,
-            binding.correction_cache,
-            binding.kg_cache,
-        )
+        _shared_metadata(binding, conv)
+        tensors = _operands(binding, conv)
+        _check_operands(tensors, specifications)
         return (
             *(_pointer(t, ty) for t, ty in zip(tensors, vtypes, strict=True)),
             conv.conv_state.stride(0),
@@ -764,29 +935,41 @@ def prepare(binding, conv, *, retain_examples=True):
 
 
 def prepare_kda_fused_verify(binding, conv, *, retain_examples=True):
-    """Public: prepare the one-launch verify for a KDA recovery binding and its speculative conv binding.
+    """Prepare experimental fused KDA recovery verification and short convolution.
 
-    Call at preparation/finalize time (it may compile); ``run_kda_fused_verify`` is graph-capturable.
-    Replaces ``short_conv.run(conv)`` followed by ``run_kda(binding)``; ``conv.out`` (the
-    recurrence input) is not written.
+    Calling this experimental API explicitly opts in; no environment switch is
+    required. Prepare before capture. The supported contract is kernel size 4,
+    dilation 1, no convolution bias, BF16 rounding, equal KDA key/value heads,
+    recurrent block size 16 or 32, and at most eight verification positions.
+    Convolution and recurrence must share starts, accepted counts, live counts,
+    and the convolution-output/recurrence-input allocation. That intermediate
+    output is not written by the fused kernel.
+
+    With ``retain_examples=False`` the binding keeps only compiled programs and
+    tensor metadata. Supply ``binding`` and ``conv`` to ``run_kda_fused_verify``
+    for each invocation; shapes, dtypes, devices and compiled strides must match.
     """
     return prepare(binding, conv, retain_examples=retain_examples)
 
 
-def run_kda_fused_verify(fused, *, lower_bound=-5.0, eps=1e-6, scale=None):
-    import math
+def run_kda_fused_verify(
+    fused, *, binding=None, conv=None, lower_bound=-5.0, eps=1e-6, scale=None
+):
+    """Run the explicitly selected experimental fused KDA operation during capture.
 
-    lower_bound, eps = float(lower_bound), float(eps)
-    scale = float(128**-0.5 if scale is None else scale)
-    if not (
-        math.isfinite(lower_bound)
-        and lower_bound < 0
-        and math.isfinite(eps)
-        and eps > 0
-        and scale > 0
-    ):
-        raise ValueError(
-            "fused KDA verify requires a negative lower bound and positive eps/scale"
-        )
-    fused.run(scale=scale, lower_bound=lower_bound, eps=eps)
-    return fused.binding.output
+    The preparation limits documented by ``prepare_kda_fused_verify`` apply.
+    Omit both operands to use retained examples, or supply both for a dynamic
+    invocation, including when preparation used ``retain_examples=False``.
+    Dynamic calls preserve prepared shapes and compiled strides; launch-time
+    outer strides may vary. Mutable operands must not overlap each other or
+    read-only operands. Scalars must be finite with scale/epsilon positive and
+    the gate lower bound negative. Returns the supplied or retained output.
+    """
+    scale, lower_bound, eps = _scalars(scale, lower_bound, eps)
+    if (binding is None) != (conv is None):
+        raise ValueError("fused KDA dynamic invocation requires both binding and conv")
+    if binding is None:
+        fused.run(scale=scale, lower_bound=lower_bound, eps=eps)
+        return fused.binding.output
+    fused.run_dynamic(binding, conv, scale=scale, lower_bound=lower_bound, eps=eps)
+    return binding.output

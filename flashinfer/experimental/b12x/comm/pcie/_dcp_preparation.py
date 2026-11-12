@@ -154,6 +154,8 @@ def query_from_runtime(runtime, *, surface, call) -> PcieQuery:
         )
     elif surface.endswith("all_gather_pair_kimi_topk"):
         metadata["threads"] = 512
+        metadata["row_blocks"] = call.get("row_blocks", 1)
+        metadata["load_batch"] = call.get("load_batch", 1)
     elif surface.endswith("kimi_topk16"):
         metadata["threads"] = int(call.get("threads", 256))
     if surface.endswith(("lse_reduce_scatter", "all_gather_heads")):

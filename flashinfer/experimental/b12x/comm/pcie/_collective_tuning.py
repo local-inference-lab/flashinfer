@@ -78,7 +78,13 @@ def _configs(query, device=None):
                         active_blocks=active,
                     )
             continue
-        if name in ("dcp_phased", "dcp_ring", "dcp_recursive", "dcp_recursive_ready"):
+        if name in (
+            "dcp_phased",
+            "dcp_phased_push",
+            "dcp_ring",
+            "dcp_recursive",
+            "dcp_recursive_ready",
+        ):
             # Automatic admission covers the qualified TP16 hardware. Phased
             # kernels also have to pass the native cluster occupancy check.
             if (
@@ -93,7 +99,13 @@ def _configs(query, device=None):
                 if payload["setup"].get("threads_override", 0)
                 else (
                     (128,)
-                    if name in ("dcp_ring", "dcp_recursive", "dcp_recursive_ready")
+                    if name
+                    in (
+                        "dcp_phased_push",
+                        "dcp_ring",
+                        "dcp_recursive",
+                        "dcp_recursive_ready",
+                    )
                     else (128, 256, 512)
                 )
             )
@@ -560,6 +572,7 @@ def plan(
             call["active_blocks"] = config.active_blocks
         if config.implementation in JOINT_FAMILIES or config.implementation in (
             "dcp_phased",
+            "dcp_phased_push",
             "dcp_ring",
             "dcp_recursive",
             "dcp_recursive_ready",

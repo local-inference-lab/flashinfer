@@ -114,6 +114,18 @@ def test_dcp8_races_phased_push_recursive_and_ring():
     assert "dcp_phased_push" in plan.query.alternatives
     assert "dcp_recursive" in plan.query.alternatives
     assert "dcp_ring" in plan.query.alternatives
+    push = [
+        value for value in configs(plan) if value.implementation == "dcp_phased_push"
+    ]
+    assert push == [
+        CollectiveConfig(
+            implementation="dcp_phased_push",
+            threads=128,
+            blocks=8,
+            submode="barrier",
+            active_blocks=8,
+        )
+    ]
 
 
 @pytest.mark.parametrize("pins", [(512, 8), (128, 8), (256, 0), (0, 8)])
@@ -177,8 +189,9 @@ def test_native_pin_retains_the_fixed_plan_and_explicit_profile_is_authoritative
     ],
 )
 @pytest.mark.parametrize("effort", ["default", "off"])
-def test_unqualified_hardware_does_not_admit_phased_candidates(device, effort):
-    query, runtime = native_query()
+@pytest.mark.parametrize("world", [8, 16])
+def test_unqualified_hardware_does_not_admit_phased_candidates(device, effort, world):
+    query, runtime = native_query(world=world)
     plan = _preparation.plan(query, runtime=runtime)
     assert {value.implementation for value in configs(plan, device, effort=effort)} == {
         "dcp"
@@ -192,6 +205,82 @@ def test_unqualified_hardware_does_not_admit_phased_candidates(device, effort):
     )
     with pytest.raises(ValueError, match="parameter space"):
         TUNING.validate_config(plan.query, phased, device)
+
+
+@pytest.mark.parametrize("owner", ["DcpAllToAll", "DcpAllToAllPool"])
+@pytest.mark.parametrize("normalize_call", [False, True])
+def test_fused_pair_expert_selection_rejects_batched_loads(owner, normalize_call):
+    query, runtime = native_query(world=8, rows=1)
+    surface = f"{owner}.all_gather_pair_kimi_topk"
+    call = {"threads": 512, "load_batch": 2}
+    with pytest.raises(ValueError, match="batched paired loads|load[ _]batch"):
+        if normalize_call:
+            query = _preparation.query_from_runtime(runtime, surface=surface, call=call)
+        else:
+            query = replace(query, surface=surface, call=FrozenMapping(call))
+        NATIVE.validate_query(query, SM120)
+
+
+@pytest.mark.parametrize("owner", ["DcpAllToAll", "DcpAllToAllPool"])
+@pytest.mark.parametrize("normalize_call", [False, True])
+def test_fused_pair_expert_selection_requires_single_cta(owner, normalize_call):
+    query, runtime = native_query(world=8, rows=1)
+    surface = f"{owner}.all_gather_pair_kimi_topk"
+    call = {"threads": 512, "row_blocks": 2}
+    with pytest.raises(ValueError, match="row_blocks"):
+        if normalize_call:
+            query = _preparation.query_from_runtime(runtime, surface=surface, call=call)
+        else:
+            query = replace(query, surface=surface, call=FrozenMapping(call))
+        NATIVE.validate_query(query, SM120)
+
+
+@pytest.mark.parametrize("owner", ["DcpAllToAll", "DcpAllToAllPool"])
+@pytest.mark.parametrize("metadata", [{}, {"row_blocks": 1, "load_batch": 1}])
+def test_fused_pair_expert_selection_accepts_default_geometry(owner, metadata):
+    query, runtime = native_query(world=8, rows=1)
+    surface = f"{owner}.all_gather_pair_kimi_topk"
+    call = {"threads": 512, **metadata}
+    raw = replace(query, surface=surface, call=FrozenMapping(call))
+    normalized = _preparation.query_from_runtime(runtime, surface=surface, call=call)
+    NATIVE.validate_query(raw, SM120)
+    NATIVE.validate_query(normalized, SM120)
+    assert normalized.call["row_blocks"] == normalized.call["load_batch"] == 1
+
+
+@pytest.mark.parametrize("world", [8, 16])
+@pytest.mark.parametrize(
+    "module,launcher",
+    [
+        ("_ring_gather_cute", "RingGather"),
+        ("_recursive_gather_cute", "RecursiveGather"),
+    ],
+)
+def test_selected_gather_flags_preserve_native_signal_layout(
+    monkeypatch, world, module, launcher
+):
+    from importlib import import_module
+
+    from b12x.comm.pcie.pcie_dcp_a2a import _FLAG_STRIDE, _MAX_BLOCKS, _MAX_RANKS
+
+    kernels = import_module(f"b12x.comm.pcie.{module}")
+    monkeypatch.setattr(kernels, "Int64", int)
+    monkeypatch.setattr(kernels, "Uint32", int)
+    flag = getattr(kernels, launcher)._flag.__wrapped__
+    owner = SimpleNamespace(_world_size=world)
+    for generation in (1, 2, 3, 0xFFFFFFFF):
+        for block in range(8):
+            for sender in range(world):
+                native = (
+                    _MAX_BLOCKS * _MAX_RANKS
+                    + (
+                        (generation % 2 * _MAX_BLOCKS + block)
+                        * _MAX_RANKS
+                        * _FLAG_STRIDE
+                    )
+                    + sender * _FLAG_STRIDE
+                )
+                assert flag(owner, 0, sender, block, generation) == native
 
 
 @pytest.mark.parametrize("world", [2, 4, 8, 9, 10, 12])

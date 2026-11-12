@@ -9,10 +9,13 @@ from ._cute_intrinsics import ld_relaxed_gpu_u32
 from ._dcp_a2a_cute import (
     _GRAPH_ARRIVED_INDEX,
     _GRAPH_EPOCH_INDEX,
+    _MAX_BLOCKS,
     _a2a_graph_epoch_arrive,
     _copy_16b,
 )
 from ._dcp_cute_common import (
+    _FLAG_STRIDE,
+    _MAX_RANKS,
     _load_relaxed_sys_u32,
     _membar_sys,
     _store_relaxed_sys_u32,
@@ -43,9 +46,12 @@ class RecursiveGather(SelectedGather):
     def _flag(self, signal, sender, block, value):
         slot = Int64(value % Uint32(2))
         index = (
-            Int64(64 * 16)
-            + ((slot * Int64(64) + Int64(block)) * Int64(self._world_size * 32))
-            + Int64(sender * 32)
+            Int64(_MAX_BLOCKS * _MAX_RANKS)
+            + (
+                (slot * Int64(_MAX_BLOCKS) + Int64(block))
+                * Int64(_MAX_RANKS * _FLAG_STRIDE)
+            )
+            + Int64(sender * _FLAG_STRIDE)
         )
         return signal + index
 
