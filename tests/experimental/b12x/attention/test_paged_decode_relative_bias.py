@@ -1,9 +1,11 @@
-"""paged_decode relative-distance bias against an FP64 reference.
+"""paged_decode relative-distance bias and per-row sink against an FP64 reference.
 
 The layer has 12 query heads over 2 KV heads (GQA group 6), 128-wide heads and
 FP8-E4M3 K/V pages.  Query row ``t`` at position ``p`` scores the key at
 position ``j`` as ``softmax_scale * q.k + bias[t, h, p - j]`` when
-``0 <= p - j < extent`` and as ``softmax_scale * q.k`` otherwise.
+``0 <= p - j < extent`` and as ``softmax_scale * q.k`` otherwise.  A per-row
+sink adds the logit ``sink[t, h]`` with a zero value to the row's softmax, so
+the output is ``o * sigmoid(lse - sink[t, h])``.
 
 Error bound.  The kernel accumulates q.k, the bias and the softmax statistics
 in FP32, rounds each probability to BF16 for the P.V product and rounds the
@@ -28,16 +30,23 @@ from ..conftest import require_b12x
 HQ, HKV, DIM, PAGE, EXTENT = 12, 2, 128, 128, 1024
 GROUP = HQ // HKV
 
-# name: (window_left, max_batch, max_q_per_req, max_seq, k_descale, v_descale)
+# name: (window_left, max_batch, max_q_per_req, max_seq, k_descale, v_descale,
+#        per-row sink)
 CASES = {
     # Full context, split-KV; unit dequant scales.
-    "global_verify": (-1, 3, 8, 6000, 1.0, 1.0),
-    "global_decode": (-1, 8, 1, 3000, 1.0, 1.0),
+    "global_verify": (-1, 3, 8, 6000, 1.0, 1.0, False),
+    "global_decode": (-1, 8, 1, 3000, 1.0, 1.0, False),
     # Non-unit dequant scales: the bias must not be scaled with K.
-    "global_verify_descaled": (-1, 3, 8, 6000, 0.25, 3.0),
+    "global_verify_descaled": (-1, 3, 8, 6000, 0.25, 3.0, False),
     # 1023 previous keys plus the row itself: every visible key has a bias.
-    "window_verify": (1023, 4, 8, 4000, 1.0, 1.0),
-    "window_decode": (1023, 8, 1, 3000, 1.0, 1.0),
+    "window_verify": (1023, 4, 8, 4000, 1.0, 1.0, False),
+    "window_decode": (1023, 8, 1, 3000, 1.0, 1.0, False),
+    # Per-row sinks: the split merge adds them for full-context layers, the
+    # forward kernel for windowed ones.
+    "global_verify_sink": (-1, 3, 8, 6000, 1.0, 1.0, True),
+    "global_decode_sink": (-1, 8, 1, 3000, 0.25, 3.0, True),
+    "window_verify_sink": (1023, 4, 8, 4000, 1.0, 1.0, True),
+    "window_decode_sink": (1023, 8, 1, 3000, 1.0, 1.0, True),
 }
 # Context lengths around the bias extent: a row whose farthest key sits at
 # distance 1022, 1023 (last biased), 1024 (first unbiased) and far beyond.
@@ -53,6 +62,7 @@ class _Layer:
             self.max_seq,
             k_descale,
             v_descale,
+            self.row_sink,
         ) = CASES[name]
         self.name = name
         self.gen = torch.Generator(device="cuda").manual_seed(seed)
@@ -81,6 +91,8 @@ class _Layer:
             kv_dtype=torch.float8_e4m3fn,
             window_left=self.window,
             has_relative_bias=has_relative_bias,
+            has_sinks=self.row_sink,
+            sink_layout="row" if self.row_sink else "head",
         )
 
     def draw(self, *, lengths=None, q_lens=None, bias_std=2.0):
@@ -106,7 +118,11 @@ class _Layer:
         total = int(cu[-1])
         q[:total] = self._randn((total, HQ, DIM), 0.5).to(torch.bfloat16)
         bias[:total] = self._randn((total, HQ, EXTENT), bias_std).to(torch.bfloat16)
+        sink = {}
+        if self.row_sink:
+            sink["attention_sink_bias"] = self._randn((self.rows, HQ), 3.0)
         return dict(
+            **sink,
             q=q,
             k_cache=self.k_cache,
             v_cache=self.v_cache,
@@ -148,7 +164,10 @@ class _Layer:
             if self.window >= 0:
                 visible = visible & (distance <= self.window)
             scores = scores.masked_fill(~visible[:, None], float("-inf"))
-            probability = scores.softmax(-1)
+            if self.row_sink:
+                sink = inputs["attention_sink_bias"][start:end].double()
+                scores = torch.cat((scores, sink[:, :, None]), -1)
+            probability = scores.softmax(-1)[..., :length]
             out[start:end] = torch.einsum("thj,jhd->thd", probability, value)
             mass = torch.einsum("thj,jhd->thd", probability, value.abs())
             bound[start:end] = (
@@ -223,7 +242,8 @@ def test_relative_bias_graph_replay_matches_reference(name):
             paged_decode.run(binding)
         for draw in draws:
             for key in _LIVE:
-                live[key].copy_(draw[key])
+                if key in live:
+                    live[key].copy_(draw[key])
             out.fill_(float("nan"))
             graph.replay()
             torch.cuda.synchronize()
@@ -231,7 +251,14 @@ def test_relative_bias_graph_replay_matches_reference(name):
         result.close()
 
 
-_LIVE = ("q", "page_table", "cache_seqlens", "cu_seqlens_q", "relative_attention_bias")
+_LIVE = (
+    "q",
+    "page_table",
+    "cache_seqlens",
+    "cu_seqlens_q",
+    "relative_attention_bias",
+    "attention_sink_bias",
+)
 
 
 @pytest.mark.parametrize("name", ["global_verify", "window_verify"])
@@ -292,6 +319,36 @@ def test_keys_at_and_beyond_the_extent_get_no_bias():
     page = int(inputs["page_table"][1, 0])
     value = layer.v_cache[page, 0].float().repeat_interleave(GROUP, 0)
     assert torch.equal(out[row].float(), value)
+
+
+@pytest.mark.parametrize("name", ["global_verify_sink", "window_verify_sink"])
+def test_row_sink_is_indexed_by_row_and_head(name):
+    """A dominant sink zeroes exactly its own rows and heads; a negligible one
+    leaves the sink-free output."""
+    require_b12x()
+    layer = _Layer(name, seed=9)
+    inputs = layer.draw()
+    sink = inputs["attention_sink_bias"]
+    sink.fill_(-200.0)
+    dominant = torch.zeros_like(sink, dtype=torch.bool)
+    dominant[1::3, ::5] = True
+    dominant[2::7, 3] = True
+    sink[dominant] = 200.0
+    with PreparationSession(device=torch.device("cuda"), autotune=False) as session:
+        result, plan = _prepare(layer, session, inputs)
+        out = torch.empty_like(inputs["q"])
+        paged_decode.run(
+            paged_decode.bind(plan, scratch=_scratch(plan), output=out, **inputs)
+        )
+        torch.cuda.synchronize()
+        result.close()
+    total = int(inputs["cu_seqlens_q"][-1])
+    assert (out[:total][dominant[:total]] == 0).all()
+    layer.row_sink = False
+    free, bound, _ = layer.reference(inputs)
+    kept = ~dominant[:total]
+    assert ((out[:total].double() - free[:total]).abs() <= bound[:total])[kept].all()
+    assert out[:total][kept].abs().max() > 0.1
 
 
 def _bias_state(has_relative_bias):
@@ -376,3 +433,29 @@ def test_bind_rejects_a_bias_outside_the_contract(shape, dtype):
             relative_attention_bias=torch.empty(shape, dtype=dtype),
             **inputs,
         )
+
+
+def test_bind_takes_a_row_sink_only_in_the_row_layout():
+    from dataclasses import replace
+
+    state, inputs = _bias_state(False)
+    per_head = replace(state, query=replace(state.query, has_sinks=True))
+    per_row = replace(
+        state, query=replace(state.query, has_sinks=True, sink_layout="row")
+    )
+    rows, heads = torch.zeros((8, HQ)), torch.zeros(HQ)
+    assert (
+        per_row.bind(plan=None, scratch=(), attention_sink_bias=rows, **inputs).sinks
+        is rows
+    )
+    for bound, sink in ((per_row, heads), (per_row, rows[:7]), (per_head, rows)):
+        with pytest.raises(ValueError, match="attention_sink_bias must be float32"):
+            bound.bind(plan=None, scratch=(), attention_sink_bias=sink, **inputs)
+    assert not paged_decode.supports(
+        num_q_heads=HQ,
+        num_kv_heads=HKV,
+        head_dim_qk=DIM,
+        head_dim_vo=DIM,
+        page_size=PAGE,
+        sink_layout="row",
+    )

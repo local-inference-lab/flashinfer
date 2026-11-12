@@ -24,7 +24,7 @@ from ._tuning import TUNING, PagedDecodeConfig, PagedDecodeQuery, _consumer_warp
 _FORWARD_ID = "attention.paged_decode.forward"
 _MERGE_ID = "attention.paged_decode.merge"
 _KV_WRITE_ID = "attention.paged_decode.kv_write"
-_COMPILE_VERSION = 3
+_COMPILE_VERSION = 4
 _KV_CUTE_DTYPE = {"bfloat16": cutlass.BFloat16, "float8_e4m3fn": cutlass.Uint8}
 
 # (name, rank, cutlass dtype or kv marker, assumed alignment) in launch order.
@@ -38,7 +38,7 @@ _FORWARD_OPERANDS = (
     ("output", 3, cutlass.BFloat16, 16),
     ("o_part", 4, cutlass.Float32, 16),
     ("lse_part", 3, cutlass.Float32, 4),
-    ("sinks", 1, cutlass.Float32, 4),
+    ("sinks", "sinks", cutlass.Float32, 4),
     ("k_descale", "descale", cutlass.Float32, 4),
     ("v_descale", "descale", cutlass.Float32, 4),
     ("relative_bias", 3, cutlass.BFloat16, 2),
@@ -49,7 +49,7 @@ _MERGE_OPERANDS = (
     ("cache_seqlens", 1, cutlass.Int32, 4),
     ("cu_seqlens_q", 1, cutlass.Int32, 4),
     ("output", 3, cutlass.BFloat16, 16),
-    ("sinks", 1, cutlass.Float32, 4),
+    ("sinks", "sinks", cutlass.Float32, 4),
 )
 
 
@@ -72,6 +72,8 @@ def _operand_dtype(dtype, query: PagedDecodeQuery):
 def _operand_rank(rank, query: PagedDecodeQuery) -> int:
     if rank == "descale":
         return 2 if query.descale_layout == "head" else 1
+    if rank == "sinks":
+        return 2 if query.sink_layout == "row" else 1
     return rank
 
 
@@ -129,6 +131,7 @@ def _forward_kernel(query: PagedDecodeQuery, config: PagedDecodeConfig):
         kv_fp8=query.kv_dtype == "float8_e4m3fn",
         descale_layout=query.descale_layout,
         has_relative_bias=query.has_relative_bias,
+        sink_layout=query.sink_layout,
     )
 
 
@@ -167,6 +170,7 @@ def _merge_kernel(query: PagedDecodeQuery, config: PagedDecodeConfig):
         window_left=query.window_left,
         heads_per_cta=heads_per_cta,
         has_sinks=query.has_sinks,
+        sink_layout=query.sink_layout,
     )
 
 
@@ -206,7 +210,8 @@ def compile_paged_decode(query_payload, config_payload, ordinal):
         )
         if config.split_kv:
             merge_args = [
-                _fake_operand(dt, rank, align) for _, rank, dt, align in _MERGE_OPERANDS
+                _fake_operand(dt, _operand_rank(rank, query), align)
+                for _, rank, dt, align in _MERGE_OPERANDS
             ]
             programs["merge"] = b12x_compile(
                 _merge_kernel(query, config),
@@ -458,15 +463,29 @@ class PreparedPagedDecode:
                 self.dummy_descale if placeholders is None else placeholders[3]
             )
         if query.has_sinks:
+            per_row = query.sink_layout == "row"
             if (
                 attention_sink_bias is None
-                or tuple(attention_sink_bias.shape) != (query.num_q_heads,)
                 or attention_sink_bias.dtype != torch.float32
+                or attention_sink_bias.ndim != (2 if per_row else 1)
+                or attention_sink_bias.shape[-1] != query.num_q_heads
+                or (per_row and attention_sink_bias.shape[0] < total_q)
             ):
-                raise ValueError("attention_sink_bias must be float32 [num_q_heads]")
+                raise ValueError(
+                    "attention_sink_bias must be float32 "
+                    + (
+                        f"[at least {total_q}, {query.num_q_heads}]"
+                        if per_row
+                        else f"[{query.num_q_heads}]"
+                    )
+                )
             sinks = attention_sink_bias
             _validate_operand(
-                "attention_sink_bias", sinks, device=self.device, rank=1, align=4
+                "attention_sink_bias",
+                sinks,
+                device=self.device,
+                rank=2 if per_row else 1,
+                align=4,
             )
         elif attention_sink_bias is not None:
             raise ValueError("the plan was declared without attention sinks")
@@ -724,6 +743,7 @@ def make_plan(caps, *, invocation=None, override=None) -> Plan:
         sm_count=int(sm_count),
         caller_owned_placeholders=bool(caps.caller_owned_placeholders),
         has_relative_bias=bool(caps.has_relative_bias),
+        sink_layout=str(caps.sink_layout),
     )
     TUNING.validate_query(query, None)
     compile_query = TUNING.encode_query(replace(query, autotune_effort="default"))

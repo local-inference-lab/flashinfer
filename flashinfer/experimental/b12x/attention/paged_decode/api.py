@@ -29,7 +29,9 @@ class Caps:
     and KV head (``"head"``).  ``causal=False`` lets every query row see the whole
     sequence (speculative drafters that attend across their query block).
     ``has_relative_bias`` adds a per-row, per-head bias to the logit of each key
-    by its distance from the row (see ``bind``).
+    by its distance from the row (see ``bind``).  ``sink_layout`` selects one
+    attention-sink logit per head (``"head"``) or per query row and head
+    (``"row"``).
     """
 
     device: torch.device | str
@@ -47,6 +49,7 @@ class Caps:
     descale_layout: str = "tensor"
     caller_owned_placeholders: bool = False
     has_relative_bias: bool = False
+    sink_layout: str = "head"
 
 
 def plan(
@@ -88,6 +91,12 @@ def bind(
     position ``cache_seqlen - q_len + (t - first row)``; the key at position ``p``
     gets ``softmax_scale * q.k + bias[t, h, position - p]`` when the distance is
     in ``[0, extent)`` and no bias otherwise.  Masked keys stay masked.
+
+    A plan with ``Caps.has_sinks`` takes float32 ``attention_sink_bias``: ``[Hq]``,
+    or ``[T, Hq]`` (more rows allowed) with ``Caps.sink_layout="row"``.  The sink
+    is one more logit in the row's softmax denominator with a zero value, so
+    the output is ``o * sigmoid(lse - sink)`` for the sink-free output ``o`` and
+    natural-log ``lse`` of the row's key logits.
 
     All tensors must be on the plan's device with unit inner strides.  Q and
     cache addresses and outer strides must be 16-byte aligned.  Cache outer
@@ -172,6 +181,7 @@ def supports(
     has_sinks: bool = False,
     descale_layout: str = "tensor",
     has_relative_bias: bool = False,
+    sink_layout: str = "head",
 ) -> bool:
     """Whether a layer family's geometry is within this op's contract."""
     try:
@@ -191,6 +201,7 @@ def supports(
                 descale_layout=str(descale_layout),
                 sm_count=1,
                 has_relative_bias=bool(has_relative_bias),
+                sink_layout=str(sink_layout),
             )
         )
     except (TypeError, ValueError):

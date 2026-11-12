@@ -19,6 +19,9 @@ groups through shared memory.
   ``[rows, q_heads, extent]`` and is read only for 16-key sub-tiles that
   intersect some row's biased range, so long contexts pay for it only on
   their last ``extent`` keys.
+* The attention sink is one extra logit with a zero value in each row's
+  softmax denominator: one per head (``[Hq]``) or one per row and head
+  (``[rows, Hq]``, indexed by the same row as ``mQ``).
 * Variants (constexpr): QK/VO head dims 256/256, 192/128, 128/128 or 64/64; causal, or
   non-causal (every row sees the whole sequence, bounded on the left by the
   window); BF16 or FP8-E4M3 KV (FP8 fragments are widened exactly to BF16 in
@@ -309,7 +312,11 @@ class PagedDecodeKernel:
         kv_fp8: bool = False,
         descale_layout: str = "tensor",
         has_relative_bias: bool = False,
+        sink_layout: str = "head",
     ):
+        if sink_layout not in ("head", "row"):
+            raise ValueError(f"unsupported sink layout {sink_layout!r}")
+        self.sink_per_row = sink_layout == "row"
         if (head_dim_qk, head_dim_vo) not in (
             (256, 256),
             (192, 128),
@@ -926,9 +933,15 @@ class PagedDecodeKernel:
                 if const_expr(self.sinks_in_kernel):
                     # The sink logit is counted once, by key group 0.
                     if row_valid[row_slot] != Int32(0) and key_group == Int32(0):
-                        m_frag[0, row_slot] = Float32(
-                            mSinks[q_head[row_slot]] * inv_sm_scale
-                        )
+                        if const_expr(self.sink_per_row):
+                            m_frag[0, row_slot] = Float32(
+                                mSinks[q_start + q_token[row_slot], q_head[row_slot]]
+                                * inv_sm_scale
+                            )
+                        else:
+                            m_frag[0, row_slot] = Float32(
+                                mSinks[q_head[row_slot]] * inv_sm_scale
+                            )
 
             frag_s_layout = cute.make_layout((1, 1, 8), stride=(8, 8, 1))
             p_frag = cute.make_rmem_tensor(
@@ -1252,7 +1265,11 @@ class PagedDecodeMergeKernel:
         heads_per_cta: int = 4,
         warps_per_row: int = 4,
         has_sinks: bool = False,
+        sink_layout: str = "head",
     ):
+        if sink_layout not in ("head", "row"):
+            raise ValueError(f"unsupported sink layout {sink_layout!r}")
+        self.sink_per_row = sink_layout == "row"
         if head_dim_vo not in (64, 128, 256):
             raise ValueError("merge kernel requires V64, V128 or V256")
         if num_q_heads % heads_per_cta != 0:
@@ -1356,7 +1373,10 @@ class PagedDecodeMergeKernel:
             )
         sink_log2 = Float32(-Float32.inf)
         if const_expr(self.has_sinks):
-            sink_log2 = Float32(mSinks[head] * LOG2_E)
+            if const_expr(self.sink_per_row):
+                sink_log2 = Float32(mSinks[q_row, head] * LOG2_E)
+            else:
+                sink_log2 = Float32(mSinks[head] * LOG2_E)
             m_row = _max_nan_f32(m_row, sink_log2)
         s_local = Float32(0.0)
         if m_row != -Float32.inf:

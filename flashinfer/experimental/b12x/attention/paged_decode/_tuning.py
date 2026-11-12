@@ -23,6 +23,7 @@ PAGE_SIZES = (64, 128)
 MAX_Q_PER_REQ = 16
 MAX_SPLITS = 128
 DESCALE_LAYOUTS = ("tensor", "request", "head")
+SINK_LAYOUTS = ("head", "row")
 
 
 def _consumer_warps(query):
@@ -48,6 +49,7 @@ class PagedDecodeQuery:
     sm_count: int
     caller_owned_placeholders: bool = False
     has_relative_bias: bool = False
+    sink_layout: str = "head"
     autotune_effort: str = field(default_factory=capture_autotune_effort)
 
     @property
@@ -104,6 +106,10 @@ def validate_query(query: PagedDecodeQuery) -> None:
         raise ValueError("max_batch and sm_count must be positive")
     if query.window_left < -1:
         raise ValueError("window_left must be -1 (none) or nonnegative")
+    if query.sink_layout not in SINK_LAYOUTS:
+        raise ValueError(f"sink_layout must be one of {SINK_LAYOUTS}")
+    if query.sink_layout == "row" and not query.has_sinks:
+        raise ValueError("a per-row sink layout requires has_sinks")
     if query.descale_layout not in DESCALE_LAYOUTS:
         raise ValueError(f"descale_layout must be one of {DESCALE_LAYOUTS}")
     if not any(_rows_fit(query, hs) for hs in _head_split_choices(query)):
@@ -235,7 +241,7 @@ def _materialize(query, device, choice):
 
 TUNING = TuningContract(
     component_id="attention.paged_decode",
-    query_schema_version=24,
+    query_schema_version=25,
     config_schema_version=22,
     query_fields=frozenset(field.name for field in fields(PagedDecodeQuery)),
     config_fields=frozenset(field.name for field in fields(PagedDecodeConfig)),
