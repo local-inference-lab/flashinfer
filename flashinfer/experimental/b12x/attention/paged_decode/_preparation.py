@@ -24,7 +24,7 @@ from ._tuning import TUNING, PagedDecodeConfig, PagedDecodeQuery, _consumer_warp
 _FORWARD_ID = "attention.paged_decode.forward"
 _MERGE_ID = "attention.paged_decode.merge"
 _KV_WRITE_ID = "attention.paged_decode.kv_write"
-_COMPILE_VERSION = 2
+_COMPILE_VERSION = 3
 _KV_CUTE_DTYPE = {"bfloat16": cutlass.BFloat16, "float8_e4m3fn": cutlass.Uint8}
 
 # (name, rank, cutlass dtype or kv marker, assumed alignment) in launch order.
@@ -41,6 +41,7 @@ _FORWARD_OPERANDS = (
     ("sinks", 1, cutlass.Float32, 4),
     ("k_descale", "descale", cutlass.Float32, 4),
     ("v_descale", "descale", cutlass.Float32, 4),
+    ("relative_bias", 3, cutlass.BFloat16, 2),
 )
 _MERGE_OPERANDS = (
     ("o_part", 4, cutlass.Float32, 16),
@@ -127,6 +128,7 @@ def _forward_kernel(query: PagedDecodeQuery, config: PagedDecodeConfig):
         causal=query.causal,
         kv_fp8=query.kv_dtype == "float8_e4m3fn",
         descale_layout=query.descale_layout,
+        has_relative_bias=query.has_relative_bias,
     )
 
 
@@ -286,6 +288,7 @@ class Binding:
     sinks: torch.Tensor
     k_descale: torch.Tensor
     v_descale: torch.Tensor
+    relative_bias: torch.Tensor
     softmax_scale: float
 
 
@@ -314,6 +317,7 @@ class PreparedPagedDecode:
         attention_sink_bias: torch.Tensor | None = None,
         k_descale: torch.Tensor | None = None,
         v_descale: torch.Tensor | None = None,
+        relative_attention_bias: torch.Tensor | None = None,
         softmax_scale: float | None = None,
     ) -> Binding:
         """Validate caller tensors against the prepared contract (no allocation,
@@ -468,6 +472,30 @@ class PreparedPagedDecode:
             raise ValueError("the plan was declared without attention sinks")
         else:
             sinks = self.dummy_sinks if placeholders is None else placeholders[2]
+        if query.has_relative_bias:
+            bias = relative_attention_bias
+            if bias is None or bias.dtype != torch.bfloat16:
+                raise ValueError(
+                    "relative_attention_bias must be BF16 [rows, num_q_heads, extent]"
+                )
+            _validate_operand(
+                "relative_attention_bias", bias, device=self.device, rank=3, align=2
+            )
+            if (
+                bias.shape[0] < total_q
+                or bias.shape[1] != query.num_q_heads
+                or bias.shape[2] < 1
+            ):
+                raise ValueError(
+                    "relative_attention_bias must be "
+                    f"[at least {total_q}, {query.num_q_heads}, extent], "
+                    f"got {tuple(bias.shape)}"
+                )
+        elif relative_attention_bias is not None:
+            raise ValueError("the plan was declared without a relative bias")
+        else:
+            # Never read; q satisfies the operand's rank, dtype and alignment.
+            bias = q
         if placeholders is not None:
             o_part, lse_part = placeholders[:2]
         elif cfg.split_kv:
@@ -508,6 +536,7 @@ class PreparedPagedDecode:
             sinks=sinks,
             k_descale=k_descale,
             v_descale=v_descale,
+            relative_bias=bias,
             softmax_scale=scale,
         )
 
@@ -638,6 +667,7 @@ class PreparedPagedDecode:
             "sinks": binding.sinks,
             "k_descale": binding.k_descale,
             "v_descale": binding.v_descale,
+            "relative_bias": binding.relative_bias,
         }
         with torch.cuda.device(self.device):
             stream = current_cuda_stream()
@@ -693,6 +723,7 @@ def make_plan(caps, *, invocation=None, override=None) -> Plan:
         descale_layout=str(caps.descale_layout),
         sm_count=int(sm_count),
         caller_owned_placeholders=bool(caps.caller_owned_placeholders),
+        has_relative_bias=bool(caps.has_relative_bias),
     )
     TUNING.validate_query(query, None)
     compile_query = TUNING.encode_query(replace(query, autotune_effort="default"))

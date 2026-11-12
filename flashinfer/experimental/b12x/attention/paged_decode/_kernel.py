@@ -13,6 +13,12 @@ groups through shared memory.
   context length and any mix of per-request query lengths (ragged verify).
 * Split partials are FP32 (normalized output + base-2 LSE); the merge kernel
   folds them, and the attention sink, into the BF16 output with one rounding.
+* A relative-distance bias variant adds ``bias[row, head, d]`` to the logit of
+  each key at distance ``d = row position - key position`` when
+  ``0 <= d < extent``; keys at other distances get no bias.  The bias is BF16
+  ``[rows, q_heads, extent]`` and is read only for 16-key sub-tiles that
+  intersect some row's biased range, so long contexts pay for it only on
+  their last ``extent`` keys.
 * Variants (constexpr): QK/VO head dims 256/256, 192/128, 128/128 or 64/64; causal, or
   non-causal (every row sees the whole sequence, bounded on the left by the
   window); BF16 or FP8-E4M3 KV (FP8 fragments are widened exactly to BF16 in
@@ -39,12 +45,14 @@ from b12x._lib.intrinsics.packed import (
 )
 from b12x._lib.intrinsics.memory import (
     get_ptr_as_int64,
+    ld_global_b16,
     ld_global_nc_u32,
     ld_global_v4_f32,
     ldmatrix_m8n8x4_b16,
     ldmatrix_m16n16x1_trans_b8,
     shared_ptr_to_u32,
     st_global_v2_f32,
+    u32_as_f32,
 )
 from b12x.attention.paged.forward_paged import (
     _assume_tensor_aligned,
@@ -88,6 +96,41 @@ def _mask_subtile(
             valid = valid and key_abs >= window_lo[row_slot]
         if not valid:
             frag_S[0, 0, reg_id] = Float32(-Float32.inf)
+
+
+@cute.jit
+def _add_relative_bias_subtile(
+    frag_S: cute.Tensor,
+    bias_bytes: cute.Tensor,
+    bias_row_byte: cute.Tensor,
+    row_pos: cute.Tensor,
+    row_valid: cute.Tensor,
+    key_abs_base,
+    lane_pair_base,
+    extent,
+    inv_sm_scale,
+):
+    """S += bias[row, head, row position - key position] / softmax scale.
+
+    ``frag_S`` holds raw q.k products, so the bias is divided by the scale
+    that later turns them into logits.  A BF16 value is the high half of the
+    FP32 with the same value, so the widening is exact.
+    """
+    for reg_id in cutlass.range_constexpr(8):
+        row_slot = (reg_id % 4) // 2
+        key_abs = key_abs_base + lane_pair_base + 8 * (reg_id // 4) + (reg_id % 2)
+        distance = row_pos[row_slot] - key_abs
+        if (
+            row_valid[row_slot] != Int32(0)
+            and distance >= Int32(0)
+            and distance < extent
+        ):
+            bits = ld_global_b16(
+                get_ptr_as_int64(
+                    bias_bytes, bias_row_byte[row_slot] + Int64(distance) * Int64(2)
+                )
+            )
+            frag_S[0, 0, reg_id] += u32_as_f32(bits << Uint32(16)) * inv_sm_scale
 
 
 @cute.jit
@@ -265,6 +308,7 @@ class PagedDecodeKernel:
         causal: bool = True,
         kv_fp8: bool = False,
         descale_layout: str = "tensor",
+        has_relative_bias: bool = False,
     ):
         if (head_dim_qk, head_dim_vo) not in (
             (256, 256),
@@ -292,6 +336,7 @@ class PagedDecodeKernel:
         self.max_q_per_req = int(max_q_per_req)
         self.window_left = int(window_left)
         self.has_sinks = bool(has_sinks)
+        self.has_relative_bias = bool(has_relative_bias)
         self.split_kv = bool(split_kv)
         # Split partials exclude the sink logit; the merge adds it once.
         self.sinks_in_kernel = self.has_sinks and not self.split_kv
@@ -370,13 +415,17 @@ class PagedDecodeKernel:
         mSinks: cute.Tensor,
         mKDescale: cute.Tensor,
         mVDescale: cute.Tensor,
+        mRelBias: cute.Tensor,
         sm_scale: Float32,
         stream: cuda.CUstream,
     ):
         """FP8 caches arrive as uint8 views with fp32 dequant scales: one value
         (``[1]``), per request (``[B]``) or per request and KV head
         (``[B, Hkv]``); the K scale joins the softmax scale and the V scale
-        multiplies the output.  BF16 caches ignore both scale tensors."""
+        multiplies the output.  BF16 caches ignore both scale tensors.
+
+        ``mRelBias`` is BF16 ``[rows, Hq, extent]``, indexed by the same row
+        as ``mQ``; kernels built without the relative bias never read it."""
         mQ = _assume_tensor_aligned(mQ)
         mKCache = _assume_tensor_aligned(mKCache)
         mVCache = _assume_tensor_aligned(mVCache)
@@ -412,6 +461,7 @@ class PagedDecodeKernel:
             mSinks,
             mKDescale,
             mVDescale,
+            mRelBias,
             tma_atom_K,
             tma_atom_V,
             k_tiles_per_entry,
@@ -440,6 +490,7 @@ class PagedDecodeKernel:
         mSinks: cute.Tensor,
         mKDescale: cute.Tensor,
         mVDescale: cute.Tensor,
+        mRelBias: cute.Tensor,
         tma_atom_K: cute.CopyAtom,
         tma_atom_V: cute.CopyAtom,
         k_tiles_per_entry: Int32,
@@ -820,6 +871,27 @@ class PagedDecodeKernel:
             else:
                 warp_window_lo = Int32(0)
 
+            # Relative bias: each row's byte offset and position, and the key
+            # range inside which some valid row of the request has a bias.
+            row_pos = cute.make_rmem_tensor(cute.make_layout((2,), stride=(1,)), Int32)
+            bias_row_byte = cute.make_rmem_tensor(
+                cute.make_layout((2,), stride=(1,)), Int64
+            )
+            bias_extent = Int32(0)
+            bias_key_lo = Int32(0)
+            bias_key_hi = Int32(-1)
+            if const_expr(self.has_relative_bias):
+                bias_extent = Int32(mRelBias.shape[2])
+                bias_key_lo = context_len - bias_extent + Int32(1)
+                bias_key_hi = context_len + qo_len - Int32(1)
+                for row_slot in cutlass.range_constexpr(2):
+                    row_pos[row_slot] = context_len + q_token[row_slot]
+                    bias_row_byte[row_slot] = (
+                        Int64(q_start + q_token[row_slot]) * Int64(mRelBias.stride[0])
+                        + Int64(q_head[row_slot]) * Int64(mRelBias.stride[1])
+                    ) * Int64(2)
+            mRelBiasBytes = cute.flatten(cute.recast_tensor(mRelBias, cutlass.Uint8))
+
             q_regs = cute.make_rmem_tensor(
                 cute.make_layout((self.num_mma_d_qk, 1, 4), stride=(4, 4, 1)), Uint32
             )
@@ -945,6 +1017,22 @@ class PagedDecodeKernel:
                                 q_in_regs=True,
                             )
                         sub_base = tile_base + Int32(sub * 16)
+                        if const_expr(self.has_relative_bias):
+                            if (
+                                sub_base <= bias_key_hi
+                                and sub_base + Int32(15) >= bias_key_lo
+                            ):
+                                _add_relative_bias_subtile(
+                                    frag_S,
+                                    mRelBiasBytes,
+                                    bias_row_byte,
+                                    row_pos,
+                                    row_valid,
+                                    sub_base,
+                                    lane_pair_base,
+                                    bias_extent,
+                                    inv_sm_scale,
+                                )
                         interior = (tile_tokens >= Int32(sub * 16 + 16)) and (
                             sub_base + Int32(15) <= causal_hi_min
                         )

@@ -47,6 +47,7 @@ class PagedDecodeQuery:
     descale_layout: str
     sm_count: int
     caller_owned_placeholders: bool = False
+    has_relative_bias: bool = False
     autotune_effort: str = field(default_factory=capture_autotune_effort)
 
     @property
@@ -234,7 +235,7 @@ def _materialize(query, device, choice):
 
 TUNING = TuningContract(
     component_id="attention.paged_decode",
-    query_schema_version=23,
+    query_schema_version=24,
     config_schema_version=22,
     query_fields=frozenset(field.name for field in fields(PagedDecodeQuery)),
     config_fields=frozenset(field.name for field in fields(PagedDecodeConfig)),

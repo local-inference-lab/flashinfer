@@ -5,7 +5,8 @@ request's K/V once for all of its query rows (rows = query tokens x GQA group,
 up to 128), with a TMA producer warp and consumer warps split into row and key
 groups.  Covers asymmetric Q/K and V head dims (192/128) and 128/128, BF16 or
 FP8-E4M3 KV (widened exactly to BF16 in registers), attention sinks,
-sliding windows, causal or non-causal masking, and ragged batches (any mix of
+sliding windows, a per-row, per-head relative-distance logit bias, causal or
+non-causal masking, and ragged batches (any mix of
 per-request query lengths up to ``max_q_per_req``).  Split-KV partitions are
 derived on device from ``cache_seqlens`` and partials are FP32, so one captured
 CUDA graph serves every context length with a single rounding of the output.
