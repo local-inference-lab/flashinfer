@@ -28,7 +28,12 @@ from b12x.attention._shared.cute import (
     pipeline as cute_pipeline,
 )
 from b12x.attention._shared.cute import ops as attention_ops
-from b12x._lib.intrinsics.memory import get_ptr_as_int64, shared_ptr_to_u32
+from b12x._lib.intrinsics.memory import (
+    get_ptr_as_int64,
+    ld_global_b16,
+    shared_ptr_to_u32,
+    u32_as_f32,
+)
 from b12x._lib.smem import make_smem_memrange_alias
 from b12x._lib.intrinsics.mma import (
     bf16_mma_m16n16k16_f32,
@@ -801,30 +806,68 @@ def _add_relative_attention_bias(
     num_mma_kv,
 ):
     relative_extent = mRelativeAttentionBias.shape[2]
-    for mma_q in cutlass.range_constexpr(num_mma_q):
-        for mma_kv in cutlass.range_constexpr(num_mma_kv):
-            for reg_id in cutlass.range_constexpr(8):
-                row_slot = (reg_id % 4) // 2
-                if frag_s[mma_q, mma_kv, reg_id] != -Float32.inf:
-                    key_local = (
-                        warp_kv_base
-                        + mma_kv * 16
-                        + lane_pair_base
-                        + 8 * (reg_id // 4)
-                        + (reg_id % 2)
-                    )
-                    distance = (
-                        causal_k_limit[mma_q, row_slot] - tile_key_base - key_local
-                    )
-                    if distance >= Int32(0) and distance < relative_extent:
-                        bias = Float32(
-                            mRelativeAttentionBias[
-                                q_row_idx_frag[mma_q, row_slot],
-                                q_head_idx_frag[mma_q, row_slot],
-                                distance,
-                            ]
+    if const_expr(mRelativeAttentionBias.element_type == cutlass.BFloat16):
+        # A BF16 value is the high half of the FP32 with the same value, so
+        # one 16-bit load per element widens exactly. Each row's byte offset
+        # is computed once per fragment.
+        bias_bytes = cute.flatten(
+            cute.recast_tensor(mRelativeAttentionBias, cutlass.Uint8)
+        )
+        for mma_q in cutlass.range_constexpr(num_mma_q):
+            for row_slot in cutlass.range_constexpr(2):
+                row_byte = (
+                    Int64(q_row_idx_frag[mma_q, row_slot])
+                    * Int64(mRelativeAttentionBias.stride[0])
+                    + Int64(q_head_idx_frag[mma_q, row_slot])
+                    * Int64(mRelativeAttentionBias.stride[1])
+                ) * Int64(2)
+                row_limit = causal_k_limit[mma_q, row_slot] - tile_key_base
+                for mma_kv in cutlass.range_constexpr(num_mma_kv):
+                    for key_slot in cutlass.range_constexpr(4):
+                        reg_id = row_slot * 2 + 4 * (key_slot // 2) + (key_slot % 2)
+                        distance = row_limit - (
+                            warp_kv_base
+                            + mma_kv * 16
+                            + lane_pair_base
+                            + 8 * (key_slot // 2)
+                            + (key_slot % 2)
                         )
-                        frag_s[mma_q, mma_kv, reg_id] += bias * inverse_softmax_scale
+                        if distance >= Int32(0) and distance < relative_extent:
+                            bits = ld_global_b16(
+                                get_ptr_as_int64(
+                                    bias_bytes, row_byte + Int64(distance) * Int64(2)
+                                )
+                            )
+                            frag_s[mma_q, mma_kv, reg_id] += (
+                                u32_as_f32(bits << Uint32(16)) * inverse_softmax_scale
+                            )
+    else:
+        for mma_q in cutlass.range_constexpr(num_mma_q):
+            for mma_kv in cutlass.range_constexpr(num_mma_kv):
+                for reg_id in cutlass.range_constexpr(8):
+                    row_slot = (reg_id % 4) // 2
+                    if frag_s[mma_q, mma_kv, reg_id] != -Float32.inf:
+                        key_local = (
+                            warp_kv_base
+                            + mma_kv * 16
+                            + lane_pair_base
+                            + 8 * (reg_id // 4)
+                            + (reg_id % 2)
+                        )
+                        distance = (
+                            causal_k_limit[mma_q, row_slot] - tile_key_base - key_local
+                        )
+                        if distance >= Int32(0) and distance < relative_extent:
+                            bias = Float32(
+                                mRelativeAttentionBias[
+                                    q_row_idx_frag[mma_q, row_slot],
+                                    q_head_idx_frag[mma_q, row_slot],
+                                    distance,
+                                ]
+                            )
+                            frag_s[mma_q, mma_kv, reg_id] += (
+                                bias * inverse_softmax_scale
+                            )
 
 
 @cute.jit
