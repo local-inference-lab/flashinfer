@@ -76,6 +76,9 @@ from b12x.attention.paged.forward_paged import (
 LOG2_E = 1.4426950408889634
 PLANE_DIM = 64
 SMEM_LIMIT = 99 * 1024
+# Sink logits above this bound, in the kernels' internal units, act as this
+# bound: the sink then holds all the probability and the output is zero.
+SINK_SATURATION = 1.0e30
 
 
 @cute.jit
@@ -942,6 +945,14 @@ class PagedDecodeKernel:
                             m_frag[0, row_slot] = Float32(
                                 mSinks[q_head[row_slot]] * inv_sm_scale
                             )
+                        # A +inf sink would make the running maximum infinite
+                        # and its rescale inf - inf. Saturated, it outweighs
+                        # every key and the row's output is zero.
+                        m_frag[0, row_slot] = cutlass.select_(
+                            m_frag[0, row_slot] > Float32(SINK_SATURATION),
+                            Float32(SINK_SATURATION),
+                            m_frag[0, row_slot],
+                        )
 
             frag_s_layout = cute.make_layout((1, 1, 8), stride=(8, 8, 1))
             p_frag = cute.make_rmem_tensor(
@@ -1304,7 +1315,7 @@ class PagedDecodeMergeKernel:
         mSeqLens: cute.Tensor,
         mCuSeqlensQ: cute.Tensor,
         mO: cute.Tensor,  # [T, Hq, 128] bf16
-        mSinks: cute.Tensor,  # [Hq] fp32 sink logits (read only with has_sinks)
+        mSinks: cute.Tensor,  # [Hq] or [rows, Hq] fp32 sink logits (has_sinks only)
         stream: cuda.CUstream,
     ):
         self.kernel(mOPart, mLsePart, mSeqLens, mCuSeqlensQ, mO, mSinks).launch(
@@ -1377,6 +1388,11 @@ class PagedDecodeMergeKernel:
                 sink_log2 = Float32(mSinks[q_row, head] * LOG2_E)
             else:
                 sink_log2 = Float32(mSinks[head] * LOG2_E)
+            sink_log2 = cutlass.select_(
+                sink_log2 > Float32(SINK_SATURATION),
+                Float32(SINK_SATURATION),
+                sink_log2,
+            )
             m_row = _max_nan_f32(m_row, sink_log2)
         s_local = Float32(0.0)
         if m_row != -Float32.inf:

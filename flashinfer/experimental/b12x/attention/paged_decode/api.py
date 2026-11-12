@@ -96,7 +96,8 @@ def bind(
     or ``[T, Hq]`` (more rows allowed) with ``Caps.sink_layout="row"``.  The sink
     is one more logit in the row's softmax denominator with a zero value, so
     the output is ``o * sigmoid(lse - sink)`` for the sink-free output ``o`` and
-    natural-log ``lse`` of the row's key logits.
+    natural-log ``lse`` of the row's key logits.  A ``+inf`` sink gives a zero
+    output and a ``-inf`` sink the sink-free output, with or without split-KV.
 
     All tensors must be on the plan's device with unit inner strides.  Q and
     cache addresses and outer strides must be 16-byte aligned.  Cache outer

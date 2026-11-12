@@ -764,6 +764,9 @@ def _apply_attention_sink_after_lse_scale(
                 )
                 * attention_ops.LOG2_E
             )
+            # A +inf sink would make sink_m - new_m inf - inf. Saturated, it
+            # outweighs every key and the row's output is zero.
+            sink_m = cutlass.select_(sink_m > Float32(1.0e30), Float32(1.0e30), sink_m)
             new_m = _max_nan_f32(old_m, sink_m)
             old_scale = (
                 Float32(0.0)

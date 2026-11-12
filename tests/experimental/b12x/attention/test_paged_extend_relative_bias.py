@@ -168,3 +168,34 @@ def test_extend_bias_peak_and_row_sink_select_exact_values(name, target):
         dominant[:, :, None], 0
     )
     assert torch.equal(out.float(), expected)
+
+
+@pytest.mark.parametrize("length", [1023 + ROWS, ROWS, 1024, 1100])
+def test_extend_window_edge_with_uniform_attention(length):
+    """Zero queries and bias: each row returns the exact mean of the keys in
+    its 1023-key window, and not that of a window one key wider or narrower."""
+    require_b12x()
+    layer = _layer("window", seed=51)
+    inputs = layer.draw(lengths=[length], bias_std=0.0)
+    inputs["q"].zero_()
+    with PreparationSession(device=torch.device("cuda"), autotune=False) as session:
+        result, run, out = _prepare(layer, session, inputs)
+        run()
+        torch.cuda.synchronize()
+        result.close()
+    shared.check_uniform_window(layer, out, inputs)
+
+
+@pytest.mark.parametrize("name", ["global_sink", "window_sink"])
+def test_extend_infinite_sinks(name):
+    """A +inf sink zeroes its row and a -inf sink is no sink, as in paged_decode."""
+    require_b12x()
+    layer = _layer(name, seed=53)
+    inputs = layer.draw(lengths=[layer.max_seq])
+    positive, finite = shared.nonfinite_sinks(layer, inputs)
+    with PreparationSession(device=torch.device("cuda"), autotune=False) as session:
+        result, run, out = _prepare(layer, session, inputs)
+        run()
+        torch.cuda.synchronize()
+        result.close()
+    shared.check_nonfinite_sinks(layer, out, inputs, positive, finite)

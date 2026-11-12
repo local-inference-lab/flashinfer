@@ -351,6 +351,117 @@ def test_row_sink_is_indexed_by_row_and_head(name):
     assert out[:total][kept].abs().max() > 0.1
 
 
+# Zero queries and a zero bias give every visible key the same probability,
+# which BF16 holds exactly, and sums of at most a few thousand FP8 values are
+# exact in FP32.  The output is then the mean of the visible values with one
+# BF16 rounding (2**-8) and an approximate reciprocal (covered by 2**-16), so
+# one key more or fewer in the window is far outside the tolerance.
+UNIFORM_TOLERANCE = 2.0**-8 + 2.0**-16
+
+
+def uniform_reference(layer, inputs, window):
+    """FP64 mean of the values each row sees through ``window`` (-1: all)."""
+    out = torch.zeros_like(inputs["q"], dtype=torch.float64)
+    cu = inputs["cu_seqlens_q"].tolist()
+    for request, length in enumerate(inputs["cache_seqlens"].tolist()):
+        start, end = cu[request], cu[request + 1]
+        pages = inputs["page_table"][request, : (length + PAGE - 1) // PAGE].long()
+        value = layer.v_cache[pages].reshape(-1, HKV, DIM)[:length].double()
+        value = (value * float(layer.v_descale)).repeat_interleave(GROUP, 1)
+        for row in range(start, end):
+            position = length - (end - start) + row - start
+            first = 0 if window < 0 else max(0, position - window)
+            out[row] = value[first : position + 1].mean(0)
+    return out
+
+
+def check_uniform_window(layer, out, inputs):
+    """The output matches the layer's window and neither neighbor of it."""
+    total = int(inputs["cu_seqlens_q"][-1])
+    got = out[:total].double()
+
+    def within(window):
+        ref = uniform_reference(layer, inputs, window)[:total]
+        return (got - ref).abs() <= UNIFORM_TOLERANCE * ref.abs() + 1e-12
+
+    assert within(layer.window).all()
+    # A neighboring window differs only for a row with that many earlier keys.
+    last_position = int(inputs["cache_seqlens"].max()) - 1
+    if last_position >= layer.window:
+        assert not within(layer.window - 1).all()
+    if last_position > layer.window:
+        assert not within(layer.window + 1).all()
+
+
+@pytest.mark.parametrize(
+    "name, lengths",
+    [
+        # First rows at positions 1024, 1039, 1151 and 3992: window starts at
+        # keys 1, 16 (a sub-tile edge), 128 (a page edge) and mid-sequence.
+        ("window_verify", [4000, 1032, 1047, 1159]),
+        ("window_verify_sink", [4000, 1032, 1047, 1159]),
+        ("window_decode", [3000, 1024, 1025, 1040, 1151, 1152, 2047, 2048]),
+    ],
+)
+def test_window_edge_with_uniform_attention(name, lengths):
+    require_b12x()
+    layer = _Layer(name, seed=41)
+    inputs = layer.draw(lengths=lengths, bias_std=0.0)
+    inputs["q"].zero_()
+    if layer.row_sink:
+        inputs["attention_sink_bias"].fill_(-float("inf"))
+    with PreparationSession(device=torch.device("cuda"), autotune=False) as session:
+        result, plan = _prepare(layer, session, inputs)
+        out = torch.empty_like(inputs["q"])
+        paged_decode.run(
+            paged_decode.bind(plan, scratch=_scratch(plan), output=out, **inputs)
+        )
+        torch.cuda.synchronize()
+        result.close()
+    check_uniform_window(layer, out, inputs)
+
+
+def nonfinite_sinks(layer, inputs):
+    """Set +inf and -inf sinks on disjoint rows and heads; return their masks
+    and the inputs of an equivalent finite reference."""
+    sink = inputs["attention_sink_bias"]
+    positive = torch.zeros_like(sink, dtype=torch.bool)
+    negative = torch.zeros_like(sink, dtype=torch.bool)
+    positive[::3, 1::4] = True
+    negative[1::3, ::4] = True
+    sink[positive] = float("inf")
+    sink[negative] = -float("inf")
+    finite = dict(inputs, attention_sink_bias=sink.masked_fill(positive, 1.0e4))
+    return positive, finite
+
+
+def check_nonfinite_sinks(layer, out, inputs, positive, finite):
+    total = int(inputs["cu_seqlens_q"][-1])
+    ref, bound, _ = layer.reference(finite)
+    assert torch.isfinite(out[:total]).all()
+    assert (out[:total][positive[:total]] == 0).all()
+    assert ((out[:total].double() - ref[:total]).abs() <= bound[:total]).all()
+
+
+@pytest.mark.parametrize("name", ["global_verify_sink", "window_verify_sink"])
+def test_infinite_sinks_agree_between_split_and_unsplit_kernels(name):
+    """A +inf sink zeroes its row and a -inf sink is no sink, in the split
+    merge kernel (full context) and in the unsplit forward kernel (window)."""
+    require_b12x()
+    layer = _Layer(name, seed=43)
+    inputs = layer.draw()
+    positive, finite = nonfinite_sinks(layer, inputs)
+    with PreparationSession(device=torch.device("cuda"), autotune=False) as session:
+        result, plan = _prepare(layer, session, inputs)
+        out = torch.empty_like(inputs["q"])
+        paged_decode.run(
+            paged_decode.bind(plan, scratch=_scratch(plan), output=out, **inputs)
+        )
+        torch.cuda.synchronize()
+        result.close()
+    check_nonfinite_sinks(layer, out, inputs, positive, finite)
+
+
 def _bias_state(has_relative_bias):
     from b12x.attention.paged_decode._preparation import PreparedPagedDecode
     from b12x.attention.paged_decode._tuning import PagedDecodeConfig, PagedDecodeQuery
