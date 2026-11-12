@@ -93,15 +93,28 @@ class RecursiveGather(SelectedGather):
             row_tiles = (packs + Int32(31)) // Int32(32)
             tiles = rows * row_tiles
             for phase in cutlass.range_constexpr(self._world_size.bit_length() - 1):
-                group = 1 << phase
-                peer = self._rank ^ group
-                own_begin = self._rank & ~(group - 1)
-                peer_begin = peer & ~(group - 1)
+                if cutlass.const_expr(self._world_size == 8):
+                    # Cross the two four-GPU switches first. Later phases only
+                    # forward shards already gathered within one switch.
+                    distance = (4, 1, 2)[phase]
+                    group = (1, 2, 4)[phase]
+                else:
+                    distance = 1 << phase
+                    group = distance
+                peer = self._rank ^ distance
                 remote = self._staging_words(stages[peer] + bank)
                 # A CTA owns the same row/column tiles in every rank segment.
                 # It only forwards bytes that it completed in an earlier phase.
                 for segment in cutlass.range_constexpr(group):
-                    sending = own_begin + segment
+                    if cutlass.const_expr(self._world_size == 8):
+                        if cutlass.const_expr(phase == 0):
+                            sending = self._rank
+                        elif cutlass.const_expr(phase == 1):
+                            sending = self._rank if segment == 0 else self._rank ^ 4
+                        else:
+                            sending = self._rank ^ (segment & 1) ^ ((segment & 2) * 2)
+                    else:
+                        sending = (self._rank & ~(distance - 1)) + segment
                     destination = sending if sending < peer else sending - 1
                     tile = first
                     while tile < tiles:
@@ -135,7 +148,15 @@ class RecursiveGather(SelectedGather):
                 cute.arch.sync_threads()
                 self._pair_barrier(signals, peer, block, tid)
                 for segment in cutlass.range_constexpr(group):
-                    receiving = peer_begin + segment
+                    if cutlass.const_expr(self._world_size == 8):
+                        if cutlass.const_expr(phase == 0):
+                            receiving = peer
+                        elif cutlass.const_expr(phase == 1):
+                            receiving = peer if segment == 0 else peer ^ 4
+                        else:
+                            receiving = peer ^ (segment & 1) ^ ((segment & 2) * 2)
+                    else:
+                        receiving = (peer & ~(distance - 1)) + segment
                     origin = receiving if receiving < self._rank else receiving - 1
                     tile = first
                     while tile < tiles:
