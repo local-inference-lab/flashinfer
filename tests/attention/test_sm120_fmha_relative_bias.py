@@ -257,3 +257,141 @@ def test_window_excludes_the_key_just_outside_it():
     torch.cuda.synchronize()
     ref, bound, _ = case.reference(bias=False, sink=False, window=1022)
     assert ((case.out.double() - ref).abs() <= bound).all()
+
+
+@pytest.mark.parametrize("window", [0, 1, 127, 128, 129, 1023])
+def test_window_edge_with_uniform_attention(window):
+    """Zero queries give every visible key the same probability, exact in
+    E4M3, so the output is the mean of the visible values with one BF16
+    rounding (2**-8) and an approximate reciprocal (covered by 2**-16).  A
+    window one key wider or narrower is outside that tolerance."""
+    _require_sm120()
+    kernel = _kernel(bias=False, sink=False, window=window)
+    case = _Case(rows=320, capacity=2048, seed=window + 61)
+    case.q8.zero_()
+    for length in (2048, 320, 449, 1343):
+        case.lengths.fill_(length)
+        case.run(kernel, bias=False, sink=False, extended=False)
+        torch.cuda.synchronize()
+        got = case.out.double()
+
+        def within(w):
+            ref, _, _ = case.reference(bias=False, sink=False, window=w)
+            return (got - ref).abs() <= (2.0**-8 + 2.0**-16) * ref.abs() + 1e-12
+
+        assert within(window).all(), length
+        # A neighboring window differs only for a row with that many earlier keys.
+        if length - 1 > window:
+            assert not within(window + 1).all(), length
+        if window > 0 and length - 1 >= window:
+            assert not within(window - 1).all(), length
+
+
+@pytest.mark.parametrize("window", [-1, 1023])
+def test_infinite_sinks(window):
+    """A +inf sink zeroes its row and a -inf sink is no sink."""
+    _require_sm120()
+    kernel = _kernel(bias=True, sink=True, window=window)
+    case = _Case(rows=320, capacity=3000, seed=71)
+    positive = torch.zeros_like(case.sink, dtype=torch.bool)
+    positive[::3, 1::4] = True
+    case.sink[positive] = float("inf")
+    case.sink[1::3, ::4] = -float("inf")
+    case.run(kernel, bias=True, sink=True)
+    torch.cuda.synchronize()
+    kernel_sink = case.sink.clone()
+    case.sink.masked_fill_(positive, 1.0e4)
+    ref, bound, _ = case.reference(bias=True, sink=True, window=window)
+    case.sink.copy_(kernel_sink)
+    assert torch.isfinite(case.out).all()
+    assert (case.out[positive] == 0).all()
+    assert ((case.out.double() - ref).abs() <= bound).all()
+
+
+def _operands():
+    q = torch.empty((8, HQ, DIM), dtype=torch.float8_e4m3fn)
+    return q, dict(
+        relative_bias=torch.empty((8, HQ, EXTENT), dtype=torch.bfloat16),
+        row_sink=torch.empty((8, HQ), dtype=torch.float32),
+        output_gate=torch.empty((8, HQ, DIM), dtype=torch.bfloat16),
+    )
+
+
+def test_operand_validation_accepts_the_contract():
+    from flashinfer.cute_dsl.attention.fmha.sm120 import (
+        validate_sm120_fmha_fp8_paged_operands as validate,
+    )
+
+    q, operands = _operands()
+    validate(q, **operands)
+    validate(q)
+    # More rows than q and a strided bias view are within the contract.
+    wide = torch.empty((9, HQ, 2 * EXTENT), dtype=torch.bfloat16)
+    validate(q, relative_bias=wide[:, :, :EXTENT])
+
+
+@pytest.mark.parametrize(
+    "name, make, message",
+    [
+        ("relative_bias", lambda t: t[:7], "at least 8 rows"),
+        ("relative_bias", lambda t: t[:, :11], "at least 8 rows"),
+        ("relative_bias", lambda t: t.float(), "must be torch.bfloat16"),
+        ("relative_bias", lambda t: t[:, :, ::2], "unit inner stride"),
+        ("relative_bias", lambda t: t[:, :, :0], "at least 8 rows"),
+        ("row_sink", lambda t: t[:7], "at least 8 rows"),
+        ("row_sink", lambda t: t[0], "at least 8 rows"),
+        ("row_sink", lambda t: t.double(), "must be torch.float32"),
+        ("row_sink", lambda t: t.repeat(1, 2)[:, ::2], "unit inner stride"),
+        ("output_gate", lambda t: t[:, :, :64], "at least 8 rows"),
+        ("output_gate", lambda t: t.float(), "must be torch.bfloat16"),
+        (
+            "output_gate",
+            lambda t: torch.empty((8, HQ, DIM + 1), dtype=t.dtype)[:, :, 1:],
+            "16-byte aligned",
+        ),
+    ],
+)
+def test_operand_validation_rejects(name, make, message):
+    from flashinfer.cute_dsl.attention.fmha.sm120 import (
+        validate_sm120_fmha_fp8_paged_operands as validate,
+    )
+
+    q, operands = _operands()
+    with pytest.raises(ValueError, match=message):
+        validate(q, **{name: make(operands[name])})
+
+
+@pytest.mark.parametrize(
+    "options, error",
+    [
+        (dict(window_left=-2), ValueError),
+        (dict(window_left=1023.0), ValueError),
+        (dict(window_left=8, is_causal=False, balanced_scheduler=False), ValueError),
+        (dict(window_left=8, head_dim=256), NotImplementedError),
+        (dict(with_relative_bias=True, head_dim=256), NotImplementedError),
+        (dict(with_row_sink=True, enable_skip_softmax=True), NotImplementedError),
+        (dict(window_left=8, with_kv_tile_ranges=True), NotImplementedError),
+        (dict(with_row_sink=True, with_lse=True), NotImplementedError),
+    ],
+)
+def test_compile_rejects_unsupported_combinations(options, error):
+    from flashinfer.cute_dsl.attention.fmha.sm120 import (
+        compile_sm120_fmha_fp8_paged_kernel,
+    )
+
+    arguments = dict(
+        in_dtype=torch.float8_e4m3fn,
+        out_dtype=torch.bfloat16,
+        num_qo_heads=HQ,
+        num_kv_heads=HKV,
+        head_dim=DIM,
+        is_causal=True,
+        kv_tile=128,
+        q_tile=128,
+        num_tokens_per_page=PAGE,
+        device=torch.device("cuda"),
+        balanced_scheduler=True,
+        kv_layout="NHD",
+    )
+    with pytest.raises(error):
+        compile_sm120_fmha_fp8_paged_kernel(**{**arguments, **options})

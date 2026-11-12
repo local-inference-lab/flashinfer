@@ -442,7 +442,36 @@ def compile_sm120_fmha_fp8_paged_kernel(
     with_row_sink: bool = False,
     window_left: int = -1,
 ):
+    """Compile the paged FP8 prefill program for one layer geometry.
+
+    ``with_relative_bias``, ``with_row_sink`` and ``with_output_gate`` add
+    operands to the launch, in the order ``output_gate, kv_tile_ranges,
+    relative_bias, row_sink`` after ``use_pdl``; a program with a bias or sink
+    takes all four, with ``None`` for the ones it was compiled without.  The
+    compiled program does not inspect its operands: call
+    :func:`validate_sm120_fmha_fp8_paged_operands` on the tensors before the
+    first launch or graph capture.
+    """
     _validate_balanced_scheduler(is_causal, balanced_scheduler)
+    if type(window_left) is not int or window_left < -1:
+        raise ValueError(
+            f"window_left must be -1 (no window) or a nonnegative int, got {window_left!r}"
+        )
+    extras = with_relative_bias or with_row_sink or window_left >= 0
+    if window_left >= 0 and not is_causal:
+        raise ValueError("window_left requires is_causal=True")
+    if extras and (head_dim, q_tile, kv_tile) == (256, 128, 128):
+        raise NotImplementedError(
+            "relative bias, row sink and window are not implemented for "
+            "head_dim 256 with 128-row Q and K/V tiles"
+        )
+    if extras and (enable_skip_softmax or with_kv_tile_ranges):
+        raise NotImplementedError(
+            "relative bias, row sink and window exclude skip-softmax and "
+            "K/V tile ranges"
+        )
+    if (with_relative_bias or with_row_sink) and with_lse:
+        raise NotImplementedError("relative bias and row sink exclude the LSE output")
 
     from flashinfer.jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 
@@ -489,3 +518,78 @@ def compile_sm120_fmha_fp8_paged_kernel(
         ),
         extra_key_files=_cache_key_files(),
     )
+
+
+def validate_sm120_fmha_fp8_paged_operands(
+    q: torch.Tensor,
+    *,
+    relative_bias: torch.Tensor | None = None,
+    row_sink: torch.Tensor | None = None,
+    output_gate: torch.Tensor | None = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> None:
+    """Check the optional operands of a paged FP8 prefill launch against ``q``.
+
+    ``q`` is the packed query ``[total_q, Hq, D]``.  The kernel indexes each
+    optional operand by the query row and head without bounds checks, so each
+    must cover every row of ``q`` on its device:
+
+    - ``relative_bias``: BF16 ``[rows >= total_q, Hq, extent >= 1]``, unit
+      inner stride.
+    - ``row_sink``: float32 ``[rows >= total_q, Hq]``, unit inner stride.
+    - ``output_gate``: ``out_dtype`` ``[rows >= total_q, Hq, D]``, unit inner
+      stride, 16-byte aligned data and outer strides.
+    """
+    if q.ndim != 3:
+        raise ValueError(f"q must be [total_q, Hq, D], got {tuple(q.shape)}")
+    rows, heads, dim = (int(n) for n in q.shape)
+
+    def check(name, tensor, dtype, trailing, layout):
+        if tensor.device != q.device:
+            raise ValueError(f"{name} must be on {q.device}, got {tensor.device}")
+        if tensor.dtype != dtype:
+            raise ValueError(f"{name} must be {dtype}, got {tensor.dtype}")
+        if (
+            tensor.ndim != 1 + len(trailing)
+            or int(tensor.shape[0]) < rows
+            or any(
+                want is not None and int(got) != want
+                for got, want in zip(tensor.shape[1:], trailing, strict=False)
+            )
+            or any(int(n) < 1 for n in tensor.shape[1:])
+        ):
+            raise ValueError(
+                f"{name} must be {layout} with at least {rows} rows, "
+                f"got {tuple(tensor.shape)}"
+            )
+        if tensor.stride(-1) != 1 or any(step <= 0 for step in tensor.stride()):
+            raise ValueError(
+                f"{name} must have a unit inner stride and positive outer "
+                f"strides, got {tuple(tensor.stride())}"
+            )
+
+    if relative_bias is not None:
+        check(
+            "relative_bias",
+            relative_bias,
+            torch.bfloat16,
+            (heads, None),
+            f"[rows, {heads}, extent]",
+        )
+    if row_sink is not None:
+        check("row_sink", row_sink, torch.float32, (heads,), f"[rows, {heads}]")
+    if output_gate is not None:
+        check(
+            "output_gate",
+            output_gate,
+            out_dtype,
+            (heads, dim),
+            f"[rows, {heads}, {dim}]",
+        )
+        item = output_gate.element_size()
+        if output_gate.data_ptr() % 16 or any(
+            step * item % 16 for step in output_gate.stride()[:-1]
+        ):
+            raise ValueError(
+                "output_gate data and outer strides must be 16-byte aligned"
+            )
