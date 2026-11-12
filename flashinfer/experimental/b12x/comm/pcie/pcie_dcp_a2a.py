@@ -1291,6 +1291,7 @@ class PCIeDCPA2A:
                 True,
                 False,
                 row_blocks,
+                int(state.query.call.get("load_batch", 1)),
             ):
                 raise RuntimeError(
                     "cold PCIe DCP paired gather CUDA graph capture is not "

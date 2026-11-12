@@ -146,6 +146,20 @@ def _validate_query(query: PcieQuery, device) -> None:
             raise ValueError("paired gather row blocks must fit the signal plane")
         if blocks > 1 and not query.call.get("disjoint_output", False):
             raise ValueError("parallel paired gather requires disjoint outputs")
+        load_batch = query.call.get("load_batch", 1)
+        if type(load_batch) is not int or load_batch not in (1, 2):
+            raise ValueError("paired gather load batch must be one or two")
+        if load_batch != 1 and (
+            blocks == 1 or not query.call.get("disjoint_output", False)
+        ):
+            raise ValueError("batched paired loads require disjoint multi-CTA rows")
+    if query.surface.endswith(".all_gather_pair_kimi_topk"):
+        for field in ("row_blocks", "load_batch"):
+            value = query.call.get(field, 1)
+            if type(value) is not int or value != 1:
+                raise ValueError(
+                    "fused Kimi paired gather requires row_blocks=1 and load_batch=1"
+                )
     if query.surface == "kimi_topk16":
         if query.topology != "local":
             raise ValueError("stateless kimi_topk16 uses one local device")

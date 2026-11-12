@@ -9,10 +9,13 @@ from ._cute_intrinsics import ld_relaxed_gpu_u32
 from ._dcp_a2a_cute import (
     _GRAPH_ARRIVED_INDEX,
     _GRAPH_EPOCH_INDEX,
+    _MAX_BLOCKS,
     _a2a_graph_epoch_arrive,
     _copy_16b,
 )
 from ._dcp_cute_common import (
+    _FLAG_STRIDE,
+    _MAX_RANKS,
     _load_relaxed_sys_u32,
     _membar_sys,
     _store_relaxed_sys_u32,
@@ -24,8 +27,10 @@ from ._runtime_gather_cute import SelectedGather
 class RingGather(SelectedGather):
     def __init__(self, world, rank, row_words, threads, blocks, chunks):
         super().__init__(world, rank, row_words, threads, blocks, chunks, "barrier")
-        if world != 16 or threads != 128 or blocks != 8:
-            raise ValueError("ring gather requires TP16 with eight 128-thread CTAs")
+        if world not in (8, 16) or threads != 128 or blocks != 8:
+            raise ValueError(
+                "ring gather requires DCP8 or DCP16 with eight 128-thread CTAs"
+            )
         self.next = (rank + 1) % world
         self.previous = (rank - 1) % world
 
@@ -33,9 +38,12 @@ class RingGather(SelectedGather):
     def _flag(self, signal, sender, block, value):
         slot = Int64(value % Uint32(2))
         index = (
-            Int64(64 * 16)
-            + ((slot * Int64(64) + Int64(block)) * Int64(16 * 32))
-            + Int64(sender * 32)
+            Int64(_MAX_BLOCKS * _MAX_RANKS)
+            + (
+                (slot * Int64(_MAX_BLOCKS) + Int64(block))
+                * Int64(_MAX_RANKS * _FLAG_STRIDE)
+            )
+            + Int64(sender * _FLAG_STRIDE)
         )
         return signal + index
 

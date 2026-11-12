@@ -311,19 +311,29 @@ def test_dcp_materialization_resolves_graph_program_before_capture(monkeypatch):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA compilation")
 @pytest.mark.parametrize("row_blocks", [1, 2, 4, 8])
-def test_paired_gather_compiles_row_partition_geometries(row_blocks):
+@pytest.mark.parametrize("load_batch", [1, 2])
+def test_paired_gather_compiles_row_partition_geometries(row_blocks, load_batch):
     query = PcieQuery(
         surface="DcpAllToAll.all_gather_pair",
         world_size=16,
         rank=0,
         topology="pcie_ipc",
         call=FrozenMapping(
-            dict(threads=512, row_blocks=row_blocks, disjoint_output=True)
+            dict(
+                threads=512,
+                row_blocks=row_blocks,
+                load_batch=load_batch,
+                disjoint_output=True,
+            )
         ),
         setup=FrozenMapping(),
     )
     payload = TUNING.encode_query(query)
     ordinal = torch.cuda.current_device()
+    if row_blocks == 1 and load_batch != 1:
+        with pytest.raises(ValueError, match="batched paired loads require"):
+            compile_dcp_surface(payload, ordinal)
+        return
     description = describe_compilation(
         CompileJob.create(
             "b12x.comm.pcie._dcp_preparation:compile_dcp_surface", payload, ordinal

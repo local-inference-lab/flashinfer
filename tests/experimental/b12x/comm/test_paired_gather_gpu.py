@@ -56,15 +56,24 @@ def _worker(rank, world, origin, directory):
     graphs = {}
     requests = []
     try:
-        for rows, row_blocks in (
-            (1, 1),
-            (1, 4),
-            (3, 2),
-            (4, 4),
-            (8, 2),
-            (8, 8),
-            (17, 4),
-            (17, 8),
+        for rows, row_blocks, load_batch, threads in (
+            (1, 1, 1, 512),
+            (1, 4, 1, 512),
+            (3, 2, 1, 512),
+            (4, 4, 1, 512),
+            (8, 2, 1, 512),
+            (8, 8, 1, 512),
+            (17, 4, 1, 512),
+            (17, 8, 1, 512),
+            (8, 2, 2, 512),
+            (8, 8, 2, 512),
+            (17, 4, 2, 512),
+            (17, 8, 2, 512),
+            # Each CTA owns at least eight rows, entering both batched loops
+            # even at world size two. Seventeen rows also exercise scalar tails
+            # with unequal row ownership at every supported world size.
+            (16, 2, 2, 32),
+            (17, 2, 2, 32),
         ):
             first = torch.empty(
                 (rows, _FIRST_WIDTH), dtype=torch.bfloat16, device=device
@@ -99,16 +108,19 @@ def _worker(rank, world, origin, directory):
                 local_second=second,
                 out_first=out_first,
                 out_second=out_second,
-                threads=512,
+                threads=threads,
                 row_blocks=row_blocks,
+                load_batch=load_batch,
             )
             query = _dcp_preparation.query_from_runtime(
                 owner, surface="DcpAllToAll.all_gather_pair", call=call
             )
             assert query.call["row_blocks"] == row_blocks
+            assert query.call["load_batch"] == load_batch
+            assert query.call["threads"] == threads
             assert query.call["disjoint_output"]
             plan = _dcp_preparation.plan(query, runtime=owner)
-            name = f"paired-rows{rows}-blocks{row_blocks}"
+            name = f"paired-rows{rows}-blocks{row_blocks}-load{load_batch}-threads{threads}"
             requests.append(
                 plan.request(
                     name=name,
@@ -122,7 +134,7 @@ def _worker(rank, world, origin, directory):
             variations = []
             for variation in range(3):
                 generator = torch.Generator().manual_seed(
-                    100000 * rows + 1000 * row_blocks + variation
+                    100000 * rows + 1000 * row_blocks + 100 * load_batch + variation
                 )
                 first_bits = torch.randint(
                     0,
@@ -158,7 +170,7 @@ def _worker(rank, world, origin, directory):
                         expected_second,
                     )
                 )
-            key = rows, row_blocks
+            key = rows, row_blocks, load_batch, threads
             cases[key] = (
                 first,
                 second,
@@ -178,7 +190,7 @@ def _worker(rank, world, origin, directory):
                 else None
             ),
         )
-        first_case = cases[1, 1]
+        first_case = cases[1, 1, 1, 512]
         for _ in range(1 if origin else 2):
             owner.all_gather_pair(
                 first_case[0],
@@ -192,7 +204,14 @@ def _worker(rank, world, origin, directory):
         for key, case in cases.items():
             graph = torch.cuda.CUDAGraph()
             with session.capture(), torch.cuda.graph(graph):
-                owner.all_gather_pair(case[0], case[1], case[2], case[3], plan=case[-1])
+                owner.all_gather_pair(
+                    case[0],
+                    case[1],
+                    case[2],
+                    case[3],
+                    plan=case[-1],
+                    threads=key[3],
+                )
             graphs[key] = graph
         assert owner._device_slot_selection
         assert owner._graph_base_slot == origin

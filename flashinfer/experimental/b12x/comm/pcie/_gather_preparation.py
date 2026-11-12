@@ -74,13 +74,15 @@ def validate_query(query):
     selected_gather_profile(
         transport, call["block_limit"], call["submode"], call["active_blocks"]
     )
-    if transport in (
-        "selected_ring",
-        "selected_recursive",
-        "selected_recursive_ready",
-    ) and (query.world_size != 16 or call["threads"] != 128):
+    if transport == "selected_ring" and (
+        query.world_size not in (8, 16) or call["threads"] != 128
+    ):
+        raise ValueError("ring gather requires DCP8 or DCP16 with 128 threads per CTA")
+    if transport in ("selected_recursive", "selected_recursive_ready") and (
+        query.world_size not in (8, 16) or call["threads"] != 128
+    ):
         raise ValueError(
-            "ring and recursive gathers require TP16 with 128 threads per CTA"
+            "recursive gathers require DCP8 or DCP16 with 128 threads per CTA"
         )
     if (
         call["threads"] not in (32, 64, 128, 256, 512)

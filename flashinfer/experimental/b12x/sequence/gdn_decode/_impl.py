@@ -353,10 +353,7 @@ def _paged_overlaps(left: torch.Tensor, right: torch.Tensor) -> bool:
     if not _overlaps(left, right):
         return False
     step = left.stride(0) * left.element_size()
-    if (
-        left.shape[0] != right.shape[0]
-        or step != right.stride(0) * right.element_size()
-    ):
+    if step <= 0 or step != right.stride(0) * right.element_size():
         return True
     left_bytes = math.prod(left.shape[1:]) * left.element_size()
     right_bytes = math.prod(right.shape[1:]) * right.element_size()
