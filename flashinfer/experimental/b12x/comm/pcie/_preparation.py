@@ -49,7 +49,7 @@ def _selected_gather_query(query, transport, thread_counts):
 
     call, setup = query.call, query.setup
     if (
-        query.world_size != 16
+        query.world_size not in (8, 16)
         or not query.surface.endswith(".all_gather_heads")
         or not call.get("disjoint_output", False)
         or not call.get("pack_aligned", False)
@@ -159,12 +159,15 @@ def plan(
         from ._collective_tuning import plan as collective_plan
 
         alternatives = {"dcp": (query, runtime)}
-        for name, transport, threads in (
+        specializations = [
             ("dcp_phased", "selected_phased_barrier", (128, 256, 512)),
             ("dcp_ring", "selected_ring", (128,)),
             ("dcp_recursive", "selected_recursive", (128,)),
             ("dcp_recursive_ready", "selected_recursive_ready", (128,)),
-        ):
+        ]
+        if query.world_size == 8:
+            specializations.append(("dcp_phased_push", "selected_phased_push", (128,)))
+        for name, transport, threads in specializations:
             selected = _selected_gather_query(query, transport, threads)
             if selected is not None:
                 alternatives[name] = (selected, runtime)

@@ -94,6 +94,28 @@ def test_static_tp16_gather_races_native_geometry_and_complete_phase_clusters():
     assert "selected_phased_push" not in repr(plan.query.alternatives)
 
 
+def test_dcp8_races_phased_push_recursive_and_ring():
+    query, runtime = native_query(world=8)
+    selected = _preparation._selected_gather_query(
+        query, "selected_phased_push", (128,)
+    )
+    assert (
+        selected is not None
+        and selected.call["gather_transport"] == "selected_phased_push"
+    )
+    assert (
+        _preparation._selected_gather_query(query, "selected_recursive", (128,))
+        is not None
+    )
+    assert (
+        _preparation._selected_gather_query(query, "selected_ring", (128,)) is not None
+    )
+    plan = _preparation.plan(query, runtime=runtime)
+    assert "dcp_phased_push" in plan.query.alternatives
+    assert "dcp_recursive" in plan.query.alternatives
+    assert "dcp_ring" in plan.query.alternatives
+
+
 @pytest.mark.parametrize("pins", [(512, 8), (128, 8), (256, 0), (0, 8)])
 def test_environment_geometry_overrides_constrain_both_implementations(pins):
     query, runtime = native_query(pins=pins)
@@ -173,11 +195,16 @@ def test_unqualified_hardware_does_not_admit_phased_candidates(device, effort):
 
 
 @pytest.mark.parametrize("world", [2, 4, 8, 9, 10, 12])
-def test_other_rank_counts_retain_their_existing_catalog(world):
+def test_other_rank_counts_catalog_with_dcp8_specializations(world):
     query, runtime = native_query(world=world)
     plan = _preparation.plan(query, runtime=runtime)
-    if world <= 8:
+    if world < 8:
         assert "dcp_phased" not in plan.query.alternatives
+    elif world == 8:
+        assert "dcp_phased" in plan.query.alternatives
+        assert "dcp_phased_push" in plan.query.alternatives
+        assert "dcp_recursive" in plan.query.alternatives
+        assert "dcp_ring" in plan.query.alternatives
     else:
         assert plan.contract is NATIVE and plan.query == query
 
@@ -217,7 +244,7 @@ def test_shape_rank_and_byte_width_participate_in_collective_identity():
     assert signatures[0] == signatures[1]
     assert signatures[0] != signatures[2]
     assert signatures[0] != signatures[3]
-    assert TUNING.candidate_contract_version == 5
+    assert TUNING.candidate_contract_version == 6
 
 
 @pytest.mark.parametrize(

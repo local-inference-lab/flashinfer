@@ -355,12 +355,13 @@ def _validate_query(query, device):
                 )
         if name in (
             "dcp_phased",
+            "dcp_phased_push",
             "dcp_ring",
             "dcp_recursive",
             "dcp_recursive_ready",
         ) and (
             query.operation != "all_gather_heads"
-            or query.world_size != 16
+            or query.world_size not in (8, 16)
             or not native.surface.endswith(".all_gather_heads")
             or native.call.get("gather_transport")
             != {
@@ -368,9 +369,10 @@ def _validate_query(query, device):
                 "dcp_recursive": "selected_recursive",
                 "dcp_recursive_ready": "selected_recursive_ready",
                 "dcp_phased": "selected_phased_barrier",
+                "dcp_phased_push": "selected_phased_push",
             }[name]
         ):
-            raise ValueError("selected gather tuning requires its TP16 barrier profile")
+            raise ValueError("selected gather tuning requires its DCP barrier profile")
 
 
 def _validate_config(query, config, device):
@@ -485,7 +487,7 @@ def _family_bucket(query):
 TUNING = TuningContract(
     component_id="comm.pcie",
     query_schema_version=8,
-    candidate_contract_version=5,
+    candidate_contract_version=6,
     config_schema_version=2,
     query_fields=frozenset(
         ("operation", "world_size", "rank", "alternatives", "default", "inplace")

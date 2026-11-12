@@ -24,8 +24,10 @@ from ._runtime_gather_cute import SelectedGather
 class RingGather(SelectedGather):
     def __init__(self, world, rank, row_words, threads, blocks, chunks):
         super().__init__(world, rank, row_words, threads, blocks, chunks, "barrier")
-        if world != 16 or threads != 128 or blocks != 8:
-            raise ValueError("ring gather requires TP16 with eight 128-thread CTAs")
+        if world not in (8, 16) or threads != 128 or blocks != 8:
+            raise ValueError(
+                "ring gather requires DCP8 or DCP16 with eight 128-thread CTAs"
+            )
         self.next = (rank + 1) % world
         self.previous = (rank - 1) % world
 
@@ -34,7 +36,7 @@ class RingGather(SelectedGather):
         slot = Int64(value % Uint32(2))
         index = (
             Int64(64 * 16)
-            + ((slot * Int64(64) + Int64(block)) * Int64(16 * 32))
+            + ((slot * Int64(64) + Int64(block)) * Int64(self._world_size * 32))
             + Int64(sender * 32)
         )
         return signal + index

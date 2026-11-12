@@ -1,4 +1,4 @@
-"""Byte-exact TP16 gather through four pairwise doubling exchanges."""
+"""Byte-exact power-of-two DCP gather through pairwise doubling exchanges."""
 
 import cutlass
 import cutlass.cute as cute
@@ -34,9 +34,9 @@ class RecursiveGather(SelectedGather):
     ):
         super().__init__(world, rank, row_words, threads, blocks, chunks, "barrier")
         self.acknowledge_consumption = acknowledge_consumption
-        if world != 16 or threads != 128 or blocks != 8:
+        if world not in (8, 16) or threads != 128 or blocks != 8:
             raise ValueError(
-                "recursive gather requires TP16 with eight 128-thread CTAs"
+                "recursive gather requires DCP8 or DCP16 with eight 128-thread CTAs"
             )
 
     @cute.jit
@@ -44,7 +44,7 @@ class RecursiveGather(SelectedGather):
         slot = Int64(value % Uint32(2))
         index = (
             Int64(64 * 16)
-            + ((slot * Int64(64) + Int64(block)) * Int64(16 * 32))
+            + ((slot * Int64(64) + Int64(block)) * Int64(self._world_size * 32))
             + Int64(sender * 32)
         )
         return signal + index
@@ -86,7 +86,7 @@ class RecursiveGather(SelectedGather):
             packs = Int32(self.row_words // 4)
             row_tiles = (packs + Int32(31)) // Int32(32)
             tiles = rows * row_tiles
-            for phase in cutlass.range_constexpr(4):
+            for phase in cutlass.range_constexpr(self._world_size.bit_length() - 1):
                 group = 1 << phase
                 peer = self._rank ^ group
                 own_begin = self._rank & ~(group - 1)
@@ -103,7 +103,7 @@ class RecursiveGather(SelectedGather):
                         pack = (tile - row * row_tiles) * Int32(32) + lane
                         if pack < packs:
                             out_pack = (
-                                Int64(row) * Int64(16) + Int64(sending)
+                                Int64(row) * Int64(self._world_size) + Int64(sending)
                             ) * Int64(packs) + Int64(pack)
                             if cutlass.const_expr(phase == 0):
                                 source_pack = Int64(row) * Int64(packs) + Int64(pack)
@@ -118,7 +118,8 @@ class RecursiveGather(SelectedGather):
                                     (output + out_pack * Int64(4)).toint()
                                 )
                             destination_pack = (
-                                Int64(row) * Int64(15) + Int64(destination)
+                                Int64(row) * Int64(self._world_size - 1)
+                                + Int64(destination)
                             ) * Int64(packs) + Int64(pack)
                             st_global_v4_u32(
                                 (remote + destination_pack * Int64(4)).toint(), *words
@@ -136,10 +137,10 @@ class RecursiveGather(SelectedGather):
                         pack = (tile - row * row_tiles) * Int32(32) + lane
                         if pack < packs:
                             incoming_pack = (
-                                Int64(row) * Int64(15) + Int64(origin)
+                                Int64(row) * Int64(self._world_size - 1) + Int64(origin)
                             ) * Int64(packs) + Int64(pack)
                             out_pack = (
-                                Int64(row) * Int64(16) + Int64(receiving)
+                                Int64(row) * Int64(self._world_size) + Int64(receiving)
                             ) * Int64(packs) + Int64(pack)
                             _copy_16b(
                                 local + incoming_pack * Int64(4),
