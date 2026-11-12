@@ -1213,6 +1213,7 @@ class _AllGatherPairLaunch(_DCPA2ABase):
         device_slot_selection: bool,
         kimi_topk: bool,
         row_blocks: int = 1,
+        load_batch: int = 1,
     ) -> None:
         super().__init__(world_size, rank, threads, device_slot_selection)
         self._kimi_topk = bool(kimi_topk)
@@ -1220,7 +1221,12 @@ class _AllGatherPairLaunch(_DCPA2ABase):
             raise ValueError("paired gather row blocks must fit the signal plane")
         if kimi_topk and row_blocks != 1:
             raise ValueError("fused single-row expert selection requires one CTA")
+        if load_batch not in (1, 2):
+            raise ValueError("paired gather load batch must be one or two")
+        if load_batch != 1 and (kimi_topk or row_blocks == 1):
+            raise ValueError("batched paired loads require disjoint multi-CTA rows")
         self._row_blocks = row_blocks
+        self._load_batch = load_batch
 
     @cute.jit
     def __call__(
@@ -1467,6 +1473,53 @@ class _AllGatherPairLaunch(_DCPA2ABase):
 
         first_output_packs = owned_rows * Int32(self._world_size) * first_packs
         linear = Int32(tidx)
+        if cutlass.const_expr(self._load_batch == 2):
+            while linear + Int32(self._threads) < first_output_packs:
+                addresses, destinations = (), ()
+                for item in cutlass.range_constexpr(2):
+                    current = linear + Int32(item) * Int32(self._threads)
+                    batch_index = current // (Int32(self._world_size) * first_packs)
+                    row_pack = current - (
+                        batch_index * Int32(self._world_size) * first_packs
+                    )
+                    batch_index = batch_index * grid + row_group
+                    source_rank = row_pack // first_packs
+                    pack = row_pack - source_rank * first_packs
+                    source_address = Int64(
+                        (
+                            local_first
+                            + (Int64(batch_index) * Int64(first_packs) + Int64(pack))
+                            * Int64(4)
+                        ).toint()
+                    )
+                    for source in cutlass.range_constexpr(self._world_size):
+                        if source_rank == Int32(source):
+                            if cutlass.const_expr(source == self._rank):
+                                source_words = local_first
+                                source_base = Int64(batch_index) * Int64(first_packs)
+                            else:
+                                source_words = self._staging_words(
+                                    staging[source] + slot_offset
+                                )
+                                source_base = Int64(batch_index) * Int64(combined_packs)
+                            source_address = Int64(
+                                (
+                                    source_words
+                                    + (source_base + Int64(pack)) * Int64(4)
+                                ).toint()
+                            )
+                    output_pack = Int64(batch_index) * Int64(self._world_size) * Int64(
+                        first_packs
+                    ) + Int64(row_pack)
+                    addresses += (source_address,)
+                    destinations += (
+                        Int64((output_first + output_pack * Int64(4)).toint()),
+                    )
+                words0 = ld_global_v4_u32(addresses[0])
+                words1 = ld_global_v4_u32(addresses[1])
+                st_global_v4_u32(destinations[0], *words0)
+                st_global_v4_u32(destinations[1], *words1)
+                linear += Int32(2) * Int32(self._threads)
         while linear < first_output_packs:
             batch_index = linear // (Int32(self._world_size) * first_packs)
             row_pack = linear - (batch_index * Int32(self._world_size) * first_packs)
@@ -1509,6 +1562,62 @@ class _AllGatherPairLaunch(_DCPA2ABase):
         if cutlass.const_expr(not self._kimi_topk):
             second_output_packs = owned_rows * Int32(self._world_size) * second_packs
             linear = Int32(tidx)
+            if cutlass.const_expr(self._load_batch == 2):
+                while linear + Int32(self._threads) < second_output_packs:
+                    addresses, destinations = (), ()
+                    for item in cutlass.range_constexpr(2):
+                        current = linear + Int32(item) * Int32(self._threads)
+                        batch_index = current // (
+                            Int32(self._world_size) * second_packs
+                        )
+                        row_pack = current - (
+                            batch_index * Int32(self._world_size) * second_packs
+                        )
+                        batch_index = batch_index * grid + row_group
+                        source_rank = row_pack // second_packs
+                        pack = row_pack - source_rank * second_packs
+                        source_address = Int64(
+                            (
+                                local_second
+                                + (
+                                    Int64(batch_index) * Int64(second_packs)
+                                    + Int64(pack)
+                                )
+                                * Int64(4)
+                            ).toint()
+                        )
+                        for source in cutlass.range_constexpr(self._world_size):
+                            if source_rank == Int32(source):
+                                if cutlass.const_expr(source == self._rank):
+                                    source_words = local_second
+                                    source_base = Int64(batch_index) * Int64(
+                                        second_packs
+                                    )
+                                else:
+                                    source_words = self._staging_words(
+                                        staging[source] + slot_offset
+                                    )
+                                    source_base = Int64(batch_index) * Int64(
+                                        combined_packs
+                                    ) + Int64(first_packs)
+                                source_address = Int64(
+                                    (
+                                        source_words
+                                        + (source_base + Int64(pack)) * Int64(4)
+                                    ).toint()
+                                )
+                        output_pack = Int64(batch_index) * Int64(
+                            self._world_size
+                        ) * Int64(second_packs) + Int64(row_pack)
+                        addresses += (source_address,)
+                        destinations += (
+                            Int64((output_second + output_pack * Int64(4)).toint()),
+                        )
+                    words0 = ld_global_v4_u32(addresses[0])
+                    words1 = ld_global_v4_u32(addresses[1])
+                    st_global_v4_u32(destinations[0], *words0)
+                    st_global_v4_u32(destinations[1], *words1)
+                    linear += Int32(2) * Int32(self._threads)
             while linear < second_output_packs:
                 batch_index = linear // (Int32(self._world_size) * second_packs)
                 row_pack = linear - (
@@ -2200,6 +2309,7 @@ def _pair_launcher_key(
     device_slot_selection: bool,
     kimi_topk: bool,
     row_blocks: int = 1,
+    load_batch: int = 1,
 ) -> tuple[object, ...]:
     """Return the cache key for a paired all-gather launcher."""
     return (
@@ -2209,6 +2319,7 @@ def _pair_launcher_key(
         bool(device_slot_selection),
         bool(kimi_topk),
         int(row_blocks),
+        int(load_batch),
     )
 
 
@@ -2219,6 +2330,7 @@ def is_all_gather_pair_prepared(
     device_slot_selection: bool,
     kimi_topk: bool = False,
     row_blocks: int = 1,
+    load_batch: int = 1,
 ) -> bool:
     return (
         _pair_launcher_key(
@@ -2228,6 +2340,7 @@ def is_all_gather_pair_prepared(
             device_slot_selection,
             kimi_topk,
             row_blocks,
+            load_batch,
         )
         in _PREPARED_PAIR_LAUNCHERS
     )
@@ -2241,6 +2354,7 @@ def _get_compiled_all_gather_pair(
     device_slot_selection: bool,
     kimi_topk: bool = False,
     row_blocks: int = 1,
+    load_batch: int = 1,
 ) -> Callable:
     """Compile and retain one paired all-gather launcher specialization."""
     launch = _AllGatherPairLaunch(
@@ -2250,6 +2364,7 @@ def _get_compiled_all_gather_pair(
         device_slot_selection,
         kimi_topk,
         row_blocks,
+        load_batch,
     )
     key = _pair_launcher_key(
         world_size,
@@ -2258,6 +2373,7 @@ def _get_compiled_all_gather_pair(
         device_slot_selection,
         kimi_topk,
         row_blocks,
+        load_batch,
     )
     raise_if_kernel_resolution_frozen("cute.compile", target=launch, cache_key=key)
     p_u32 = _u32_ptr(16, align=4)
@@ -2295,6 +2411,7 @@ def _get_compiled_all_gather_pair(
                 "device_slot_selection",
                 "kimi_topk",
                 "row_blocks",
+                "load_batch",
             ),
         ),
     )

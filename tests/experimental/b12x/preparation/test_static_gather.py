@@ -392,12 +392,14 @@ def test_parallel_paired_gather_rejects_overlapping_outputs_before_preparation()
         out_first=out_first,
         out_second=out_second,
         row_blocks=4,
+        load_batch=2,
     )
     query = _preparation.query_from_runtime(
         runtime, surface="DcpAllToAll.all_gather_pair", call=call
     )
     NATIVE.validate_query(query, SM120)
     assert query.call["row_blocks"] == 4 and query.call["disjoint_output"]
+    assert query.call["load_batch"] == 2
     shared = torch.empty((4 * 3584,), dtype=torch.bfloat16)
     call.update(
         local_first=shared[: 4 * 224].view(4, 224), out_first=shared.view(4, 3584)
@@ -408,7 +410,9 @@ def test_parallel_paired_gather_rejects_overlapping_outputs_before_preparation()
     with pytest.raises(ValueError, match="disjoint"):
         NATIVE.validate_query(query, SM120)
     # The one-CTA declaration preserves its existing alias contract.
-    query = replace(query, call=FrozenMapping(dict(query.call, row_blocks=1)))
+    query = replace(
+        query, call=FrozenMapping(dict(query.call, row_blocks=1, load_batch=1))
+    )
     NATIVE.validate_query(query, SM120)
     assert not _pair_outputs_disjoint(
         first, second, out_first, out_first.view(torch.float32)

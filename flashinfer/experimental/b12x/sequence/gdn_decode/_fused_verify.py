@@ -1,6 +1,6 @@
 """One-launch KDA speculative verification: short convolution + recovery verify + gated RMSNorm.
 
-The production verify path launches three kernels per KDA layer: the speculative short
+The unfused verify path launches three kernels per KDA layer: the speculative short
 convolution (Triton), the CuTe recovery verification, and the Triton gated RMSNorm. This
 module runs all three in one launch of 4- or 8-CTA clusters, one cluster per (request, value
 head), one CTA per 32- or 16-row value tile, exactly the geometry of the verification kernel.
@@ -103,7 +103,9 @@ def _st_cluster(smem_ptr, rank, value, *, loc=None, ip=None):
 
 def _sigmoid_triton(x):
     """``1 / (1 + exp(-x))`` as Triton lowers it (mul by -log2 e, ex2.approx, div.full)."""
-    return _div_full(Float32(1.0), _addrn(_ex2(_mul(x, Float32(_LOG2E_NEG))), Float32(1.0)))
+    return _div_full(
+        Float32(1.0), _addrn(_ex2(_mul(x, Float32(_LOG2E_NEG))), Float32(1.0))
+    )
 
 
 class _FusedVerify:
@@ -165,11 +167,40 @@ class _FusedVerify:
         stream: cuda.CUstream,
     ):
         self.kernel(
-            x, conv_weight, conv_slots, fresh, accepted, conv_state, gate, beta, a_log, bias, state,
-            starts, indices, live_seqs, live_tokens, output, z, norm_weight, corrections, kg,
-            conv_slot_stride, index_stride, state_stride, correction_stride, kg_stride,
-            beta_row_stride, beta_head_stride, z_row_stride, z_head_stride,
-            capacity, token_capacity, scale, lower, eps,
+            x,
+            conv_weight,
+            conv_slots,
+            fresh,
+            accepted,
+            conv_state,
+            gate,
+            beta,
+            a_log,
+            bias,
+            state,
+            starts,
+            indices,
+            live_seqs,
+            live_tokens,
+            output,
+            z,
+            norm_weight,
+            corrections,
+            kg,
+            conv_slot_stride,
+            index_stride,
+            state_stride,
+            correction_stride,
+            kg_stride,
+            beta_row_stride,
+            beta_head_stride,
+            z_row_stride,
+            z_head_stride,
+            capacity,
+            token_capacity,
+            scale,
+            lower,
+            eps,
         ).launch(
             grid=(self.tiles, capacity * self.heads, 1),
             block=(self.block_v * 8, 1, 1),
@@ -247,10 +278,14 @@ class _FusedVerify:
             cute.make_layout((self.window, 128), stride=(128, 1)),
             byte_alignment=16,
         )
-        inverse_rms = smem.allocate_tensor(Float32, cute.make_layout((self.window,)), byte_alignment=16)
+        inverse_rms = smem.allocate_tensor(
+            Float32, cute.make_layout((self.window,)), byte_alignment=16
+        )
 
         # Rows past the live tokens: the norm kernel's zero fill, done once by request 0's clusters.
-        bounded_tokens = cutlass.max(Int32(0), cutlass.min(Int32(live_tokens[0]), token_capacity))
+        bounded_tokens = cutlass.max(
+            Int32(0), cutlass.min(Int32(live_tokens[0]), token_capacity)
+        )
         if request == 0:
             token = bounded_tokens + tid // self.block_v
             while token < token_capacity:
@@ -280,14 +315,23 @@ class _FusedVerify:
                 slot = Int64(conv_slots[request])
                 fresh_value = Int32(fresh[request])
                 rollback = cutlass.min(Int32(accepted[request]) - 1, Int32(self.spec))
-                state_base = slot * conv_slot_stride + Int64(channel) * self.channel_stride
+                state_base = (
+                    slot * conv_slot_stride + Int64(channel) * self.channel_stride
+                )
                 history = cute.make_rmem_tensor((self.history,), Float32)
                 for position in cutlass.range_constexpr(self.history):
                     history[position] = Float32(0.0)
                     source_position = Int32(position) + rollback
-                    if slot >= 0 and fresh_value == 0 and source_position < self.capacity_positions:
+                    if (
+                        slot >= 0
+                        and fresh_value == 0
+                        and source_position < self.capacity_positions
+                    ):
                         history[position] = Float32(
-                            conv_state[state_base + Int64(source_position) * self.position_stride]
+                            conv_state[
+                                state_base
+                                + Int64(source_position) * self.position_stride
+                            ]
                         )
                 query = cute.make_rmem_tensor((self.nq,), Float32)
                 for relative in cutlass.range_constexpr(self.nq):
@@ -298,28 +342,42 @@ class _FusedVerify:
                         )
                 weights = cute.make_rmem_tensor((self.kernel_size,), Float32)
                 for tap in cutlass.range_constexpr(self.kernel_size):
-                    weights[tap] = Float32(conv_weight[Int64(channel) * self.kernel_size + tap])
+                    weights[tap] = Float32(
+                        conv_weight[Int64(channel) * self.kernel_size + tap]
+                    )
                 for relative in cutlass.range_constexpr(self.nq):
-                  if relative < count:
-                    accumulator = Float32(0.0)
-                    for tap in cutlass.range_constexpr(self.kernel_size):
-                        lag = self.kernel_size - 1 - tap
-                        if cutlass.const_expr(relative >= lag):
-                            accumulator = _fma(query[relative - lag], weights[tap], accumulator)
-                        elif cutlass.const_expr(self.history + relative >= lag):
-                            accumulator = _fma(history[self.history + relative - lag], weights[tap], accumulator)
-                    convolved = Float32(BFloat16(accumulator))
-                    activated = Float32(BFloat16(_mul(_sigmoid_triton(convolved), convolved)))
-                    if slot < 0:
-                        activated = Float32(0.0)
-                    if part == 2:
-                        conv_out[(tid % self.block_v) * self.nq + relative] = activated
-                    else:
-                        if cutlass.const_expr(relative < self.window):
-                            # Q/K columns are needed by every CTA of the cluster: push them.
-                            target = vectors.iterator + ((part * self.window + relative) * 128 + column)
-                            for peer in cutlass.range_constexpr(self.tiles):
-                                _st_cluster(target, Int32(peer), activated)
+                    if relative < count:
+                        accumulator = Float32(0.0)
+                        for tap in cutlass.range_constexpr(self.kernel_size):
+                            lag = self.kernel_size - 1 - tap
+                            if cutlass.const_expr(relative >= lag):
+                                accumulator = _fma(
+                                    query[relative - lag], weights[tap], accumulator
+                                )
+                            elif cutlass.const_expr(self.history + relative >= lag):
+                                accumulator = _fma(
+                                    history[self.history + relative - lag],
+                                    weights[tap],
+                                    accumulator,
+                                )
+                        convolved = Float32(BFloat16(accumulator))
+                        activated = Float32(
+                            BFloat16(_mul(_sigmoid_triton(convolved), convolved))
+                        )
+                        if slot < 0:
+                            activated = Float32(0.0)
+                        if part == 2:
+                            conv_out[(tid % self.block_v) * self.nq + relative] = (
+                                activated
+                            )
+                        else:
+                            if cutlass.const_expr(relative < self.window):
+                                # Q/K columns are needed by every CTA of the cluster: push them.
+                                target = vectors.iterator + (
+                                    (part * self.window + relative) * 128 + column
+                                )
+                                for peer in cutlass.range_constexpr(self.tiles):
+                                    _st_cluster(target, Int32(peer), activated)
                 if slot >= 0 and count > 0:
                     for position in cutlass.range_constexpr(self.history):
                         value = Float32(0.0)
@@ -327,10 +385,13 @@ class _FusedVerify:
                             value = history[position + 1]
                         else:
                             value = query[position + 1 - self.history]
-                        conv_state[state_base + Int64(position) * self.position_stride] = BFloat16(value)
+                        conv_state[
+                            state_base + Int64(position) * self.position_stride
+                        ] = BFloat16(value)
                     for candidate in cutlass.range_constexpr(self.spec):
                         conv_state[
-                            state_base + Int64(self.history + candidate) * self.position_stride
+                            state_base
+                            + Int64(self.history + candidate) * self.position_stride
                         ] = BFloat16(query[candidate + 1])
             cute.arch.cluster_arrive()
             cute.arch.cluster_wait()
@@ -341,9 +402,17 @@ class _FusedVerify:
                 for pos in cutlass.range_constexpr(self.window):
                     if pos < count and key_lane == 0:
                         for peer in cutlass.range_constexpr(self.tiles):
-                            _st_cluster(decoded_all.iterator + (pos * 128 + row), Int32(peer), Float32(0.0))
+                            _st_cluster(
+                                decoded_all.iterator + (pos * 128 + row),
+                                Int32(peer),
+                                Float32(0.0),
+                            )
             else:
-                base = source * state_stride + head.to(Int64) * self.strides[7] + row.to(Int64) * self.strides[8]
+                base = (
+                    source * state_stride
+                    + head.to(Int64) * self.strides[7]
+                    + row.to(Int64) * self.strides[8]
+                )
                 s = cute.make_rmem_tensor((16,), Float32)
                 for j in cutlass.range_constexpr(16):
                     s[j] = Float32(state[base + Int64(key_lane + j * 8)])
@@ -355,12 +424,20 @@ class _FusedVerify:
                     if pos < count:
                         token = Int64(start + pos)
                         values[pos] = Float32(conv_out[local_row * self.nq + pos])
-                        betas[pos] = Float32(beta[token * beta_row_stride + head.to(Int64) * beta_head_stride])
+                        betas[pos] = Float32(
+                            beta[
+                                token * beta_row_stride
+                                + head.to(Int64) * beta_head_stride
+                            ]
+                        )
                 a = cute.math.exp(Float32(a_log[head]), fastmath=False)
                 for step in cutlass.range_constexpr((self.window + warps - 1) // warps):
                     pos = warp + step * warps
                     if pos < count:
-                        kg_base = source * kg_stride + (head.to(Int64) * self.window + Int64(pos)) * 256
+                        kg_base = (
+                            source * kg_stride
+                            + (head.to(Int64) * self.window + Int64(pos)) * 256
+                        )
                         qsum = Float32(0.0)
                         ksum = Float32(0.0)
                         for j in cutlass.range_constexpr(4):
@@ -371,24 +448,47 @@ class _FusedVerify:
                             ksum += kv * kv
                             if tile == 0:
                                 kg[kg_base + k.to(Int64)] = BFloat16(kv)
-                        qinv = cute.math.rsqrt(warp_reduce(qsum, _add) + 1.0e-6, fastmath=False)
-                        kinv = cute.math.rsqrt(warp_reduce(ksum, _add) + 1.0e-6, fastmath=False)
+                        qinv = cute.math.rsqrt(
+                            warp_reduce(qsum, _add) + 1.0e-6, fastmath=False
+                        )
+                        kinv = cute.math.rsqrt(
+                            warp_reduce(ksum, _add) + 1.0e-6, fastmath=False
+                        )
                         for j in cutlass.range_constexpr(4):
                             k = lane + j * 32
-                            vectors[0, pos, k] = Float32(vectors[0, pos, k]) * qinv * scale
+                            vectors[0, pos, k] = (
+                                Float32(vectors[0, pos, k]) * qinv * scale
+                            )
                             vectors[1, pos, k] = Float32(vectors[1, pos, k]) * kinv
-                for step in cutlass.range_constexpr((self.window * 128 + threads - 1) // threads):
+                for step in cutlass.range_constexpr(
+                    (self.window * 128 + threads - 1) // threads
+                ):
                     index = tid + step * threads
                     pos = index // 128
                     column = index % 128
                     if index < self.window * 128 and pos < count:
                         token = Int64(start + pos)
-                        raw = Float32(gate[token * self.strides[1] + head.to(Int64) * self.strides[2] + column.to(Int64)])
-                        biased = raw + Float32(bias[head.to(Int64) * self.strides[5] + column.to(Int64)])
-                        activated = lower / (1.0 + cute.math.exp(-a * biased, fastmath=False))
-                        vectors[2, pos, column] = cute.math.exp(activated, fastmath=False)
+                        raw = Float32(
+                            gate[
+                                token * self.strides[1]
+                                + head.to(Int64) * self.strides[2]
+                                + column.to(Int64)
+                            ]
+                        )
+                        biased = raw + Float32(
+                            bias[head.to(Int64) * self.strides[5] + column.to(Int64)]
+                        )
+                        activated = lower / (
+                            1.0 + cute.math.exp(-a * biased, fastmath=False)
+                        )
+                        vectors[2, pos, column] = cute.math.exp(
+                            activated, fastmath=False
+                        )
                         if tile == 0:
-                            kg_base = source * kg_stride + (head.to(Int64) * self.window + Int64(pos)) * 256
+                            kg_base = (
+                                source * kg_stride
+                                + (head.to(Int64) * self.window + Int64(pos)) * 256
+                            )
                             kg[kg_base + 128 + column.to(Int64)] = BFloat16(raw)
                 cute.arch.sync_threads()
                 for pos in cutlass.range_constexpr(self.window):
@@ -399,7 +499,9 @@ class _FusedVerify:
                             s[j] = s[j] * Float32(vectors[2, pos, k])
                             dot += s[j] * Float32(vectors[1, pos, k])
                         dot = warp_reduce(dot, _add, 8)
-                        delta = (values[pos] - dot) / (1.0 + cute.math.exp(-betas[pos], fastmath=False))
+                        delta = (values[pos] - dot) / (
+                            1.0 + cute.math.exp(-betas[pos], fastmath=False)
+                        )
                         decoded = Float32(0.0)
                         for j in cutlass.range_constexpr(16):
                             k = key_lane + j * 8
@@ -409,7 +511,11 @@ class _FusedVerify:
                         if key_lane == 0:
                             rounded = Float32(BFloat16(decoded))
                             for peer in cutlass.range_constexpr(self.tiles):
-                                _st_cluster(decoded_all.iterator + (pos * 128 + row), Int32(peer), rounded)
+                                _st_cluster(
+                                    decoded_all.iterator + (pos * 128 + row),
+                                    Int32(peer),
+                                    rounded,
+                                )
                             record = (
                                 source * correction_stride
                                 + (head.to(Int64) * self.window + Int64(pos)) * 128
@@ -422,7 +528,11 @@ class _FusedVerify:
             norm_value = Float32(norm_weight[row])
             if norm_pos < count:
                 gate_input = Float32(
-                    z[Int64(start + norm_pos) * z_row_stride + head.to(Int64) * z_head_stride + row.to(Int64)]
+                    z[
+                        Int64(start + norm_pos) * z_row_stride
+                        + head.to(Int64) * z_head_stride
+                        + row.to(Int64)
+                    ]
                 )
             cute.arch.cluster_arrive()
             cute.arch.cluster_wait()
@@ -437,31 +547,52 @@ class _FusedVerify:
                         value = Float32(decoded_all[pos, w * 32 + lane])
                         square = _mul(value, value)
                         for level in cutlass.range_constexpr(5):
-                            square = _addrn(square, cute.arch.shuffle_sync_bfly(square, offset=16 >> level))
+                            square = _addrn(
+                                square,
+                                cute.arch.shuffle_sync_bfly(square, offset=16 >> level),
+                            )
                         sums[w] = square
                     total = _addrn(_addrn(sums[0], sums[2]), _addrn(sums[1], sums[3]))
                     if lane == 0:
-                        inverse_rms[pos] = _rsqrt_ftz(_addrn(eps, _div_full(total, Float32(128.0))))
+                        inverse_rms[pos] = _rsqrt_ftz(
+                            _addrn(eps, _div_full(total, Float32(128.0)))
+                        )
             cute.arch.sync_threads()
             if norm_pos < count:
                 token = Int64(start + norm_pos)
-                normalized = _mul(Float32(inverse_rms[norm_pos]), Float32(decoded_all[norm_pos, row]))
+                normalized = _mul(
+                    Float32(inverse_rms[norm_pos]), Float32(decoded_all[norm_pos, row])
+                )
                 weighted = _mul(normalized, norm_value)
-                off = token * self.strides[9] + head.to(Int64) * self.strides[10] + row.to(Int64)
+                off = (
+                    token * self.strides[9]
+                    + head.to(Int64) * self.strides[10]
+                    + row.to(Int64)
+                )
                 output[off] = BFloat16(_mul(weighted, _sigmoid_triton(gate_input)))
 
 
 class FusedVerifyBinding:
-    """A prepared one-launch verify: the gdn recovery binding plus the speculative conv binding."""
+    """A prepared one-launch verify with static or caller-owned dynamic operands."""
 
-    def __init__(self, binding, conv, launch, args):
+    def __init__(self, binding, conv, launch, args, build_args):
         self.binding, self.conv, self._launch, self._args = binding, conv, launch, args
+        self._build_args = build_args
 
     def run(self, *, scale, lower_bound, eps):
+        if self._args is None:
+            raise ValueError(
+                "this fused verify retains no preparation examples; use run_dynamic"
+            )
         self._launch(*self._args, scale, lower_bound, eps, current_cuda_stream())
 
+    def run_dynamic(self, binding, conv, *, scale, lower_bound, eps):
+        """Launch with fresh caller-owned tensors; no preparation pointers are retained."""
+        args = self._build_args(binding, conv)
+        self._launch(*args, scale, lower_bound, eps, current_cuda_stream())
 
-def prepare(binding, conv):
+
+def prepare(binding, conv, *, retain_examples=True):
     """Compile (cached by geometry) and pre-build the launch arguments of the fused verify."""
     from b12x.preparation.types import require_prepared
 
@@ -473,24 +604,57 @@ def prepare(binding, conv):
     if not query.recover_speculative_state:
         raise ValueError("fused KDA verify requires recover_speculative_state")
     if block_v not in (16, 32) or query.value_heads != query.key_heads:
-        raise ValueError("fused KDA verify requires recurrent_block_v 16 or 32 and KDA heads")
-    if cq.mode != "decode" or cq.max_speculative_tokens < 1 or cq.kernel_size != 4 or cq.dilation != 1:
-        raise ValueError("fused KDA verify requires speculative decode convolution, kernel 4, dilation 1")
-    if cq.channels != 3 * query.value_heads * 128 or not cq.round_before_silu or conv.conv_bias is not None:
-        raise ValueError("fused KDA verify requires 3 x heads x 128 channels, BF16 rounding, no bias")
+        raise ValueError(
+            "fused KDA verify requires recurrent_block_v 16 or 32 and KDA heads"
+        )
+    if (
+        cq.mode != "decode"
+        or cq.max_speculative_tokens < 1
+        or cq.kernel_size != 4
+        or cq.dilation != 1
+    ):
+        raise ValueError(
+            "fused KDA verify requires speculative decode convolution, kernel 4, dilation 1"
+        )
+    if (
+        cq.channels != 3 * query.value_heads * 128
+        or not cq.round_before_silu
+        or conv.conv_bias is not None
+    ):
+        raise ValueError(
+            "fused KDA verify requires 3 x heads x 128 channels, BF16 rounding, no bias"
+        )
     if query.state_index_columns > 8:
-        raise ValueError("fused KDA verify requires a verify window of at most 8 tokens")
+        raise ValueError(
+            "fused KDA verify requires a verify window of at most 8 tokens"
+        )
     if cq.max_speculative_tokens + 1 < query.state_index_columns:
-        raise ValueError("fused KDA verify requires a conv window covering the verify window")
+        raise ValueError(
+            "fused KDA verify requires a conv window covering the verify window"
+        )
     if binding.mixed_qkv.data_ptr() != conv.out.data_ptr():
-        raise ValueError("fused KDA verify requires the conv output to be the recurrence input")
-    if conv.x.stride(1) != 1 or binding.z.stride(2) != 1 or binding.output.stride(2) != 1:
+        raise ValueError(
+            "fused KDA verify requires the conv output to be the recurrence input"
+        )
+    if (
+        conv.x.stride(1) != 1
+        or binding.z.stride(2) != 1
+        or binding.output.stride(2) != 1
+    ):
         raise ValueError("fused KDA verify requires unit inner strides")
-    if conv.conv_weight.stride() != (cq.kernel_size, 1) or binding.norm_weight.stride() != (1,):
+    if conv.conv_weight.stride() != (
+        cq.kernel_size,
+        1,
+    ) or binding.norm_weight.stride() != (1,):
         raise ValueError("fused KDA verify requires contiguous conv and norm weights")
     capacity = binding.state_indices.shape[0]
-    if cq.max_seqs != capacity or binding.num_accepted_tokens.data_ptr() != conv.num_accepted_tokens.data_ptr():
-        raise ValueError("fused KDA verify requires one request capacity and shared accepted counts")
+    if (
+        cq.max_seqs != capacity
+        or binding.num_accepted_tokens.data_ptr() != conv.num_accepted_tokens.data_ptr()
+    ):
+        raise ValueError(
+            "fused KDA verify requires one request capacity and shared accepted counts"
+        )
     conv_strides = (conv.conv_state.stride(1), conv.conv_state.stride(2))
     weight_type = _numeric_type(conv.conv_weight.dtype)
     norm_type = _numeric_type(binding.norm_weight.dtype)
@@ -498,15 +662,42 @@ def prepare(binding, conv):
     bias_type = _numeric_type(binding.dt_bias.dtype)
     index_type = _numeric_type(binding.state_indices.dtype)
     vtypes = (
-        BFloat16, weight_type, Int64, Uint8, Int32, BFloat16,
-        BFloat16, BFloat16, a_type, bias_type, Float32, Int32, index_type, Int32, Int32,
-        BFloat16, BFloat16, norm_type, Float32, BFloat16,
+        BFloat16,
+        weight_type,
+        Int64,
+        Uint8,
+        Int32,
+        BFloat16,
+        BFloat16,
+        BFloat16,
+        a_type,
+        bias_type,
+        Float32,
+        Int32,
+        index_type,
+        Int32,
+        Int32,
+        BFloat16,
+        BFloat16,
+        norm_type,
+        Float32,
+        BFloat16,
     )
     strides = (*query.kda_strides[:6], 0, *query.kda_strides[7:])
     key = (
-        query.value_heads, query.state_index_columns, block_v, query.null_state_index,
-        cq.max_speculative_tokens, cq.input_row_stride, conv_strides, str(conv.conv_weight.dtype),
-        str(binding.norm_weight.dtype), query.a_log_dtype, query.dt_bias_dtype, query.state_indices_dtype, strides,
+        query.value_heads,
+        query.state_index_columns,
+        block_v,
+        query.null_state_index,
+        cq.max_speculative_tokens,
+        cq.input_row_stride,
+        conv_strides,
+        str(conv.conv_weight.dtype),
+        str(binding.norm_weight.dtype),
+        query.a_log_dtype,
+        query.dt_bias_dtype,
+        query.state_indices_dtype,
+        strides,
     )
     kernel = _FusedVerify(query, cq, block_v, conv_strides, weight_type, norm_type)
     launch = b12x_compile(
@@ -519,40 +710,67 @@ def prepare(binding, conv):
         Float32(-5.0),
         Float32(1e-6),
         current_cuda_stream(),
-        compile_spec=KernelCompileSpec.from_key("sequence.gdn_decode.kda_fused_verify", 1, key),
+        compile_spec=KernelCompileSpec.from_key(
+            "sequence.gdn_decode.kda_fused_verify", 1, key
+        ),
     )
-    tensors = (
-        conv.x, conv.conv_weight, conv.state_slot_ids, conv.state_is_fresh.view(torch.uint8),
-        conv.num_accepted_tokens, conv.conv_state,
-        binding.raw_g, binding.raw_beta, binding.A_log, binding.dt_bias, binding.recurrent_state,
-        binding.query_start_loc, binding.state_indices, binding.num_seqs, binding.num_tokens,
-        binding.output, binding.z, binding.norm_weight, binding.correction_cache, binding.kg_cache,
+
+    def build_args(binding, conv):
+        tensors = (
+            conv.x,
+            conv.conv_weight,
+            conv.state_slot_ids,
+            conv.state_is_fresh.view(torch.uint8),
+            conv.num_accepted_tokens,
+            conv.conv_state,
+            binding.raw_g,
+            binding.raw_beta,
+            binding.A_log,
+            binding.dt_bias,
+            binding.recurrent_state,
+            binding.query_start_loc,
+            binding.state_indices,
+            binding.num_seqs,
+            binding.num_tokens,
+            binding.output,
+            binding.z,
+            binding.norm_weight,
+            binding.correction_cache,
+            binding.kg_cache,
+        )
+        return (
+            *(_pointer(t, ty) for t, ty in zip(tensors, vtypes, strict=True)),
+            conv.conv_state.stride(0),
+            binding.state_indices.stride(0),
+            binding.recurrent_state.stride(0),
+            binding.correction_cache.stride(0),
+            binding.kg_cache.stride(0),
+            binding.raw_beta.stride(0),
+            binding.raw_beta.stride(1),
+            binding.z.stride(0),
+            binding.z.stride(1),
+            binding.state_indices.shape[0],
+            binding.output.shape[0],
+        )
+
+    args = build_args(binding, conv) if retain_examples else None
+    return FusedVerifyBinding(
+        binding if retain_examples else None,
+        conv if retain_examples else None,
+        launch,
+        args,
+        build_args,
     )
-    args = (
-        *(_pointer(t, ty) for t, ty in zip(tensors, vtypes, strict=True)),
-        conv.conv_state.stride(0),
-        binding.state_indices.stride(0),
-        binding.recurrent_state.stride(0),
-        binding.correction_cache.stride(0),
-        binding.kg_cache.stride(0),
-        binding.raw_beta.stride(0),
-        binding.raw_beta.stride(1),
-        binding.z.stride(0),
-        binding.z.stride(1),
-        capacity,
-        binding.output.shape[0],
-    )
-    return FusedVerifyBinding(binding, conv, launch, args)
 
 
-def prepare_kda_fused_verify(binding, conv):
+def prepare_kda_fused_verify(binding, conv, *, retain_examples=True):
     """Public: prepare the one-launch verify for a KDA recovery binding and its speculative conv binding.
 
     Call at preparation/finalize time (it may compile); ``run_kda_fused_verify`` is graph-capturable.
     Replaces ``short_conv.run(conv)`` followed by ``run_kda(binding)``; ``conv.out`` (the
     recurrence input) is not written.
     """
-    return prepare(binding, conv)
+    return prepare(binding, conv, retain_examples=retain_examples)
 
 
 def run_kda_fused_verify(fused, *, lower_bound=-5.0, eps=1e-6, scale=None):
@@ -560,7 +778,15 @@ def run_kda_fused_verify(fused, *, lower_bound=-5.0, eps=1e-6, scale=None):
 
     lower_bound, eps = float(lower_bound), float(eps)
     scale = float(128**-0.5 if scale is None else scale)
-    if not (math.isfinite(lower_bound) and lower_bound < 0 and math.isfinite(eps) and eps > 0 and scale > 0):
-        raise ValueError("fused KDA verify requires a negative lower bound and positive eps/scale")
+    if not (
+        math.isfinite(lower_bound)
+        and lower_bound < 0
+        and math.isfinite(eps)
+        and eps > 0
+        and scale > 0
+    ):
+        raise ValueError(
+            "fused KDA verify requires a negative lower bound and positive eps/scale"
+        )
     fused.run(scale=scale, lower_bound=lower_bound, eps=eps)
     return fused.binding.output
