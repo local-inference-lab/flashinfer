@@ -2151,6 +2151,47 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         return row_state
 
     @cute.jit
+    def add_relative_bias(
+        self,
+        basic_params: SimpleNamespace,
+        s_regs: cutlass.Array,
+        kv_seq_idx: cutlass.Int32,
+    ) -> None:
+        """Add ``bias[row, head, row position - key position]`` to the scores.
+
+        ``s_regs`` holds unscaled Q.K products, so the bias is divided by the
+        softmax scale that later turns them into logits. Keys at a negative
+        distance or at ``extent`` and beyond get no bias.
+        """
+        relative_bias = basic_params.relative_bias
+        extent = cutlass.Int32(relative_bias.shape[2])
+        for row_half in cutlass.range_constexpr(2):
+            q_row_in_cta = (
+                basic_params.q_warp_row0 + basic_params.lane_div4 + row_half * 8
+            )
+            q_token = basic_params.q_seq_idx + self.q_row_token(q_row_in_cta)
+            if q_token < basic_params.seqlen_q:
+                q_position = q_token + basic_params.causal_q_offset
+                bias_row = basic_params.q_token_base + q_token
+                bias_head = basic_params.q_head_idx + self.q_row_head_offset(
+                    q_row_in_cta, cutlass.Int32(1)
+                )
+                for k_frag in cutlass.range_constexpr(self.qk_k_frags):
+                    for col in cutlass.range_constexpr(2):
+                        distance = q_position - (
+                            kv_seq_idx + k_frag * 8 + 2 * basic_params.lane_mod4 + col
+                        )
+                        if distance >= 0 and distance < extent:
+                            s_idx = k_frag * 4 + row_half * 2 + col
+                            s_regs[s_idx] = (
+                                s_regs[s_idx]
+                                + cutlass.Float32(
+                                    relative_bias[bias_row, bias_head, distance]
+                                )
+                                * basic_params.relative_bias_scale
+                            )
+
+    @cute.jit
     def compute_one_kv_tile_direct_state(
         self,
         basic_params: SimpleNamespace,
@@ -2163,6 +2204,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         uses_kv_ring: cutlass.Constexpr[bool],
         is_masked_frontier_tile: cutlass.Constexpr[bool],
         uses_softmax_init_path: cutlass.Constexpr[bool],
+        adds_relative_bias: cutlass.Constexpr[bool] = False,
     ) -> None:
         """One direct-row-state QK/skip/softmax/PV iteration."""
         if cutlass.const_expr(uses_kv_ring):
@@ -2209,6 +2251,8 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             )
 
         kv_seq_idx = kv_tile_idx * self.kv_tile
+        if cutlass.const_expr(adds_relative_bias):
+            self.add_relative_bias(basic_params, s_regs, kv_seq_idx)
         valid_rows = cute.math.min(self.kv_tile, basic_params.seqlen_k - kv_seq_idx)
         skip_softmax = cutlass.Boolean(False)
         if cutlass.const_expr(enable_skip_softmax and not uses_softmax_init_path):
@@ -2298,6 +2342,8 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         cu_seqlens_k: cute.Tensor | None = None,
         kv_tile_ranges: cute.Tensor | None = None,
         output_gate: cute.Tensor | None = None,
+        relative_bias: cute.Tensor | None = None,
+        row_sink: cute.Tensor | None = None,
     ) -> None:
         """SM120 FMHA prefill FP8 kernel.
 
@@ -2317,7 +2363,29 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         :param cu_seqlens_q: Optional cumulative offsets for packed Q/O.
         :param block_tables: Shared K/V page indices with shape ``[B,max_pages]``.
         :param cu_seqlens_k: Optional cumulative offsets for packed K/V.
+        :param relative_bias: Optional BF16 ``[total_q, Hq, extent]`` logit bias
+            by distance: the key ``d`` positions before a query row gets
+            ``bias[row, head, d]`` for ``0 <= d < extent``.
+        :param row_sink: Optional float32 ``[total_q, Hq]`` attention sink:
+            one more logit per row and head with a zero value.
         """
+        if cutlass.const_expr(relative_bias is not None or row_sink is not None):
+            if cutlass.const_expr(
+                self.head_tile == 256 and self.q_tile == 128 and self.kv_tile == 128
+            ):
+                raise NotImplementedError(
+                    "relative_bias and row_sink are not implemented for the "
+                    "distributed row state of head_tile 256"
+                )
+            if cutlass.const_expr(
+                skip_softmax_threshold is not None
+                or kv_tile_ranges is not None
+                or lse is not None
+            ):
+                raise NotImplementedError(
+                    "relative_bias and row_sink exclude skip-softmax, K/V tile "
+                    "ranges and the LSE output"
+                )
         tidx, _, _ = cute.arch.thread_idx()
         block_x, block_y, block_z = cute.arch.block_idx()
         if cutlass.const_expr(self.balanced_scheduler):
@@ -2738,6 +2806,12 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                 causal_q_offset=causal_q_offset,
                 q_seq_stride=q_seq_stride,
                 q_l2_cache_hint=q_l2_cache_hint,
+                q_token_base=q_token_base,
+                q_head_idx=q_head_idx,
+                relative_bias=relative_bias,
+                # Scores are scaled by softmax_scale * log2(e) after the bias.
+                relative_bias_scale=cutlass.Float32(1.4426950408889634)
+                / softmax_scale_log2,
                 # Compute-warp row and lane ownership.
                 q_warp_row0=q_warp_row0,
                 lane=lane,
@@ -2824,6 +2898,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                             uses_kv_ring=True,
                             is_masked_frontier_tile=True,
                             uses_softmax_init_path=(step == 0),
+                            adds_relative_bias=relative_bias is not None,
                         )
                     else:
                         self.compute_one_kv_tile_direct_state(
@@ -2837,6 +2912,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                             uses_kv_ring=False,
                             is_masked_frontier_tile=True,
                             uses_softmax_init_path=(step == 0),
+                            adds_relative_bias=relative_bias is not None,
                         )
                 kv_tile_idx -= 1
                 if cutlass.const_expr(uses_unified_kv_ring):
@@ -2844,6 +2920,40 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                         pipeline_k_stage = cutlass.Int32(2)
                     else:
                         pipeline_k_stage -= 1
+
+            # Biased tiles: unmasked tiles that still hold a key within the
+            # bias extent of the tile's first row. Every later tile is at or
+            # beyond the extent from all rows and takes the plain loop below.
+            if cutlass.const_expr(relative_bias is not None):
+                first_biased_key = (
+                    q_seq_idx
+                    + causal_q_offset
+                    - cutlass.Int32(relative_bias.shape[2])
+                    + 1
+                )
+                while (
+                    kv_tile_idx >= kv_begin_tile
+                    and (kv_tile_idx + 1) * self.kv_tile > first_biased_key
+                ):
+                    self.compute_one_kv_tile_direct_state(
+                        basic_params,
+                        mma_params,
+                        softmax_params,
+                        q_regs,
+                        num_kv_tiles,
+                        kv_tile_idx,
+                        pipeline_k_stage,
+                        uses_kv_ring=uses_unified_kv_ring,
+                        is_masked_frontier_tile=False,
+                        uses_softmax_init_path=False,
+                        adds_relative_bias=True,
+                    )
+                    kv_tile_idx -= 1
+                    if cutlass.const_expr(uses_unified_kv_ring):
+                        if pipeline_k_stage == 0:
+                            pipeline_k_stage = cutlass.Int32(2)
+                        else:
+                            pipeline_k_stage -= 1
 
             # Phase 2: remaining tiles outside the explicit mask frontier.
             while kv_tile_idx >= kv_begin_tile:
@@ -2932,6 +3042,38 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                 row_max_1 = row_max[1]
                 row_sum_0 = row_sum[0]
                 row_sum_1 = row_sum[1]
+
+            if cutlass.const_expr(row_sink is not None):
+                # The sink joins the normalizer as one more probability with a
+                # zero value. row_sum is relative to row_max and carries the P
+                # pre-scale; a row without keys has row_max -inf and stays zero.
+                for row_half in cutlass.range_constexpr(2):
+                    sink_row_in_cta = q_warp_row0 + lane_div4 + row_half * 8
+                    sink_q_seq_idx = q_seq_idx + self.q_row_token(sink_row_in_cta)
+                    sink_term = cutlass.Float32(0.0)
+                    if sink_q_seq_idx < seqlen_q:
+                        sink_row_max = row_max_0
+                        if cutlass.const_expr(row_half == 1):
+                            sink_row_max = row_max_1
+                        sink_term = cute.math.exp2(
+                            cutlass.Float32(
+                                row_sink[
+                                    q_token_base + sink_q_seq_idx,
+                                    q_head_idx
+                                    + self.q_row_head_offset(
+                                        sink_row_in_cta, cutlass.Int32(1)
+                                    ),
+                                ]
+                            )
+                            * 1.4426950408889634
+                            - sink_row_max * softmax_scale_log2
+                            + self.P_FP8_PRESCALE_LOG2,
+                            fastmath=True,
+                        )
+                    if cutlass.const_expr(row_half == 0):
+                        row_sum_0 = row_sum_0 + sink_term
+                    else:
+                        row_sum_1 = row_sum_1 + sink_term
 
             # The four lanes in each lane quad hold identical final online
             # softmax state for one Q row. Have one leader write each of the
@@ -3183,6 +3325,52 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         output_gate: cute.Tensor | None = None,
         kv_tile_ranges: cute.Tensor | None = None,
     ) -> None:
+        """Launch without a relative bias or row sink; see :meth:`_launch_extended`."""
+        self._launch_extended(
+            q,
+            k,
+            v,
+            o,
+            lse,
+            softmax_scale_log2,
+            output_scale,
+            skip_softmax_threshold,
+            stream,
+            seqlens_kv,
+            cu_seqlens_q,
+            block_tables,
+            cu_seqlens_k,
+            max_seqlen_q,
+            use_pdl,
+            output_gate,
+            kv_tile_ranges,
+            None,
+            None,
+        )
+
+    @cute.jit
+    def _launch_extended(
+        self,
+        q: cute.Tensor,
+        k: cute.Tensor,
+        v: cute.Tensor,
+        o: cute.Tensor,
+        lse: cute.Tensor | None,
+        softmax_scale_log2: cutlass.Float32,
+        output_scale: cutlass.Float32,
+        skip_softmax_threshold: cute.Tensor | None,
+        stream: cuda_driver.CUstream,
+        seqlens_kv: cute.Tensor | None = None,
+        cu_seqlens_q: cute.Tensor | None = None,
+        block_tables: cute.Tensor | None = None,
+        cu_seqlens_k: cute.Tensor | None = None,
+        max_seqlen_q: cutlass.Int32 | None = None,
+        use_pdl: bool = False,
+        output_gate: cute.Tensor | None = None,
+        kv_tile_ranges: cute.Tensor | None = None,
+        relative_bias: cute.Tensor | None = None,
+        row_sink: cute.Tensor | None = None,
+    ) -> None:
         """Launch the SM120 PRIM FMHA FP8 kernel.
 
         :param q: Packed query ``(total_q, Hq, D)``.
@@ -3322,6 +3510,8 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             cu_seqlens_k,
             kv_tile_ranges,
             output_gate,
+            relative_bias,
+            row_sink,
         ).launch(
             grid=grid,
             block=(self.threads_per_cta, 1, 1),

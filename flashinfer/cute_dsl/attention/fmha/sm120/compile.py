@@ -162,6 +162,8 @@ def _compile_sm120_fmha_fp8_paged_kernel(
     gqa_pack_size: int = 1,
     kv_layout: str = "HND",
     with_output_gate: bool = False,
+    with_relative_bias: bool = False,
+    with_row_sink: bool = False,
 ):
     """Compile one sequence-length-independent packed-Q paged kernel."""
     _validate_balanced_scheduler(is_causal, balanced_scheduler)
@@ -215,6 +217,26 @@ def _compile_sm120_fmha_fp8_paged_kernel(
             assumed_align=16,
         )
         if with_output_gate
+        else None
+    )
+    fake_relative_bias = (
+        cute.runtime.make_fake_tensor(
+            cutlass.BFloat16,
+            (cute.sym_int(), num_qo_heads, cute.sym_int()),
+            stride=(cute.sym_int(), cute.sym_int(), 1),
+            assumed_align=2,
+        )
+        if with_relative_bias
+        else None
+    )
+    fake_row_sink = (
+        cute.runtime.make_fake_tensor(
+            cutlass.Float32,
+            (cute.sym_int(), num_qo_heads),
+            stride=(cute.sym_int(), 1),
+            assumed_align=4,
+        )
+        if with_row_sink
         else None
     )
     fake_lse = (
@@ -281,6 +303,31 @@ def _compile_sm120_fmha_fp8_paged_kernel(
 
     stream_fake = make_fake_stream(use_tvm_ffi_env_stream=True)
 
+    if with_relative_bias or with_row_sink:
+        # The bias and sink follow every other optional operand of ``_launch``.
+        return cute.compile(
+            fmha._launch_extended,
+            fake_q,
+            fake_k,
+            fake_v,
+            fake_o,
+            fake_lse,
+            cutlass.Float32(1.0),
+            cutlass.Float32(1.0),
+            fake_skip_softmax_threshold,
+            stream_fake,
+            fake_seqlens_kv,
+            fake_cu_seqlens_q,
+            fake_block_tables,
+            None,
+            cutlass.Int32(1),
+            True,
+            fake_output_gate,
+            fake_kv_tile_ranges,
+            fake_relative_bias,
+            fake_row_sink,
+            options="--enable-tvm-ffi",
+        )
     return cute.compile(
         fmha._launch if with_output_gate else fmha,
         fake_q,
@@ -389,6 +436,8 @@ def compile_sm120_fmha_fp8_paged_kernel(
     gqa_pack_size: int = 1,
     kv_layout: str = "HND",
     with_output_gate: bool = False,
+    with_relative_bias: bool = False,
+    with_row_sink: bool = False,
 ):
     _validate_balanced_scheduler(is_causal, balanced_scheduler)
 
@@ -406,6 +455,8 @@ def compile_sm120_fmha_fp8_paged_kernel(
         f"_skip{int(enable_skip_softmax)}_gate{int(with_output_gate)}"
         + ("_kvsplit" if with_kv_tile_ranges else "")
         + (f"_gqa{gqa_pack_size}" if gqa_pack_size > 1 else "")
+        + ("_relbias" if with_relative_bias else "")
+        + ("_rowsink" if with_row_sink else "")
     )
     return build_and_load_cute_dsl_kernel(
         "sm120_prims_fmha_fp8",
@@ -428,6 +479,8 @@ def compile_sm120_fmha_fp8_paged_kernel(
             gqa_pack_size,
             kv_layout,
             with_output_gate,
+            with_relative_bias,
+            with_row_sink,
         ),
         extra_key_files=_cache_key_files(),
     )
