@@ -199,6 +199,49 @@ def ptx_mma_m16n8k32_f32(
 
 
 @cute.jit
+def ptx_mma_m16n8k16_bf16_f32(
+    a0: cutlass.Int32,
+    a1: cutlass.Int32,
+    a2: cutlass.Int32,
+    a3: cutlass.Int32,
+    b0: cutlass.Int32,
+    b1: cutlass.Int32,
+) -> tuple[cutlass.Float32, cutlass.Float32, cutlass.Float32, cutlass.Float32]:
+    """``mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32`` from a zero accumulator."""
+    zero = cutlass.Float32(0.0)
+    return cute.arch.inline_ptx(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32"
+        " {$0,$1,$2,$3}, {$4,$5,$6,$7}, {$8,$9}, {$10,$11,$12,$13};",
+        write_only_types=[
+            cutlass.Float32,
+            cutlass.Float32,
+            cutlass.Float32,
+            cutlass.Float32,
+        ],
+        read_only_args=[a0, a1, a2, a3, b0, b1, zero, zero, zero, zero],
+    )
+
+
+@cute.jit
+def round_f32_to_bf16(value: cutlass.Float32) -> cutlass.Float32:
+    """Round to the nearest BF16 value and return it as FP32."""
+    return cute.arch.inline_ptx(
+        (
+            "{\n"
+            "  .reg .b16 h;\n"
+            "  .reg .b32 w;\n"
+            "  cvt.rn.bf16.f32 h, $1;\n"
+            "  cvt.u32.u16 w, h;\n"
+            "  shl.b32 w, w, 16;\n"
+            "  mov.b32 $0, w;\n"
+            "}"
+        ),
+        write_only_types=[cutlass.Float32],
+        read_only_args=[value],
+    )
+
+
+@cute.jit
 def get_swizzled_col(
     row: cutlass.Int32,
     col: cutlass.Int32,
@@ -2241,6 +2284,123 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                             )
 
     @cute.jit
+    def add_factored_relative_bias(
+        self,
+        basic_params: SimpleNamespace,
+        s_regs: cutlass.Array,
+        kv_seq_idx: cutlass.Int32,
+    ) -> None:
+        """Add ``round_bf16(factor[row, head, :] @ projection[d, :])`` to the scores.
+
+        One ``m16n8k16`` MMA gives the bias of the warp's 16 rows at 8
+        consecutive distances. A row's distance to a key grows by one per
+        row, so the score at (row ``i``, key ``k``) needs the MMA column
+        ``(i - k) mod 8``: it sits in the same row's lane quad, in the lane
+        that owns that column, and moves with one shuffle. Eighteen MMAs cover
+        the 143 distances between the tile's 16 rows and 128 keys. Each result
+        is rounded to BF16, as a materialized BF16 bias would be.
+        """
+        projection = basic_params.relative_projection
+        extent = cutlass.Int32(projection.shape[0])
+        group = basic_params.lane_div4
+        quad = basic_params.lane_mod4
+        # Distance from the warp's first row to the tile's first key.
+        delta = (
+            basic_params.q_seq_idx
+            + basic_params.q_warp_row0
+            + basic_params.causal_q_offset
+            - kv_seq_idx
+        )
+        # For key column c of this lane: the MMA column that holds its
+        # distance, the lane that owns that column, and whether the distance
+        # falls in the previous MMA.
+        shift0 = group - 2 * quad
+        shift1 = shift0 - 1
+        source0 = group * 4 + ((shift0 & 7) >> 1)
+        source1 = group * 4 + ((shift1 & 7) >> 1)
+        previous0 = shift0 < 0
+        previous1 = shift1 < 0
+        odd_group = (group & 1) != 0
+        projection_ptr = projection.iterator.raw_ptr()
+        a_regs = basic_params.relative_factor_regs
+        scale = basic_params.relative_bias_scale
+        for step in cutlass.range_constexpr(18):
+            mma_index = step - 16
+            first_distance = delta + 8 * mma_index
+            # B column n of the MMA is this lane group's distance.
+            b_distance = first_distance + group
+            if b_distance < 0:
+                b_distance = cutlass.Int32(0)
+            if b_distance >= extent:
+                b_distance = extent - 1
+            b_low = (projection_ptr + b_distance * 16 + 2 * quad).load(
+                count=2, alignment=4
+            )
+            b_high = (projection_ptr + b_distance * 16 + 2 * quad + 8).load(
+                count=2, alignment=4
+            )
+            d0, d1, d2, d3 = ptx_mma_m16n8k16_bf16_f32(
+                a_regs[0],
+                a_regs[1],
+                a_regs[2],
+                a_regs[3],
+                pack_to_i32((b_low[0], b_low[1]), cutlass.BFloat16),
+                pack_to_i32((b_high[0], b_high[1]), cutlass.BFloat16),
+            )
+            # This lane's result columns are distances 2 * quad and + 1.
+            even_distance = first_distance + 2 * quad
+            # Distances outside [0, extent) carry no bias.
+            even_keep = cutlass.Float32(0.0)
+            odd_keep = cutlass.Float32(0.0)
+            if even_distance >= 0 and even_distance < extent:
+                even_keep = cutlass.Float32(1.0)
+            if even_distance + 1 >= 0 and even_distance + 1 < extent:
+                odd_keep = cutlass.Float32(1.0)
+            d0 = round_f32_to_bf16(d0) * even_keep
+            d1 = round_f32_to_bf16(d1) * odd_keep
+            d2 = round_f32_to_bf16(d2) * even_keep
+            d3 = round_f32_to_bf16(d3) * odd_keep
+            # Key column 0 reads the MMA column of the group's parity.
+            x00 = d0
+            x01 = d2
+            x10 = d1
+            x11 = d3
+            if odd_group:
+                x00 = d1
+                x01 = d3
+                x10 = d0
+                x11 = d2
+            for col in cutlass.range_constexpr(2):
+                previous = previous0 if col == 0 else previous1
+                source = source0 if col == 0 else source1
+                for row_half in cutlass.range_constexpr(2):
+                    if cutlass.const_expr(col == 0):
+                        staged = x00 if row_half == 0 else x01
+                    else:
+                        staged = x10 if row_half == 0 else x11
+                    value = prims.shfl_sync(
+                        thread_mask=0xFFFFFFFF,
+                        val=staged,
+                        offset=source,
+                        mask_and_clamp=0x1F,
+                        kind=prims.Shfl.IDX,
+                    )
+                    here = value
+                    before = cutlass.Float32(0.0)
+                    if previous:
+                        here = cutlass.Float32(0.0)
+                        before = value
+                    # MMA index = row_half - k_frag, or one less when the
+                    # column's distance wraps into the previous MMA.
+                    k_frag = row_half - mma_index
+                    if cutlass.const_expr(0 <= k_frag < self.qk_k_frags):
+                        s_idx = k_frag * 4 + row_half * 2 + col
+                        s_regs[s_idx] = s_regs[s_idx] + here * scale
+                    if cutlass.const_expr(0 <= k_frag - 1 < self.qk_k_frags):
+                        s_idx = (k_frag - 1) * 4 + row_half * 2 + col
+                        s_regs[s_idx] = s_regs[s_idx] + before * scale
+
+    @cute.jit
     def compute_one_kv_tile_direct_state(
         self,
         basic_params: SimpleNamespace,
@@ -2301,7 +2461,10 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
 
         kv_seq_idx = kv_tile_idx * self.kv_tile
         if cutlass.const_expr(adds_relative_bias):
-            self.add_relative_bias(basic_params, s_regs, kv_seq_idx)
+            if cutlass.const_expr(basic_params.relative_projection is not None):
+                self.add_factored_relative_bias(basic_params, s_regs, kv_seq_idx)
+            else:
+                self.add_relative_bias(basic_params, s_regs, kv_seq_idx)
         if cutlass.const_expr(self.window_left >= 0):
             self.mask_window(basic_params, s_regs, kv_seq_idx)
         valid_rows = cute.math.min(self.kv_tile, basic_params.seqlen_k - kv_seq_idx)
@@ -2395,6 +2558,8 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         output_gate: cute.Tensor | None = None,
         relative_bias: cute.Tensor | None = None,
         row_sink: cute.Tensor | None = None,
+        relative_factor: cute.Tensor | None = None,
+        relative_projection: cute.Tensor | None = None,
     ) -> None:
         """SM120 FMHA prefill FP8 kernel.
 
@@ -2419,8 +2584,32 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             ``bias[row, head, d]`` for ``0 <= d < extent``.
         :param row_sink: Optional float32 ``[total_q, Hq]`` attention sink:
             one more logit per row and head with a zero value.
+        :param relative_factor: Optional BF16 ``[total_q, Hq, 16]``. With
+            ``relative_projection``, BF16 ``[extent, 16]``, it stands for the
+            bias ``round_bf16(factor[row, head, :] @ projection[d, :])``,
+            which the kernel evaluates instead of reading a bias tensor.
         """
-        if cutlass.const_expr(relative_bias is not None or row_sink is not None):
+        has_factored_bias = cutlass.const_expr(relative_factor is not None)
+        if cutlass.const_expr(
+            (relative_factor is None) != (relative_projection is None)
+            or (has_factored_bias and relative_bias is not None)
+        ):
+            raise ValueError(
+                "relative_factor and relative_projection come together and "
+                "replace relative_bias"
+            )
+        if cutlass.const_expr(has_factored_bias and self.gqa_pack_size != 1):
+            raise NotImplementedError(
+                "the factored relative bias requires one query head per CTA"
+            )
+        if cutlass.const_expr(
+            has_factored_bias and (self.q_tile != 128 or self.kv_tile != 128)
+        ):
+            raise NotImplementedError(
+                "the factored relative bias requires 128-row Q and K/V tiles"
+            )
+        adds_bias = cutlass.const_expr(relative_bias is not None or has_factored_bias)
+        if cutlass.const_expr(adds_bias or row_sink is not None):
             if cutlass.const_expr(
                 self.head_tile == 256 and self.q_tile == 128 and self.kv_tile == 128
             ):
@@ -2858,6 +3047,26 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             for i in cutlass.range_constexpr(self.pv_d_frags * 4):
                 o_regs[i] = 0.0
 
+            # A fragment of the factored bias: this lane's two rows of the
+            # warp's 16 by 16 factor block, zero for rows past the request.
+            relative_factor_regs = cutlass.Array(cutlass.Int32, 4, alignment=16)
+            if cutlass.const_expr(has_factored_bias):
+                for row_half in cutlass.range_constexpr(2):
+                    factor_token = q_seq_idx + q_warp_row0 + lane_div4 + row_half * 8
+                    for k_half in cutlass.range_constexpr(2):
+                        packed = cutlass.Int32(0)
+                        if factor_token < seqlen_q:
+                            pair = (
+                                relative_factor.iterator.raw_ptr()
+                                + (q_token_base + factor_token)
+                                * relative_factor.stride[0]
+                                + q_head_idx * relative_factor.stride[1]
+                                + 2 * lane_mod4
+                                + 8 * k_half
+                            ).load(count=2, alignment=4)
+                            packed = pack_to_i32((pair[0], pair[1]), cutlass.BFloat16)
+                        relative_factor_regs[k_half * 2 + row_half] = packed
+
             basic_params = SimpleNamespace(
                 # Problem shape and logical Q coordinates.
                 seqlen_q=seqlen_q,
@@ -2872,6 +3081,8 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                 q_token_base=q_token_base,
                 q_head_idx=q_head_idx,
                 relative_bias=relative_bias,
+                relative_projection=relative_projection,
+                relative_factor_regs=relative_factor_regs,
                 # Scores are scaled by softmax_scale * log2(e) after the bias.
                 relative_bias_scale=cutlass.Float32(1.4426950408889634)
                 / softmax_scale_log2,
@@ -2961,7 +3172,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                             uses_kv_ring=True,
                             is_masked_frontier_tile=True,
                             uses_softmax_init_path=(step == 0),
-                            adds_relative_bias=relative_bias is not None,
+                            adds_relative_bias=adds_bias,
                         )
                     else:
                         self.compute_one_kv_tile_direct_state(
@@ -2975,7 +3186,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                             uses_kv_ring=False,
                             is_masked_frontier_tile=True,
                             uses_softmax_init_path=(step == 0),
-                            adds_relative_bias=relative_bias is not None,
+                            adds_relative_bias=adds_bias,
                         )
                 kv_tile_idx -= 1
                 if cutlass.const_expr(uses_unified_kv_ring):
@@ -2987,13 +3198,12 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             # Biased tiles: unmasked tiles that still hold a key within the
             # bias extent of the tile's first row. Every later tile is at or
             # beyond the extent from all rows and takes the plain loop below.
-            if cutlass.const_expr(relative_bias is not None):
-                first_biased_key = (
-                    q_seq_idx
-                    + causal_q_offset
-                    - cutlass.Int32(relative_bias.shape[2])
-                    + 1
-                )
+            if cutlass.const_expr(adds_bias):
+                if cutlass.const_expr(has_factored_bias):
+                    bias_extent = cutlass.Int32(relative_projection.shape[0])
+                else:
+                    bias_extent = cutlass.Int32(relative_bias.shape[2])
+                first_biased_key = q_seq_idx + causal_q_offset - bias_extent + 1
                 while (
                     kv_tile_idx >= kv_begin_tile
                     and (kv_tile_idx + 1) * self.kv_tile > first_biased_key
@@ -3409,6 +3619,8 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             kv_tile_ranges,
             None,
             None,
+            None,
+            None,
         )
 
     @cute.jit
@@ -3433,6 +3645,8 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         kv_tile_ranges: cute.Tensor | None = None,
         relative_bias: cute.Tensor | None = None,
         row_sink: cute.Tensor | None = None,
+        relative_factor: cute.Tensor | None = None,
+        relative_projection: cute.Tensor | None = None,
     ) -> None:
         """Launch the SM120 PRIM FMHA FP8 kernel.
 
@@ -3575,6 +3789,8 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             output_gate,
             relative_bias,
             row_sink,
+            relative_factor,
+            relative_projection,
         ).launch(
             grid=grid,
             block=(self.threads_per_cta, 1, 1),

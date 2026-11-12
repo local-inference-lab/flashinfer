@@ -39,7 +39,7 @@ def _require_sm120():
     pytest.importorskip("cutlass")
 
 
-def _kernel(*, bias, sink, gate=False, window=-1):
+def _kernel(*, bias, sink, gate=False, window=-1, factored=False):
     from flashinfer.cute_dsl.attention.fmha.sm120 import (
         compile_sm120_fmha_fp8_paged_kernel,
     )
@@ -58,7 +58,8 @@ def _kernel(*, bias, sink, gate=False, window=-1):
         balanced_scheduler=True,
         kv_layout="NHD",
         with_output_gate=gate,
-        with_relative_bias=bias,
+        with_relative_bias=bias and not factored,
+        with_factored_relative_bias=factored,
         with_row_sink=sink,
         window_left=window,
     )
@@ -86,16 +87,40 @@ class _Case:
         self.lengths = torch.tensor([capacity], dtype=torch.int32, device="cuda")
         self.cu = torch.tensor([0, rows], dtype=torch.int32, device="cuda")
         self.out = torch.empty_like(self.q)
+        self.factor = torch.empty((rows, HQ, 16), dtype=torch.bfloat16, device="cuda")
+        self.projection = torch.empty((EXTENT, 16), dtype=torch.bfloat16, device="cuda")
+        self.gate = randn((rows, HQ, DIM), 2.0).to(torch.bfloat16)
 
-    def run(self, kernel, *, bias, sink, gate=None, extended=True):
+    def draw_factored_bias(self, *, exact=True):
+        """Draw ``factor`` and ``projection`` and set ``bias`` to the BF16
+        rounding of their exact product.  Exact operands have few significant
+        bits, so the kernel's FP32 sums are exact and it rounds to this bias."""
+        if exact:
+            shape = lambda t, scale: (
+                torch.randint(-8, 9, t.shape, generator=self.gen, device="cuda") / scale
+            )
+            self.factor.copy_(shape(self.factor, 4).to(torch.bfloat16))
+            self.projection.copy_(shape(self.projection, 8).to(torch.bfloat16))
+        else:
+            self.factor.copy_(self.randn(self.factor.shape, 1.0).to(torch.bfloat16))
+            self.projection.copy_(
+                self.randn(self.projection.shape, 0.5).to(torch.bfloat16)
+            )
+        product = self.factor.double() @ self.projection.double().t()
+        self.bias.copy_(product.to(torch.bfloat16))
+
+    def run(
+        self, kernel, *, bias, sink, gate=None, extended=True, factored=False, out=None
+    ):
         from cutlass import Float32, Int32
 
-        self.out.fill_(float("nan"))
+        out = self.out if out is None else out
+        out.fill_(float("nan"))
         kernel(
             self.q8,
             self.key.permute(0, 2, 1, 3),
             self.value.permute(0, 2, 1, 3),
-            self.out,
+            out,
             None,
             Float32(math.log2(math.e) / math.sqrt(DIM)),
             Float32(1),
@@ -108,7 +133,14 @@ class _Case:
             False,
             # The plain program takes only the K/V tile ranges after use_pdl.
             *(
-                (gate, None, self.bias if bias else None, self.sink if sink else None)
+                (
+                    gate,
+                    None,
+                    self.bias if bias and not factored else None,
+                    self.sink if sink else None,
+                    self.factor if factored else None,
+                    self.projection if factored else None,
+                )
                 if extended
                 else (None,)
             ),
@@ -395,3 +427,179 @@ def test_compile_rejects_unsupported_combinations(options, error):
     )
     with pytest.raises(error):
         compile_sm120_fmha_fp8_paged_kernel(**{**arguments, **options})
+
+
+@pytest.mark.parametrize(
+    "window, sink, gate",
+    [(-1, True, False), (1023, True, False), (100, False, False), (1023, True, True)],
+)
+def test_factored_bias_graph_replay_matches_reference_and_operand(window, sink, gate):
+    """The bias evaluated in the kernel from a rank-16 factor and projection
+    equals the materialized BF16 bias: one captured graph, replayed over
+    contexts around the extent and the window, meets the reference bound and
+    is bit-identical to the program that reads the bias operand."""
+    _require_sm120()
+    factored = _kernel(bias=True, sink=sink, window=window, gate=gate, factored=True)
+    operand = _kernel(bias=True, sink=sink, window=window, gate=gate)
+    case = _Case(rows=320, capacity=4096, seed=window + 83)
+    case.draw_factored_bias()
+    gate_tensor = case.gate if gate else None
+    expected = torch.empty_like(case.out)
+    case.run(factored, bias=True, sink=sink, gate=gate_tensor, factored=True)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        case.run(factored, bias=True, sink=sink, gate=gate_tensor, factored=True)
+    for length in (4096, 320, EXTENT, EXTENT + 1, 320 + EXTENT - 1, 2500, 421, 448):
+        case.lengths.fill_(length)
+        case.q8.copy_(case.randn(case.q.shape, 0.5).to(torch.float8_e4m3fn))
+        case.sink.copy_(case.randn(case.sink.shape, 3.0))
+        case.gate.copy_(case.randn(case.gate.shape, 2.0).to(torch.bfloat16))
+        case.draw_factored_bias()
+        graph.replay()
+        case.run(operand, bias=True, sink=sink, gate=gate_tensor, out=expected)
+        torch.cuda.synchronize()
+        assert torch.equal(case.out, expected), length
+        ref, bound, _ = case.reference(bias=True, sink=sink, window=window)
+        if gate:
+            # The kernel rounds the output to BF16 before and after the gate.
+            weight = torch.sigmoid(case.gate.double())
+            bound = bound * weight + (2.0**-8 + 2.0**-12) * (ref * weight).abs()
+            ref = ref * weight
+        excess = (case.out.double() - ref).abs() - bound
+        assert excess.max().item() <= 0.0, (length, excess.max().item())
+        plain, _, _ = case.reference(bias=False, sink=sink, window=window)
+        if gate:
+            plain = plain * weight
+        assert ((case.out.double() - plain).abs() > bound).any()
+
+
+def test_factored_bias_with_unrestricted_operands():
+    """With arbitrary BF16 operands the kernel's FP32 sum can round to the
+    neighboring BF16 value, one part in 2**8 of the bias.  A logit error of at
+    most ``delta`` changes each probability by a factor within ``exp(2 *
+    delta)``, which adds ``(exp(2 * delta) - 1) * mass`` to the bound."""
+    _require_sm120()
+    kernel = _kernel(bias=True, sink=True, window=1023, factored=True)
+    case = _Case(rows=320, capacity=2500, seed=89)
+    case.draw_factored_bias(exact=False)
+    case.run(kernel, bias=True, sink=True, factored=True)
+    torch.cuda.synchronize()
+    ref, bound, _ = case.reference(bias=True, sink=True, window=1023)
+    delta = 2.0**-8 * float(case.bias.abs().max())
+    mass = (bound - 2.0**-8 * ref.abs()) / (2.0**-4 + 2.0**-11)
+    assert (
+        (case.out.double() - ref).abs() <= bound + math.expm1(2 * delta) * mass
+    ).all()
+
+
+@pytest.mark.parametrize("window", [-1, 1023])
+@pytest.mark.parametrize("target", [0, 1, 7, 8, EXTENT - 1])
+def test_factored_bias_peak_selects_the_key_at_its_distance(target, window):
+    """A projection with one nonzero row gives a dominant bias at that
+    distance only: every row returns the value stored there, bit-exactly."""
+    _require_sm120()
+    kernel = _kernel(bias=True, sink=True, window=window, factored=True)
+    case = _Case(rows=320, capacity=EXTENT + 700 + 320, seed=target + 97)
+    case.factor.zero_()
+    case.factor[:, :, 5] = 12.0
+    case.projection.zero_()
+    case.projection[target, 5] = 8.0
+    case.sink.fill_(-200.0)
+    dominant = torch.zeros_like(case.sink, dtype=torch.bool)
+    dominant[1::3, ::5] = True
+    case.sink[dominant] = 400.0
+    case.run(kernel, bias=True, sink=True, factored=True)
+    torch.cuda.synchronize()
+    slot = case.capacity - case.rows + torch.arange(case.rows, device="cuda") - target
+    pages = case.table[0, slot // PAGE].long()
+    value = case.value[pages, slot % PAGE].float().repeat_interleave(GROUP, 1)
+    assert torch.equal(case.out.float(), value.masked_fill(dominant[:, :, None], 0))
+
+
+def test_factored_bias_stops_at_the_extent():
+    """A bias of -96 at every distance below the extent leaves attention over
+    the keys at distance 1024 and beyond."""
+    _require_sm120()
+    kernel = _kernel(bias=True, sink=False, factored=True)
+    case = _Case(rows=320, capacity=EXTENT + 320, seed=101)
+    case.factor.zero_()
+    case.factor[:, :, 0] = 16.0
+    case.projection.zero_()
+    case.projection[:, 0] = -6.0
+    case.bias.fill_(-96.0)
+    case.run(kernel, bias=True, sink=False, factored=True)
+    torch.cuda.synchronize()
+    ref, bound, biased_mass = case.reference(bias=True, sink=False)
+    assert biased_mass.max().item() < 1e-30
+    assert ((case.out.double() - ref).abs() <= bound).all()
+    value = case.value[int(case.table[0, 0]), 0].float().repeat_interleave(GROUP, 0)
+    assert torch.equal(case.out[0].float(), value)
+
+
+def test_factored_operand_validation():
+    from flashinfer.cute_dsl.attention.fmha.sm120 import (
+        compile_sm120_fmha_fp8_paged_kernel,
+        validate_sm120_fmha_fp8_paged_operands as validate,
+    )
+
+    q, operands = _operands()
+    factor = torch.empty((8, HQ, 16), dtype=torch.bfloat16)
+    projection = torch.empty((EXTENT, 16), dtype=torch.bfloat16)
+    validate(q, relative_factor=factor, relative_projection=projection)
+    for bad, message in (
+        (dict(relative_factor=factor), "come together"),
+        (
+            dict(
+                relative_factor=factor,
+                relative_projection=projection,
+                relative_bias=operands["relative_bias"],
+            ),
+            "replace relative_bias",
+        ),
+        (
+            dict(relative_factor=factor[:7], relative_projection=projection),
+            "at least 8 rows",
+        ),
+        (
+            dict(relative_factor=factor[:, :, :8], relative_projection=projection),
+            "at least 8 rows",
+        ),
+        (
+            dict(relative_factor=factor.float(), relative_projection=projection),
+            "must be torch.bfloat16",
+        ),
+        (
+            dict(relative_factor=factor, relative_projection=projection.t()),
+            "relative_projection must be",
+        ),
+        (
+            dict(relative_factor=factor, relative_projection=projection[::2]),
+            "relative_projection must be",
+        ),
+    ):
+        with pytest.raises(ValueError, match=message):
+            validate(q, **bad)
+    arguments = dict(
+        in_dtype=torch.float8_e4m3fn,
+        out_dtype=torch.bfloat16,
+        num_qo_heads=HQ,
+        num_kv_heads=HKV,
+        head_dim=DIM,
+        is_causal=True,
+        kv_tile=128,
+        q_tile=128,
+        num_tokens_per_page=PAGE,
+        device=torch.device("cuda"),
+        balanced_scheduler=True,
+        kv_layout="NHD",
+        with_factored_relative_bias=True,
+    )
+    for options, error in (
+        (dict(with_relative_bias=True), ValueError),
+        (dict(gqa_pack_size=2), NotImplementedError),
+        (dict(q_tile=64, kv_tile=64), NotImplementedError),
+        (dict(with_lse=True), NotImplementedError),
+    ):
+        with pytest.raises(error):
+            compile_sm120_fmha_fp8_paged_kernel(**{**arguments, **options})

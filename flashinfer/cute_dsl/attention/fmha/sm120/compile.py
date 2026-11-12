@@ -165,6 +165,7 @@ def _compile_sm120_fmha_fp8_paged_kernel(
     with_relative_bias: bool = False,
     with_row_sink: bool = False,
     window_left: int = -1,
+    with_factored_relative_bias: bool = False,
 ):
     """Compile one sequence-length-independent packed-Q paged kernel."""
     _validate_balanced_scheduler(is_causal, balanced_scheduler)
@@ -229,6 +230,26 @@ def _compile_sm120_fmha_fp8_paged_kernel(
             assumed_align=2,
         )
         if with_relative_bias
+        else None
+    )
+    fake_relative_factor = (
+        cute.runtime.make_fake_tensor(
+            cutlass.BFloat16,
+            (cute.sym_int(), num_qo_heads, 16),
+            stride=(cute.sym_int(), cute.sym_int(), 1),
+            assumed_align=4,
+        )
+        if with_factored_relative_bias
+        else None
+    )
+    fake_relative_projection = (
+        make_fake_compact_tensor(
+            cutlass.BFloat16,
+            (cute.sym_int(), 16),
+            stride_order=(1, 0),
+            assumed_align=4,
+        )
+        if with_factored_relative_bias
         else None
     )
     fake_row_sink = (
@@ -305,7 +326,7 @@ def _compile_sm120_fmha_fp8_paged_kernel(
 
     stream_fake = make_fake_stream(use_tvm_ffi_env_stream=True)
 
-    if with_relative_bias or with_row_sink:
+    if with_relative_bias or with_row_sink or with_factored_relative_bias:
         # The bias and sink follow every other optional operand of ``_launch``.
         return cute.compile(
             fmha._launch_extended,
@@ -328,6 +349,8 @@ def _compile_sm120_fmha_fp8_paged_kernel(
             fake_kv_tile_ranges,
             fake_relative_bias,
             fake_row_sink,
+            fake_relative_factor,
+            fake_relative_projection,
             options="--enable-tvm-ffi",
         )
     return cute.compile(
@@ -441,13 +464,18 @@ def compile_sm120_fmha_fp8_paged_kernel(
     with_relative_bias: bool = False,
     with_row_sink: bool = False,
     window_left: int = -1,
+    with_factored_relative_bias: bool = False,
 ):
     """Compile the paged FP8 prefill program for one layer geometry.
 
-    ``with_relative_bias``, ``with_row_sink`` and ``with_output_gate`` add
-    operands to the launch, in the order ``output_gate, kv_tile_ranges,
-    relative_bias, row_sink`` after ``use_pdl``; a program with a bias or sink
-    takes all four, with ``None`` for the ones it was compiled without.  The
+    ``with_relative_bias``, ``with_row_sink``, ``with_factored_relative_bias``
+    and ``with_output_gate`` add operands to the launch, in the order
+    ``output_gate, kv_tile_ranges, relative_bias, row_sink, relative_factor,
+    relative_projection`` after ``use_pdl``; a program with a bias or sink takes
+    all six, with ``None`` for the ones it was compiled without.
+    ``with_factored_relative_bias`` evaluates the bias
+    ``round_bf16(relative_factor[row, head, :] @ relative_projection[d, :])``
+    in the kernel in place of reading ``relative_bias``.  The
     compiled program does not inspect its operands: call
     :func:`validate_sm120_fmha_fp8_paged_operands` on the tensors before the
     first launch or graph capture.
@@ -457,6 +485,21 @@ def compile_sm120_fmha_fp8_paged_kernel(
         raise ValueError(
             f"window_left must be -1 (no window) or a nonnegative int, got {window_left!r}"
         )
+    if with_factored_relative_bias and with_relative_bias:
+        raise ValueError(
+            "with_factored_relative_bias replaces with_relative_bias; pass one"
+        )
+    if with_factored_relative_bias and (gqa_pack_size, q_tile, kv_tile) != (
+        1,
+        128,
+        128,
+    ):
+        raise NotImplementedError(
+            "the factored relative bias requires gqa_pack_size 1 and 128-row "
+            "Q and K/V tiles"
+        )
+    with_relative_bias_operand = with_relative_bias
+    with_relative_bias = with_relative_bias or with_factored_relative_bias
     extras = with_relative_bias or with_row_sink or window_left >= 0
     if window_left >= 0 and not is_causal:
         raise ValueError("window_left requires is_causal=True")
@@ -487,9 +530,10 @@ def compile_sm120_fmha_fp8_paged_kernel(
         f"_skip{int(enable_skip_softmax)}_gate{int(with_output_gate)}"
         + ("_kvsplit" if with_kv_tile_ranges else "")
         + (f"_gqa{gqa_pack_size}" if gqa_pack_size > 1 else "")
-        + ("_relbias" if with_relative_bias else "")
+        + ("_relbias" if with_relative_bias_operand else "")
         + ("_rowsink" if with_row_sink else "")
         + (f"_win{window_left}" if window_left >= 0 else "")
+        + ("_relrank16" if with_factored_relative_bias else "")
     )
     return build_and_load_cute_dsl_kernel(
         "sm120_prims_fmha_fp8",
@@ -512,9 +556,10 @@ def compile_sm120_fmha_fp8_paged_kernel(
             gqa_pack_size,
             kv_layout,
             with_output_gate,
-            with_relative_bias,
+            with_relative_bias_operand,
             with_row_sink,
             window_left,
+            with_factored_relative_bias,
         ),
         extra_key_files=_cache_key_files(),
     )
@@ -526,6 +571,8 @@ def validate_sm120_fmha_fp8_paged_operands(
     relative_bias: torch.Tensor | None = None,
     row_sink: torch.Tensor | None = None,
     output_gate: torch.Tensor | None = None,
+    relative_factor: torch.Tensor | None = None,
+    relative_projection: torch.Tensor | None = None,
     out_dtype: torch.dtype = torch.bfloat16,
 ) -> None:
     """Check the optional operands of a paged FP8 prefill launch against ``q``.
@@ -539,6 +586,10 @@ def validate_sm120_fmha_fp8_paged_operands(
     - ``row_sink``: float32 ``[rows >= total_q, Hq]``, unit inner stride.
     - ``output_gate``: ``out_dtype`` ``[rows >= total_q, Hq, D]``, unit inner
       stride, 16-byte aligned data and outer strides.
+    - ``relative_factor``: BF16 ``[rows >= total_q, Hq, 16]``, unit inner
+      stride, 4-byte aligned data and outer strides; given together with
+    - ``relative_projection``: contiguous BF16 ``[extent >= 1, 16]``, 4-byte
+      aligned.  The pair replaces ``relative_bias``.
     """
     if q.ndim != 3:
         raise ValueError(f"q must be [total_q, Hq, D], got {tuple(q.shape)}")
@@ -568,6 +619,40 @@ def validate_sm120_fmha_fp8_paged_operands(
                 f"strides, got {tuple(tensor.stride())}"
             )
 
+    if (relative_factor is None) != (relative_projection is None):
+        raise ValueError("relative_factor and relative_projection come together")
+    if relative_factor is not None:
+        if relative_bias is not None:
+            raise ValueError(
+                "relative_factor and relative_projection replace relative_bias"
+            )
+        check(
+            "relative_factor",
+            relative_factor,
+            torch.bfloat16,
+            (heads, 16),
+            f"[rows, {heads}, 16]",
+        )
+        if relative_factor.data_ptr() % 4 or any(
+            step % 2 for step in relative_factor.stride()[:-1]
+        ):
+            raise ValueError(
+                "relative_factor data and outer strides must be 4-byte aligned"
+            )
+        if (
+            relative_projection.device != q.device
+            or relative_projection.dtype != torch.bfloat16
+            or relative_projection.ndim != 2
+            or relative_projection.shape[0] < 1
+            or relative_projection.shape[1] != 16
+            or not relative_projection.is_contiguous()
+            or relative_projection.data_ptr() % 4
+        ):
+            raise ValueError(
+                "relative_projection must be contiguous, 4-byte aligned "
+                f"torch.bfloat16 [extent, 16] on {q.device}, got "
+                f"{relative_projection.dtype} {tuple(relative_projection.shape)}"
+            )
     if relative_bias is not None:
         check(
             "relative_bias",
