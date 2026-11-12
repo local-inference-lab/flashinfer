@@ -357,6 +357,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         balanced_scheduler: bool = False,
         gqa_pack_size: int = 1,
         paged_kv_layout: str = "HND",
+        window_left: int = -1,
     ) -> None:
         """Initialize the FMHA prefill kernel configuration.
 
@@ -374,7 +375,19 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             that causal masking is enabled when this option is true.
         :param gqa_pack_size: Q heads sharing one K/V head packed into each Q
             tile (row ``r`` is token ``r // gqa_pack_size``). Must divide ``q_tile``.
+        :param window_left: Keys visible to the left of a causal row's own
+            position, or -1 for the whole sequence.
         """
+        if window_left < -1:
+            raise ValueError("window_left must be -1 (none) or nonnegative")
+        if window_left >= 0 and not is_causal:
+            raise ValueError("a sliding window requires causal masking")
+        if window_left >= 0 and (head_tile, q_tile, kv_tile) == (256, 128, 128):
+            raise NotImplementedError(
+                "a sliding window is not implemented for the distributed row "
+                "state of head_tile 256"
+            )
+        self.window_left = window_left
         if paged_kv_layout not in ("HND", "NHD"):
             raise ValueError("paged_kv_layout must be HND or NHD")
         self.paged_kv_layout = paged_kv_layout
@@ -2151,6 +2164,42 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         return row_state
 
     @cute.jit
+    def mask_window(
+        self,
+        basic_params: SimpleNamespace,
+        s_regs: cutlass.Array,
+        kv_seq_idx: cutlass.Int32,
+    ) -> None:
+        """Mask keys more than ``window_left`` positions before their row.
+
+        Only tiles that reach left of the last row's window start hold such a
+        key; the other tiles skip the per-element test.
+        """
+        last_position = (
+            basic_params.q_seq_idx
+            + basic_params.causal_q_offset
+            + self.q_tile_tokens
+            - 1
+        )
+        if kv_seq_idx < last_position - self.window_left:
+            for row_half in cutlass.range_constexpr(2):
+                q_row_in_cta = (
+                    basic_params.q_warp_row0 + basic_params.lane_div4 + row_half * 8
+                )
+                q_position = (
+                    basic_params.q_seq_idx
+                    + self.q_row_token(q_row_in_cta)
+                    + basic_params.causal_q_offset
+                )
+                for k_frag in cutlass.range_constexpr(self.qk_k_frags):
+                    for col in cutlass.range_constexpr(2):
+                        key = kv_seq_idx + k_frag * 8 + 2 * basic_params.lane_mod4 + col
+                        if q_position - key > self.window_left:
+                            s_regs[
+                                k_frag * 4 + row_half * 2 + col
+                            ] = -cutlass.Float32.inf
+
+    @cute.jit
     def add_relative_bias(
         self,
         basic_params: SimpleNamespace,
@@ -2253,6 +2302,8 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         kv_seq_idx = kv_tile_idx * self.kv_tile
         if cutlass.const_expr(adds_relative_bias):
             self.add_relative_bias(basic_params, s_regs, kv_seq_idx)
+        if cutlass.const_expr(self.window_left >= 0):
+            self.mask_window(basic_params, s_regs, kv_seq_idx)
         valid_rows = cute.math.min(self.kv_tile, basic_params.seqlen_k - kv_seq_idx)
         skip_softmax = cutlass.Boolean(False)
         if cutlass.const_expr(enable_skip_softmax and not uses_softmax_init_path):
@@ -2386,6 +2437,13 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                     "relative_bias and row_sink exclude skip-softmax, K/V tile "
                     "ranges and the LSE output"
                 )
+        if cutlass.const_expr(
+            self.window_left >= 0
+            and (skip_softmax_threshold is not None or kv_tile_ranges is not None)
+        ):
+            raise NotImplementedError(
+                "a sliding window excludes skip-softmax and K/V tile ranges"
+            )
         tidx, _, _ = cute.arch.thread_idx()
         block_x, block_y, block_z = cute.arch.block_idx()
         if cutlass.const_expr(self.balanced_scheduler):
@@ -2483,6 +2541,11 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         # Split KV: the item covers K/V tiles [begin, end); an empty range writes O = 0, LSE = -inf.
         kv_begin_tile = cutlass.Int32(0)
         has_kv_work = seqlen_k > 0
+        if cutlass.const_expr(self.window_left >= 0):
+            # The Q tile's first row has the leftmost window start.
+            first_window_key = q_seq_idx + causal_q_offset - self.window_left
+            if first_window_key > 0:
+                kv_begin_tile = first_window_key // self.kv_tile
         if cutlass.const_expr(kv_tile_ranges is not None):
             kv_begin_tile = cutlass.Int32(kv_tile_ranges[batch_idx, 0])
             num_kv_tiles = cute.math.min(

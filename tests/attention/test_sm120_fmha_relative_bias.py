@@ -3,7 +3,8 @@
 Shape: 12 query heads over 2 K/V heads, head dim 128, NHD pages of 128 tokens,
 one request whose query rows end its K/V sequence.  The key ``d`` positions
 before a row scores ``softmax_scale * q.k + bias[row, head, d]`` for ``0 <= d <
-extent``; ``sink[row, head]`` is one more logit with a zero value.
+extent``; ``sink[row, head]`` is one more logit with a zero value.  A window
+of ``w`` lets a row see the ``w`` keys before it and itself.
 
 The kernel multiplies FP8 Q by FP8 K into FP32, keeps the softmax statistics
 in FP32, rounds each probability, scaled by 2**8 relative to the row maximum,
@@ -38,7 +39,7 @@ def _require_sm120():
     pytest.importorskip("cutlass")
 
 
-def _kernel(*, bias, sink, gate=False):
+def _kernel(*, bias, sink, gate=False, window=-1):
     from flashinfer.cute_dsl.attention.fmha.sm120 import (
         compile_sm120_fmha_fp8_paged_kernel,
     )
@@ -59,6 +60,7 @@ def _kernel(*, bias, sink, gate=False):
         with_output_gate=gate,
         with_relative_bias=bias,
         with_row_sink=sink,
+        window_left=window,
     )
 
 
@@ -112,7 +114,7 @@ class _Case:
             ),
         )
 
-    def reference(self, *, bias, sink, query=None):
+    def reference(self, *, bias, sink, query=None, window=-1):
         """FP64 output, error bound, and probability mass inside the extent."""
         length = int(self.lengths[0])
         pages = self.table[0, : (length + PAGE - 1) // PAGE].long()
@@ -127,7 +129,10 @@ class _Case:
         if bias:
             index = distance.clamp(0, EXTENT - 1)[:, None].expand(-1, HQ, -1)
             scores = scores + self.bias.double().gather(2, index) * in_extent[:, None]
-        scores = scores.masked_fill(~(distance >= 0)[:, None], float("-inf"))
+        visible = distance >= 0
+        if window >= 0:
+            visible = visible & (distance <= window)
+        scores = scores.masked_fill(~visible[:, None], float("-inf"))
         if sink:
             scores = torch.cat((scores, self.sink.double()[:, :, None]), -1)
         probability = scores.softmax(-1)[..., :length]
@@ -143,39 +148,58 @@ class _Case:
         return out, bound, (probability * in_extent[:, None]).sum(-1)
 
 
-@pytest.mark.parametrize("bias, sink", [(True, False), (False, True), (True, True)])
-def test_graph_replay_matches_reference(bias, sink):
-    """One captured graph serves contexts on both sides of the bias extent."""
+@pytest.mark.parametrize(
+    "bias, sink, window",
+    [
+        (True, False, -1),
+        (False, True, -1),
+        (True, True, -1),
+        # 1023 previous keys plus the row itself: the window equals the extent.
+        (True, True, 1023),
+        (True, False, 1023),
+        # A window that ends inside a key tile and well inside the extent.
+        (True, True, 100),
+    ],
+)
+def test_graph_replay_matches_reference(bias, sink, window):
+    """One captured graph serves contexts on both sides of the bias extent and
+    of the window."""
     _require_sm120()
-    kernel = _kernel(bias=bias, sink=sink)
+    kernel = _kernel(bias=bias, sink=sink, window=window)
     case = _Case(rows=320, capacity=4096, seed=3)
     case.run(kernel, bias=bias, sink=sink)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         case.run(kernel, bias=bias, sink=sink)
-    for length in (4096, 320, EXTENT, EXTENT + 1, 320 + EXTENT - 1, 2500):
+    for length in (4096, 320, EXTENT, EXTENT + 1, 320 + EXTENT - 1, 2500, 421, 448):
         case.lengths.fill_(length)
         case.q8.copy_(case.randn(case.q.shape, 0.5).to(torch.float8_e4m3fn))
         case.bias.copy_(case.randn(case.bias.shape, 2.0).to(torch.bfloat16))
         case.sink.copy_(case.randn(case.sink.shape, 3.0))
         graph.replay()
         torch.cuda.synchronize()
-        ref, bound, _ = case.reference(bias=bias, sink=sink)
+        ref, bound, _ = case.reference(bias=bias, sink=sink, window=window)
         assert torch.isfinite(case.out).all()
         excess = (case.out.double() - ref).abs() - bound
         assert excess.max().item() <= 0.0, (length, excess.max().item())
-        plain, _, _ = case.reference(bias=False, sink=False)
+        plain, _, _ = case.reference(bias=False, sink=False, window=window)
         assert ((case.out.double() - plain).abs() > bound).any()
+        if window >= 0 and length > window + 320:
+            # The window matters: full-context attention violates the bound.
+            full, _, _ = case.reference(bias=bias, sink=sink)
+            assert ((case.out.double() - full).abs() > bound).any()
 
 
+@pytest.mark.parametrize("window", [-1, 1023])
 @pytest.mark.parametrize("target", [0, 1, EXTENT - 1])
-def test_bias_peak_and_row_sink_select_exact_values(target):
-    """A dominant bias returns the value at its distance bit-exactly; a
-    dominant sink zeroes exactly its own rows and heads."""
+def test_bias_peak_and_row_sink_select_exact_values(target, window):
+    """A dominant bias returns the value at its distance bit-exactly, including
+    the last key inside the window; a dominant sink zeroes exactly its own rows
+    and heads."""
     _require_sm120()
-    kernel = _kernel(bias=True, sink=True)
-    case = _Case(rows=320, capacity=EXTENT - 1 + 320, seed=target + 5)
+    kernel = _kernel(bias=True, sink=True, window=window)
+    case = _Case(rows=320, capacity=EXTENT + 700 + 320, seed=target + 5)
     case.bias.zero_()
     case.bias[:, :, target] = 96.0
     case.sink.fill_(-200.0)
@@ -219,3 +243,17 @@ def test_bias_and_sink_free_kernel_is_unchanged():
     case.run(_kernel(bias=True, sink=True), bias=True, sink=True)
     torch.cuda.synchronize()
     assert torch.equal(case.out, plain)
+
+
+def test_window_excludes_the_key_just_outside_it():
+    """A bias peak one position beyond a 1022-key window finds its key masked,
+    so the row falls back to the keys inside the window."""
+    _require_sm120()
+    kernel = _kernel(bias=True, sink=False, window=1022)
+    case = _Case(rows=320, capacity=EXTENT + 700 + 320, seed=17)
+    case.bias.zero_()
+    case.bias[:, :, EXTENT - 1] = 96.0
+    case.run(kernel, bias=True, sink=False)
+    torch.cuda.synchronize()
+    ref, bound, _ = case.reference(bias=False, sink=False, window=1022)
+    assert ((case.out.double() - ref).abs() <= bound).all()

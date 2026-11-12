@@ -164,6 +164,7 @@ def _compile_sm120_fmha_fp8_paged_kernel(
     with_output_gate: bool = False,
     with_relative_bias: bool = False,
     with_row_sink: bool = False,
+    window_left: int = -1,
 ):
     """Compile one sequence-length-independent packed-Q paged kernel."""
     _validate_balanced_scheduler(is_causal, balanced_scheduler)
@@ -187,6 +188,7 @@ def _compile_sm120_fmha_fp8_paged_kernel(
         balanced_scheduler=balanced_scheduler,
         gqa_pack_size=gqa_pack_size,
         paged_kv_layout=kv_layout,
+        window_left=window_left,
     )
 
     sym_b = cute.sym_int()
@@ -438,6 +440,7 @@ def compile_sm120_fmha_fp8_paged_kernel(
     with_output_gate: bool = False,
     with_relative_bias: bool = False,
     with_row_sink: bool = False,
+    window_left: int = -1,
 ):
     _validate_balanced_scheduler(is_causal, balanced_scheduler)
 
@@ -457,6 +460,7 @@ def compile_sm120_fmha_fp8_paged_kernel(
         + (f"_gqa{gqa_pack_size}" if gqa_pack_size > 1 else "")
         + ("_relbias" if with_relative_bias else "")
         + ("_rowsink" if with_row_sink else "")
+        + (f"_win{window_left}" if window_left >= 0 else "")
     )
     return build_and_load_cute_dsl_kernel(
         "sm120_prims_fmha_fp8",
@@ -481,6 +485,7 @@ def compile_sm120_fmha_fp8_paged_kernel(
             with_output_gate,
             with_relative_bias,
             with_row_sink,
+            window_left,
         ),
         extra_key_files=_cache_key_files(),
     )
