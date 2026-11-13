@@ -470,11 +470,15 @@ class _IslandRSLaunch:
                     ).align(4),
                     dtype=Uint32,
                 )
-                while index < stop - begin:
-                    destination_stage[Int64(self._lane) * quarter + index] = (
-                        input_words[begin + index]
-                    )
-                    index += stride
+                # In the non-RSAG push specialization, the owned contribution
+                # is read directly from the input during reduction instead of
+                # staging it locally and reading it back.
+                if cutlass.const_expr(self._cross_island_rsag or lane != self._lane):
+                    while index < stop - begin:
+                        destination_stage[Int64(self._lane) * quarter + index] = (
+                            input_words[begin + index]
+                        )
+                        index += stride
             else:
                 while index < stop - begin:
                     self_stage[begin + index] = input_words[begin + index]
@@ -526,8 +530,14 @@ class _IslandRSLaunch:
             for p in cutlass.range_constexpr(_ISLAND_SIZE):
                 peer = self._island * _ISLAND_SIZE + p
                 if cutlass.const_expr(self._local_push):
-                    peer_stage = self_stage
-                    peer_begin = Int64(p) * quarter
+                    if cutlass.const_expr(
+                        p == self._lane and not self._cross_island_rsag
+                    ):
+                        peer_stage = input_words
+                        peer_begin = mine_begin
+                    else:
+                        peer_stage = self_stage
+                        peer_begin = Int64(p) * quarter
                 else:
                     peer_begin = mine_begin
                     peer_stage = cute.recast_ptr(
@@ -558,8 +568,14 @@ class _IslandRSLaunch:
             for p in cutlass.range_constexpr(_ISLAND_SIZE):
                 peer = self._island * _ISLAND_SIZE + p
                 if cutlass.const_expr(self._local_push):
-                    peer_stage = self_stage
-                    peer_begin = Int64(p) * quarter
+                    if cutlass.const_expr(
+                        p == self._lane and not self._cross_island_rsag
+                    ):
+                        peer_stage = input_words
+                        peer_begin = mine_begin
+                    else:
+                        peer_stage = self_stage
+                        peer_begin = Int64(p) * quarter
                 else:
                     peer_begin = mine_begin
                     peer_stage = cute.recast_ptr(
@@ -646,8 +662,30 @@ class _IslandRSLaunch:
                     total_lo += lo
                     total_hi += hi
                 value = pack_f32x2_to_bf16x2(total_lo, total_hi)
-                self_final[mine_begin + index + Int64(item) * cross_stride] = value
+                if cutlass.const_expr(not self._local_push or self._cross_island_rsag):
+                    self_final[mine_begin + index + Int64(item) * cross_stride] = value
                 output_words[mine_begin + index + Int64(item) * cross_stride] = value
+                if cutlass.const_expr(self._local_push and not self._cross_island_rsag):
+                    for destination_lane in cutlass.range_constexpr(_ISLAND_SIZE):
+                        if cutlass.const_expr(destination_lane != self._lane):
+                            destination_final = cute.recast_ptr(
+                                cute.make_ptr(
+                                    cutlass.BFloat16,
+                                    Int64(
+                                        slabs[
+                                            self._island * _ISLAND_SIZE
+                                            + destination_lane
+                                        ].toint()
+                                    )
+                                    + final_offset,
+                                    cute.AddressSpace.gmem,
+                                    assumed_align=16,
+                                ).align(4),
+                                dtype=Uint32,
+                            )
+                            destination_final[
+                                mine_begin + index + Int64(item) * cross_stride
+                            ] = value
             index += Int64(4) * cross_stride
         while index < mine_length:
             total_lo = Float32(0.0)
@@ -667,8 +705,27 @@ class _IslandRSLaunch:
                 total_lo += lo
                 total_hi += hi
             value = pack_f32x2_to_bf16x2(total_lo, total_hi)
-            self_final[mine_begin + index] = value
+            if cutlass.const_expr(not self._local_push or self._cross_island_rsag):
+                self_final[mine_begin + index] = value
             output_words[mine_begin + index] = value
+            if cutlass.const_expr(self._local_push and not self._cross_island_rsag):
+                for destination_lane in cutlass.range_constexpr(_ISLAND_SIZE):
+                    if cutlass.const_expr(destination_lane != self._lane):
+                        destination_final = cute.recast_ptr(
+                            cute.make_ptr(
+                                cutlass.BFloat16,
+                                Int64(
+                                    slabs[
+                                        self._island * _ISLAND_SIZE + destination_lane
+                                    ].toint()
+                                )
+                                + final_offset,
+                                cute.AddressSpace.gmem,
+                                assumed_align=16,
+                            ).align(4),
+                            dtype=Uint32,
+                        )
+                        destination_final[mine_begin + index] = value
             index += cross_stride
         cute.arch.barrier()
 
@@ -715,9 +772,10 @@ class _IslandRSLaunch:
                         index += cross_stride
             cute.arch.barrier()
 
-        # Publish completed quarters. Pushed quarters occupy disjoint ranges
-        # in each recipient's existing final plane and are copied locally.
-        if cutlass.const_expr(self._local_push):
+        # RSAG publishes completed quarters in a separate pass. The non-RSAG
+        # push specialization above already forwarded each rounded value to all
+        # three local peers directly from registers.
+        if cutlass.const_expr(self._local_push and self._cross_island_rsag):
             for p in cutlass.range_constexpr(_ISLAND_SIZE):
                 if cutlass.const_expr(p != self._lane):
                     push_peer = self._island * _ISLAND_SIZE + p
@@ -839,7 +897,7 @@ def get_island_rs_launcher(
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "comm.pcie.island_rs.bf16",
-            1,
+            3,
             cache_key,
             labels=(
                 "world_size",
