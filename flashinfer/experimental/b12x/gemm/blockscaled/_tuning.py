@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 from b12x._lib.quant.block_codec import BLOCK_CODECS, block_codec
 
 from dataclasses import asdict, dataclass, field, replace
@@ -20,6 +22,22 @@ from b12x.preparation.tuning import (
 from b12x.gemm._tuning import _codegen_snapshot
 
 MXFP8_PREFILL_MIN_ROWS = 2048
+
+# Opt-in (default 8 = unchanged): largest row count that uses the MXFP8 A16 decode geometry
+# (_mxfp8_a16_decode_config) as the untuned default. Rows 9..16 still fit one 16-row MMA tile,
+# so the decode geometry applies unchanged; the generic fallback (64x64, split_k=1) under-fills
+# narrow/deep-K outputs there (Kimi K3.1 TP8 M=16: N=448/K=7168 24.7 -> 5.5 us, N=1536/K=7168
+# 25.2 -> 10.7 us on RTX PRO 6000 Max-Q). Values above 16 are clamped to 16.
+_MXFP8_A16_DECODE_MAX_ROWS = max(
+    8, min(16, int(os.environ.get("B12X_MXFP8_A16_DECODE_MAX_ROWS", "8")))
+)
+
+# Opt-in (default off): restrict the MXFP8 A16 search space for decode rows (M<=16) to
+# mma_warps=4 and tile_k=64, for autotuned plans as well as the default. On RTX PRO 6000 Max-Q
+# the race picked mma_warps=2 / tile_k=128 for several Kimi K3.1 TP8 projections although
+# back-to-back HBM-streamed calls are slower with them (o_proj 7168x1536: tk128/w2 11.1 us vs
+# tk64/w4 9.3 us). Same split-K and K order, so outputs are unchanged bit for bit.
+_MXFP8_A16_DECODE_W4_TK64 = os.environ.get("B12X_MXFP8_A16_DECODE_W4_TK64", "0") == "1"
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -257,10 +275,41 @@ def _default_config(query, device):
     return BlockscaledConfig(mode="quantized")
 
 
+def _mxfp8_a16_decode_config(query, device):
+    """Decode-row (M<=8) MXFP8 A16 geometry: 64x64 tiles, split-K only to fill half the SMs.
+
+    The former fixed (tile_n=128, split_k=4) under-filled narrow outputs (N=448: 16 CTAs on
+    188 SMs, 2.1x slower than the best swept config) and over-split wide ones (N=7168, K=1536:
+    1.34x slower). Measured on RTX PRO 6000 Max-Q (188 SMs) at Kimi K3.1 TP8 decode shapes, this
+    choice is within 10% of the best swept A16 configuration on every shape. Each split keeps
+    at least 256 K columns, so tiny-K projections stay unsplit.
+    """
+    tiles = -(-query.out_features // 64)
+    split = 1
+    target = max(1, device.sm_count // 2)
+    while split < 16 and tiles * split < target and query.in_features // (2 * split) >= 256:
+        split *= 2
+    return BlockscaledConfig(mode="a16", tile_n=64, tile_k=64, split_k=split)
+
+
+def _mxfp8_a16_extended_decode(query, device):
+    if _MXFP8_A16_DECODE_MAX_ROWS <= 8 or query.num_tokens > _MXFP8_A16_DECODE_MAX_ROWS:
+        return False
+    return (
+        device is not None
+        and device.compute_capability in ((12, 0), (12, 1))
+        and query.in_features == query.padded_in_features
+        and query.in_features % 32 == 0
+        and query.out_features % 8 == 0
+        and query.source_contiguous
+        and query.source_aligned
+    )
+
+
 def _a16_default_config(query, device):
     if query.recipe == "mxfp8" or device is None:
-        if _automatic_a16(query, device):
-            return BlockscaledConfig(mode="a16", tile_n=128, tile_k=64, split_k=4)
+        if _automatic_a16(query, device) or _mxfp8_a16_extended_decode(query, device):
+            return _mxfp8_a16_decode_config(query, device)
         return BlockscaledConfig(mode="a16", tile_n=64, tile_k=64, split_k=1)
     m, n, k = query.num_tokens, query.out_features, query.in_features
     sms = device.sm_count
@@ -535,6 +584,12 @@ def _tuning_parameters(query, device):
             )
 
     expanded = mxfp8_a16_dequant(query, BlockscaledConfig(mode="a16"))
+    decode_w4_tk64 = (
+        _MXFP8_A16_DECODE_W4_TK64
+        and query.recipe == "mxfp8"
+        and query.num_tokens <= 16
+        and not expanded
+    )
 
     def eligible(parameters):
         if (
@@ -619,7 +674,11 @@ def _tuning_parameters(query, device):
             else ("a16", "quantized")
             if query.activation_mode == "auto"
             else (query.activation_mode,),
-            "mma_warps": (2, 4) if query.recipe == "mxfp8" else (None,),
+            "mma_warps": (4,)
+            if decode_w4_tk64
+            else (2, 4)
+            if query.recipe == "mxfp8"
+            else (None,),
             "dense_config": dense_configs,
             "fuse_swiglu": (False, True)
             if query.source_activation == "swiglu_bf16"
@@ -632,6 +691,11 @@ def _tuning_parameters(query, device):
                 parameters["mode"] != "a16"
                 or parameters["tile_n"] != 4
                 or query.num_tokens <= 8
+            ),
+            lambda parameters: (
+                not decode_w4_tk64
+                or parameters["mode"] != "a16"
+                or parameters["tile_k"] == 64
             ),
         ),
         autotune_effort=query.autotune_effort,
