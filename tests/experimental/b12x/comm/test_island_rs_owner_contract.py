@@ -1,4 +1,4 @@
-"""Island preparation binds one physical grid and coordinates capability failures."""
+"""Island calls preserve physical grids, coordinated setup, and storage contracts."""
 
 from dataclasses import replace
 from types import SimpleNamespace
@@ -58,6 +58,59 @@ def test_matching_grid_binds_independent_active_participation(direct, active):
     owner, query = _owner_and_query()
     query = replace(query, call=FrozenMapping(dict(query.call, active_blocks=active)))
     assert _bind(owner, query, direct).query == query
+
+
+@pytest.mark.parametrize(
+    "input_start,output_start,reject",
+    [(0, 64, True), (64, 0, True), (0, 0, False), (0, 512, False)],
+    ids=["forward-overlap", "backward-overlap", "exact-alias", "disjoint-views"],
+)
+@pytest.mark.parametrize("entry_point", ["all_reduce", "prepared_call"])
+def test_output_storage_contract(
+    monkeypatch, input_start, output_start, reject, entry_point
+):
+    storage = torch.empty(1024, dtype=torch.bfloat16)
+    source = storage[input_start : input_start + 512]
+    output = storage[output_start : output_start + 512]
+    owner, query = _owner_and_query()
+    owner._closed, owner.max_elements = False, source.numel()
+    query = replace(
+        query,
+        call=FrozenMapping(dict(query.call, inp={"shape": tuple(source.shape)})),
+    )
+    launcher, plan = object(), object()
+    state = _owner_preparation._OwnerState(query, owner, launcher)
+    launches = []
+
+    def prepared(actual_plan, component, device):
+        assert actual_plan is plan
+        assert component == "comm.pcie" and device == owner.device
+        return state
+
+    def run(actual_launcher, inp, out, blocks, stream, *, active_blocks):
+        assert actual_launcher is launcher
+        assert inp is source and out is output
+        assert blocks == 64 and active_blocks == 16
+        launches.append(out)
+        return out
+
+    monkeypatch.setattr(pcie_island_rs, "require_prepared", prepared)
+    monkeypatch.setattr(owner, "_run_prepared", run)
+
+    def invoke():
+        if entry_point == "all_reduce":
+            return owner.all_reduce(source, out=output, plan=plan)
+        call = _owner_preparation.prepared_call(state, inp=source, out=output)
+        assert call.output is output and call.capture_safe
+        return call.run()
+
+    if reject:
+        with pytest.raises(ValueError, match="overlap|alias"):
+            invoke()
+        assert not launches
+    else:
+        assert invoke() is output
+        assert len(launches) == 1
 
 
 @pytest.mark.parametrize("local_failure", [False, True])

@@ -164,7 +164,9 @@ def query_from_runtime(
         }
     elif surface == "PCIeIslandRSAllReduce.all_reduce":
         inp, out = raw["inp"], raw.get("out")
-        from .pcie_island_rs import _pick_blocks
+        from .pcie_island_rs import _pick_blocks, _validate_output_overlap
+
+        _validate_output_overlap(inp, out)
 
         blocks = int(runtime.blocks)
         if raw.get("blocks") is not None and int(raw["blocks"]) != blocks:
@@ -435,11 +437,14 @@ def prepared_call(state, **actual):
             capture_safe=True,
         )
     if query.surface == "PCIeIslandRSAllReduce.all_reduce":
+        from .pcie_island_rs import _validate_output_overlap
+
         out = actual.get("out")
         if out is None:
             import torch
 
             out = torch.empty_like(actual["inp"])
+        _validate_output_overlap(actual["inp"], out)
         return PreparedCall(
             run=lambda: runtime._run_prepared(
                 state.launcher(),

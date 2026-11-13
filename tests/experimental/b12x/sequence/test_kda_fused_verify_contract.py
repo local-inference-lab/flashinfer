@@ -4,6 +4,7 @@
 """Host-side contracts for prepared KDA convolution and recovery launches."""
 
 import gc
+from contextlib import nullcontext
 from dataclasses import replace
 from types import SimpleNamespace
 import weakref
@@ -105,6 +106,7 @@ def invocation(monkeypatch):
     monkeypatch.setattr(fused, "_fake_pointer", lambda dtype: None)
     monkeypatch.setattr(fused, "_pointer", lambda tensor, dtype: tensor.data_ptr())
     monkeypatch.setattr(fused, "current_cuda_stream", lambda: None)
+    monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())
     return binding, conv, launches
 
 

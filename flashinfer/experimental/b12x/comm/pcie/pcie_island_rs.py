@@ -32,6 +32,21 @@ _ISLAND_SIZE = 4
 _ALIGNMENT = 256
 
 
+def _validate_output_overlap(inp, out):
+    # Exact alias keeps each CTA's writes within its consumed input slice.
+    # Shifted overlap can overwrite another CTA's inputs before it reads them.
+    if (
+        out is not None
+        and inp.device == out.device
+        and inp.data_ptr() != out.data_ptr()
+        and inp.data_ptr() < out.data_ptr() + out.nbytes
+        and out.data_ptr() < inp.data_ptr() + inp.nbytes
+    ):
+        raise ValueError(
+            "island reduce-scatter permits exact in-place output or disjoint storage, not partial overlap"
+        )
+
+
 def _align_up(value: int, alignment: int = _ALIGNMENT) -> int:
     return (int(value) + alignment - 1) // alignment * alignment
 
@@ -237,6 +252,7 @@ class PCIeIslandRSAllReduce:
             or out.data_ptr() % 4 != 0
         ):
             raise ValueError("output must match input and be 4-byte aligned")
+        _validate_output_overlap(inp, out)
         selected = int(state.query.call["blocks"])
         if blocks is not None and int(blocks) != selected:
             raise ValueError("blocks differs from the prepared island plan")

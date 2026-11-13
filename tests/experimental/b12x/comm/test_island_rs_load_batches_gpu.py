@@ -13,10 +13,13 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 
-pytestmark = pytest.mark.skipif(
-    os.getenv("B12X_RUN_PCIE_ISLAND_RS_TEST") != "1",
-    reason="requires sixteen peer-accessible GPUs",
-)
+pytestmark = [
+    pytest.mark.node_exclusive,
+    pytest.mark.skipif(
+        os.getenv("B12X_RUN_PCIE_ISLAND_RS_TEST") != "1",
+        reason="requires sixteen peer-accessible GPUs",
+    ),
+]
 
 
 def _input(elements, rank, variation, device):

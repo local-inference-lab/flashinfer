@@ -710,9 +710,10 @@ def _check_operands(tensors, specifications):
 class FusedVerifyBinding:
     """A prepared one-launch verify with static or caller-owned dynamic operands."""
 
-    def __init__(self, binding, conv, launch, args, build_args):
+    def __init__(self, binding, conv, launch, args, build_args, device):
         self.binding, self.conv, self._launch, self._args = binding, conv, launch, args
         self._build_args = build_args
+        self.device = device
 
     def run(self, *, scale, lower_bound, eps):
         scale, lower_bound, eps = _scalars(scale, lower_bound, eps)
@@ -720,13 +721,15 @@ class FusedVerifyBinding:
             raise ValueError(
                 "this fused verify retains no preparation examples; use run_dynamic"
             )
-        self._launch(*self._args, scale, lower_bound, eps, current_cuda_stream())
+        with torch.cuda.device(self.device):
+            self._launch(*self._args, scale, lower_bound, eps, current_cuda_stream())
 
     def run_dynamic(self, binding, conv, *, scale, lower_bound, eps):
         """Launch with fresh caller-owned tensors; no preparation pointers are retained."""
         scale, lower_bound, eps = _scalars(scale, lower_bound, eps)
         args = self._build_args(binding, conv)
-        self._launch(*args, scale, lower_bound, eps, current_cuda_stream())
+        with torch.cuda.device(self.device):
+            self._launch(*args, scale, lower_bound, eps, current_cuda_stream())
 
 
 def prepare(binding, conv, *, retain_examples=True):
@@ -889,21 +892,22 @@ def prepare(binding, conv, *, retain_examples=True):
     )
     _check_operands(examples, specifications)
 
-    kernel = _FusedVerify(query, cq, block_v, conv_strides, weight_type, norm_type)
-    launch = b12x_compile(
-        kernel,
-        *(_fake_pointer(t) for t in vtypes),
-        *(Int64(1) for _ in range(9)),
-        Int32(1),
-        Int32(1),
-        Float32(1.0),
-        Float32(-5.0),
-        Float32(1e-6),
-        current_cuda_stream(),
-        compile_spec=KernelCompileSpec.from_key(
-            "sequence.gdn_decode.kda_fused_verify", 1, key
-        ),
-    )
+    with torch.cuda.device(binding.output.device):
+        kernel = _FusedVerify(query, cq, block_v, conv_strides, weight_type, norm_type)
+        launch = b12x_compile(
+            kernel,
+            *(_fake_pointer(t) for t in vtypes),
+            *(Int64(1) for _ in range(9)),
+            Int32(1),
+            Int32(1),
+            Float32(1.0),
+            Float32(-5.0),
+            Float32(1e-6),
+            current_cuda_stream(),
+            compile_spec=KernelCompileSpec.from_key(
+                "sequence.gdn_decode.kda_fused_verify", 1, key
+            ),
+        )
 
     def build_args(binding, conv):
         _shared_metadata(binding, conv)
@@ -931,6 +935,7 @@ def prepare(binding, conv, *, retain_examples=True):
         launch,
         args,
         build_args,
+        binding.output.device,
     )
 
 

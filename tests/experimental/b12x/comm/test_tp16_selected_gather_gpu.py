@@ -9,10 +9,13 @@ from pathlib import Path
 
 import pytest
 
-pytestmark = pytest.mark.skipif(
-    os.getenv("B12X_RUN_PCIE_DCP_A2A_TEST") != "1",
-    reason="requires explicitly assigned peer-accessible SM120 GPUs",
-)
+pytestmark = [
+    pytest.mark.node_exclusive,
+    pytest.mark.skipif(
+        os.getenv("B12X_RUN_PCIE_DCP_A2A_TEST") != "1",
+        reason="requires explicitly assigned peer-accessible SM120 GPUs",
+    ),
+]
 
 
 def _worker(rank, world, directory):

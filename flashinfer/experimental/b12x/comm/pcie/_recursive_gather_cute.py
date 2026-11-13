@@ -94,8 +94,8 @@ class RecursiveGather(SelectedGather):
             tiles = rows * row_tiles
             for phase in cutlass.range_constexpr(self._world_size.bit_length() - 1):
                 if cutlass.const_expr(self._world_size == 8):
-                    # Cross the two four-GPU switches first. Later phases only
-                    # forward shards already gathered within one switch.
+                    # Cross the two four-GPU switches first. Later exchanges
+                    # stay within each switch while forwarding both sets of shards.
                     distance = (4, 1, 2)[phase]
                     group = (1, 2, 4)[phase]
                 else:

@@ -54,7 +54,10 @@ def _apply_executor_lifetime_patch() -> None:
     if _EXECUTOR_LIFETIME_PATCHED:
         return
 
-    from cutlass.base_dsl.jit_executor import JitExecutor
+    try:
+        from cutlass.base_dsl.jit_executor import JitExecutor
+    except ImportError:
+        return
 
     original_init = JitExecutor.__init__
 
