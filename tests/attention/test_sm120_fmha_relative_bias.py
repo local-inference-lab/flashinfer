@@ -66,8 +66,15 @@ def _kernel(*, bias, sink, gate=False, window=-1, factored=False):
 
 
 class _Case:
-    def __init__(self, *, rows, capacity, seed):
-        self.rows, self.capacity = rows, capacity
+    """One request of ``rows`` query rows, or several with ``q_lens`` rows and
+    ``lengths`` keys each, packed in one launch over a shared page pool."""
+
+    def __init__(self, *, rows=None, capacity, seed, q_lens=None, lengths=None):
+        if q_lens is None:
+            q_lens, lengths = [rows], [capacity]
+        rows = sum(q_lens)
+        batch = len(q_lens)
+        self.rows, self.capacity, self.q_lens = rows, capacity, list(q_lens)
         gen = torch.Generator(device="cuda").manual_seed(seed)
         self.gen = gen
         pages = (capacity + PAGE - 1) // PAGE
@@ -76,16 +83,19 @@ class _Case:
             return torch.randn(shape, generator=gen, device="cuda") * std
 
         self.randn = randn
-        self.key = randn((pages + 2, PAGE, HKV, DIM), 0.5).to(torch.float8_e4m3fn)
-        self.value = randn((pages + 2, PAGE, HKV, DIM), 0.5).to(torch.float8_e4m3fn)
-        self.table = torch.randperm(pages + 2, generator=gen, device="cuda")[:pages]
-        self.table = self.table.to(torch.int32).view(1, pages).contiguous()
+        pool = batch * pages + 2
+        self.key = randn((pool, PAGE, HKV, DIM), 0.5).to(torch.float8_e4m3fn)
+        self.value = randn((pool, PAGE, HKV, DIM), 0.5).to(torch.float8_e4m3fn)
+        self.table = torch.randperm(pool, generator=gen, device="cuda")
+        self.table = self.table[: batch * pages].to(torch.int32)
+        self.table = self.table.view(batch, pages).contiguous()
         self.q = randn((rows, HQ, DIM), 0.5).to(torch.bfloat16)
         self.q8 = self.q.to(torch.float8_e4m3fn)
         self.bias = randn((rows, HQ, EXTENT), 2.0).to(torch.bfloat16)
         self.sink = randn((rows, HQ), 3.0)
-        self.lengths = torch.tensor([capacity], dtype=torch.int32, device="cuda")
-        self.cu = torch.tensor([0, rows], dtype=torch.int32, device="cuda")
+        self.lengths = torch.tensor(lengths, dtype=torch.int32, device="cuda")
+        self.cu = torch.zeros(batch + 1, dtype=torch.int32, device="cuda")
+        self.cu[1:] = torch.tensor(q_lens, device="cuda").cumsum(0)
         self.out = torch.empty_like(self.q)
         self.factor = torch.empty((rows, HQ, 16), dtype=torch.bfloat16, device="cuda")
         self.projection = torch.empty((EXTENT, 16), dtype=torch.bfloat16, device="cuda")
@@ -129,7 +139,7 @@ class _Case:
             self.cu,
             self.table,
             None,
-            Int32(self.rows),
+            Int32(max(self.q_lens)),
             False,
             # The plain program takes only the K/V tile ranges after use_pdl.
             *(
@@ -145,6 +155,19 @@ class _Case:
                 else (None,)
             ),
         )
+
+    def request(self, index):
+        """The single-request case that holds request ``index`` of the launch."""
+        import copy
+
+        start, end = int(self.cu[index]), int(self.cu[index + 1])
+        view = copy.copy(self)
+        view.rows, view.q_lens = end - start, [end - start]
+        view.lengths = self.lengths[index : index + 1]
+        view.table = self.table[index : index + 1]
+        for name in ("q8", "bias", "sink", "gate", "factor", "out"):
+            setattr(view, name, getattr(self, name)[start:end])
+        return view
 
     def reference(self, *, bias, sink, query=None, window=-1):
         """FP64 output, error bound, and probability mass inside the extent."""
@@ -476,7 +499,8 @@ def test_factored_bias_graph_replay_matches_reference_and_operand(window, sink, 
 
 def test_factored_bias_with_unrestricted_operands():
     """With arbitrary BF16 operands the kernel's FP32 sum can round to the
-    neighboring BF16 value, one part in 2**8 of the bias.  A logit error of at
+    neighboring BF16 value.  BF16 values are spaced at most 2**-7 of their
+    magnitude apart, so the bias moves by at most that.  A logit error of at
     most ``delta`` changes each probability by a factor within ``exp(2 *
     delta)``, which adds ``(exp(2 * delta) - 1) * mass`` to the bound."""
     _require_sm120()
@@ -486,7 +510,7 @@ def test_factored_bias_with_unrestricted_operands():
     case.run(kernel, bias=True, sink=True, factored=True)
     torch.cuda.synchronize()
     ref, bound, _ = case.reference(bias=True, sink=True, window=1023)
-    delta = 2.0**-8 * float(case.bias.abs().max())
+    delta = 2.0**-7 * float(case.bias.abs().max())
     mass = (bound - 2.0**-8 * ref.abs()) / (2.0**-4 + 2.0**-11)
     assert (
         (case.out.double() - ref).abs() <= bound + math.expm1(2 * delta) * mass
@@ -603,3 +627,65 @@ def test_factored_operand_validation():
     ):
         with pytest.raises(error):
             compile_sm120_fmha_fp8_paged_kernel(**{**arguments, **options})
+
+
+@pytest.mark.parametrize("window", [-1, 1023])
+def test_factored_bias_indexes_rows_across_requests(window):
+    """Five requests of uneven query and key lengths, one of them empty: each
+    request's rows read their own factor rows.  The output is bit-identical to
+    the bias-operand program and each live request meets the reference bound.
+    Query lengths that are not multiples of the 128-row tile leave padded rows
+    in each request's last tile, next to the following request's factors."""
+    _require_sm120()
+    factored = _kernel(bias=True, sink=True, window=window, factored=True)
+    operand = _kernel(bias=True, sink=True, window=window)
+    case = _Case(
+        capacity=2304,
+        seed=window + 107,
+        q_lens=[200, 131, 0, 77, 129],
+        lengths=[900, 2304, 640, 77, 1153],
+    )
+    case.draw_factored_bias()
+    expected = torch.empty_like(case.out)
+    case.run(factored, bias=True, sink=True, factored=True)
+    case.run(operand, bias=True, sink=True, out=expected)
+    torch.cuda.synchronize()
+    assert torch.equal(case.out, expected)
+    for index, rows in enumerate(case.q_lens):
+        if rows:
+            request = case.request(index)
+            ref, bound, _ = request.reference(bias=True, sink=True, window=window)
+            assert ((request.out.double() - ref).abs() <= bound).all(), index
+    # Each request's rows carry a different bias: with the first request's
+    # factors in every request the operand program gives another result.
+    shifted = case.bias.clone()
+    case.bias[200:331] = shifted[:131]
+    case.run(operand, bias=True, sink=True, out=expected)
+    torch.cuda.synchronize()
+    assert not torch.equal(case.out, expected)
+
+
+def test_factored_bias_ignores_nonfinite_products_beyond_the_extent():
+    """Projection rows 0 and 1023 are the rows a clamped out-of-extent distance
+    loads.  With an infinite entry there, keys inside the extent get the
+    operand program's result and rows whose keys all lie beyond the extent or
+    at other distances stay finite."""
+    _require_sm120()
+    factored = _kernel(bias=True, sink=False, factored=True)
+    operand = _kernel(bias=True, sink=False)
+    case = _Case(rows=320, capacity=EXTENT + 700 + 320, seed=109)
+    case.draw_factored_bias()
+    # A -inf bias at distances 0 and 1023 masks those two keys in both
+    # programs; every other key, including those beyond the extent, is live.
+    case.factor[:, :, 3] = 1.0
+    case.projection[:, 3] = 0.0
+    case.projection[0, 3] = -float("inf")
+    case.projection[EXTENT - 1, 3] = -float("inf")
+    product = case.factor.double() @ case.projection.double().t()
+    case.bias.copy_(product.to(torch.bfloat16))
+    expected = torch.empty_like(case.out)
+    case.run(factored, bias=True, sink=False, factored=True)
+    case.run(operand, bias=True, sink=False, out=expected)
+    torch.cuda.synchronize()
+    assert torch.isfinite(expected).all()
+    assert torch.equal(case.out, expected)

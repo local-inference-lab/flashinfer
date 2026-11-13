@@ -2298,7 +2298,14 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         ``(i - k) mod 8``: it sits in the same row's lane quad, in the lane
         that owns that column, and moves with one shuffle. Eighteen MMAs cover
         the 143 distances between the tile's 16 rows and 128 keys. Each result
-        is rounded to BF16, as a materialized BF16 bias would be.
+        is rounded to BF16, as a materialized BF16 bias would be; where the
+        FP32 sum falls on the other side of a rounding boundary from the exact
+        product, the two differ by one BF16 step, at most ``2**-7`` of the
+        value.
+
+        Distances outside ``[0, extent)`` get a zero projection column, so
+        non-finite projection rows stay inside the extent. A non-finite
+        factor row makes its whole row non-finite.
         """
         projection = basic_params.relative_projection
         extent = cutlass.Int32(projection.shape[0])
@@ -2327,39 +2334,29 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         for step in cutlass.range_constexpr(18):
             mma_index = step - 16
             first_distance = delta + 8 * mma_index
-            # B column n of the MMA is this lane group's distance.
+            # B column n of the MMA is this lane group's distance. A distance
+            # outside [0, extent) carries no bias: its column of the
+            # projection is zero, so no projection row is read for it and its
+            # results are zero for every finite factor row.
             b_distance = first_distance + group
-            if b_distance < 0:
-                b_distance = cutlass.Int32(0)
-            if b_distance >= extent:
-                b_distance = extent - 1
-            b_low = (projection_ptr + b_distance * 16 + 2 * quad).load(
-                count=2, alignment=4
-            )
-            b_high = (projection_ptr + b_distance * 16 + 2 * quad + 8).load(
-                count=2, alignment=4
-            )
+            b0 = cutlass.Int32(0)
+            b1 = cutlass.Int32(0)
+            if b_distance >= 0 and b_distance < extent:
+                b_low = (projection_ptr + b_distance * 16 + 2 * quad).load(
+                    count=2, alignment=4
+                )
+                b_high = (projection_ptr + b_distance * 16 + 2 * quad + 8).load(
+                    count=2, alignment=4
+                )
+                b0 = pack_to_i32((b_low[0], b_low[1]), cutlass.BFloat16)
+                b1 = pack_to_i32((b_high[0], b_high[1]), cutlass.BFloat16)
             d0, d1, d2, d3 = ptx_mma_m16n8k16_bf16_f32(
-                a_regs[0],
-                a_regs[1],
-                a_regs[2],
-                a_regs[3],
-                pack_to_i32((b_low[0], b_low[1]), cutlass.BFloat16),
-                pack_to_i32((b_high[0], b_high[1]), cutlass.BFloat16),
+                a_regs[0], a_regs[1], a_regs[2], a_regs[3], b0, b1
             )
-            # This lane's result columns are distances 2 * quad and + 1.
-            even_distance = first_distance + 2 * quad
-            # Distances outside [0, extent) carry no bias.
-            even_keep = cutlass.Float32(0.0)
-            odd_keep = cutlass.Float32(0.0)
-            if even_distance >= 0 and even_distance < extent:
-                even_keep = cutlass.Float32(1.0)
-            if even_distance + 1 >= 0 and even_distance + 1 < extent:
-                odd_keep = cutlass.Float32(1.0)
-            d0 = round_f32_to_bf16(d0) * even_keep
-            d1 = round_f32_to_bf16(d1) * odd_keep
-            d2 = round_f32_to_bf16(d2) * even_keep
-            d3 = round_f32_to_bf16(d3) * odd_keep
+            d0 = round_f32_to_bf16(d0)
+            d1 = round_f32_to_bf16(d1)
+            d2 = round_f32_to_bf16(d2)
+            d3 = round_f32_to_bf16(d3)
             # Key column 0 reads the MMA column of the group's parity.
             x00 = d0
             x01 = d2
