@@ -879,6 +879,7 @@ def test_a4_prefill_graph_replay_reuses_launches(terms, monkeypatch):
 @pytest.mark.parametrize(
     "intermediate_size,terms,capacity,warps,tokens,ready",
     [
+        (128, 2, 320, 16, 131, False),
         (256, 1, 320, 8, 131, False),
         (256, 1, 3072, 8, 131, False),
         (256, 2, 3072, 8, 131, False),
@@ -895,12 +896,15 @@ def test_a4_prefill_graph_replay_reuses_launches(terms, monkeypatch):
 def test_a4_csf_scale_readers_preserve_dense_graph_output(
     intermediate_size, terms, capacity, warps, tokens, ready, monkeypatch
 ):
-    """Scale expansion preserves native arithmetic and caller stream ordering."""
+    """Expanded and inline scales preserve every pipeline byte under replay."""
     import numpy as np
 
     from b12x._lib.quant.nvfp4_csf import Nvfp4CsfDecoder
     from b12x._lib.runtime_control import kernel_resolution_guard
     from b12x.moe import fused_moe as moe
+    from b12x.moe.fused_moe._binding_ops import scale_buffers
+    from b12x.moe.fused_moe._tuning import MoeDecodeConfig
+    from b12x.moe._shared.kernels.w4a16.prefill_a4 import _carve_layout
     from .test_w4a16_csf_tp6 import _swizzled
 
     device = require_b12x()
@@ -922,6 +926,7 @@ def test_a4_csf_scale_readers_preserve_dense_graph_output(
         # retain base/code words.
         logical[:, :, 1::2] = 0x68 + (row + expert) % 8
         logical[:, 5, ::8] = 0
+        logical[:, 6, ::8] = 1  # Flushed scales after native lifting.
         logical = logical.astype(np.uint8)
         case[name] = _swizzled(logical, device)
         case[name + "_log"] = (
@@ -929,11 +934,31 @@ def test_a4_csf_scale_readers_preserve_dense_graph_output(
         )
     a1g = torch.linspace(800, 1100, E, device=device)
     a2g = torch.linspace(24, 56, E, device=device)
-    owners = [_prepare(case, a1g, a2g, csf=csf) for csf in (False, True)]
+    inline = I % 128 == 0
+    owners = [_prepare(case, a1g, a2g, csf=csf) for csf in (inline, True)]
     x, ids, wts = _inputs(tokens, 51)
+    ids = ids.to(torch.int64 if warps == 16 else torch.int32)
+
+    def routes():
+        ids.remainder_(E - 2)  # Leave two experts empty as routing changes.
+        ids[::17, 0] = -1
+        ids[::19, 1] = E
+
+    routes()
     bindings, outputs, scratches = [], [], []
-    for owner in owners:
-        plan = _plan(owner, capacity)
+    for index, owner in enumerate(owners):
+        plan = moe.plan_execution(
+            experts=owner,
+            capacity=moe.ExecutionCapacity(max_tokens=capacity, top_k=TOPK),
+            invocation={"fast_math": True, "a4_prefill": True},
+            override=MoeDecodeConfig(
+                backend="w4a16",
+                route_planner="internal",
+                max_active_clusters=None,
+                w4a16_route_mode="packed",
+                csf_inline_scales=bool(index and inline),
+            ),
+        )
         scratch = tuple(
             torch.empty(s.shape, dtype=s.dtype, device=device)
             for s in plan.scratch_specs()
@@ -949,29 +974,74 @@ def test_a4_csf_scale_readers_preserve_dense_graph_output(
             a4_prefill=True,
             scales_expanded=ready,
         )
+        assert moe.uses_expanded_nvfp4_scales(
+            plan, num_tokens=tokens, a4_prefill=True
+        ) == (owner._impl.nvfp4_csf is not None and not (index and inline))
+        if index and inline:
+            assert scale_buffers(binding) == ([], [])
         bindings.append(binding)
         outputs.append(output)
         scratches.append(scratch)
     launches = [binding.a4_prefill_launches for binding in bindings]
-    assert launches[0].fc1 is launches[1].fc1
-    assert launches[0].fc2 is launches[1].fc2
+    assert launches[1].csf_inline_scales is inline
+    assert (launches[0].fc1 is launches[1].fc1) == (not inline)
+    assert (launches[0].fc2 is launches[1].fc2) == (not inline)
     packed = owners[1]._impl.representation.value
     scale_scratch = (packed.w13_scale, packed.w2_scale)
-    consumes_expanded = ready
 
-    def reject_expansion(*args, **kwargs):
-        raise AssertionError("Caller-expanded scales must skip per-call expansion")
+    def pipeline_bytes(index):
+        binding = bindings[index]
+        regions, _ = _carve_layout(launches[index], tokens)
+        raw = binding.intermediate_cache2.view(-1).view(torch.uint8)
+        return [
+            outputs[index].view(torch.uint8),
+            binding.intermediate_cache13.view(-1)[: tokens * TOPK * H].view(
+                torch.uint8
+            ),
+            *(raw.narrow(0, off, size) for off, size in regions[2:4]),
+        ]
 
-    if ready:
-        monkeypatch.setattr(Nvfp4CsfDecoder, "decode", reject_expansion)
+    def clear_pipeline(index):
+        for tensor in (bindings[index].intermediate_cache13, *scratches[index]):
+            tensor.view(torch.uint8).fill_(0x7F)
+
+    def check_bytes():
+        assert all(
+            torch.equal(a, b)
+            for a, b in zip(pipeline_bytes(0), pipeline_bytes(1), strict=True)
+        )
+        if inline:
+            assert all(
+                torch.all(buffer.view(torch.uint8) == 0x7F) for buffer in scale_scratch
+            )
+
+    def reject_expansion(method):
+        def guarded(decoder, *args, **kwargs):
+            if decoder.first is owners[1]._impl.nvfp4_csf.first:
+                raise AssertionError(
+                    "Prepared inline/caller-expanded scales must skip expansion"
+                )
+            return method(decoder, *args, **kwargs)
+
+        return guarded
+
+    if ready or inline:
+        monkeypatch.setattr(
+            Nvfp4CsfDecoder, "decode", reject_expansion(Nvfp4CsfDecoder.decode)
+        )
+    if inline:
+        monkeypatch.setattr(
+            Nvfp4CsfDecoder, "decode_all", reject_expansion(Nvfp4CsfDecoder.decode_all)
+        )
     for buffer in scale_scratch:
         buffer.view(torch.uint8).fill_(0x7F)
-    if consumes_expanded:
+    if ready and not inline:
         assert moe.expand_scales(owners[1])
-    for binding in bindings:
+    for index, binding in enumerate(bindings):
+        clear_pipeline(index)
         moe.run(binding=binding)
     torch.cuda.synchronize()
-    torch.testing.assert_close(outputs[1], outputs[0], rtol=0, atol=0)
+    check_bytes()
     assert torch.isfinite(outputs[1]).all() and torch.count_nonzero(outputs[1])
     graph = torch.cuda.CUDAGraph()
     stable = (*scratches[1], *scale_scratch, outputs[1])
@@ -984,10 +1054,13 @@ def test_a4_csf_scale_readers_preserve_dense_graph_output(
                 changed = _inputs(x.shape[0], seed)
                 for target, source in zip((x, ids, wts), changed, strict=True):
                     target.copy_(source)
+                routes()
+                clear_pipeline(0)
                 moe.run(binding=bindings[0])
-                for buffer in (*scratches[1], *scale_scratch):
+                clear_pipeline(1)
+                for buffer in scale_scratch:
                     buffer.view(torch.uint8).fill_(0x7F)
-                if consumes_expanded:
+                if ready and not inline:
                     assert moe.expand_scales(owners[1])
                 outputs[1].fill_(float("nan"))
                 torch.cuda.synchronize()
@@ -998,8 +1071,8 @@ def test_a4_csf_scale_readers_preserve_dense_graph_output(
                 assert torch.cuda.memory_allocated() == allocated
                 assert torch.cuda.max_memory_allocated() == allocated
                 assert pointers == tuple(t.data_ptr() for t in stable)
-                torch.testing.assert_close(outputs[1], outputs[0], rtol=0, atol=0)
-                if not consumes_expanded:
+                check_bytes()
+                if not inline and not ready:
                     assert all(
                         not torch.all(buffer.view(torch.uint8) == 0x7F)
                         for buffer in scale_scratch
