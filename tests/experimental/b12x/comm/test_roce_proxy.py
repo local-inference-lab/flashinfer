@@ -121,7 +121,7 @@ def test_layout_places_variable_length_area_after_two_shot():
         lib = load()
     except RuntimeError as exc:  # no C compiler or libibverbs headers
         pytest.skip(str(exc))
-    assert lib.roce_abi_version() == ABI_VERSION == 14
+    assert lib.roce_abi_version() == ABI_VERSION == 15
     piped = Layout(4, 2 << 20, 64 << 20)
     assert piped.varlen_bytes == 0
     assert piped.varlen_recv_off == piped.varlen_flag_off == piped.total_bytes
@@ -137,3 +137,28 @@ def test_layout_places_variable_length_area_after_two_shot():
     for bad in (1000, (1 << 32) + 4096):
         with pytest.raises(ValueError):
             Layout(4, 2 << 20, 0, bad)
+
+
+def test_ring_mailbox_is_sized_by_topology():
+    """Only a broadcasting line reserves the large mailbox; every other topology keeps main's."""
+    from b12x.comm.roce._proxy import load, ring_bytes
+
+    try:
+        load()
+    except RuntimeError as exc:  # no C compiler or libibverbs headers
+        pytest.skip(str(exc))
+    # Per slot: an 8-byte acknowledgment word, a 128-byte outgoing descriptor, and one
+    # mailbox (a 128-byte descriptor plus its packet).
+    small = 65_536 + 128 + 8 + 128
+    large = 262_144 + 128 + 8 + 128
+    # A closed four-rank ring relays per destination and shares one eight-slot window
+    # per (origin, rail): four origins, two rails, eight slots.
+    assert ring_bytes(4) == 4 * 2 * 8 * small == 4_211_200
+    # The same group on an open line broadcasts 256 KiB in 32 slots per destination.
+    assert ring_bytes(4, ring_open=True) == 4 * 2 * 32 * 3 * large == 201_529_344
+    # Broadcast is disabled for two- and three-rank lines, so they keep the small block.
+    # Closed rings also keep that geometry, with storage growing with the world size.
+    assert ring_bytes(2, ring_open=True) == ring_bytes(2) == 2 * 2 * 8 * small
+    assert ring_bytes(3, ring_open=True) == ring_bytes(3)
+    assert ring_bytes(8) == 8 * 2 * 8 * small == 8_422_400
+    assert ring_bytes(1) == 0 and ring_bytes(17) == 0

@@ -30,7 +30,9 @@ The exchange group's rank order defines the cycle `0,1,...,N-1,0`, with
 2 through 16 ranks. All ranks must select the same mode and capacities. Only
 the two neighbors' queue pairs connect (one for a two-rank cycle). This also
 works on a switched fabric, allowing neighbor-only connectivity to be emulated
-without changing host routes, firewall rules, or cabling.
+without changing host routes, firewall rules, or cabling. `ring_open=True` selects the same
+transport over a line in rank order instead of a cycle: ranks 0 and `N-1` have one neighbor each,
+and from four ranks up all-gather chunks are broadcast once per direction (see the relays below).
 
 On a physical ring, enumerate the active RDMA functions on both cabled ports
 using `hca_names` and set the appropriate `gid_index`. The existing route planner
@@ -42,23 +44,35 @@ can perform that exchange without requiring an NCCL data transport.
 One-shot reductions, two-shot reductions, fixed gathers, and variable-length
 gathers share the same native write path. Non-neighbor transfers use the
 shorter direction around the ring; equal distances choose increasing ranks.
-Relays split each rail into at most 64 KiB packets. Each original sender owns
-eight mailbox slots per rail at every rank, so up to eight packets per sender
-and rail are in flight, and it reuses a slot only after the end-to-end
-acknowledgment of the packet that last used it. Acknowledgments propagate back
+Relays split each rail into packets of at most 64 KiB, or 256 KiB where a chunk
+is broadcast. Each original sender owns a mailbox window per rail at every rank,
+either one window per destination (32 slots, on a broadcasting line) or one
+window shared by its destinations in the order it posted them (8 slots,
+everywhere else), and a slot is reused only after the end-to-end acknowledgment
+of the packet that last used it. Acknowledgments
+propagate back
 only after the downstream transfer has finished reading its source, preserving
 staging lifetimes without circular credit dependencies between senders. The
 sender's payload is read only by its first-hop write, so its lifetime follows
 the same completion rules as a direct write.
 
-The proxy owns about 1 MiB of extra registered host memory per rank in the
-world (8.0 MiB at eight ranks, 16.1 MiB at sixteen), allocated before connection
-exchange. No relay allocation or Python callback occurs during replay. Existing
-captured buffers and kernel layouts are retained. Proxy ABI 10 extends the
-connection blob and sizes the mailbox region; native consumers must use the
-matching C source and call `roce_enable_ring` before exchanging blobs. The
-returned `native_description()` records `ring`; private mailbox addresses are
-exchanged fresh at startup rather than restored from a CUDA graph.
+The proxy owns one aligned block of registered host memory per rank in the world,
+sized by the topology it is about to enable, allocated before connection
+exchange: on a broadcasting line `world * 2 * 32 * (world - 1)` mailboxes of
+256 KiB, and elsewhere `world * 2 * 8` mailboxes of 64 KiB, plus their
+acknowledgment and descriptor words. That is 192.2 MiB at four ranks, 896.9 MiB
+at eight and 3.75 GiB at sixteen on a line, against 4.0 MiB at four, 8.0 MiB at
+eight and 16.1 MiB at sixteen on a ring. No relay allocation or Python callback
+occurs during replay. Existing captured buffers and kernel layouts are retained.
+Proxy ABI 15 gives the block this geometry.
+Native consumers must use the matching C source and call `roce_enable_ring` (or
+`roce_enable_ring_open` for a line) before exchanging blobs. The returned
+`native_description()` records `ring` and `ring_bytes`; private mailbox addresses are
+exchanged fresh at startup rather than restored from a CUDA graph. Every rank of a group must run
+the same proxy source: the connection blob grew from 1,168 to 1,184 bytes to carry the mailbox
+window, the packet size and the protocol tag, and `roce_connect` fails with `ranks disagree on CPU
+relay protocol or geometry` before any operation is posted. Kernels exported at ABI 11 through 14
+keep their captured addresses, because the region layout and the doorbell words are ABI 14's.
 
 The two halves of the pipelined two-shot path are also separate operations.
 `reduce_scatter` reduces a whole message and keeps this rank's shard of the
@@ -85,13 +99,22 @@ reached the op (proxy ABI 14). Without the credits, a write overtaking a slow
 peer's read ends in that peer's wait timeout or in silently mixed rows. Other
 transitions are ordered by data dependencies and carry no credits. On the ring
 transports, a credit to a rank that is not a neighbor travels as an empty
-mailbox write.
+mailbox write. On an open chain an all-gather chunk is broadcast, and a forwarded write is causally
+downstream of the origin's posting, so it inherits that origin's start-of-op credit gate.
 
 Collective generations range from 1 through 2,147,483,647. The proxy fails
 with `RoCE sequence space exhausted` before dispatching a larger generation;
 recreate every rank's runtime to reset the sequence. The bound preserves the
 meaning of zero-initialized chunk-ready words and the healthy error sentinel.
 It applies to the direct and ring transports and does not change the proxy ABI.
+
+Every queue pair declares support for two send scatter-gather entries. A per-destination relay
+combines descriptor and payload in a two-SGE RDMA write, followed by its commit write. A broadcast
+writes descriptor, final receive-row payload and commit separately in queue-pair order.
+`roce_create` fails for a device whose `max_sge` is below two, on every transport. A context that
+failed, or that was stopped while posting an operation, is terminal: `roce_start` refuses it and
+the runtime must be recreated, because a partly posted operation leaves a serial that downstream
+ranks wait for.
 
 ## Rails, lanes and the all-gather relay
 
@@ -140,7 +163,34 @@ shard-gather operations, not to the variable-length all-gather;
 `native_description()["relay_plan"]` is the plan a native runtime passes to
 `roce_set_relay`. Proxy ABI 13 adds `roce_set_relay`.
 
+On an open chain, the two-shot all-gather phase and the shard gather are broadcast once per direction
+instead of relayed once per destination (proxy ABI 15). Each packet names the far endpoint as its
+target; its payload is written into the next host's receive row, and every host it passes publishes
+the flag for its own row and forwards the bytes from that row, so each rank's shard crosses each link
+once: 12 shard-sized link transfers for a round on a four-rank line against 20, and 8 on a middle
+rank against 14. Broadcast is enabled only for open chains of four or more ranks; two- and three-rank chains retain per-destination delivery. The
+reduce-scatter phase, one-shot and variable-length transfers, and every transfer on a cycle or
+between cable partners keep per-destination delivery. Broadcast packets are forwarded in serial
+order, not arrival order: a hop forwards the next serial of its origin, target and rail
+(`ring_order[origin][target][rail] + 1` in `ring_service`) and a chain endpoint follows
+`fanout_previous` instead. A per-destination relay holds one window per (origin, rail) and forwards
+its arrivals in the order the origin posted them.
+
+A runtime must budget the mailbox block before it constructs the transport: `roce_ring_bytes(world,
+open)` returns its size in bytes per rank for that topology (201,529,344 at four ranks on a line,
+4,211,200 on a ring, zero outside 2..16), `roce_enable_ring` or `roce_enable_ring_open` allocates and
+registers it, and `native_description()["ring_bytes"]` reports it. Broadcast topologies use 256 KiB
+packets behind a 32-slot window per destination; every other topology uses 64 KiB packets and an
+eight-slot window shared by destinations for each origin and rail.
+
 ## Runnable checks
+
+CPU-only proxy checks (a C compiler and libibverbs headers required, no GPU or RDMA device):
+
+```sh
+PYTHONPATH=flashinfer/experimental python3 -m pytest -q --confcutdir=tests/experimental/b12x \
+  tests/experimental/b12x/comm/test_roce_{proxy,routes,ring_arrival,relay_guard}.py
+```
 
 The transport validator uses real libibverbs registrations and RDMA writes,
 with CPU-produced doorbells and byte-exact reference checks. It needs Python,
@@ -158,7 +208,8 @@ The default source directory is this checkout. Use `--source PATH` to validate
 another proxy source directory, `--skew-rank R` to delay one CPU driver between
 operations, `--consume-delay-ms D` to make that rank read peers' rows late,
 `--scatter-gather` to add reduce-scatter and shard-gather ops in every order
-between pipelined kinds, `--mesh` to check the ordinary direct transport, `--lanes L` to
+between pipelined kinds, `--mesh` to check the ordinary direct transport, `--ring-open` to run the
+line transport and its broadcast, `--lanes L` to
 select the queue pairs per rail, or `--mesh --relay` to relay two-shot
 all-gather chunks through cable partners, which requires ranks that pair up over
 direct cables and all four functions in `--hca-names`. The validator
@@ -196,6 +247,22 @@ must preserve every operation's payload. The generation-limit tests initialize
 stopped proxies through a test-only C wrapper: a two-shot graph completes at
 generation 2,147,483,647, then the next replay must report sequence exhaustion
 without advancing the epoch or posting another transfer.
+
+The mixed-collectives benchmark is a torchrun target of its own. One iteration
+replays a CUDA graph of six `gather_shards` calls (80, 12, 16, 16 and 8 MiB and
+128 KiB of gathered BF16) and three 1 MiB two-shot all-reduces, compares every
+output exactly after every replay, and reports each rank's median replay time:
+
+```sh
+B12X_ROCE_HCA=roceP2p1s0f0,roceP2p1s0f1,rocep1s0f0,rocep1s0f1 B12X_ROCE_GID_INDEX=3 \
+torchrun --nnodes=N --nproc-per-node=1 --node-rank=R \
+  --master-addr=RANK_ZERO_HOST --master-port=29650 \
+  benchmarks/experimental/b12x/benchmark_roce_mixed_collectives.py --iters 2000
+```
+
+It builds the line transport unless `--transport ring` or `--transport mesh` is
+given, and `--mix gathers` or `--mix twoshots` runs one kind of collective
+alone. A wrong output or a transport failure ends the run with exit status 3.
 
 ## Validation limits
 
@@ -243,6 +310,15 @@ waits for every peer's flags; median over 500 operations, slowest rank) measured
 | One-shot | 64 KiB | 72 us |
 | One-shot | 1 MiB | 1.3 ms |
 | Two-shot | 16 MiB | 5.0 ms |
+
+Proxy ABI 15 ran on four DGX Sparks, one GB10 each, cabled as an open line in rank order with two
+RoCE rails per link: `validate_roce_ring_native.py --ring-open --iterations 120`, alone and with
+`--scatter-gather`, exited 0 on every rank, and the seven `test_roce_*_gpu.py` files gave 236 passed
+and 6 skipped over two neighboring hosts. No GPU pytest ran over an open chain of more than two
+ranks. A closed four-rank ring ran the same proxy outside pytest:
+`validate_roce_ring_native.py --world-size 4 --iterations 120 --skew-rank 2`, with and without
+`--scatter-gather`, and the mixed-collectives benchmark with `--transport ring` exited 0 on every
+rank. No closed-ring GPU pytest, one-rail operation or cable-partner relay ran with this proxy.
 
 Full-model ring serving and ring performance under a model remain unqualified.
 These finite tests do not establish progress under every possible failure or
