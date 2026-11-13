@@ -18,14 +18,41 @@ from b12x.sequence.gdn_decode._tuning import GdnQuery
 from b12x.sequence.short_conv._tuning import ShortConvQuery
 
 
+class _PlanToken:
+    """Weak-referenceable identity for prepared metadata in host-only tests."""
+
+
 @pytest.fixture
-def invocation(monkeypatch):
+def prepared_states(monkeypatch):
+    from b12x.preparation import types
+
+    states = {}
+
+    def require_prepared(plan, operation, *args):
+        expected_operation, state = states[id(plan)]
+        assert operation == expected_operation
+        return state
+
+    monkeypatch.setattr(types, "require_prepared", require_prepared)
+    return states
+
+
+def _attach_plan(target, prepared_states, *, query=None):
+    operation, state = prepared_states[id(target.plan)]
+    replacement = SimpleNamespace(**vars(state))
+    replacement.query = replace(state.query) if query is None else query
+    target.plan = _PlanToken()
+    prepared_states[id(target.plan)] = operation, replacement
+
+
+@pytest.fixture
+def invocation(monkeypatch, prepared_states):
     # Compilation and pointer conversion are the CUDA boundary; validation runs
     # against real tensor metadata without launching a device program.
     tokens, heads, slots, window = 4, 1, 3, 4
     bf16 = lambda *shape: torch.empty(shape, dtype=torch.bfloat16)
     binding = SimpleNamespace(
-        plan=object(),
+        plan=_PlanToken(),
         mixed_qkv=bf16(tokens, 384),
         raw_g=bf16(tokens, heads, 128),
         raw_beta=bf16(tokens, heads),
@@ -44,7 +71,7 @@ def invocation(monkeypatch):
         kg_cache=bf16(slots, heads, window, 256),
     )
     conv = SimpleNamespace(
-        plan=object(),
+        plan=_PlanToken(),
         x=bf16(tokens, 384),
         conv_weight=bf16(384, 4),
         query_start_loc=binding.query_start_loc,
@@ -90,13 +117,8 @@ def invocation(monkeypatch):
     )
     state = SimpleNamespace(query=query, layout=SimpleNamespace(recurrent_block_v=32))
     conv_state = SimpleNamespace(query=cq)
-    from b12x.preparation import types
-
-    monkeypatch.setattr(
-        types,
-        "require_prepared",
-        lambda plan, *args: state if plan is binding.plan else conv_state,
-    )
+    prepared_states[id(binding.plan)] = "attention.gdn", state
+    prepared_states[id(conv.plan)] = "sequence.short_conv", conv_state
     launches = []
     monkeypatch.setattr(
         fused,
@@ -139,17 +161,127 @@ def test_public_dynamic_run_requires_both_operands(invocation, operand):
     assert not launches
 
 
-def test_dynamic_preparation_releases_example_tensors(invocation):
+def test_dynamic_preparation_releases_example_tensors_and_plans(invocation):
     binding, conv, _ = invocation
     references = [weakref.ref(tensor) for tensor in fused._operands(binding, conv)]
+    references.extend((weakref.ref(binding.plan), weakref.ref(conv.plan)))
     prepared = fused.prepare_kda_fused_verify(binding, conv, retain_examples=False)
-    # The fixture retains its namespaces; clearing their fields leaves compiled
-    # metadata and closures as the only possible owners of example tensors.
+    # Clearing the fixture's namespaces exposes tensor or plan ownership retained
+    # by the compiled binding's metadata and closures.
     binding.__dict__.clear()
     conv.__dict__.clear()
     gc.collect()
     assert prepared.binding is None and prepared.conv is None
     assert all(reference() is None for reference in references)
+
+
+@pytest.mark.parametrize("bias_value", [0.0, 1.0])
+def test_dynamic_convolution_rejects_bias(invocation, bias_value):
+    binding, conv, launches = invocation
+    prepared = fused.prepare_kda_fused_verify(binding, conv, retain_examples=False)
+    conv.conv_bias = torch.full((384,), bias_value, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="bias"):
+        fused.run_kda_fused_verify(prepared, binding=binding, conv=conv)
+    assert not launches
+
+
+def test_dynamic_attached_plan_rejects_different_null_state_policy(
+    invocation, prepared_states
+):
+    binding, conv, launches = invocation
+    prepared = fused.prepare_kda_fused_verify(binding, conv, retain_examples=False)
+    query = prepared_states[id(binding.plan)][1].query
+    binding.state_indices.zero_()
+    _attach_plan(binding, prepared_states, query=replace(query, null_state_index=None))
+    with pytest.raises(ValueError, match="semantics|null_state"):
+        fused.run_kda_fused_verify(prepared, binding=binding, conv=conv)
+    assert not launches
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"kernel_size": 5},
+        {"dilation": 2},
+        {"round_before_silu": False},
+        {"bias_dtype": "bfloat16"},
+    ],
+    ids=["kernel-size", "dilation", "rounding", "bias-contract"],
+)
+def test_dynamic_attached_plan_rejects_different_convolution_semantics(
+    invocation, prepared_states, change
+):
+    binding, conv, launches = invocation
+    prepared = fused.prepare_kda_fused_verify(binding, conv, retain_examples=False)
+    query = prepared_states[id(conv.plan)][1].query
+    _attach_plan(
+        conv, prepared_states, query=replace(query, state_strides=None, **change)
+    )
+    with pytest.raises(ValueError, match="semantics|convolution|bias"):
+        fused.run_kda_fused_verify(prepared, binding=binding, conv=conv)
+    assert not launches
+
+
+def test_dynamic_attached_plans_allow_equivalent_metadata(invocation, prepared_states):
+    binding, conv, launches = invocation
+    prepared = fused.prepare_kda_fused_verify(binding, conv, retain_examples=False)
+    original_plans = binding.plan, conv.plan
+    _attach_plan(binding, prepared_states)
+    _attach_plan(conv, prepared_states)
+    assert binding.plan is not original_plans[0]
+    assert conv.plan is not original_plans[1]
+    assert (
+        fused.run_kda_fused_verify(prepared, binding=binding, conv=conv)
+        is binding.output
+    )
+    assert len(launches) == 1
+
+
+def test_dynamic_attached_plans_allow_capacity_and_tile_differences(
+    invocation, prepared_states
+):
+    binding, conv, launches = invocation
+    prepared = fused.prepare_kda_fused_verify(binding, conv, retain_examples=False)
+    for target in (binding, conv):
+        query = prepared_states[id(target.plan)][1].query
+        _attach_plan(
+            target,
+            prepared_states,
+            query=replace(query, max_tokens=8, max_seqs=2, max_state_slots=5),
+        )
+    prepared_states[id(binding.plan)][1].layout = SimpleNamespace(recurrent_block_v=16)
+    assert (
+        fused.run_kda_fused_verify(prepared, binding=binding, conv=conv)
+        is binding.output
+    )
+    assert len(launches) == 1
+
+
+@pytest.mark.parametrize("explicit_none", [False, True])
+def test_dynamic_operands_allow_planless_namespaces(invocation, explicit_none):
+    binding, conv, launches = invocation
+    prepared = fused.prepare_kda_fused_verify(binding, conv, retain_examples=False)
+    binding = SimpleNamespace(
+        **{
+            name: value
+            for name, value in vars(binding).items()
+            if name not in {"plan", "mixed_qkv"}
+        }
+    )
+    conv = SimpleNamespace(
+        **{
+            name: value
+            for name, value in vars(conv).items()
+            if name not in {"plan", "conv_bias", "out"}
+        }
+    )
+    if explicit_none:
+        binding.plan = conv.plan = None
+    assert (
+        fused.run_kda_fused_verify(prepared, binding=binding, conv=conv)
+        is binding.output
+    )
+    assert len(launches) == 1
 
 
 @pytest.mark.parametrize("dynamic", [False, True])

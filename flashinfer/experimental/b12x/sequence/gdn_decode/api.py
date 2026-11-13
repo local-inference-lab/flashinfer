@@ -50,7 +50,10 @@ def run_kda_fused_verify(
 
     The preparation restrictions in ``prepare_kda_fused_verify`` apply. Omit
     both operands to use retained examples, or provide both for dynamic
-    execution. Mutable storage must not overlap live reads or other outputs;
+    execution. Planless operands inherit the prepared null-state and convolution
+    semantics. Attached plans must agree without changing prepared capacities.
+    Dynamic calls reject convolution bias. Mutable storage must not overlap
+    live reads or other outputs;
     shapes, dtypes and compiled strides must match preparation. Scale and
     epsilon must be finite and positive; the gate lower bound finite and
     negative. Returns the supplied or retained output tensor.

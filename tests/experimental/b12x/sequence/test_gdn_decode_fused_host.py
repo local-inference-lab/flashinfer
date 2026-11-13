@@ -89,6 +89,9 @@ def _bindings():
         **shared,
     )
     query = SimpleNamespace(
+        gate_activation="sigmoid",
+        qk_l2norm=True,
+        state_dtype="float32",
         recover_speculative_state=True,
         key_heads=1,
         value_heads=1,
@@ -125,6 +128,7 @@ def _bindings():
                 dilation=1,
                 channels=384,
                 round_before_silu=True,
+                bias_dtype=None,
                 input_row_stride=384,
                 max_seqs=1,
                 state_length=3,

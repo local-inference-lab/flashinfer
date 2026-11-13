@@ -606,6 +606,42 @@ def _shared_metadata(binding, conv):
             )
 
 
+_RECURRENCE_SEMANTICS = (
+    "gate_activation",
+    "qk_l2norm",
+    "state_dtype",
+    "key_heads",
+    "value_heads",
+    "state_index_columns",
+    "null_state_index",
+    "recover_speculative_state",
+)
+_CONVOLUTION_SEMANTICS = (
+    "mode",
+    "channels",
+    "kernel_size",
+    "dilation",
+    "max_speculative_tokens",
+    "round_before_silu",
+    "bias_dtype",
+)
+
+
+def _check_dynamic_plan(operands, component, expected):
+    """An optional attached plan must agree with the prepared operator's semantics."""
+    from b12x.preparation.types import require_prepared
+
+    plan = getattr(operands, "plan", None)
+    if plan is None:
+        return
+    query = require_prepared(plan, component).query
+    for name, value in expected:
+        if getattr(query, name) != value:
+            raise ValueError(
+                f"fused KDA {component} plan has incompatible semantics: {name}"
+            )
+
+
 def _operands(binding, conv):
     return (
         conv.x,
@@ -891,6 +927,13 @@ def prepare(binding, conv, *, retain_examples=True):
         for name, tensor, kind in zip(_OPERAND_NAMES, examples, vtypes, strict=True)
     )
     _check_operands(examples, specifications)
+    # Retain immutable metadata only; plans can own the example tensors.
+    recurrence_semantics = tuple(
+        (name, getattr(query, name)) for name in _RECURRENCE_SEMANTICS
+    )
+    convolution_semantics = tuple(
+        (name, getattr(cq, name)) for name in _CONVOLUTION_SEMANTICS
+    )
 
     with torch.cuda.device(binding.output.device):
         kernel = _FusedVerify(query, cq, block_v, conv_strides, weight_type, norm_type)
@@ -910,6 +953,10 @@ def prepare(binding, conv, *, retain_examples=True):
         )
 
     def build_args(binding, conv):
+        if getattr(conv, "conv_bias", None) is not None:
+            raise ValueError("fused KDA verify does not support convolution bias")
+        _check_dynamic_plan(binding, "attention.gdn", recurrence_semantics)
+        _check_dynamic_plan(conv, "sequence.short_conv", convolution_semantics)
         _shared_metadata(binding, conv)
         tensors = _operands(binding, conv)
         _check_operands(tensors, specifications)
@@ -966,7 +1013,10 @@ def run_kda_fused_verify(
     Omit both operands to use retained examples, or supply both for a dynamic
     invocation, including when preparation used ``retain_examples=False``.
     Dynamic calls preserve prepared shapes and compiled strides; launch-time
-    outer strides may vary. Mutable operands must not overlap each other or
+    outer strides may vary. Kernel semantics, including the null-state policy,
+    remain fixed by preparation. Planless tensor operands inherit those semantics;
+    any attached plans must agree with them without changing prepared capacities.
+    Convolution bias remains unsupported. Mutable operands must not overlap each other or
     read-only operands. Scalars must be finite with scale/epsilon positive and
     the gate lower bound negative. Returns the supplied or retained output.
     """
