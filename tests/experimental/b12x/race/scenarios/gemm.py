@@ -12,8 +12,8 @@ from ._base import Scenario, _generator, _rows_for_waves
 def dense_blockscaled_mxfp8(device, case) -> Scenario:
     """b12x blockscaled MXFP8 GEMM at a fixed plan mode (quantized or a16).
 
-    Defaults are GLM-5.3 Flash TP4's KDA input projection at 96 rows, the shape
-    that exposed the stage-reuse race (local-inference-lab/flashinfer#16).
+    Defaults: the KDA input projection of GLM-5.3 Flash at tensor parallel 4
+    (4096 -> 6288), with rows for about three waves of 64x128 output tiles.
     """
     from b12x.gemm import blockscaled
     from b12x.gemm.blockscaled._a16 import _weight_parts
@@ -89,9 +89,11 @@ FUZZ = {
 }
 
 
-# Fixed races put back by mutations.py: delete the fix's lines, then expect a scenario to fail.
+# Known races that mutations.py reintroduces; each must make a scenario fail.
 MUTATIONS = {
-    # local-inference-lab/flashinfer#16: TMA refill of a stage consumers may still be reading.
+    # Without fence.proxy.async after producer_acquire, the TMA refill of a
+    # shared-memory stage can land while consumers still read it with ldmatrix
+    # (fence added in local-inference-lab/flashinfer#16).
     "dense_gemm_stage_fence": {
         "module": "b12x._lib.dense_gemm",
         "replace": [("cute.arch.fence_view_async_shared()", "pass")],

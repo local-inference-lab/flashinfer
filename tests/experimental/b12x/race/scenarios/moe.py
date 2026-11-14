@@ -6,21 +6,20 @@ and replays ``fused_moe.run`` into a NaN-poisoned output. The kernels under
 test synchronize CTAs through software grid barriers, so each family checks
 that the prepared binding really selected the implementation it targets and
 that an eager run writes finite, nonzero output (a scenario whose output were
-all NaN would replay "bit-exactly" and prove nothing).
+all NaN would replay identically and prove nothing). All use the serving
+defaults; route packing and atomic reductions may reorder arithmetic between
+replays, which ``ReplayCheck`` tolerates.
 
 - ``moe_w4a16``: the W4A16 fused kernel. M >= 9 (and smaller M with enough
   route reuse) runs the route-packed cooperative body (FC1, activation and FC2
   phases separated by ``_grid_barrier`` over ``sms * blocks_per_sm`` resident
   CTAs, ordered split-K turns) followed by a fixed-order top-k sum; other
-  M <= 8 runs the same fused kernel on direct (unpacked) top-k routes. Cases
-  keep at most ~32 routes per expert, since larger packs are not reproducible
-  even on a quiet GPU (see ``_fuzz_moe_w4a16``).
+  M <= 8 runs the same fused kernel on direct (unpacked) top-k routes.
 - ``moe_dynamic``: the persistent cooperative dynamic kernel (NVFP4, W4A8 or
   W8A8 weights) with its atomic task queue and ``_resident_grid_barrier``,
-  always with ``deterministic_output=True`` (one row per routed pair, then a
-  fixed-order top-k sum). The default reduction, a BF16 atomic scatter of one
-  FC2 partial per intermediate slice, differs between quiet replays even at
-  top-k 1, so it cannot be checked bit-exactly.
+  using the default BF16 atomic-scatter output; a case with
+  ``"deterministic": True`` uses the per-pair rows and fixed-order top-k sum
+  instead.
 - ``moe_micro``: the cooperative decode micro kernel (M <= 8 tokens, fewer
   than 64 routed rows). M = 1 hands FC1 to FC2 through the per-token
   ``_token_publish_fc1_ready``/``_token_wait_fc1_ready`` pair, whose arrival
@@ -255,14 +254,13 @@ def moe_w4a16(device, case) -> Scenario:
 
 
 def moe_dynamic(device, case) -> Scenario:
-    """Persistent dynamic kernel (``mode`` nvfp4, w4a8_nvfp4 or w8a8_mx) with
-    the fixed-order deterministic output reduction."""
+    """Persistent dynamic kernel (``mode`` nvfp4, w4a8_nvfp4 or w8a8_mx)."""
     return _fused_moe(
         device,
         case,
         mode=case.get("mode", "nvfp4"),
         implementation="dynamic",
-        deterministic=True,
+        deterministic=case.get("deterministic", False),
     )
 
 
@@ -293,6 +291,7 @@ _E32 = {"experts": 32, "hidden": 2048, "intermediate": 512, "top_k": 4}
 
 CASES = {
     "moe_w4a16": [
+        {**_E32, "m": 1024},  # experts span several 64-row route blocks
         {**_GLM16, "m": 9},
         {**_GLM16, "m": 64},
         {**_E64, "m": 33},
@@ -302,8 +301,18 @@ CASES = {
         {**_E64, "m": 4},  # direct top-k routes
     ],
     "moe_dynamic": [
+        # NVFP4 at M16/M32 dynamic tiles (the first three) depends on the
+        # producer's proxy fence before each TMA stage refill
+        # (local-inference-lab/flashinfer#24); without it, 3-12% of contended
+        # replays on GB10 are corrupted.
         {**_E64, "m": 64, "mode": "nvfp4"},
         {**_E64, "m": 256, "mode": "nvfp4"},
+        {
+            **_E64,
+            "m": 64,
+            "mode": "nvfp4",
+            "deterministic": True,
+        },
         {**_E32, "m": 512, "mode": "nvfp4"},
         {**_E64, "m": 64, "mode": "w4a8_nvfp4"},
         {**_QWEN, "m": 64, "mode": "w8a8_mx"},
@@ -332,14 +341,7 @@ def _fuzz_geometry(rng: random.Random) -> dict:
 
 def _fuzz_moe_w4a16(rng: random.Random) -> dict:
     case = _fuzz_geometry(rng)
-    # At about 64 or more routes per expert (an expert spanning several 64-row
-    # route blocks) quiet replays already differ in a few bytes: the multi-CTA
-    # relaxed-atomic route sort packs routes in a different order each replay
-    # and the result depends on that order. Stay at or below 32 per expert.
-    limit = 32 * case["experts"] // case["top_k"]
-    case["m"] = rng.choice(
-        [m for m in (9, 12, 17, 32, 48, 96, 160, 256) if m <= limit] or [9]
-    )
+    case["m"] = rng.choice((9, 12, 17, 32, 48, 96, 160, 256, 384, 512))
     return case
 
 
@@ -372,8 +374,9 @@ FUZZ = {
 }
 
 
-# local-inference-lab/flashinfer#18: the W4A16 grid barrier's relaxed arrival
-# atomic let other CTAs pass before this CTA's FC1/activation stores were visible.
+# The W4A16 grid barrier's arrival atomic is relaxed; without the release fence
+# before it (local-inference-lab/flashinfer#18), other CTAs can pass the barrier
+# before this CTA's FC1/activation stores are visible.
 _W4A16_BARRIER_FENCE = (
     "            # The arrival atomic is relaxed: release this CTA's global writes, which\n"
     "            # sync_threads made visible to thread 0, before other CTAs can pass.\n"
