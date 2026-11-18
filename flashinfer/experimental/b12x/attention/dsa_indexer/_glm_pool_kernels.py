@@ -161,7 +161,10 @@ def _decode_update_kernel(
             gate + row * gate_stride_0 + dim, mask=dim_mask, other=0.0
         ).to(tl.float32)
         cache_location = tl.load(slot_mapping + row).to(tl.int64)
+        # Validate the slot before converting it: the conversion maps -1 to page 0.
+        write_pool = (cache_location >= 0) & (state_slot >= 0)
         if PACKED_MAIN_SLOTS:
+            write_pool &= position % POOL_SIZE == POOL_SIZE - 1
             parent_page = cache_location // model_block_size
             model_page_offset = cache_location - parent_page * model_block_size
             pool_offset = model_page_offset // POOL_SIZE
@@ -170,13 +173,6 @@ def _decode_update_kernel(
             cache_location = (
                 parent_page * parent_stride_pages + child_page
             ) * PAGE_SIZE + child_offset
-            write_pool = (
-                (position % POOL_SIZE == POOL_SIZE - 1)
-                & (cache_location >= 0)
-                & (state_slot >= 0)
-            )
-        else:
-            write_pool = (cache_location >= 0) & (state_slot >= 0)
         pool_mask = (dim < HEAD_DIM) & write_pool
         maximum = tl.full((BLOCK_D,), -float("inf"), tl.float32)
         for slot in tl.static_range(0, POOL_SIZE):

@@ -236,6 +236,57 @@ def test_pool_state_survives_repeated_chunk_boundaries():
         graph.reset()
 
 
+@pytest.mark.parametrize("mode", ["decode", "prefill"])
+@torch.no_grad()
+def test_negative_main_slot_preserves_cache(mode):
+    # Prefill already guards the original slot; it is a parity check.
+    device = require_b12x()
+    cache = torch.full((8, 64, 132), 0xA5, dtype=torch.uint8, device=device)
+    tail = torch.randn((2, 2, 8, 128), dtype=torch.bfloat16, device=device)
+    state_slots = torch.tensor([1], dtype=torch.int64, device=device)
+    starts = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    key = torch.randn((1, 128), dtype=torch.bfloat16, device=device)
+    gate = torch.randn_like(key)
+    ape = torch.randn((4, 128), dtype=torch.bfloat16, device=device)
+    # A token owned by another context-parallel rank has slot -1; its tail state is still updated.
+    token_slots = torch.tensor([-1], dtype=torch.int64, device=device)
+    positions = torch.tensor([3], dtype=torch.int64, device=device)
+    arguments = (
+        cache,
+        tail,
+        state_slots,
+        starts,
+        key,
+        gate,
+        ape,
+        token_slots,
+        positions,
+    )
+    initial_cache, initial_tail = cache.clone(), tail.clone()
+    expected_tail = initial_tail.clone()
+    expected_tail[1, 0, 3] = key[0]
+    expected_tail[1, 1, 3] = gate[0]
+    plan = glm_pool.plan_pools(*arguments, mode=mode)
+    with PreparationSession(
+        device=device, autotune=False, compile_workers=0
+    ) as session:
+        session.prepare(
+            (
+                plan.request(
+                    name="pool",
+                    prepare_call=lambda state: PreparedCall(
+                        run=lambda: state.update(*arguments)
+                    ),
+                ),
+            )
+        )
+        cache.copy_(initial_cache)
+        tail.copy_(initial_tail)
+        glm_pool.update_pools(*arguments, plan=plan)
+        torch.testing.assert_close(cache, initial_cache, rtol=0, atol=0)
+        torch.testing.assert_close(tail, expected_tail, rtol=0, atol=0)
+
+
 def _reference(cache, tail, starts, key, gate, ape, slots, positions):
     expected_cache, expected_tail = cache.clone(), tail.clone()
     keys_out = expected_cache.view(cache.shape[0], -1)[:, : 64 * 128].view(-1, 64, 128)
