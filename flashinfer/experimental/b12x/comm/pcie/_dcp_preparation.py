@@ -24,7 +24,8 @@ from b12x.preparation import (
     PreparedCall,
 )
 
-from ._tuning import PcieConfig, PcieQuery, TUNING
+from ._tuning import PAIRWISE_THREADS, PAIRWISE_BLOCKS, PcieConfig, PcieQuery, TUNING
+
 
 _DCP_SURFACES = frozenset(
     {
@@ -218,6 +219,7 @@ def compile_dcp_surface(query_payload, ordinal):
                     call["dtype"],
                     int(call["threads"]),
                     slot,
+                    call.get("payload_schedule") == "pairwise",
                 )
                 for slot in (False, True)
             }
@@ -401,6 +403,13 @@ def plan(
         launchers = load_programs(
             compile_dcp_surface(TUNING.encode_query(query), device.ordinal)
         )
+        if query.call.get("payload_schedule") == "pairwise":
+            from ._joint_cluster_cute import validate_cluster_residency
+
+            for launcher in launchers.values():
+                validate_cluster_residency(
+                    launcher, PAIRWISE_BLOCKS, PAIRWISE_THREADS, PAIRWISE_BLOCKS
+                )
         return _DcpExecutionState(query, runtime, MappingProxyType(dict(launchers)))
 
     owned = getattr(runtime, "_owned_buffers", ())

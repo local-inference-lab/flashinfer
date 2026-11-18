@@ -14,12 +14,16 @@ tuning keys. Every caller still binds its own serving operands.
 | Staged `AllReduce.all_reduce`, direct peer groups | Native pull; LL and Simple peer push; BF16 payload-ready full reduction and reduce-scatter/all-gather; provisioned BF16 two-shot |
 | Staged fused residual addition and RMSNorm | Native staged transports compatible with declared input, residual, normalization, grouping, and output arithmetic |
 | DCP `all_gather_heads` and `lse_reduce_scatter`, TP2/4/8 | Thread count and block limit; equivalent effective grids are measured once |
-| DCP `all_gather_heads`, TP16 | Ordinary DCP geometry; phased, ring, and recursive profiles on SM120 devices with at least 64 SMs |
+| DCP `all_gather_heads`, TP4/8/16 | Ring on TP4/8/16; phased and recursive profiles on TP8/16, on SM120 devices with at least 64 SMs |
+| DCP `lse_reduce_scatter`, TP4 | Direct and XOR pairwise push schedules |
+| BF16 two-shot push, TP4 | Direct and XOR pairwise payload schedules |
 | IslandRS `all_reduce`, TP16 | Thread and active-CTA counts; four SM transports combining local pull or push with cross-island full reduction or reduce-scatter/all-gather; hybrid local SM writes and cross-island copy-engine transfers |
 
 Payload-ready transports require their reserved incoming slots, BF16 support,
 and sufficient SMs to keep their grid resident. Two-shot retains its native
-capacity and alignment constraints.
+capacity and alignment constraints. Pairwise schedules require SM120 with at
+least 64 SMs and a resident eight-CTA cluster of 128-thread blocks; explicit
+thread or block overrides exclude them.
 Unsupported alternatives are absent, rather than failing over during execution.
 Plain tuning admits FP16/BF16 tensors with positive 16-byte-packed payloads
 within the prepared staging capacity. LL requires two capacity shards per remote
@@ -48,7 +52,7 @@ disabled tuning retains the static dispatch policy. Explicit
 `CollectiveConfig(implementation=..., threads=..., blocks=...)` pins a legal
 configuration. Native low-level plans still use `PcieConfig`.
 
-TP16 gather tuning retains ordinary DCP as its default. Selected alternatives
+Gather tuning retains ordinary DCP as its default. Selected alternatives
 require disjoint contiguous, 16-byte-aligned rows. The phased profile requires a
 compiled kernel that can keep its complete eight-CTA cluster active; its
 unpinned thread counts are 128, 256, and 512. The ring profile admits 128 or 512
@@ -61,7 +65,9 @@ outside 128 and 512; recursive profiles exclude thread overrides other than 128.
 message shape races normally
 without enabling a runtime ladder or changing the all-reduce channel.
 The loaded phased kernel must pass its occupancy check before capture; failure
-stops preparation.
+stops preparation. Isolated races do not measure cluster-launch waits behind
+overlapping compute. The selection key does not describe PCIe links; retune
+after re-cabling a GPU group.
 
 IslandRS assumes 16 ranks arranged as four contiguous four-rank islands.
 Preparation races five transports over 128, 256, 512, 768, and 1024 threads and
@@ -106,7 +112,9 @@ Audit effort measures the unrestricted catalog. Explicit pins and disabled
 tuning bypass calibration. Caller-supplied benchmark contexts and dependent
 requests do not share built-in calibration. Requests retaining measured finalists
 preserve their complete family catalogs. Fused arithmetic and DCP operations
-retain their shape-specific searches. A bucket shortlist is empirical: performance
+retain their shape-specific searches. TP4 BF16 push all-reduce catalogs with
+an admitted pairwise two-shot candidate also bypass family pruning so each
+shape measures the complete catalog; other devices retain bucket calibration. A bucket shortlist is empirical: performance
 within a bucket should be checked against audit races when changing transport
 kernels or bucket boundaries.
 
@@ -465,9 +473,10 @@ generations earlier. The final downstream acknowledgment drains the operation
 before its channel epoch advances. Staging banks and operation epochs retain the
 same layout.
 
-Ring and recursive declarations require DCP8 or TP16, `block_limit=8`,
-`active_blocks=8`, and `submode="barrier"`; they use no cluster. Ring accepts
-`threads=128` or `threads=512`; recursive profiles require `threads=128`. Set
+Ring declarations admit TP4/8/16; recursive declarations require DCP8 or TP16.
+Both require `block_limit=8`, `active_blocks=8`, and `submode="barrier"`;
+they use no cluster. Ring accepts `threads=128` or `threads=512`;
+recursive profiles require `threads=128`. Set
 `gather_transport="selected_ring"` in the declaration above to select the ring.
 The `selected_recursive` profile exchanges one, two, four, then eight rank
 segments with XOR partners. Each CTA forwards its own completed output segments

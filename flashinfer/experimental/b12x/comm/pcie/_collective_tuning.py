@@ -13,7 +13,14 @@ from b12x.preparation import (
 )
 from b12x.preparation._efficiency import capture_autotune_effort
 
-from ._tuning import PcieQuery, TUNING as NATIVE
+from ._tuning import (
+    PAIRWISE_THREADS,
+    PAIRWISE_BLOCKS,
+    pairwise_device,
+    PcieQuery,
+    TUNING as NATIVE,
+)
+
 from ._joint_profile import JOINT_FAMILIES, profile_records
 
 
@@ -79,6 +86,14 @@ def _configs(query, device=None):
                         active_blocks=active,
                     )
             continue
+        if name in ("dcp_pairwise", "twoshot_pairwise"):
+            if pairwise_device(device):
+                yield CollectiveConfig(
+                    implementation=name,
+                    threads=PAIRWISE_THREADS,
+                    blocks=PAIRWISE_BLOCKS,
+                )
+            continue
         if name in (
             "dcp_phased",
             "dcp_phased_push",
@@ -86,14 +101,9 @@ def _configs(query, device=None):
             "dcp_recursive",
             "dcp_recursive_ready",
         ):
-            # Automatic admission covers the qualified TP16 hardware. Phased
-            # kernels also have to pass the native cluster occupancy check.
-            if (
-                device is None
-                or device.vendor != "nvidia"
-                or device.compute_capability != (12, 0)
-                or device.sm_count < 64
-            ):
+            # Selected profiles require SM120 hardware with at least 64 SMs.
+            # Phased kernels also have to pass the native cluster occupancy check.
+            if not pairwise_device(device):
                 continue
             if payload["setup"].get("threads_override", 0):
                 counts = (threads,)
@@ -340,6 +350,19 @@ def _validate_query(query, device):
         NATIVE.validate_query(native, device)
         if (native.world_size, native.rank) != (query.world_size, query.rank):
             raise ValueError("native alternatives must use the same rank group")
+        if name == "twoshot_pairwise" and (
+            query.operation != "all_reduce"
+            or native.surface != "PCIeTwoShotBF16.all_reduce"
+            or native.call.get("payload_schedule") != "pairwise"
+        ):
+            raise ValueError(
+                "pairwise two-shot tuning requires its TP4 native schedule"
+            )
+        if name == "dcp_pairwise" and (
+            query.operation != "lse_reduce_scatter"
+            or native.call.get("payload_schedule") != "pairwise"
+        ):
+            raise ValueError("pairwise LSE tuning requires its DCP4 native schedule")
         if name in ISLAND_VARIANTS and (
             query.operation != "all_reduce"
             or query.world_size != 16
@@ -372,7 +395,10 @@ def _validate_query(query, device):
             "dcp_recursive_ready",
         ) and (
             query.operation != "all_gather_heads"
-            or query.world_size not in (8, 16)
+            or (
+                query.world_size not in (8, 16)
+                and not (query.world_size == 4 and name == "dcp_ring")
+            )
             or not native.surface.endswith(".all_gather_heads")
             or native.call.get("gather_transport")
             != {
@@ -443,7 +469,9 @@ def _collective_signature(query):
 def _family_bucket(query):
     if query.operation != "all_reduce":
         return None
-    if any(name in query.alternatives for name in ISLAND_VARIANTS):
+    if "twoshot_pairwise" in query.alternatives or any(
+        name in query.alternatives for name in ISLAND_VARIANTS
+    ):
         # Retain independent measurements for each message shape and fixed grid.
         return None
     from math import prod

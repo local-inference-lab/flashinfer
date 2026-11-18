@@ -27,8 +27,8 @@ from ._dcp_cute_common import (
     _load_relaxed_sys_u32,
     _membar_sys,
     _store_relaxed_sys_u32,
+    _threadfence_sys,
 )
-from ._joint_cluster_cute import _threadfence_sys
 from ._runtime_gather_cute import SelectedGather
 
 

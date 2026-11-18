@@ -10,6 +10,19 @@ from dataclasses import dataclass, replace
 from b12x.preparation import BackendConfig, FrozenMapping, make_fixed_contract
 
 
+PAIRWISE_THREADS = 128
+PAIRWISE_BLOCKS = 8
+
+
+def pairwise_device(device):
+    return (
+        device is not None
+        and device.vendor == "nvidia"
+        and device.compute_capability == (12, 0)
+        and device.sm_count >= 64
+    )
+
+
 # Native execution surfaces after the all-reduce manager's plan-time routing.
 # Values are supported worlds, never a set of transports to race.
 SURFACES = {
@@ -134,6 +147,30 @@ def _validate_query(query: PcieQuery, device) -> None:
             raise ValueError(
                 "variable gather requires aligned rows and a complete CTA bank within staging"
             )
+    if (
+        query.surface.startswith("PCIeTwoShotBF16.")
+        and query.call.get("payload_schedule", "direct") == "pairwise"
+    ):
+        if (
+            query.world_size != 4
+            or query.call["threads"] != PAIRWISE_THREADS
+            or query.call["block_limit"] != PAIRWISE_BLOCKS
+            or query.call["transport"] != "push"
+        ):
+            raise ValueError(
+                "pairwise two-shot requires TP4 push with eight 128-thread CTAs"
+            )
+    if query.surface.endswith(".lse_reduce_scatter"):
+        transport = query.call.get("payload_schedule", "direct")
+        if transport not in ("direct", "pairwise") or (
+            transport == "pairwise"
+            and (
+                query.world_size != 4
+                or query.call["threads"] != PAIRWISE_THREADS
+                or query.call["block_limit"] != PAIRWISE_BLOCKS
+            )
+        ):
+            raise ValueError("pairwise LSE requires DCP4 with eight 128-thread CTAs")
     if query.surface.endswith(".all_gather_heads"):
         transport = query.call.get("gather_transport", "barrier")
         from ._gather_preparation import GATHER_MODES, validate_query as validate_gather

@@ -36,6 +36,7 @@ from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils.device import current_cuda_stream
 from b12x._lib.utils.pointers import make_ptr
 
+from ._dcp_cute_common import _threadfence_sys
 from ._cute_intrinsics import (
     graph_epoch_arrive_serialized,
     ld_relaxed_gpu_u32,
@@ -90,9 +91,13 @@ class _TwoShotBf16Launch:
         slot_bias: int,
         threads: int,
         row_elems: int,
+        pairwise: bool = False,
     ) -> None:
         if operation not in ("reduce_scatter", "all_gather"):
             raise ValueError(f"invalid two-shot operation {operation!r}")
+        if pairwise and world_size != 4:
+            raise ValueError("pairwise payloads require world size four")
+        self._pairwise = bool(pairwise)
         self._operation = operation
         self._world_size = int(world_size)
         self._rank = int(rank)
@@ -191,7 +196,7 @@ class _TwoShotBf16Launch:
             block=[self._threads, 1, 1],
             max_number_threads=(512, 1, 1),
             min_blocks_per_mp=1,
-            cluster=(1, 1, 1),
+            cluster=(8 if self._pairwise else 1, 1, 1),
             stream=stream,
         )
 
@@ -417,7 +422,11 @@ class _TwoShotBf16Launch:
         # Phase one: push remote shards (posted PCIe writes), rank-staggered.
         peer_index = Int32(1)
         while peer_index < Int32(self._world_size):
-            destination = (local_rank + peer_index) % Int32(self._world_size)
+            destination = (
+                (local_rank ^ peer_index)
+                if self._pairwise
+                else (local_rank + peer_index) % Int32(self._world_size)
+            )
             destination_base = (
                 self._select_address(staging, destination) + staging_slot_offset
             )
@@ -446,6 +455,10 @@ class _TwoShotBf16Launch:
                         words[3],
                     )
                 index += Int64(block_threads)
+            if cutlass.const_expr(self._pairwise):
+                _threadfence_sys()
+                cute.arch.cluster_arrive()
+                cute.arch.cluster_wait()
             peer_index += Int32(1)
 
         self._barrier(signals, local_rank)
@@ -563,6 +576,7 @@ def get_twoshot_bf16_launcher(
     threads: int,
     row_elems: int,
     device_index: int,
+    pairwise: bool = False,
 ) -> Callable[..., None]:
     """Compile and return one static world/operation/thread specialization."""
     process_key = _bf16_process_key(
@@ -596,6 +610,7 @@ def get_twoshot_bf16_launcher(
         slot_bias,
         threads,
         row_elems,
+        pairwise,
     )
     cache_key = (
         "bf16",
@@ -606,6 +621,7 @@ def get_twoshot_bf16_launcher(
         slot_bias,
         int(threads),
         int(row_elems),
+        bool(pairwise),
     )
     raise_if_kernel_resolution_frozen(
         "cute.compile", target=launch, cache_key=cache_key

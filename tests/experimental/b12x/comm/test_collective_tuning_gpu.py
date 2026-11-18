@@ -219,6 +219,95 @@ def _worker(rank, world, directory):
             with pytest.raises(RuntimeError, match="disagree on producers"):
                 _drive(owner, requests)
             owner.close()
+        if world == 4:
+            from b12x.comm.pcie import CollectiveConfig
+
+            owner = session("pairwise-transitions")
+            retained, calls = [], []
+            for rows in (1, 3, 48):
+                config = CollectiveConfig(
+                    implementation="twoshot_pairwise", threads=128, blocks=8
+                )
+                plans, requests, operands = declarations(
+                    shape=(rows, 4096), override=config
+                )
+                retained.append(_drive(owner, requests))
+                calls.append((plans[0], *operands[0]))
+            graph = torch.cuda.CUDAGraph()
+            with owner.capture(), manager.capture(), torch.cuda.graph(graph):
+                for plan, source, out in calls:
+                    manager.all_reduce(source, out=out, plan=plan)
+            owner.freeze()
+            saved = [[torch.empty_like(out) for _, _, out in calls] for _ in range(5)]
+            for step in range(5):
+                for _, source, _ in calls:
+                    source.fill_(rank + step + 1)
+                graph.replay()
+                for target, (_, _, out) in zip(saved[step], calls):
+                    target.copy_(out)
+            torch.cuda.synchronize()
+            for step, outputs in enumerate(saved):
+                for target in outputs:
+                    torch.testing.assert_close(
+                        target, torch.full_like(target, 10 + 4 * step), rtol=0, atol=0
+                    )
+            graph.reset()
+            for result in retained:
+                result.close()
+            owner.close()
+        if world == 4:
+            from b12x.comm import pcie
+            from b12x.preparation import PreparedCall
+
+            dcp = pcie.DcpAllToAll.from_exchange_group(
+                exchange_group=dist.group.WORLD,
+                device=device,
+                max_batch_size=3,
+                total_heads=64,
+                head_dim=512,
+                stream_affine=False,
+            )
+            owner = session("dcp-row-selection")
+            results, graphs, outputs, inputs = [], [], [], []
+            for rows in (1, 3):
+                source = torch.full(
+                    (rows, 64, 512), rank + 1, dtype=torch.bfloat16, device=device
+                )
+                lse = torch.zeros((rows, 64), device=device)
+                out = torch.empty((rows, 16, 512), dtype=source.dtype, device=device)
+                inputs.append((source, lse))
+                call = dict(partial_output=source, partial_lse=lse, out=out)
+                query = pcie.query_from_runtime(
+                    dcp, surface="DcpAllToAll.lse_reduce_scatter", call=call
+                )
+                plan = pcie.plan(query, runtime=dcp)
+                request = plan.request(
+                    name=f"dcp-{rows}",
+                    collective=CollectiveRequirement(f"dcp-{rows}", members),
+                    prepare_call=lambda state, call=call: PreparedCall(
+                        run=lambda: state.run(**call), output=call["out"]
+                    ),
+                )
+                results.append(_drive(owner, (request,)))
+                graph = torch.cuda.CUDAGraph()
+                with owner.capture(), torch.cuda.graph(graph):
+                    dcp.lse_reduce_scatter(source, lse, out=out, plan=plan)
+                graphs.append(graph)
+                outputs.append(out)
+            owner.freeze()
+            for index in (0, 1, 1, 0, 1):
+                graphs[index].replay()
+            torch.cuda.synchronize()
+            for out in outputs:
+                torch.testing.assert_close(
+                    out, torch.full_like(out, 2.5), rtol=0, atol=0
+                )
+            for graph in graphs:
+                graph.reset()
+            for result in results:
+                result.close()
+            owner.close()
+            dcp.close()
         if world == 2:
             for shape in ((8, 5120), (513, 1536)):
                 owner = session(f"noncanonical-{shape}")

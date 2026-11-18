@@ -47,6 +47,46 @@ def query():
 
 
 @pytest.mark.parametrize(
+    "operation, alternative",
+    [("all_gather_heads", "dcp_ring"), ("lse_reduce_scatter", "dcp_pairwise")],
+)
+def test_tp4_transport_race_retains_direct_candidate_and_default(
+    operation, alternative
+):
+    import torch
+    from b12x.comm.pcie._preparation import plan as collective_plan
+    from b12x.preparation import DeviceIdentity, autotune_effort
+
+    q = query()
+    q = replace(
+        q,
+        surface=f"DcpAllToAll.{operation}",
+        call=FrozenMapping(
+            dict(q.call, gather_transport="barrier", submode="", active_blocks=0)
+        ),
+        setup=FrozenMapping(dict(q.setup, threads_override=0, blocks_override=0)),
+    )
+    prepared = collective_plan(q, runtime=SimpleNamespace(device=torch.device("cpu")))
+    assert set(prepared.query.alternatives) == {"dcp", alternative}
+    assert prepared.query.default.implementation == "dcp"
+    device = DeviceIdentity("nvidia", (12, 0), 148, "synthetic SM120")
+    with autotune_effort("default"):
+        configs = [
+            config
+            for _, config in prepared.contract.iterate(
+                prepared.contract.configure(prepared.query, device=device)
+            )
+        ]
+    assert {config.implementation for config in configs} == {"dcp", alternative}
+    assert {c.threads for c in configs if c.implementation == alternative} == (
+        {128, 512} if alternative == "dcp_ring" else {128}
+    )
+    with autotune_effort("off"):
+        configured = prepared.contract.configure(prepared.query, device=device)
+    assert configured.default == prepared.query.default
+
+
+@pytest.mark.parametrize(
     "changes",
     [
         {"shape": (64, 64)},
@@ -239,8 +279,29 @@ def test_pairwise_gather_requires_its_explicit_geometry(transport):
                 replace(q, call=FrozenMapping(dict(q.call, **change))), None
             )
     for world in (2, 4, 8, 12):
-        with pytest.raises(ValueError):
-            TUNING.validate_query(replace(q, world_size=world), None)
+        candidate = replace(q, world_size=world)
+        if transport == "selected_ring" and world in (4, 8):
+            candidate = replace(
+                candidate,
+                setup=FrozenMapping(dict(q.setup, total_heads=world)),
+                call=FrozenMapping(
+                    dict(
+                        candidate.call,
+                        out_shape=(64, world, 64),
+                        out_stride=(world * 64, 64, 1),
+                    )
+                ),
+            )
+            TUNING.validate_query(candidate, None)
+            TUNING.validate_query(
+                replace(
+                    candidate, call=FrozenMapping(dict(candidate.call, threads=512))
+                ),
+                None,
+            )
+        else:
+            with pytest.raises(ValueError):
+                TUNING.validate_query(candidate, None)
 
 
 def varlen_query():
@@ -323,3 +384,31 @@ def test_varlen_gather_requires_own_output_row(monkeypatch):
         owner.all_gather_varlen(
             out[0], torch.zeros(4, dtype=torch.int64), out=out, plan=None
         )
+
+
+@pytest.mark.parametrize(
+    "surface", ["PCIeTwoShotBF16.all_reduce", "DcpAllToAll.lse_reduce_scatter"]
+)
+@pytest.mark.parametrize(
+    "changes", [{"world_size": 2}, {"world_size": 8}, {"threads": 256}]
+)
+def test_pairwise_requires_tp4_cluster_geometry(surface, changes):
+    call = dict(
+        threads=128,
+        block_limit=8,
+        transport="push",
+        payload_schedule="pairwise",
+    )
+    world = changes.get("world_size", 4)
+    if "threads" in changes:
+        call["threads"] = changes["threads"]
+    q = PcieQuery(
+        surface=surface,
+        world_size=world,
+        rank=0,
+        topology="pcie_ipc",
+        call=FrozenMapping(call),
+        setup=FrozenMapping(),
+    )
+    with pytest.raises(ValueError, match="pairwise"):
+        TUNING.validate_query(q, None)

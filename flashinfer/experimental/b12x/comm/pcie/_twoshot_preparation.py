@@ -25,7 +25,8 @@ from b12x.preparation import (
     current_plan,
 )
 
-from ._tuning import PcieConfig, PcieQuery, TUNING
+from ._tuning import PAIRWISE_THREADS, PAIRWISE_BLOCKS, PcieConfig, PcieQuery, TUNING
+
 
 _FP8_SURFACES = frozenset(
     {
@@ -404,6 +405,7 @@ def compile_twoshot_surface(query_payload, ordinal: int):
                 int(call["threads"]),
                 int(call["row_elems"]),
                 int(ordinal),
+                bool(call.get("payload_schedule") == "pairwise"),
             )
             for operation in operations
             for device_slot, bias in call["device_slot_variants"]
@@ -588,13 +590,15 @@ def plan(
         )
 
     def materialize(selection, device):
-        return _TwoShotExecutionState(
-            query,
-            runtime,
-            MappingProxyType(
-                load_programs(compile_twoshot_surface(payload, device.ordinal))
-            ),
-        )
+        launchers = load_programs(compile_twoshot_surface(payload, device.ordinal))
+        if query.call.get("payload_schedule") == "pairwise":
+            from ._joint_cluster_cute import validate_cluster_residency
+
+            for launcher in launchers.values():
+                validate_cluster_residency(
+                    launcher, PAIRWISE_BLOCKS, PAIRWISE_THREADS, PAIRWISE_BLOCKS
+                )
+        return _TwoShotExecutionState(query, runtime, MappingProxyType(launchers))
 
     return Plan(
         contract=TUNING,

@@ -11,8 +11,6 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, Int64, Uint32
-from cutlass._mlir.dialects import llvm
-from cutlass.cutlass_dsl import dsl_user_op
 
 from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
 from b12x._lib.compile_plan import attach_programs
@@ -28,24 +26,10 @@ from ._cute_intrinsics import (
     pack_f32x2_to_bf16x2,
     st_relaxed_sys_global_v4_u32,
 )
+from ._dcp_cute_common import _threadfence_sys
 from ._joint_cute import _JointLaunch, _EPOCH_OFFSET
 from ._joint_profile import validate_cluster_geometry
 from ._oneshot_cute import _dummy
-
-
-@dsl_user_op
-def _threadfence_sys(*, loc=None, ip=None):
-    llvm.inline_asm(
-        None,
-        [],
-        "fence.sc.sys;",
-        "",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
 
 
 class _JointClusterLaunch(_JointLaunch):

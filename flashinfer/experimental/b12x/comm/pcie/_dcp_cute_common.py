@@ -22,6 +22,21 @@ _MAX_RANKS = 16
 
 
 @dsl_user_op
+def _threadfence_sys(*, loc=None, ip=None):
+    llvm.inline_asm(
+        None,
+        [],
+        "fence.sc.sys;",
+        "",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def _membar_sys(*, loc=None, ip=None) -> None:
     llvm.inline_asm(
         None,

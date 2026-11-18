@@ -7,7 +7,8 @@ from dataclasses import replace
 from math import prod
 
 from b12x.preparation import FrozenMapping, Plan
-from ._tuning import PcieConfig, PcieQuery, TUNING
+from ._tuning import PAIRWISE_THREADS, PAIRWISE_BLOCKS, PcieConfig, PcieQuery, TUNING
+
 from ._collective_tuning import CollectiveConfig
 
 
@@ -49,7 +50,10 @@ def _selected_gather_query(query, transport, thread_counts):
 
     call, setup = query.call, query.setup
     if (
-        query.world_size not in (8, 16)
+        (
+            query.world_size not in (8, 16)
+            and not (query.world_size == 4 and transport == "selected_ring")
+        )
         or not query.surface.endswith(".all_gather_heads")
         or not call.get("disjoint_output", False)
         or not call.get("pack_aligned", False)
@@ -89,7 +93,8 @@ def plan(
     """Declare native work; neither topology nor a communicator is constructed.
 
     DCP head gather and LSE reduce-scatter expose launch candidates on TP2–8.
-    TP16 head gather also races phased, ring, and recursive-doubling profiles.
+    Head gather races ring profiles on TP4/8/16 and phased and recursive
+    profiles on TP8/16. TP4 LSE and push two-shot also race pairwise schedules.
     IslandRS reductions tune threads and active CTA counts while retaining a
     fixed physical grid and resource owner. Other low-level declarations retain their explicit configuration.
     ``AllReduce.plan`` composes eligible one-shot and two-shot transports.
@@ -159,6 +164,26 @@ def plan(
         from ._collective_tuning import plan as collective_plan
 
         alternatives = {"dcp": (query, runtime)}
+        if (
+            query.world_size == 4
+            and query.surface.endswith(".lse_reduce_scatter")
+            and not query.setup.get("threads_override", 0)
+            and not query.setup.get("blocks_override", 0)
+        ):
+            alternatives["dcp_pairwise"] = (
+                replace(
+                    query,
+                    call=FrozenMapping(
+                        dict(
+                            query.call,
+                            threads=PAIRWISE_THREADS,
+                            block_limit=PAIRWISE_BLOCKS,
+                            payload_schedule="pairwise",
+                        )
+                    ),
+                ),
+                runtime,
+            )
         specializations = [
             ("dcp_phased", "selected_phased_barrier", (128, 256, 512)),
             ("dcp_ring", "selected_ring", (128, 512)),

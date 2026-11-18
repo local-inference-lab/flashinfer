@@ -13,6 +13,7 @@ from torch.distributed import ProcessGroup
 
 from b12x.preparation.types import Plan, require_prepared
 
+from ._tuning import PAIRWISE_BLOCKS
 from ._cuda_ipc import CudaRTLibrary
 from .pcie_oneshot import (
     _ABANDONED_PCIE_RUNTIME_QUARANTINE,
@@ -957,6 +958,8 @@ class PCIeDCPA2A:
             raise ValueError("DCP threads differ from the prepared launcher")
         rows = int(partial_output.shape[0]) * self.heads_per_rank
         blocks = max(1, min(block_limit, (rows + threads // 32 - 1) // (threads // 32)))
+        if state.query.call.get("payload_schedule") == "pairwise":
+            blocks = PAIRWISE_BLOCKS
         capturing = _is_current_stream_capturing(self.device)
         if capturing and not self._device_slot_selection:
             self._graph_base_slot = self._next_slot & 1

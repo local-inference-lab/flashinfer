@@ -12,7 +12,7 @@ import torch.multiprocessing as mp
 
 import b12x.comm.pcie.pcie_dcp_a2a as pcie_dcp_a2a
 from b12x.comm.pcie import _dcp_preparation as preparation
-from b12x.preparation import CollectiveRequirement, PreparationSession
+from b12x.preparation import CollectiveRequirement, PreparationSession, PreparedCall
 from b12x.comm.pcie.pcie_oneshot import PCIeOneshotAllReduce
 from b12x.comm.pcie.pcie_dcp_a2a import (
     PCIeDCPA2A,
@@ -135,7 +135,9 @@ def _local_staging_words(channel, stream: torch.cuda.Stream) -> tuple[int, int]:
     return words[0].value, words[1].value
 
 
-def _prepare_channel(session, channel):
+def _prepare_channel(session, channel, *, pairwise=False):
+    from b12x.comm import pcie
+
     plans = {}
     for operation, dtypes in (
         ("all_gather_heads", (torch.bfloat16, torch.float16, torch.float8_e4m3fn)),
@@ -143,17 +145,17 @@ def _prepare_channel(session, channel):
     ):
         for dtype in dtypes:
             if operation == "all_gather_heads":
+                # Selected ring plans bind the row shape; replay uses one-row views.
                 call = dict(
-                    threads=GATHER_THREADS,
                     local_input=torch.zeros(
-                        MAX_BATCH,
+                        1 if pairwise else MAX_BATCH,
                         channel.heads_per_rank,
                         QUERY_HEAD_DIM,
                         dtype=dtype,
                         device=channel.device,
                     ),
                     out=torch.empty(
-                        MAX_BATCH,
+                        1 if pairwise else MAX_BATCH,
                         TOTAL_HEADS,
                         QUERY_HEAD_DIM,
                         dtype=dtype,
@@ -185,9 +187,27 @@ def _prepare_channel(session, channel):
             query = preparation.query_from_runtime(
                 channel,
                 surface=f"DcpAllToAll.{operation}",
-                call=call,
+                call=dict(call, threads=GATHER_THREADS)
+                if operation == "all_gather_heads"
+                else call,
             )
-            plan = preparation.plan(query, runtime=channel)
+            if pairwise:
+                implementation = (
+                    "dcp_ring" if operation == "all_gather_heads" else "dcp_pairwise"
+                )
+                plan = pcie.plan(
+                    query,
+                    runtime=channel,
+                    override=pcie.CollectiveConfig(
+                        implementation=implementation,
+                        threads=128,
+                        blocks=8,
+                        submode="barrier" if operation == "all_gather_heads" else "",
+                        active_blocks=8 if operation == "all_gather_heads" else 0,
+                    ),
+                )
+            else:
+                plan = preparation.plan(query, runtime=channel)
             name = f"{operation}-{dtype}"
             session.prepare(
                 (
@@ -197,8 +217,8 @@ def _prepare_channel(session, channel):
                             key=name,
                             ranks=tuple(range(channel.world_size)),
                         ),
-                        prepare_call=lambda state, call=call: preparation.prepare_call(
-                            state, **call
+                        prepare_call=lambda state, call=call: PreparedCall(
+                            run=lambda: state.run(**call), output=call["out"]
                         ),
                     ),
                 ),
@@ -420,6 +440,8 @@ def _check_graph(
     rank: int,
     world_size: int,
     device: torch.device,
+    *,
+    pairwise: bool = False,
 ) -> None:
     stream = torch.cuda.Stream(device=device)
     pool.prepare_channels(("graph",))
@@ -475,7 +497,7 @@ def _check_graph(
     ]
 
     with torch.cuda.stream(stream):
-        plans = _prepare_channel(session, channel)
+        plans = _prepare_channel(session, channel, pairwise=pairwise)
         channel.all_gather_heads(
             local_queries[0],
             gathered_queries[0],
@@ -493,7 +515,7 @@ def _check_graph(
     graph = torch.cuda.CUDAGraph()
     with pool.capture(stream, channel_id="graph:layer-stack") as graph_channel:
         with torch.cuda.stream(stream):
-            graph_plans = _prepare_channel(session, graph_channel)
+            graph_plans = _prepare_channel(session, graph_channel, pairwise=pairwise)
         with session.capture(), torch.cuda.graph(graph, stream=stream):
             for layer in range(layers):
                 graph_channel.all_gather_heads(
@@ -759,12 +781,15 @@ def _check_queued_mixed_grid_graph(
     rank: int,
     world_size: int,
     device: torch.device,
+    *,
+    pairwise: bool = False,
 ) -> None:
     """Stress slot retirement across odd, mixed-grid graph replays.
 
-    The graph intentionally contains 2-block gather, 16-block LSE, then
-    2-block gather.  Its odd transport-node count flips the starting slot on
-    every replay.  Replays are queued without a rank barrier or device sync,
+    Pairwise runs mix an eight-CTA ring and pairwise LSE with the direct gather.
+    Direct runs retain the 2-block gather, 16-block LSE, 2-block gather stack.
+    The odd transport-node count flips the starting slot on every replay.
+    Replays are queued without a rank barrier or device sync,
     and rank zero pauses after its first enqueue so peer hosts can enqueue the
     next replay before rank zero enqueues its matching launch.
     """
@@ -811,7 +836,12 @@ def _check_queued_mixed_grid_graph(
     graph = torch.cuda.CUDAGraph()
     dist.barrier()
     with pool.capture(channel_id="graph:mixed-grid") as channel:
-        plans = _prepare_channel(session, channel)
+        plain_plans = _prepare_channel(session, channel)
+        plans = (
+            _prepare_channel(session, channel, pairwise=True)
+            if pairwise
+            else plain_plans
+        )
         with session.capture(), torch.cuda.graph(graph):
             channel.all_gather_heads(
                 query_a, gathered_a, plan=plans["all_gather_heads", query_a.dtype]
@@ -823,7 +853,7 @@ def _check_queued_mixed_grid_graph(
                 plan=plans["lse_reduce_scatter", partial_output.dtype],
             )
             channel.all_gather_heads(
-                query_b, gathered_b, plan=plans["all_gather_heads", query_b.dtype]
+                query_b, gathered_b, plan=plain_plans["all_gather_heads", query_b.dtype]
             )
 
     replay_steps = (4100, 4200, 4300)
@@ -938,6 +968,7 @@ def _worker(
     heads_per_rank: int | None,
     query_head_dim: int,
     gather_threads: int,
+    pairwise: bool,
 ) -> None:
     global TOTAL_HEADS, QUERY_HEAD_DIM, GATHER_THREADS
     GATHER_THREADS = gather_threads
@@ -986,11 +1017,13 @@ def _worker(
         dist.barrier()
         if rank == 0:
             print("A2A GPU gate: graph replay", flush=True)
-        _check_graph(pool, session, rank, world_size, device)
+        _check_graph(pool, session, rank, world_size, device, pairwise=pairwise)
         dist.barrier()
         if rank == 0:
             print("A2A GPU gate: queued mixed-grid skew", flush=True)
-        _check_queued_mixed_grid_graph(pool, session, rank, world_size, device)
+        _check_queued_mixed_grid_graph(
+            pool, session, rank, world_size, device, pairwise=pairwise
+        )
         if rank == 0:
             print("A2A GPU gate: complete", flush=True)
         torch.cuda.synchronize(device)
@@ -1252,8 +1285,9 @@ def _preflight_rejection_worker(rank: int, world_size: int, port: int) -> None:
 
 @pytest.mark.parametrize("heads_per_rank,query_head_dim", [(None, 576), (3, 64)])
 @pytest.mark.parametrize("gather_threads", [256, 1024])
+@pytest.mark.parametrize("pairwise", [False, True])
 def test_pcie_dcp_a2a_eager_and_cuda_graph_correctness(
-    heads_per_rank, query_head_dim, gather_threads
+    heads_per_rank, query_head_dim, gather_threads, pairwise
 ):
     if (
         os.getenv("B12X_PCIE_DCP_TEST_EXPECT_RESIDENCY_REJECTION") == "1"
@@ -1263,6 +1297,8 @@ def test_pcie_dcp_a2a_eager_and_cuda_graph_correctness(
     if not torch.cuda.is_available():
         pytest.skip("CUDA is unavailable")
     world_size = int(os.getenv("B12X_PCIE_DCP_A2A_WORLD_SIZE", "2"))
+    if pairwise and world_size != 4:
+        pytest.skip("pairwise payloads require world size four")
     if gather_threads == 1024 and world_size != 2:
         pytest.skip("1024-thread gather blocks use the TP2 kernel")
     if world_size not in (2, 4, 8, 16):
@@ -1273,7 +1309,14 @@ def test_pcie_dcp_a2a_eager_and_cuda_graph_correctness(
         )
     mp.spawn(
         _worker,
-        args=(world_size, _free_port(), heads_per_rank, query_head_dim, gather_threads),
+        args=(
+            world_size,
+            _free_port(),
+            heads_per_rank,
+            query_head_dim,
+            gather_threads,
+            pairwise,
+        ),
         nprocs=world_size,
         join=True,
     )

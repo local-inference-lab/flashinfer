@@ -13,8 +13,7 @@ from ._dcp_a2a_cute import (
     _copy_16b,
     _copy_16b_addr,
 )
-from ._dcp_cute_common import _membar_sys, block_pair_barrier
-from ._joint_cluster_cute import _threadfence_sys
+from ._dcp_cute_common import _membar_sys, _threadfence_sys, block_pair_barrier
 from ._runtime_gather_cute import SelectedGather
 
 

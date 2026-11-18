@@ -348,7 +348,37 @@ def test_paired_gather_compiles_row_partition_geometries(row_blocks, load_batch)
 
 @pytest.mark.parametrize(
     "module,factory,args",
-    [("_ring_gather_cute", "compile_varlen_ring", (4, 0, 4096, 16384))],
+    [
+        ("_ring_gather_cute", "compile_varlen_ring", (4, 0, 4096, 16384)),
+        (
+            "_dcp_a2a_cute",
+            "_get_compiled_lse_reduce_scatter",
+            (4, 0, "bf16", 128, False, False),
+        ),
+        (
+            "_dcp_a2a_cute",
+            "_get_compiled_lse_reduce_scatter",
+            (4, 0, "bf16", 128, True, True),
+        ),
+        ("_dcp_a2a_cute", "_get_compiled_all_gather_heads", (4, 0, 128, True)),
+        ("_dcp_a2a_cute", "_get_compiled_all_gather_pair", (4, 0, 128, True)),
+        ("_dcp_a2a_cute", "_get_compiled_kimi_topk16", (128,)),
+        (
+            "_twoshot_bf16_cute",
+            "get_twoshot_bf16_launcher",
+            ("reduce_scatter", 4, 0, True, 0, 128, 4096, 0, False),
+        ),
+        (
+            "_twoshot_bf16_cute",
+            "get_twoshot_bf16_launcher",
+            ("reduce_scatter", 4, 0, True, 0, 128, 4096, 0, True),
+        ),
+        (
+            "_twoshot_bf16_cute",
+            "get_twoshot_bf16_allreduce_launcher",
+            (4, 0, True, 0, 128, 4096, 0),
+        ),
+    ],
 )
 def test_transport_compile_specs_without_cuda(monkeypatch, module, factory, args):
     from importlib import import_module

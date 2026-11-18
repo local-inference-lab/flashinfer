@@ -27,6 +27,7 @@ from torch.distributed import ProcessGroup
 
 from b12x.preparation.types import Plan, require_prepared
 
+from ._tuning import PAIRWISE_BLOCKS
 from ._cuda_ipc import CudaRTLibrary
 from .pcie_oneshot import (
     _ABANDONED_PCIE_RUNTIME_QUARANTINE,
@@ -387,6 +388,8 @@ class PCIeTwoShotBF16:
         if shard_packs > self._pack_stride:
             raise ValueError("pcie_twoshot_bf16 staging capacity exceeded")
         blocks = max(1, min(int(block_limit), (shard_packs + threads - 1) // threads))
+        if state.query.call.get("payload_schedule") == "pairwise":
+            blocks = PAIRWISE_BLOCKS
         capturing = _is_current_stream_capturing(self.device)
         if capturing and self._capture_context_depth <= 0:
             raise RuntimeError("PCIe twoshot-bf16 capture requires runtime.capture()")

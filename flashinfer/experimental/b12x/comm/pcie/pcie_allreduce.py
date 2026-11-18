@@ -14,8 +14,10 @@ from torch.distributed import ProcessGroup
 
 from b12x.preparation import FrozenMapping, Plan
 from b12x.preparation.types import require_prepared
+from b12x.preparation.device import detect_device
+
+from ._tuning import PAIRWISE_THREADS, PAIRWISE_BLOCKS, pairwise_device, PcieConfig
 from ._collective_tuning import CollectiveConfig
-from ._tuning import PcieConfig
 
 from .pcie_hierarchical import (
     SUPPORTED_WORLD_SIZES as HIERARCHICAL_WORLD_SIZES,
@@ -550,6 +552,28 @@ class PCIeAllReduce:
                         call={"inp": inp, **call},
                     )
                     alternatives["twoshot"] = (native, twoshot)
+                    if (
+                        self.world_size == 4
+                        and native.call["transport"] == "push"
+                        and not any(key in call for key in ("threads", "block_limit"))
+                        and pairwise_device(detect_device(target.device).identity)
+                    ):
+                        from dataclasses import replace
+
+                        alternatives["twoshot_pairwise"] = (
+                            replace(
+                                native,
+                                call=FrozenMapping(
+                                    dict(
+                                        native.call,
+                                        payload_schedule="pairwise",
+                                        threads=PAIRWISE_THREADS,
+                                        block_limit=PAIRWISE_BLOCKS,
+                                    )
+                                ),
+                            ),
+                            twoshot,
+                        )
                     if self._use_bf16_twoshot(inp, output):
                         default = "twoshot"
                 from ._joint_profile import JOINT_FAMILIES

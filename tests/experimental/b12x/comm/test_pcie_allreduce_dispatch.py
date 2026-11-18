@@ -375,3 +375,71 @@ def test_public_plan_requires_explicit_joint_opt_in(
         )
     assert {config.implementation for config in configs} == expected
     assert len(configs) > len(expected)
+
+
+@pytest.mark.parametrize("cc,sms", [((12, 0), 148), ((12, 1), 148), ((12, 0), 32)])
+@pytest.mark.parametrize("transport", ["pull", "push"])
+@pytest.mark.parametrize("prefer_twoshot", [False, True])
+def test_tp4_plan_only_offers_pairwise_for_push(
+    monkeypatch, transport, prefer_twoshot, cc, sms
+):
+    from b12x.comm.pcie import _preparation, _collective_tuning
+    from b12x.comm.pcie._tuning import PcieQuery
+    from b12x.preparation import DeviceIdentity, FrozenMapping, autotune_effort
+
+    device = DeviceIdentity("nvidia", cc, sms, "synthetic device")
+    monkeypatch.setattr(
+        dispatch, "detect_device", lambda d: SimpleNamespace(identity=device)
+    )
+    runtime = SimpleNamespace(
+        rank=0, world_size=4, device=torch.device("cpu"), single_channel=True
+    )
+    runtime._prepared_channel_for_stream = lambda stream, channel: runtime
+    twoshot = SimpleNamespace(accepts=lambda inp: True)
+    manager = dispatch.PCIeAllReduce(runtime, "oneshot", bf16_twoshot=twoshot)
+    monkeypatch.setattr(manager, "_use_bf16_twoshot", lambda *args: prefer_twoshot)
+
+    def query(owner, *, surface, call):
+        return PcieQuery(
+            surface=surface,
+            world_size=4,
+            rank=0,
+            topology="pcie_ipc",
+            call=FrozenMapping(
+                dict(
+                    transport=transport if owner is twoshot else "pull",
+                    stage_input=True,
+                    threads=128,
+                    blocks=8,
+                    block_limit=8,
+                    dtype="bfloat16",
+                    shape=(256,),
+                    size_packs=32,
+                )
+            ),
+            setup=FrozenMapping(dict(shape=(256,))),
+        )
+
+    monkeypatch.setattr(_preparation, "query_from_runtime", query)
+    monkeypatch.setattr(
+        _collective_tuning, "oneshot_alternatives", lambda q, r: {"pull": (q, r)}
+    )
+    plan = manager.plan(torch.empty(256, dtype=torch.bfloat16))
+    admitted = transport == "push" and cc == (12, 0) and sms >= 64
+    assert ("twoshot_pairwise" in plan.query.alternatives) == admitted
+    assert "twoshot" in plan.query.alternatives
+    assert "pull" in plan.query.alternatives
+    assert (_collective_tuning._family_bucket(plan.query) is None) == admitted
+    expected = "twoshot" if prefer_twoshot else "pull"
+    assert plan.query.default.implementation == expected
+    with autotune_effort("default"):
+        configs = [
+            c
+            for _, c in plan.contract.iterate(
+                plan.contract.configure(plan.query, device=device)
+            )
+        ]
+    assert {c.implementation for c in configs} == set(plan.query.alternatives)
+    with autotune_effort("off"):
+        configured = plan.contract.configure(plan.query, device=device)
+    assert configured.default.implementation == expected
