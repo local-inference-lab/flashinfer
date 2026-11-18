@@ -344,3 +344,25 @@ def test_paired_gather_compiles_row_partition_geometries(row_blocks, load_batch)
     launchers = compile_dcp_surface(payload, ordinal)
     assert set(program_keys(launchers)) == set(description.programs)
     load_programs(launchers)
+
+
+@pytest.mark.parametrize(
+    "module,factory,args",
+    [("_ring_gather_cute", "compile_varlen_ring", (4, 0, 4096, 16384))],
+)
+def test_transport_compile_specs_without_cuda(monkeypatch, module, factory, args):
+    from importlib import import_module
+
+    kernels = import_module(f"b12x.comm.pcie.{module}")
+    compile_name = "compile_kernel" if module == "_ring_gather_cute" else "b12x_compile"
+    compile_kernel = Mock(return_value=Mock(__b12x_programs__=()))
+    monkeypatch.setattr(kernels, compile_name, compile_kernel)
+    monkeypatch.setattr(kernels, "make_ptr", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(kernels, "current_cuda_stream", lambda: 0)
+    if hasattr(kernels, "raise_if_kernel_resolution_frozen"):
+        monkeypatch.setattr(
+            kernels, "raise_if_kernel_resolution_frozen", lambda *args, **kwargs: None
+        )
+    getattr(kernels, factory).__wrapped__(*args)
+    compile_kernel.assert_called_once()
+    assert compile_kernel.call_args.kwargs["compile_spec"] is not None

@@ -315,3 +315,92 @@ def startup_spec(plan, profiles):
         pairs,
     )
     return JointStartupSpec(key, pairs, state.selector, state, False, state.query.rank)
+
+
+def validate_varlen_buffers(runtime, output, counts):
+    if (
+        output.dtype != torch.uint8
+        or output.ndim != 2
+        or output.shape[0] != runtime.world_size
+        or not output.is_contiguous()
+        or output.shape[1] <= 0
+        or output.shape[1] % 16
+        or output.data_ptr() % 16
+        or counts.shape != (runtime.world_size,)
+        or counts.dtype != torch.int64
+        or not counts.is_contiguous()
+        or counts.data_ptr() % 8
+        or output.device != runtime.device
+        or counts.device != runtime.device
+    ):
+        raise ValueError(
+            "variable gather requires contiguous CUDA byte rows and int64 counts on its device"
+        )
+
+
+@dataclass
+class VarlenGatherState:
+    query: object
+    runtime: object
+    launcher: object
+
+    def require_runtime(self, runtime):
+        if runtime is not self.runtime:
+            raise ValueError("variable gather plan belongs to another channel")
+
+    def run(self, *, out, counts):
+        runtime = self.runtime
+        if out.shape[1] != self.query.call["capacity"]:
+            raise ValueError("variable gather row capacity differs from its plan")
+        runtime._check_stream()
+        if not runtime._device_slot_selection:
+            runtime._graph_base_slot = runtime._next_slot & 1
+            runtime._device_slot_selection = True
+        bank = runtime._graph_base_slot
+        self.launcher(
+            out.data_ptr(),
+            counts.data_ptr(),
+            runtime._staging_ptrs[bank],
+            runtime._signal_ptrs,
+            runtime._slot_bytes if bank == 0 else -runtime._slot_bytes,
+        )
+        return out
+
+
+def varlen_plan(query, *, runtime, invocation, override):
+    from ._ring_gather_cute import compile_varlen_ring
+
+    TUNING.validate_query(query, None)
+    for field in ("slot_bytes", "exchange_chunks", "exchange_offset"):
+        if query.setup[field] != getattr(runtime, "_" + field):
+            raise ValueError(f"variable gather {field} differs from its runtime owner")
+    args = (
+        query.world_size,
+        query.rank,
+        query.call["capacity"],
+        query.call["bank_bytes"],
+    )
+    return Plan(
+        contract=TUNING,
+        query=query,
+        invocation=invocation,
+        override=override,
+        _compile_jobs=lambda config, device: (
+            CompileJob.create(
+                "b12x.comm.pcie._ring_gather_cute:compile_varlen_ring", *args
+            ),
+        ),
+        _memory_requirements=lambda config, device: MemoryRequirements(
+            persistent=(
+                PersistentMemory(
+                    ("pcie-dcp-runtime", id(runtime)),
+                    sum(b.nbytes for b in runtime._owned_buffers),
+                    sum(b.nbytes for b in runtime._owned_buffers),
+                ),
+            )
+        ),
+        _materialize=lambda selection, device: VarlenGatherState(
+            query, runtime, load_programs(compile_varlen_ring(*args))
+        ),
+        _device=runtime.device,
+    )

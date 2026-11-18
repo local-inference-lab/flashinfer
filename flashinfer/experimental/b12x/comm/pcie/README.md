@@ -440,6 +440,15 @@ offsets even when that barrier origin is bank one. All ranks must use the same
 profile and serialize calls sharing a channel; profile changes require earlier
 replays to have drained.
 
+`all_gather_varlen` gathers live prefixes of contiguous uint8 rows at DCP2/4.
+Its device int64 counts must be identical on every rank, multiples of 16, and
+within the row capacity; invalid counts trap before communication and invalidate
+the CUDA context. Inconsistent counts can hang peers. The prepared
+bank must be a multiple of 16 KiB and fit at or below `exchange_offset` when
+word-exchange packets are reserved, otherwise within `slot_bytes`. Calls on one
+owner must be serialized: byte gathers share epochs and staging banks with its
+other DCP calls.
+
 The experimental `selected_ring` profile uses one fixed outgoing neighbor and
 one incoming neighbor. The eight CTAs divide a flattened sequence of 16-byte
 input packs, so a warp may span row boundaries.

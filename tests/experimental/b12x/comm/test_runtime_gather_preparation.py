@@ -241,3 +241,85 @@ def test_pairwise_gather_requires_its_explicit_geometry(transport):
     for world in (2, 4, 8, 12):
         with pytest.raises(ValueError):
             TUNING.validate_query(replace(q, world_size=world), None)
+
+
+def varlen_query():
+    return PcieQuery(
+        surface="DcpAllToAll.all_gather_varlen",
+        world_size=4,
+        rank=0,
+        topology="pcie_ipc",
+        call=FrozenMapping(dict(capacity=131072, bank_bytes=16384)),
+        setup=FrozenMapping(
+            dict(slot_bytes=32768, exchange_chunks=1, exchange_offset=16640)
+        ),
+    )
+
+
+@pytest.mark.parametrize("world", [2, 4, 8, 16])
+def test_varlen_gather_admits_qualified_worlds(world):
+    q = replace(varlen_query(), world_size=world)
+    if world in (2, 4):
+        TUNING.validate_query(q, None)
+    else:
+        with pytest.raises(ValueError, match="supports world sizes"):
+            TUNING.validate_query(q, None)
+
+
+@pytest.mark.parametrize("bank", [0, 16383, 32768, 49152])
+def test_varlen_gather_rejects_incomplete_or_overlapping_bank(bank):
+    q = varlen_query()
+    with pytest.raises(ValueError, match="complete CTA bank"):
+        TUNING.validate_query(
+            replace(q, call=FrozenMapping(dict(q.call, bank_bytes=bank))), None
+        )
+
+
+@pytest.mark.parametrize("field", ["slot_bytes", "exchange_chunks", "exchange_offset"])
+def test_varlen_gather_requires_matching_receive_owner(field):
+    from b12x.comm.pcie._gather_preparation import varlen_plan
+
+    q = varlen_query()
+    runtime = SimpleNamespace(**{"_" + key: value for key, value in q.setup.items()})
+    setattr(runtime, "_" + field, q.setup[field] + 1)
+    with pytest.raises(ValueError, match=field + " differs"):
+        varlen_plan(q, runtime=runtime, invocation=FrozenMapping(), override=None)
+
+
+def test_varlen_gather_requires_own_output_row(monkeypatch):
+    from contextlib import nullcontext
+    import torch
+    from b12x.comm.pcie import pcie_dcp_a2a as module
+
+    owner = object.__new__(module.PCIeDCPA2A)
+    owner.device, owner.rank, owner._closed = torch.device("cpu"), 0, False
+    from b12x.comm.pcie._gather_preparation import VarlenGatherState
+
+    owner.world_size = 4
+    state = VarlenGatherState(None, owner, None)
+    monkeypatch.setattr(module, "require_prepared", lambda *args: state)
+    monkeypatch.setattr(module, "_device_guard", lambda device: nullcontext())
+    out = torch.zeros((4, 16), dtype=torch.uint8)
+    with pytest.raises(ValueError, match="in-place output row"):
+        owner.all_gather_varlen(
+            out[0].clone(), torch.zeros(4, dtype=torch.int64), out=out, plan=None
+        )
+    with pytest.raises(ValueError, match="contiguous CUDA byte rows"):
+        owner.all_gather_varlen(
+            out[0], torch.zeros(4, dtype=torch.int64), out=out[0], plan=None
+        )
+    from b12x.comm.pcie._gather_preparation import SelectedGatherState
+
+    head_state = SelectedGatherState(None, owner, None, None)
+    monkeypatch.setattr(module, "require_prepared", lambda *args: head_state)
+    with pytest.raises(
+        ValueError, match="variable gather plan belongs to another channel"
+    ):
+        owner.all_gather_varlen(
+            out[0], torch.zeros(4, dtype=torch.int64), out=out, plan=None
+        )
+    owner._closed = True
+    with pytest.raises(RuntimeError, match="closed"):
+        owner.all_gather_varlen(
+            out[0], torch.zeros(4, dtype=torch.int64), out=out, plan=None
+        )

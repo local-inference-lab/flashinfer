@@ -780,6 +780,32 @@ class PCIeDCPA2A:
             stream_affine=stream_affine,
         )
 
+    def all_gather_varlen(self, source, counts, *, out, plan):
+        """Gather in-place byte prefixes on DCP2/4 through a prepared ring.
+
+        Counts are identical on every rank, int64, in [0, row capacity], and
+        multiples of 16. Invalid device counts trap before communication.
+        Suffixes are untouched. ``out`` is required; this entry uses the current
+        stream. Calls on this owner must be serialized.
+        """
+        from ._gather_preparation import VarlenGatherState, validate_varlen_buffers
+
+        with _device_guard(self.device):
+            if self._closed:
+                raise RuntimeError("PCIe DCP A2A channel is closed")
+            state = self._prepared_state(plan)
+            if not isinstance(state, VarlenGatherState):
+                raise ValueError("variable gather plan belongs to another channel")
+            validate_varlen_buffers(self, out, counts)
+            if (
+                source.data_ptr() != out[self.rank].data_ptr()
+                or source.nbytes != out.shape[1]
+            ):
+                raise ValueError(
+                    "variable gather source must be its in-place output row"
+                )
+            return state.run(out=out, counts=counts)
+
     def _bind_stream_key(self, stream_key: Optional[int]) -> None:
         if not self._stream_affine or stream_key is None:
             return

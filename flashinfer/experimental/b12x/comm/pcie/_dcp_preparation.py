@@ -30,6 +30,7 @@ _DCP_SURFACES = frozenset(
     {
         "DcpAllToAll.lse_reduce_scatter",
         "DcpAllToAll.all_gather_heads",
+        "DcpAllToAll.all_gather_varlen",
         "DcpAllToAll.all_gather_pair",
         "DcpAllToAll.all_gather_pair_kimi_topk",
         "DcpAllToAll.kimi_topk16",
@@ -94,6 +95,21 @@ def query_from_runtime(runtime, *, surface, call) -> PcieQuery:
             "blocks_override": int(runtime._block_limit_override),
         }
     )
+    if surface.endswith(".all_gather_varlen"):
+        from ._gather_preparation import validate_varlen_buffers
+
+        output, counts = call["out"], call["counts"]
+        validate_varlen_buffers(runtime, output, counts)
+        return PcieQuery(
+            surface=surface,
+            world_size=runtime.world_size,
+            rank=runtime.rank,
+            topology="pcie_ipc",
+            setup=setup,
+            call=FrozenMapping(
+                {"capacity": output.shape[1], "bank_bytes": call["bank_bytes"]}
+            ),
+        )
     requested_threads = int(call.get("threads", 256))
     requested_blocks = int(call.get("block_limit", 16))
     effective_threads, effective_blocks = runtime._resolve_launch_config(
@@ -371,6 +387,13 @@ def plan(
         and query.call.get("gather_transport") in GATHER_MODES
     ):
         return gather_plan(
+            query, runtime=runtime, invocation=invocation, override=override
+        )
+
+    if query.surface.endswith(".all_gather_varlen"):
+        from ._gather_preparation import varlen_plan
+
+        return varlen_plan(
             query, runtime=runtime, invocation=invocation, override=override
         )
 

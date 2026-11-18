@@ -25,6 +25,7 @@ SURFACES = {
     "TwoShotReduceScatter.reduce_scatter_fp8": (2, 4, 8),
     "TwoShotReduceScatter.all_gather_fp8": (2, 4, 8),
     "DcpAllToAll.lse_reduce_scatter": (2, 4, 8, 9, 10, 12, 16),
+    "DcpAllToAll.all_gather_varlen": (2, 4),
     "DcpAllToAll.all_gather_heads": (2, 4, 8, 9, 10, 12, 16),
     "DcpAllToAll.all_gather_pair": (2, 4, 8, 16),
     "DcpAllToAll.all_gather_pair_kimi_topk": (2, 4, 8, 16),
@@ -114,6 +115,25 @@ def _validate_query(query: PcieQuery, device) -> None:
             call["active_blocks"],
             cluster_size=call["joint_cluster_size"],
         )
+    if query.surface.endswith(".all_gather_varlen"):
+        capacity, bank = query.call["capacity"], query.call["bank_bytes"]
+        limit = (
+            query.setup["exchange_offset"]
+            if query.setup["exchange_chunks"]
+            else query.setup["slot_bytes"]
+        )
+        if (
+            type(capacity) is not int
+            or capacity <= 0
+            or capacity % 16
+            or type(bank) is not int
+            or bank <= 0
+            or bank % (8 * 128 * 16)
+            or bank > limit
+        ):
+            raise ValueError(
+                "variable gather requires aligned rows and a complete CTA bank within staging"
+            )
     if query.surface.endswith(".all_gather_heads"):
         transport = query.call.get("gather_transport", "barrier")
         from ._gather_preparation import GATHER_MODES, validate_query as validate_gather

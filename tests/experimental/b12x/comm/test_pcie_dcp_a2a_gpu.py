@@ -1322,3 +1322,234 @@ def test_pcie_dcp_a2a_coordinates_one_rank_preflight_failure_before_ipc():
         nprocs=world_size,
         join=True,
     )
+
+
+def _varlen_worker(rank, world, port):
+    from b12x.comm import pcie
+    from b12x.preparation import PreparedCall
+    from b12x.comm.pcie._dcp_a2a_cute import _GRAPH_EPOCH_INDEX, _GRAPH_ARRIVED_INDEX
+    from b12x.comm.pcie.pcie_dcp_a2a import _SIGNAL_BYTES
+
+    torch.set_num_threads(2)
+    torch.cuda.set_device(rank)
+    device = torch.device("cuda", rank)
+    dist.init_process_group(
+        "gloo", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=world
+    )
+    # Small banks exercise repeated reuse without a large fixture allocation.
+    bank, capacity = 16384, 131072
+    owner = pcie.DcpAllToAll.from_exchange_group(
+        exchange_group=dist.group.WORLD,
+        device=device,
+        max_batch_size=1,
+        total_heads=world,
+        head_dim=bank // (2 * world),
+        stream_affine=False,
+    )
+    other = pcie.DcpAllToAll.from_exchange_group(
+        exchange_group=dist.group.WORLD,
+        device=device,
+        max_batch_size=1,
+        total_heads=world,
+        head_dim=64,
+        stream_affine=False,
+    )
+    session = PreparationSession(
+        device=device, autotune=False, compile_workers=2, prime=False
+    )
+    graphs, cases, requests = [], [], []
+    try:
+        for size in (capacity, capacity // 2):
+            out = torch.empty((world, size), dtype=torch.uint8, device=device)
+            counts = torch.zeros(world, dtype=torch.int64, device=device)
+            query = pcie.query_from_runtime(
+                owner,
+                surface="DcpAllToAll.all_gather_varlen",
+                call={"out": out, "counts": counts, "bank_bytes": bank},
+            )
+            plan = pcie.plan(query, runtime=owner)
+            requests.append(
+                plan.request(
+                    name=f"varlen-{size}",
+                    prepare_call=lambda state, o=out, c=counts: PreparedCall(
+                        run=lambda: state.run(out=o, counts=c), output=o
+                    ),
+                    collective=CollectiveRequirement(
+                        key=f"varlen-{size}", ranks=tuple(range(world))
+                    ),
+                )
+            )
+            cases.append((out, counts, plan))
+        heads = []
+        for channel in (owner, other):
+            source = torch.full(
+                (1, 1, channel.query_head_dim),
+                rank + 1,
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            output = torch.empty(
+                (1, world, channel.query_head_dim), dtype=torch.bfloat16, device=device
+            )
+            query = pcie.query_from_runtime(
+                channel,
+                surface="DcpAllToAll.all_gather_heads",
+                call={
+                    "local_input": source,
+                    "out": output,
+                    "threads": 128,
+                    "block_limit": 8,
+                },
+            )
+            plan = preparation.plan(query, runtime=channel)
+            requests.append(
+                plan.request(
+                    name=f"heads-{len(heads)}",
+                    prepare_call=lambda state, x=source, y=output: PreparedCall(
+                        run=lambda: state.run(local_input=x, out=y), output=y
+                    ),
+                    collective=CollectiveRequirement(
+                        key=f"heads-{len(heads)}", ranks=tuple(range(world))
+                    ),
+                )
+            )
+            heads.append((channel, source, output, plan))
+        session.prepare(
+            tuple(requests),
+            coordinator=lambda progress: (
+                progress.ready_collectives[0].key
+                if progress.ready_collectives
+                else None
+            ),
+        )
+        out, counts, plan = cases[0]
+        out[rank].fill_(rank + 11)
+        counts.fill_(capacity)
+        torch.cuda.synchronize(device)
+        with torch.cuda.device((rank + 1) % world):
+            owner.all_gather_varlen(out[rank], counts, out=out, plan=plan)
+        torch.cuda.synchronize(device)
+        for peer in range(world):
+            assert torch.all(out[peer] == peer + 11)
+        counts.zero_()
+        stream = torch.cuda.Stream(device=device)
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for out, counts, plan in cases:
+                owner.all_gather_varlen(out[rank], counts, out=out, plan=plan)
+                stream.synchronize()
+                dist.barrier()
+                graph = torch.cuda.CUDAGraph()
+                with session.capture(), torch.cuda.graph(graph, stream=stream):
+                    owner.all_gather_varlen(out[rank], counts, out=out, plan=plan)
+                graphs.append(graph)
+            auxiliary = torch.cuda.Stream(device=device)
+            out, counts, plan = cases[0]
+            for reverse in (False, True):
+                graph = torch.cuda.CUDAGraph()
+                with session.capture(), torch.cuda.graph(graph, stream=stream):
+                    channel, source, output, head_plan = heads[0]
+                    # One owner is serialized across different collective contracts.
+                    channel.all_gather_heads(source, out=output, plan=head_plan)
+                    channel, source, output, head_plan = heads[1]
+                    if reverse:
+                        channel.all_gather_heads(source, out=output, plan=head_plan)
+                    auxiliary.wait_stream(stream)
+                    with torch.cuda.stream(auxiliary):
+                        owner.all_gather_varlen(out[rank], counts, out=out, plan=plan)
+                    if not reverse:
+                        channel.all_gather_heads(source, out=output, plan=head_plan)
+                    stream.wait_stream(auxiliary)
+                graphs.append(graph)
+        torch.cuda.current_stream().wait_stream(stream)
+        torch.cuda.synchronize()
+        # Ready, acknowledgement, and epoch counters all cross uint32 wrap.
+        words = (ctypes.c_uint32 * (_SIGNAL_BYTES // 4))()
+        for i in range(64 * 16):
+            words[i] = 0xFFFFFFFD
+        for i in range(64 * 16, len(words), 32):
+            words[i] = words[i + 3] = 0xFFFFFFFD
+        words[_GRAPH_EPOCH_INDEX], words[_GRAPH_ARRIVED_INDEX] = 0xFFFFFFFD, 0
+        owner._ipc.cudaMemcpyAsync(
+            owner._signal_ptrs[rank],
+            ctypes.addressof(words),
+            _SIGNAL_BYTES,
+            torch.cuda.current_stream().cuda_stream,
+        )
+        torch.cuda.synchronize()
+        dist.barrier()
+        schedule, snapshots, operands = [], [], []
+        columns = torch.arange(capacity, device=device)
+        for trial in range(20):
+            variant = (trial // 2) % 2
+            size = cases[variant][0].shape[1]
+            patterns = (
+                [0] * world,
+                [size] + [0] * (world - 1),
+                [bank - 16, bank, bank + 16, size],
+                [16 * (r + 1) for r in range(world)],
+                [size] * world,
+            )
+            values = (patterns[trial % len(patterns)] * world)[:world]
+            schedule.append((variant, values, trial))
+            snapshots.append(torch.empty_like(cases[variant][0]))
+            operands.append(
+                (
+                    torch.tensor(values, dtype=torch.int64, device=device),
+                    ((columns[:size] + rank * 37 + trial * 13) % 251).to(torch.uint8),
+                )
+            )
+        # Exercise both construction orders on distinct owners under rank skew.
+        for reverse in (False, True):
+            out, counts, _ = cases[0]
+            counts.fill_(capacity)
+            out[rank].fill_(rank + 7)
+            if rank == int(reverse):
+                torch.cuda._sleep(500000)
+            for _ in range(5):
+                graphs[2 + int(reverse)].replay()
+            torch.cuda.synchronize()
+            for peer in range(world):
+                assert torch.all(out[peer] == peer + 7)
+                for _, _, output, _ in heads:
+                    assert torch.all(output[:, peer] == peer + 1)
+        for skew in (0, world - 1):
+            if rank == skew:
+                torch.cuda._sleep(500000)
+            # No host rank barriers between adjacent or alternating graph replays.
+            for (variant, values, trial), saved, (sizes, payload) in zip(
+                schedule, snapshots, operands
+            ):
+                out, counts, _ = cases[variant]
+                out.fill_(0xA5)
+                out[rank].copy_(payload)
+                counts.copy_(sizes)
+                graphs[variant].replay()
+                saved.copy_(out)
+            torch.cuda.synchronize()
+            for (variant, values, trial), saved in zip(schedule, snapshots):
+                for peer, count in enumerate(values):
+                    expected = (
+                        (columns[: saved.shape[1]] + peer * 37 + trial * 13) % 251
+                    ).to(torch.uint8)
+                    assert torch.equal(saved[peer, :count], expected[:count])
+                    if peer == rank:
+                        assert torch.equal(saved[peer, count:], expected[count:])
+                    else:
+                        assert torch.all(saved[peer, count:] == 0xA5)
+        dist.barrier()
+    finally:
+        torch.cuda.synchronize()
+        for graph in graphs:
+            graph.reset()
+        session.close()
+        other.close()
+        owner.close()
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("world", [2, 4])
+def test_varlen_ring_queued_replay(world):
+    if torch.cuda.device_count() < world:
+        pytest.skip(f"requires {world} peer-accessible GPUs")
+    mp.spawn(_varlen_worker, args=(world, _free_port()), nprocs=world, join=True)
