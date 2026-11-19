@@ -20,6 +20,7 @@ GATHER_MODES = {
     "selected_ring": ("barrier",),
     "selected_recursive": ("barrier",),
     "selected_recursive_ready": ("barrier",),
+    "selected_recursive_outer_first": ("barrier",),
 }
 
 
@@ -40,6 +41,7 @@ def selected_gather_profile(transport, blocks, mode, active):
         "selected_ring",
         "selected_recursive",
         "selected_recursive_ready",
+        "selected_recursive_outer_first",
     ) and (blocks != 8 or active != 8):
         raise ValueError(
             "ring and recursive gathers require eight active and physical CTAs"
@@ -80,9 +82,13 @@ def validate_query(query):
         raise ValueError(
             "ring gather requires DCP4, DCP8 or DCP16 with 128 or 512 threads per CTA"
         )
-    if transport in ("selected_recursive", "selected_recursive_ready") and (
-        query.world_size not in (8, 16) or call["threads"] != 128
-    ):
+    if transport == "selected_recursive_outer_first" and query.world_size != 16:
+        raise ValueError("outer-first recursive doubling requires sixteen ranks")
+    if transport in (
+        "selected_recursive",
+        "selected_recursive_ready",
+        "selected_recursive_outer_first",
+    ) and (query.world_size not in (8, 16) or call["threads"] != 128):
         raise ValueError(
             "recursive gathers require DCP8 or DCP16 with 128 threads per CTA"
         )
@@ -108,6 +114,7 @@ def validate_query(query):
         "selected_ring",
         "selected_recursive",
         "selected_recursive_ready",
+        "selected_recursive_outer_first",
     ):
         chunks = query.setup["exchange_chunks"]
         if (

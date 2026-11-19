@@ -190,6 +190,10 @@ def plan(
             ("dcp_recursive", "selected_recursive", (128,)),
             ("dcp_recursive_ready", "selected_recursive_ready", (128,)),
         ]
+        if query.world_size == 16:
+            specializations.append(
+                ("dcp_recursive_outer_first", "selected_recursive_outer_first", (128,))
+            )
         if query.world_size == 8:
             specializations.append(("dcp_phased_push", "selected_phased_push", (128,)))
         for name, transport, threads in specializations:

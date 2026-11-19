@@ -79,6 +79,7 @@ def test_static_tp16_gather_races_native_geometry_and_complete_phase_clusters():
         "dcp_ring",
         "dcp_recursive",
         "dcp_recursive_ready",
+        "dcp_recursive_outer_first",
     }
     assert plan.query.default == CollectiveConfig(
         implementation="dcp", threads=256, blocks=16
@@ -111,6 +112,7 @@ def test_dcp8_races_phased_push_recursive_and_ring():
         _preparation._selected_gather_query(query, "selected_ring", (128,)) is not None
     )
     plan = _preparation.plan(query, runtime=runtime)
+    assert "dcp_recursive_outer_first" not in plan.query.alternatives
     assert "dcp_phased_push" in plan.query.alternatives
     assert "dcp_recursive" in plan.query.alternatives
     assert "dcp_ring" in plan.query.alternatives
@@ -135,7 +137,14 @@ def test_environment_geometry_overrides_constrain_both_implementations(pins):
     values = configs(plan)
     expected = {"dcp", "dcp_phased"}
     if pins[0] in (0, 128):
-        expected.update(("dcp_ring", "dcp_recursive", "dcp_recursive_ready"))
+        expected.update(
+            (
+                "dcp_ring",
+                "dcp_recursive",
+                "dcp_recursive_ready",
+                "dcp_recursive_outer_first",
+            )
+        )
     elif pins[0] == 512:
         expected.add("dcp_ring")
     assert {value.implementation for value in values} == expected
@@ -350,7 +359,7 @@ def test_shape_rank_and_byte_width_participate_in_collective_identity():
     assert signatures[0] == signatures[1]
     assert signatures[0] != signatures[2]
     assert signatures[0] != signatures[3]
-    assert TUNING.candidate_contract_version == 9
+    assert TUNING.candidate_contract_version == 10
 
 
 @pytest.mark.parametrize(
@@ -361,6 +370,7 @@ def test_shape_rank_and_byte_width_participate_in_collective_identity():
         ("dcp_ring", 512, "ring"),
         ("dcp_recursive", 128, "recursive"),
         ("dcp_recursive_ready", 128, "recursive_ready"),
+        ("dcp_recursive_outer_first", 128, "recursive_outer_first"),
     ],
 )
 def test_selected_compile_and_materialization_use_the_winning_profile(

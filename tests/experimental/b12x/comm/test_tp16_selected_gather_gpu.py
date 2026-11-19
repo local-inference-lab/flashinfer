@@ -53,6 +53,8 @@ def _worker(rank, world, directory):
         ("selected_recursive", 128, 8),
         ("selected_recursive_ready", 128, 8),
     )
+    if world == 16:
+        profiles += (("selected_recursive_outer_first", 128, 8),)
     try:
         for origin in (0, 1):
             snapshot = None
@@ -134,9 +136,7 @@ def _worker(rank, world, directory):
                         requests.append(
                             plan.request(
                                 name=name,
-                                prepare_call=lambda state,
-                                source=source,
-                                output=output: (
+                                prepare_call=lambda state, source=source, output=output: (
                                     PreparedCall(
                                         run=lambda: state.run(
                                             local_input=source, out=output
@@ -181,6 +181,7 @@ def _worker(rank, world, directory):
                         "selected_ring",
                         "selected_recursive",
                         "selected_recursive_ready",
+                        "selected_recursive_outer_first",
                     )
                     for item in (
                         ((1, "ordinary", 128, 2), 0),

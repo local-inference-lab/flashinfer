@@ -129,6 +129,13 @@ Partial overlaps remain rejected. Standalone reduce-scatter and all-gather
 require disjoint outputs. All operations and graph replays sharing one runtime
 must remain serialized.
 
+On 16 ranks, static gather tuning also measures acknowledged recursive doubling with
+the higher rank bits first (XOR distances 4, 8, 1, 2). When each group of four
+consecutive ranks shares a physical switch, this order sends three shard-equivalents
+across switches per rank. The lower-bit-first order sends twelve. Both orders
+return the same rank-major rows and share the ordinary per-peer generations.
+The tuning trial chooses the order for its installed rank placement.
+
 ## Benchmark and synchronization contract
 
 The `_benchmark.py` fixtures allocate private operands, generate and reset inputs,

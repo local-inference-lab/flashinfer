@@ -217,7 +217,7 @@ class SelectedGather(_AllGatherHeadsLaunch):
 
 @program_cache
 def compile_selected_gather(world, rank, row_words, threads, blocks, chunks, transport):
-    if transport in ("recursive", "recursive_ready"):
+    if transport in ("recursive", "recursive_ready", "recursive_outer_first"):
         from ._recursive_gather_cute import RecursiveGather
 
         operation = RecursiveGather(
@@ -227,7 +227,8 @@ def compile_selected_gather(world, rank, row_words, threads, blocks, chunks, tra
             threads,
             blocks,
             chunks,
-            acknowledge_consumption=transport == "recursive",
+            acknowledge_consumption=transport != "recursive_ready",
+            outer_first=transport == "recursive_outer_first",
         )
     elif transport == "ring":
         from ._ring_gather_cute import RingGather
@@ -286,6 +287,7 @@ def compile_selected_gather(world, rank, row_words, threads, blocks, chunks, tra
                 "ring",
                 "recursive",
                 "recursive_ready",
+                "recursive_outer_first",
             )
             and rows * row_words > chunks * 64
         ):

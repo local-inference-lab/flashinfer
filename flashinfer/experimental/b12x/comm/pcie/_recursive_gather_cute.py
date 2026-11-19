@@ -34,9 +34,13 @@ class RecursiveGather(SelectedGather):
         blocks,
         chunks,
         acknowledge_consumption=True,
+        outer_first=False,
     ):
         super().__init__(world, rank, row_words, threads, blocks, chunks, "barrier")
         self.acknowledge_consumption = acknowledge_consumption
+        self.outer_first = outer_first
+        if outer_first and world != 16:
+            raise ValueError("outer-first recursive doubling requires sixteen ranks")
         if world not in (8, 16) or threads != 128 or blocks != 8:
             raise ValueError(
                 "recursive gather requires DCP8 or DCP16 with eight 128-thread CTAs"
@@ -98,6 +102,10 @@ class RecursiveGather(SelectedGather):
                     # stay within each switch while forwarding both sets of shards.
                     distance = (4, 1, 2)[phase]
                     group = (1, 2, 4)[phase]
+                elif cutlass.const_expr(self.outer_first):
+                    # For four GPUs per switch, the first two rounds cross switches.
+                    distance = (4, 8, 1, 2)[phase]
+                    group = 1 << phase
                 else:
                     distance = 1 << phase
                     group = distance
@@ -113,6 +121,8 @@ class RecursiveGather(SelectedGather):
                             sending = self._rank if segment == 0 else self._rank ^ 4
                         else:
                             sending = self._rank ^ (segment & 1) ^ ((segment & 2) * 2)
+                    elif cutlass.const_expr(self.outer_first):
+                        sending = self._rank ^ ((segment & 3) << 2) ^ (segment >> 2)
                     else:
                         sending = (self._rank & ~(distance - 1)) + segment
                     destination = sending if sending < peer else sending - 1
@@ -155,6 +165,8 @@ class RecursiveGather(SelectedGather):
                             receiving = peer if segment == 0 else peer ^ 4
                         else:
                             receiving = peer ^ (segment & 1) ^ ((segment & 2) * 2)
+                    elif cutlass.const_expr(self.outer_first):
+                        receiving = peer ^ ((segment & 3) << 2) ^ (segment >> 2)
                     else:
                         receiving = (peer & ~(distance - 1)) + segment
                     origin = receiving if receiving < self._rank else receiving - 1
