@@ -6,7 +6,16 @@ META = OpMeta(
     name="peer_record_gather",
     group="comm",
     api_style="planned",
-    entry_points=("PeerRecordGatherQuery", "plan", "bind", "gather", "is_supported"),
+    entry_points=(
+        "PeerRecordGatherQuery",
+        "plan",
+        "bind",
+        "gather",
+        "is_supported",
+        "InterleavedStageQuery",
+        "plan_interleaved_stage",
+        "stage_interleaved_records",
+    ),
     dtypes=("uint8", "fp8"),
     requires=("triton",),
     provenance=Provenance(
