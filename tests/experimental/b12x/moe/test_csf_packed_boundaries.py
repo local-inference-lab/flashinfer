@@ -74,6 +74,20 @@ def test_frozen_csf_first_mapped_binding(dtype, routing, monkeypatch):
     )
 
 
+@pytest.mark.parametrize("compiled", [False, True])
+def test_mapped_staged_mxfp4_matches_whole_expert_and_clears_unrouted_outputs(
+    compiled, monkeypatch
+):
+    _check_csf_graphs(
+        "mapped",
+        torch.int32,
+        monkeypatch,
+        compiled=compiled,
+        route_experts=16,
+        staged=True,
+    )
+
+
 def _check_csf_graphs(
     kind,
     dtype,
@@ -87,6 +101,7 @@ def _check_csf_graphs(
     compile_workers=0,
     token_capacity=None,
     bitmap_routes=False,
+    staged=False,
 ):
     device = require_b12x()
     capacity = (
@@ -96,7 +111,12 @@ def _check_csf_graphs(
     route_experts = experts if route_experts is None else route_experts
     route_offset = experts if route_experts > experts else 0
     (native, compressed), scales = _prepare_arms(
-        hidden, 192, "w31", monkeypatch, activation_mode="a16", packing="source_native"
+        hidden,
+        192,
+        "w31",
+        monkeypatch,
+        activation_mode="a16",
+        packing="mma_packed" if staged else "source_native",
     )
     decoder = compressed._impl.nvfp4_csf
     if kind in ("prefetched", "prefetched_after_bind"):
@@ -129,7 +149,9 @@ def _check_csf_graphs(
                 max_tokens=capacity, top_k=topk, route_num_experts=route_experts
             ),
             invocation={"fast_math": False},
-            override=config,
+            override=replace(config, w4a16_packed_schedule="split")
+            if staged and owner is compressed
+            else config,
             scale_expansion=expansion if owner is compressed else None,
         )
         for owner in (native, compressed)
