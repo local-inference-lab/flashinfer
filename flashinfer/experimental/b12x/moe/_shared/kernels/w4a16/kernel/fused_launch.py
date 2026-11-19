@@ -104,6 +104,7 @@ def compile_w4a16_fused_moe(
     _require_cached: bool = False,
     small_m_occupancy: int | None = None,
     csf_inline_scales: bool = False,
+    split_projections: bool = False,
 ) -> W4A16FusedMoeCompileResult:
     if small_m_occupancy is None:
         small_m_occupancy = _w4a16_small_m_occupancy()
@@ -522,8 +523,11 @@ def compile_w4a16_fused_moe(
         trellis_decode_table=trellis_decode_table,
         small_m_occupancy=small_m_occupancy,
         csf_inline_scales=csf_inline_scales,
+        split_projections=split_projections,
     )
     compile_key = ("w4a16_fused_moe", kernel.__cache_key__)
+    if split_projections:
+        compile_key += ("split_projections",)
     cache_key = (device, compile_key)
     cached = _FUSED_CACHE.get(cache_key)
     if cached is None and _require_cached:

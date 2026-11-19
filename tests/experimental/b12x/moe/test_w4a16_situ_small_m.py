@@ -147,6 +147,29 @@ def test_native_mxfp4_i256_graph_with_deep_pipelines(rows, pipeline_stages):
     )
 
 
+@pytest.mark.parametrize(
+    "rows,activation,geometry,layout",
+    [
+        (1, "silu", (8, 256, 192, 2), "w13"),
+        (4, "situ", (8, 384, 192, 3), "w31"),
+        (8, "silu", (16, 256, 256, 4), "w31"),
+        (16, "situ", (8, 256, 192, 2), "w13"),
+    ],
+)
+def test_packed_three_stage_graph_matches_reference(rows, activation, geometry, layout):
+    _check_small_m(
+        rows,
+        "packed",
+        "fused",
+        activation,
+        geometry=geometry,
+        layout=layout,
+        packed_schedule="split",
+        required_packing="mma_packed",
+        replay_graph=True,
+    )
+
+
 def _check_small_m(
     rows,
     route_mode,
@@ -162,6 +185,7 @@ def _check_small_m(
     pipeline_stages=3,
     required_packing=None,
     replay_graph=False,
+    packed_schedule="fused",
 ):
     from b12x.moe import fused_moe
     from b12x.moe.fused_moe._tuning import MoeDecodeConfig
@@ -294,6 +318,7 @@ def _check_small_m(
             max_active_clusters=None,
             w4a16_route_mode=route_mode,
             w4a16_direct_schedule=direct_schedule,
+            w4a16_packed_schedule=packed_schedule,
             **launch,
         ),
     )
@@ -390,7 +415,7 @@ def _check_small_m(
             graph.replay()
             torch.cuda.synchronize(device)
             assert bool(output[0].eq(0).all())
-            if replay_graph:
+            if replay_graph and rows > 1:
                 metrics = compare_to_reference(output[1:], expected[1:])
                 assert metrics.cos >= 0.9975, metrics
                 active_reference_rms = (

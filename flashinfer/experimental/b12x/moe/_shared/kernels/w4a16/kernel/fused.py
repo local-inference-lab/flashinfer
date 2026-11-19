@@ -112,6 +112,7 @@ class W4A16FusedMoeKernel:
         trellis_decode_table: str = "auto",
         small_m_occupancy: int | None = None,
         csf_inline_scales: bool = False,
+        split_projections: bool = False,
     ):
         activation = normalize_moe_activation(activation)
         is_gated = validate_activation(activation)
@@ -212,6 +213,24 @@ class W4A16FusedMoeKernel:
                 "FC2 schedule factor must divide one packed route block: "
                 f"factor={self.fc2_schedule_route_block_factor}, "
                 f"maximum={expected_fc2_schedule_factor}"
+            )
+        self.split_projections = split_projections
+        if split_projections and not (
+            is_gated
+            and element_dtype == "bf16"
+            and weight_layout == "packed"
+            and scale_format == "e8m0_k32"
+            and not direct_topk_routes
+            and not use_expert_map
+            and not full_rotation
+            and not intermediate_rotation
+            and not collect_activation_amax
+            and not tc_decode_fused_sum
+            and not prefill_fused_sum_fp32
+            and not csf_inline_scales
+        ):
+            raise ValueError(
+                "split projections require packed BF16 gated MXFP4 experts with separate route reduction"
             )
         self.activation = activation
         self.activation_is_gated = is_gated
@@ -868,6 +887,94 @@ class W4A16FusedMoeKernel:
                 (Int64(_LUT_E4M3_VALUE_TABLE_ENTRIES),), stride=(1,)
             ),
         )
+        if cutlass.const_expr(self.split_projections):
+            # Stream ordering publishes every producer before the next phase,
+            # leaving the GEMM work partition and accumulation order intact.
+            for phase in cutlass.range_constexpr(2):
+                if cutlass.const_expr(phase == 0):
+                    inputs, weights, output = a_bf16_flat, w13_i32_flat, fc1_bf16_flat
+                    scales, gains, partials = (
+                        w13_scales_i32_flat,
+                        w13_global_scale,
+                        fc1_c_tmp_f32_flat,
+                    )
+                    rows = active_m
+                else:
+                    elems = (
+                        self.top_k
+                        * self.intermediate_size
+                        // self.activation_vector_elements
+                    )
+                    blocks = cutlass.max(
+                        Int32(1),
+                        cutlass.min(
+                            grid_x,
+                            (active_m * elems + self.cta_threads - 1)
+                            // self.cta_threads,
+                        ),
+                    )
+                    self.pointwise_phase(
+                        fc1_bf16_flat,
+                        activated_bf16_flat,
+                        fc2_bf16_flat,
+                        rot_scales_flat,
+                        locks_i32_flat,
+                        active_m,
+                        False,
+                    ).launch(
+                        grid=(blocks, 1, 1),
+                        block=(self.cta_threads, 1, 1),
+                        stream=stream,
+                    )
+                    if cutlass.const_expr(self.zero_fc2_output):
+                        # FC1 and FC2 may alias, so clearing FC2 follows activation.
+                        self.pointwise_phase(
+                            fc1_bf16_flat,
+                            activated_bf16_flat,
+                            fc2_bf16_flat,
+                            rot_scales_flat,
+                            locks_i32_flat,
+                            active_m,
+                            True,
+                        ).launch(
+                            grid=(grid_x, 1, 1),
+                            block=(self.cta_threads, 1, 1),
+                            stream=stream,
+                        )
+                    inputs, weights, output = (
+                        activated_bf16_flat,
+                        w2_i32_flat,
+                        fc2_bf16_flat,
+                    )
+                    scales, gains, partials = (
+                        w2_scales_i32_flat,
+                        w2_global_scale,
+                        fc2_c_tmp_f32_flat,
+                    )
+                    rows = active_m * Int32(self.top_k)
+                self.projection_phase(
+                    inputs,
+                    weights,
+                    output,
+                    scales,
+                    gains,
+                    packed_route_indices,
+                    block_expert_ids,
+                    packed_route_count,
+                    topk_weights_flat,
+                    partials,
+                    locks_i32_flat,
+                    rows,
+                    phase,
+                ).launch(
+                    grid=(grid_x, 1, 1),
+                    block=(self.cta_threads, 1, 1),
+                    min_blocks_per_mp=self.blocks_per_sm,
+                    cooperative=True,
+                    preferred_smem_carveout=self.smem_carveout,
+                    stream=stream,
+                )
+            return
         grid = (grid_x, 1, 1)
         self.kernel(
             a_bf16_flat,
@@ -917,6 +1024,84 @@ class W4A16FusedMoeKernel:
             preferred_smem_carveout=self.smem_carveout,
             stream=stream,
         )
+
+    @cute.kernel
+    def projection_phase(
+        self,
+        inputs: cute.Tensor,
+        weights: cute.Tensor,
+        output: cute.Tensor,
+        scales: cute.Tensor,
+        gains: cute.Tensor,
+        routes: cute.Tensor,
+        experts: cute.Tensor,
+        count: cute.Tensor,
+        route_weights: cute.Tensor,
+        partials: cute.Tensor,
+        locks: cute.Tensor,
+        rows: Int32,
+        phase: cutlass.Constexpr,
+    ):
+        tid, _, _ = cute.arch.thread_idx()
+        cta, _, _ = cute.arch.block_idx()
+        grid, _, _ = cute.arch.grid_dim()
+        gemm = self.fc1 if cutlass.const_expr(phase == 0) else self.fc2
+        smem = cutlass.utils.SmemAllocator()
+
+        @cute.struct
+        class Storage:
+            words: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Uint32, gemm.shared_words], 1024
+            ]
+
+        storage = smem.allocate(Storage)
+        gemm._run_persistent_gemm(
+            inputs,
+            inputs,
+            weights,
+            output,
+            scales,
+            gains,
+            routes,
+            experts,
+            count,
+            route_weights,
+            partials,
+            locks,
+            Int64(0),
+            shared_ptr_to_u32(storage.words.data_ptr()),
+            Int32(tid),
+            Int32(cta),
+            Int32(grid),
+            rows,
+        )
+
+    @cute.kernel
+    def pointwise_phase(
+        self,
+        fc1: cute.Tensor,
+        activated: cute.Tensor,
+        fc2: cute.Tensor,
+        rotation: cute.Tensor,
+        locks: cute.Tensor,
+        rows: Int32,
+        clear_output: cutlass.Constexpr,
+    ):
+        tid, _, _ = cute.arch.thread_idx()
+        cta, _, _ = cute.arch.block_idx()
+        grid, _, _ = cute.arch.grid_dim()
+        if cutlass.const_expr(clear_output):
+            self._zero_fc2_output(fc2, Int32(tid), Int32(cta), Int32(grid), rows)
+        else:
+            self._run_activation(
+                fc1, activated, rotation, Int32(tid), Int32(cta), Int32(grid), rows
+            )
+        if tid == 0 and cta == 0:
+            # Other expert graphs may reuse this lock array with the fused schedule.
+            red_add_global_release_i32(
+                get_ptr_as_int64(locks, Int32(self.barrier_sense_off)),
+                Int32(1 if clear_output else 2),
+            )
 
     @cute.kernel
     def kernel(
