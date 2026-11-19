@@ -11,7 +11,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from b12x.comm.pcie import interleaved_topk
+from b12x.comm import interleaved_topk
 from b12x.comm.pcie.pcie_dcp_a2a import PCIeDCPA2A
 from b12x.preparation import PreparationSession, PreparedCall
 

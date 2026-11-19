@@ -6,8 +6,17 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from b12x.comm.pcie import interleaved_topk as selection
+from b12x.comm import interleaved_topk as selection
 from b12x.comm.pcie.pcie_dcp_a2a import PCIeDCPA2A, _SIGNAL_BYTES
+
+
+def test_pcie_import_keeps_the_same_selector_api():
+    from b12x.comm.pcie import interleaved_topk
+
+    assert interleaved_topk.InterleavedTopKQuery is selection.InterleavedTopKQuery
+    assert interleaved_topk.plan is selection.plan
+    assert interleaved_topk.supports_channel is selection.supports_channel
+    assert interleaved_topk.jit is selection.jit
 
 
 def channel():
