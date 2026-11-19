@@ -14,6 +14,7 @@ from b12x.preparation import (
 )
 
 from .pcie_dcp_a2a import _SIGNAL_BYTES, PCIeDCPA2A
+from . import _interleaved_topk_jit as jit
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -41,6 +42,7 @@ def supports_channel(runtime):
         and runtime.max_batch_size >= 4
         and runtime._signal_bytes >= _SIGNAL_BYTES
         and runtime._slot_bytes >= 4 * (2048 + 64) * 8
+        and jit.sources_available()
     )
 
 
@@ -85,26 +87,23 @@ def plan(runtime, *, cache_pages):
     Ranks must provide identical global positions and issue channel operations
     in the same order, serially with all other uses of the channel. IDs are
     shard-local token indices. Each rank provides four contiguous rows of
-    2048 int32 IDs and FP32 scores. Up to 2048 local entries are visible per
-    row, followed by (-1, -inf) padding. FP32 radix keys, rank and original
-    input column determine ties. Causal and page filtering follow selection.
+    2048 int32 IDs and FP32 scores. The number of nonnegative IDs per row is
+    at most the number of visible shard tokens. Padding (-1, -inf) may appear
+    in any column. FP32 radix keys, rank and original input column
+    determine ties. Causal and page filtering follow selection.
     The contiguous int32 owner and slot outputs retain each row's local input
     order, with -1 padding and an int32 count. Page tables map local groups
     of 128 tokens and may share one row across all four int64 positions.
     """
     if not supports_channel(runtime):
         raise ValueError(
-            "interleaved top-k requires an owned 16-rank DCP channel with two 67584-byte banks"
+            "interleaved top-k requires an owned 16-rank DCP channel with two "
+            "67584-byte banks and the experimental CUDA kernel sources"
         )
     if type(cache_pages) is not int or not 0 < cache_pages <= (2**31 - 1) // 128:
         raise ValueError(
             "interleaved top-k cache pages must fit positive int32 token slots"
         )
-    from flashinfer.jit.interleaved_topk_slots import (
-        gen_interleaved_topk_slots_module,
-        source_id,
-    )
-
     query = InterleavedTopKQuery(
         rows=4, world=16, rank=runtime.rank, cache_pages=cache_pages
     )
@@ -112,7 +111,7 @@ def plan(runtime, *, cache_pages):
     def materialize(selection, device):
         with torch.cuda.device(device.ordinal):
             return _State(
-                gen_interleaved_topk_slots_module().build_and_load().run,
+                jit.gen_interleaved_topk_slots_module().build_and_load().run,
                 runtime,
                 cache_pages,
             )
@@ -121,7 +120,7 @@ def plan(runtime, *, cache_pages):
     return Plan(
         contract=_CONTRACT,
         query=query,
-        invocation=FrozenMapping({"program": source_id()}),
+        invocation=FrozenMapping({"program": jit.source_id()}),
         _device=runtime.device,
         _compile_jobs=lambda config, device: (),
         _materialize=materialize,

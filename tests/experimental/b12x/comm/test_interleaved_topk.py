@@ -49,6 +49,18 @@ def test_page_bounds(pages):
         selection.plan(channel(), cache_pages=pages)
 
 
+def test_missing_optional_sources_decline_the_candidate(monkeypatch, tmp_path):
+    jit = selection.jit
+    monkeypatch.setattr(jit, "_SOURCES", (tmp_path / "omitted.cu",))
+    try:
+        jit.sources_available.cache_clear()
+        assert not selection.supports_channel(channel())
+        with pytest.raises(ValueError, match="experimental CUDA kernel sources"):
+            selection.plan(channel(), cache_pages=1)
+    finally:
+        jit.sources_available.cache_clear()
+
+
 def test_source_and_resident_ownership_are_part_of_declaration():
     runtime = channel()
     runtime._owned_buffers = [SimpleNamespace(nbytes=811_008)]

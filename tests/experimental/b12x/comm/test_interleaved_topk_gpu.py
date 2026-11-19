@@ -65,6 +65,13 @@ def fixture(positions, seed, rank, table_rows):
             ids[row, peer, :length] = rng
             ids[row, peer, length:] = -1
             ids[row, peer, 17:length:509] = -1
+            if 0 < length < K:
+                # The source selector allows gaps before the last valid column.
+                ids[row, peer, -1] = ids[row, peer, 0]
+                words[row, peer, -1] = words[row, peer, 0]
+                ids[row, peer, 0] = -1
+                if pos == 0 and peer == 0:
+                    words[row, peer, -1] = 0x3F800000
             if length == K:
                 # Future or out-of-table IDs still participate in score selection.
                 ids[row, peer, 31] = (1 << 30) + 1

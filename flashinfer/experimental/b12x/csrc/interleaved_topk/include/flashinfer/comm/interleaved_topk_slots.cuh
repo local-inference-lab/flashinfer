@@ -3,7 +3,8 @@
 
 // Select the attention records consumed by one interleaved DCP shard.
 // Input is the captured rank-major candidate contract: each rank contributes
-// up to 2048 (FP32 score bits, global position) pairs and pads with (-inf,-1).
+// up to 2048 (FP32 score bits, shard-local token index) pairs. Padding may
+// appear anywhere. A valid token's ordinal in the candidate row breaks ties.
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -43,14 +44,9 @@ __device__ __forceinline__ unsigned long long* mailbox(unsigned* base, int bank,
   return reinterpret_cast<unsigned long long*>(base + 1024 +
                                                ((bank * 64 + row) * 16 + sender) * 32 + 8);
 }
-__device__ __forceinline__ int visible(long long total, int owner) {
-  return int(min((long long)k, (total + 15 - owner) / 16));
-}
-
 __device__ __forceinline__ uint2 local_pair(const int* ids, const unsigned* scores, int j) {
   const int i = ids[j];
-  return i < 0 ? make_uint2(0xff800000u, 0xffffffffu)
-               : make_uint2(scores[j], unsigned(i));
+  return i < 0 ? make_uint2(0xff800000u, 0xffffffffu) : make_uint2(scores[j], unsigned(i));
 }
 
 __global__ void local_candidate_slots(const int* local_ids, const unsigned* local_scores,
@@ -61,7 +57,7 @@ __global__ void local_candidate_slots(const int* local_ids, const unsigned* loca
   using Scan = cub::BlockScan<int, threads>;
   __shared__ typename Scan::TempStorage scan;
   __shared__ unsigned gen, graph_epoch;
-  __shared__ int above, below, local_ties, remaining, preceding, nout, staging;
+  __shared__ int above, below, local_ties, remaining, preceding, nout, staging, extent;
   __shared__ unsigned cutoff, peer_counts[16];
   __shared__ sampled::Storage boundary;
   sampled::Key threshold = 0;
@@ -69,12 +65,11 @@ __global__ void local_candidate_slots(const int* local_ids, const unsigned* loca
   const long long position = positions[row];
   // Each peer supplies at most k entries, including for an int64 absolute position.
   const long long total = max(0ll, min(position, static_cast<long long>(world * k)) + 1);
-  const int local_count = visible(total, rank);
   const bool short_row = total <= k;
   unsigned* header = peers.flags[rank];
   if (tid == 0) {
     graph_epoch = load_gpu(header + 1025);
-    above = below = local_ties = nout = preceding = 0;
+    above = below = local_ties = nout = preceding = extent = 0;
     // Short invocations never borrow a payload bank. Leave its parity
     // unchanged so two regular bank users always have an intervening
     // all-rank arrival before either can overwrite an earlier payload.
@@ -95,21 +90,22 @@ __global__ void local_candidate_slots(const int* local_ids, const unsigned* loca
   const long long bank_offset = (graph_epoch & 1u) * stride;
   sampled::Key* local_stage =
       reinterpret_cast<sampled::Key*>(peers.stage[rank] + bank_offset) + row * sampled::stage_items;
-  int hi = 0, lo = 0, special = 0;
-  for (int j = tid; j < local_count; j += threads) {
-    const uint2 p = local_pair(local_ids, local_scores, row * k + j);
-    const unsigned v = int(p.y) < 0 ? pad : key(p.x);
-    hi += (v > pad);
-    lo += (v < pad);
-    special += (int(p.y) >= 0 && v == pad);
+  int hi = 0, lo = 0, special = 0, last = 0;
+  for (int j = tid; position >= 0 && j < k; j += threads) {
+    if (local_ids[row * k + j] >= 0) {
+      const unsigned v = key(local_scores[row * k + j]);
+      hi += (v > pad);
+      lo += (v < pad);
+      special += (v == pad);
+      last = j + 1;
+    }
   }
   if (!short_row) {
     sampled::Key vals[8];
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
       int j = tid * 8 + i;
-      uint2 p = j < local_count ? local_pair(local_ids, local_scores, row * k + j)
-                                : make_uint2(0xff800000u, 0xffffffffu);
+      uint2 p = local_pair(local_ids, local_scores, row * k + j);
       vals[i] = sampled::tie_key(int(p.y) < 0 ? pad : key(p.x), rank, j);
     }
     sampled::publish_sorted(boundary, local_stage, vals);
@@ -117,6 +113,9 @@ __global__ void local_candidate_slots(const int* local_ids, const unsigned* loca
   if (hi) atomicAdd(&above, hi);
   if (lo) atomicAdd(&below, lo);
   if (special) atomicAdd(&local_ties, special);
+  // The indexer can leave padding among valid entries. Token counts bound
+  // their cardinality, while the last nonnegative ID bounds this scan.
+  if (last) atomicMax(&extent, last);
   for (int j = tid; j < k; j += threads) {
     owners[row * k + j] = -1;
     slots[row * k + j] = -1;
@@ -175,6 +174,7 @@ __global__ void local_candidate_slots(const int* local_ids, const unsigned* loca
   // Keep the original local indexer's order, including its cutoff ties.
   // Page filtering follows score selection, so an invalid page still
   // occupies its score rank in the cutoff calculation.
+  const int local_count = extent;
   for (int j0 = 0; j0 < local_count; j0 += threads) {
     int j = j0 + tid;
     uint2 pair = j < local_count ? local_pair(local_ids, local_scores, row * k + j)
