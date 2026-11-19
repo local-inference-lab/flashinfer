@@ -136,7 +136,9 @@ def _worker(rank, world, directory):
                         requests.append(
                             plan.request(
                                 name=name,
-                                prepare_call=lambda state, source=source, output=output: (
+                                prepare_call=lambda state,
+                                source=source,
+                                output=output: (
                                     PreparedCall(
                                         run=lambda: state.run(
                                             local_input=source, out=output
