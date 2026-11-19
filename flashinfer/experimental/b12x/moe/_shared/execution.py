@@ -772,6 +772,13 @@ def make_moe_spec(
     )
 
 
+def mxfp4_mma_tiles_cover(hidden_size: int, intermediate_size: int) -> bool:
+    """Both projections admit a whole K64/N128 or K128/N64 tile at 128 threads."""
+    return (hidden_size % 128 == 0 and intermediate_size % 64 == 0) or (
+        hidden_size % 64 == 0 and intermediate_size % 128 == 0
+    )
+
+
 def plan_moe_weight_preparation(
     specs: MoESpec | Iterable[MoESpec],
     *,
@@ -996,20 +1003,22 @@ def plan_moe_weight_preparation(
                 continue
             layout = requested_w4a16_layout
             if layout is None:
-                # The packed MMA kernels only have tile configs for
-                # 128-aligned intermediate shards; the native path already
-                # supports compact sub-32 tails (see
-                # test_w4a16_e8m0_native_compact_tail_uses_ceil_scale_grid),
-                # so route every non-128-aligned e8m0 shard through it
-                # instead of failing at kernel-config time (e.g. 2048/TP6 =
-                # 352, 3072/TP16 = 192).
                 layout = (
                     PreparedWeightLayout.SOURCE_NATIVE
                     if (source_format == "modelopt_nvfp4" and source_recipe_selected)
                     or (
-                        source_format == "fp4_e8m0_k32" and intermediate_size % 128 != 0
+                        source_format == "fp4_e8m0_k32"
+                        and not mxfp4_mma_tiles_cover(hidden_size, intermediate_size)
                     )
                     else PreparedWeightLayout.MMA_PACKED
+                )
+            if (
+                source_format == "fp4_e8m0_k32"
+                and layout is PreparedWeightLayout.MMA_PACKED
+                and not mxfp4_mma_tiles_cover(hidden_size, intermediate_size)
+            ):
+                raise ValueError(
+                    "MMA-packed MXFP4 requires dividing K64/N128 or K128/N64 tiles"
                 )
             if (
                 source_format == "modelopt_nvfp4"
