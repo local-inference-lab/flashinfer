@@ -559,6 +559,9 @@ class PCIeDCPA2A:
                 "staging slot pointers must have one shared positive stride"
             )
         self._slot_bytes = next(iter(slot_deltas))
+        # A borrowed address does not establish the writable extent or initial
+        # contents of the signal region. The allocating factory supplies both.
+        self._signal_bytes = 0
         # Raw borrowed layouts expose only their existing DCP regions. The
         # allocating factory enables word exchange after reserving zeroed state.
         self._exchange_chunks = 0
@@ -732,6 +735,7 @@ class PCIeDCPA2A:
             ext_module=ext_module,
             stream_affine=stream_affine,
         )
+        runtime._signal_bytes = layout.signal_bytes
         runtime._exchange_chunks = layout.exchange_chunks
         runtime._exchange_offset = layout.exchange_offset
         runtime._exchange_counter_offset = layout.exchange_counter_offset

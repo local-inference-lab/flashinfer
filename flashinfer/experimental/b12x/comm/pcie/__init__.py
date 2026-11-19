@@ -38,9 +38,8 @@ kernel; DMA and hierarchical collectives do not provide this operation.
 - ``VocabParallelArgmax``: TP8/TP12/TP16 fused BF16 add and exact global
   greedy argmax.
 
-Every device kernel is authored in Python with CuTe DSL. Host-side CUDA
-Runtime/Driver calls are also made from Python; this package contains no
-repo-authored C++ or CUDA source and never invokes a native extension build.
+Collective implementations use CuTe DSL. The optional four-row interleaved
+top-k slot selector builds its CUDA C++ entry point through FlashInfer JIT.
 """
 
 from __future__ import annotations
