@@ -58,6 +58,12 @@ def _configs(query, device=None):
         call = payload["call"]
         blocks = int(call.get("blocks", call.get("block_limit", 16)))
         threads = int(call["threads"])
+        if name in ("dcp_route_separate", "dcp_route_row"):
+            if name == "dcp_route_separate" or pairwise_device(device):
+                yield CollectiveConfig(
+                    implementation=name, threads=threads, blocks=blocks
+                )
+            continue
         if name in ISLAND_VARIANTS:
             # Physical CTAs keep buffer parity synchronized. Only participating
             # CTAs advance communication epochs, so active counts can vary safely.
@@ -352,6 +358,13 @@ def _validate_query(query, device):
         NATIVE.validate_query(native, device)
         if (native.world_size, native.rank) != (query.world_size, query.rank):
             raise ValueError("native alternatives must use the same rank group")
+        if name in ("dcp_route_separate", "dcp_route_row") and (
+            query.operation != "all_gather_pair_kimi_topk"
+            or query.world_size != 16
+            or native.call.get("route_transport")
+            != {"dcp_route_separate": "separate", "dcp_route_row": "row"}[name]
+        ):
+            raise ValueError("Kimi row gathering requires a complete four-row route")
         if name == "twoshot_pairwise" and (
             query.operation != "all_reduce"
             or native.surface != "PCIeTwoShotBF16.all_reduce"

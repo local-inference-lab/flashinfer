@@ -343,6 +343,8 @@ class _ReductionInputs:
 
 def benchmark_call(state, *, inplace=False):
     dcp = state.query.surface.startswith(("DcpAllToAll.", "DcpAllToAllPool."))
+    if state.query.surface.endswith(".all_gather_pair_kimi_topk"):
+        return _route_benchmark_call(state)
     inputs = _DcpInputs(state) if dcp else _ReductionInputs(state, inplace=inplace)
     if not dcp and not inputs.twoshot and not inputs.owner:
         try:
@@ -432,3 +434,78 @@ class _DcpInputs:
     def close(self):
         self.producers = ()
         self.reference = None
+
+
+def _route_benchmark_call(state):
+    """Validate whole four-row rank-major outputs and Kimi's lower-ID tie rule."""
+    device, rank = state.runtime.device, state.query.rank
+    cases = []
+    features = torch.arange(4 * 896, dtype=torch.long).reshape(4, 896)
+    latent_bytes = torch.arange(4 * 3584, dtype=torch.int32).reshape(4, 3584)
+    for seed in (0, 1, 2):
+        # These logits give exactly representable sigmoid scores on CPU and GPU.
+        # Permute score groups across experts so a wrong rank order remains visible.
+        labels = (features * (2 * seed + 3) + seed) % 7
+        lookup = torch.tensor(
+            [0.0, float("inf"), float("-inf"), -0.0, float("nan"), 0.0, float("inf")]
+        )
+        logits = lookup[labels]
+        raw = torch.where(
+            torch.isposinf(logits), 1.0, torch.where(logits == 0, 0.5, 0.0)
+        )
+        bias = (((torch.arange(896) * (3 * seed + 1)) % 11) - 4).float() * 0.125
+        ids = torch.argsort(raw + bias, descending=True, stable=True)[:, :16]
+        top = torch.gather(raw, 1, ids)
+        denominator = top.sum(1, keepdim=True)
+        weights = top * torch.where(denominator > 0, 1.0 / denominator, 1.0)
+        latent = (latent_bytes * 97 + seed * 117).to(torch.int16).view(torch.bfloat16)
+        cases.append(
+            tuple(
+                v.to(device)
+                for v in (
+                    latent[:, rank * 224 : (rank + 1) * 224].contiguous(),
+                    logits[:, rank * 56 : (rank + 1) * 56].contiguous(),
+                    bias,
+                    latent,
+                    logits,
+                    weights,
+                    ids.to(torch.int32),
+                )
+            )
+        )
+    down, router, bias, latent, logits, weights, ids = tuple(
+        torch.empty_like(v) for v in cases[0]
+    )
+    active = 0
+
+    def produce(i):
+        nonlocal active
+        active = i
+        for target, source in zip((down, router, bias), cases[i][:3]):
+            target.copy_(source)
+
+    def validate():
+        values = (down, router, bias, latent, logits, weights, ids)
+        for value, expected in zip(values, cases[active]):
+            _assert_output(value.view(torch.uint8), expected.view(torch.uint8))
+
+    def run():
+        return state.run(
+            local_down=down,
+            local_router=router,
+            correction_bias=bias,
+            out_down=latent,
+            out_logits=logits,
+            topk_weights=weights,
+            topk_ids=ids,
+        )
+
+    producers = tuple(partial(produce, i) for i in range(len(cases)))
+    return PreparedCall(
+        run=run,
+        output=(latent, logits, weights, ids),
+        produce=producers[0],
+        benchmark_producers=producers,
+        validate=validate,
+        owners=(state.runtime,),
+    )

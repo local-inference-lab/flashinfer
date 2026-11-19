@@ -78,6 +78,46 @@ def _is_supported_bhd_layout(tensor: torch.Tensor) -> bool:
     return packed_token_major or capacity_strided_head_major
 
 
+def _check_four_row_route(runtime, down, router, bias, latent, logits, weights, ids):
+    """Check the seven live operands of the prepared four-row expert route."""
+    if (
+        runtime.world_size != 16
+        or runtime.max_batch_size < 4
+        or runtime.query_head_dim != 672
+    ):
+        raise ValueError(
+            "four-row Kimi expert selection requires a sixteen-rank 672-byte channel"
+        )
+    expected = (
+        ("down", down, (4, 224), torch.bfloat16),
+        ("router", router, (4, 56), torch.float32),
+        ("bias", bias, (896,), torch.float32),
+        ("latent", latent, (4, 3584), torch.bfloat16),
+        ("logits", logits, (4, 896), torch.float32),
+        ("weights", weights, (4, 16), torch.float32),
+        ("ids", ids, (4, 16), torch.int32),
+    )
+    previous = []
+    for i, (name, value, shape, dtype) in enumerate(expected):
+        if (
+            value is None
+            or value.shape != shape
+            or value.dtype != dtype
+            or value.device != runtime.device
+            or not value.is_contiguous()
+            or value.data_ptr() % 16
+        ):
+            raise ValueError(
+                f"four-row Kimi {name} must be contiguous aligned {dtype} {shape} on {runtime.device}"
+            )
+        start, end = value.data_ptr(), value.data_ptr() + value.nbytes
+        if i >= 3 and any(start < stop and other < end for other, stop in previous):
+            raise ValueError(
+                "four-row Kimi outputs must be disjoint from each other and their input tensors"
+            )
+        previous.append((start, end))
+
+
 def kimi_topk16(
     router_logits: torch.Tensor,
     correction_bias: torch.Tensor,
@@ -1390,6 +1430,7 @@ class PCIeDCPA2A:
         topk_ids: Optional[torch.Tensor] = None,
         *,
         plan: Plan,
+        out_logits: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         with _device_guard(self.device):
             return self._all_gather_pair_kimi_topk_on_device(
@@ -1400,6 +1441,7 @@ class PCIeDCPA2A:
                 topk_weights,
                 topk_ids,
                 state=self._prepared_state(plan),
+                out_logits=out_logits,
             )
 
     def _all_gather_pair_kimi_topk_on_device(
@@ -1412,10 +1454,52 @@ class PCIeDCPA2A:
         topk_ids,
         *,
         state,
+        out_logits=None,
     ):
         self._check_stream()
         if self._closed:
             raise RuntimeError("PCIeDCPA2A is closed")
+        if state.query.call.get("rows", 1) == 4:
+            _check_four_row_route(
+                self,
+                local_down,
+                local_router,
+                correction_bias,
+                out_down,
+                out_logits,
+                topk_weights,
+                topk_ids,
+            )
+            if (
+                _is_current_stream_capturing(self.device)
+                and not self._device_slot_selection
+            ):
+                self._graph_base_slot = self._next_slot & 1
+                self._device_slot_selection = True
+            slot = (
+                self._graph_base_slot
+                if self._device_slot_selection
+                else self._next_slot
+            )
+            if not self._device_slot_selection:
+                self._next_slot ^= 1
+            state.launcher(self._device_slot_selection)(
+                local_down.data_ptr(),
+                local_router.data_ptr(),
+                correction_bias.data_ptr(),
+                out_down.data_ptr(),
+                out_logits.data_ptr(),
+                topk_weights.data_ptr(),
+                topk_ids.data_ptr(),
+                self._staging_ptrs[slot],
+                self._signal_ptrs,
+                (self._slot_bytes if slot == 0 else -self._slot_bytes) // 256,
+            )
+            return out_down, topk_weights, topk_ids
+        if out_logits is not None:
+            raise ValueError(
+                "only a four-row Kimi route returns the full gathered logits"
+            )
         down_width, router_width = 3584 // self.world_size, 896 // self.world_size
         expected = (
             (local_down, (1, down_width), torch.bfloat16, "local_down"),
@@ -2220,6 +2304,7 @@ class PCIeDCPA2APool:
         topk_ids=None,
         *,
         plan: Plan,
+        out_logits=None,
         stream=None,
         channel_id=None,
     ):
@@ -2236,6 +2321,7 @@ class PCIeDCPA2APool:
                         topk_weights,
                         topk_ids,
                         plan=plan,
+                        out_logits=out_logits,
                     )
             return channel.all_gather_pair_kimi_topk(
                 local_down,
@@ -2245,6 +2331,7 @@ class PCIeDCPA2APool:
                 topk_weights,
                 topk_ids,
                 plan=plan,
+                out_logits=out_logits,
             )
 
     def kimi_topk16(

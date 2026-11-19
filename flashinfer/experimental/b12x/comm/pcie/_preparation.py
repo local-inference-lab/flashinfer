@@ -143,6 +143,37 @@ def plan(
             invocation=invocation,
             override=override,
         )
+    if (
+        runtime is not None
+        and query.surface.endswith(".all_gather_pair_kimi_topk")
+        and query.call.get("rows", 1) == 4
+        and not isinstance(override, PcieConfig)
+    ):
+        from ._collective_tuning import plan as collective_plan
+
+        alternatives = {
+            "dcp_route_separate": (
+                replace(query, call=FrozenMapping(dict(query.call, block_limit=1))),
+                runtime,
+            )
+        }
+        if query.call["threads"] == 512:
+            alternatives["dcp_route_row"] = (
+                replace(
+                    query,
+                    call=FrozenMapping(
+                        dict(query.call, route_transport="row", block_limit=4)
+                    ),
+                ),
+                runtime,
+            )
+        return collective_plan(
+            alternatives,
+            default="dcp_route_separate",
+            invocation=invocation,
+            override=override,
+        )
+
     from ._gather_preparation import GATHER_MODES
 
     if query.surface.endswith(".all_gather_heads") and (
