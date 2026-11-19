@@ -129,6 +129,25 @@ Partial overlaps remain rejected. Standalone reduce-scatter and all-gather
 require disjoint outputs. All operations and graph replays sharing one runtime
 must remain serialized.
 
+### Four-row reduction in a Triton consumer
+
+An SM120 tensor-parallel group can reduce four contiguous BF16 rows of width
+3,584 or 7,168 before running a row-local Triton epilogue in the same CTA.
+`island_row.prepared_rows(plan, rows=4, width=width, threads=threads)`
+returns a layout for an eligible prepared IslandRS owner. The layout borrows
+the local slab and the six remote mappings that the owner already holds.
+Every participating rank must enter its channel serially in the same order.
+
+The enclosing Triton kernel launches `layout.grid`. It calls
+`island_row.reduce_rows` on every physical CTA, passing the aligned input and
+output tensors, the tuple from `layout.arguments(source, destination)`, and the
+rank and width specialization. CTA indices 0–3 write their complete reduced
+row before entering the local epilogue. The other CTAs still advance their bank
+counters. Both reduction stages add four FP32 operands from positive zero
+in rank order and round once to BF16. Interleaved ordinary and fused calls keep
+the native generation and bank protocol. Preparation can measure this combined
+operation against the selected ordinary reduction and the same epilogue.
+
 ## Benchmark and synchronization contract
 
 The `_benchmark.py` fixtures allocate private operands, generate and reset inputs,
