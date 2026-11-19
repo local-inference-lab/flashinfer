@@ -48,7 +48,12 @@ def bind(
     plan: Plan,
     **kwargs,
 ) -> Binding:
-    """Bind caller-owned views to an already prepared dense-MLA plan."""
+    """Bind caller-owned views to a prepared dense-MLA plan.
+
+    An optional contiguous FP32 `lse_output` of shape `[max_total_q, num_q_heads]`
+    receives the natural-log attention normalizers directly. Its writable storage
+    must be disjoint from all input, output and workspace operands.
+    """
     if not isinstance(plan, Plan):
         raise TypeError("bind requires a session-prepared Plan")
     device = (

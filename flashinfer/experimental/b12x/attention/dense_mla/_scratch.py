@@ -10,6 +10,7 @@ import torch
 
 from b12x._lib.scratch import (
     ScratchBufferSpec,
+    require_disjoint,
     scratch_buffer_spec,
     scratch_tensor,
 )
@@ -677,6 +678,7 @@ class Plan:
         q_scale: torch.Tensor | None = None,
         sm_scale: float = K3_SM_SCALE,
         active_splits: int | None = None,
+        lse_output: torch.Tensor | None = None,
     ) -> Binding:
         storage = scratch_tensor(
             scratch,
@@ -684,6 +686,33 @@ class Plan:
             owner="dense MLA",
         )
         scratch_views = _materialize(self.caps, storage, self.layout)
+        if lse_output is not None:
+            if (
+                lse_output.dtype != torch.float32
+                or lse_output.device != scratch_views.device
+                or lse_output.shape != scratch_views.final_lse.shape
+                or not lse_output.is_contiguous()
+            ):
+                raise ValueError(
+                    "dense MLA LSE output must be contiguous FP32 at the planned query and head capacities"
+                )
+            _storage_bounds(lse_output, name="lse_output")
+            require_disjoint(
+                lse_output,
+                (
+                    q,
+                    kv_cache,
+                    output,
+                    page_table,
+                    cache_seqlens,
+                    cu_seqlens_q,
+                    kv_scale,
+                    q_scale,
+                    storage,
+                ),
+                owner="dense MLA LSE output",
+            )
+            scratch_views.final_lse = lse_output
         return _validate_binding(
             scratch=scratch_views,
             q=q,

@@ -45,8 +45,7 @@ def test_empty_rows_after_populated_replay(splits, active_splits):
     )
     scale = torch.ones(1, device=device)
     with _prepared_scope():
-        binding = _bind(
-            plan,
+        operands = dict(
             q=query,
             kv_cache=cache,
             output=output,
@@ -58,17 +57,31 @@ def test_empty_rows_after_populated_replay(splits, active_splits):
             sm_scale=192**-0.5,
             active_splits=active_splits,
         )
+        binding = _bind(plan, **operands)
+        external_lse = torch.empty((rows, heads), dtype=torch.float32, device=device)
+        external_output = torch.empty_like(output)
+        direct = _bind(
+            plan, **{**operands, "output": external_output}, lse_output=external_lse
+        )
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             _, lse = dense_mla.run(binding=binding)
+            _, direct_lse = dense_mla.run(binding=direct)
+        assert direct_lse.data_ptr() == external_lse.data_ptr()
         assert binding.scratch.num_splits == splits
         assert binding.active_splits == active_splits
         for count, poison in ((records, False), (0, False), (1, True), (0, True)):
             lengths[::2] = count
             if poison:
                 output.fill_(float("nan"))
+                external_lse.fill_(float("nan"))
+                external_output.fill_(float("nan"))
             graph.replay()
             torch.cuda.synchronize()
+            assert torch.equal(lse.view(torch.int32), external_lse.view(torch.int32))
+            assert torch.equal(
+                output.view(torch.int16), external_output.view(torch.int16)
+            )
             torch.testing.assert_close(
                 output[1::2], torch.full_like(output[1::2], 0.25), atol=0.002, rtol=0.01
             )
@@ -83,3 +96,13 @@ def test_empty_rows_after_populated_replay(splits, active_splits):
                     rtol=0.01,
                 )
         graph.reset()
+        with pytest.raises(ValueError, match="must not overlap"):
+            _bind(
+                plan,
+                **operands,
+                lse_output=output.view(torch.float32)
+                .flatten()[: rows * heads]
+                .view(rows, heads),
+            )
+        with pytest.raises(ValueError, match="contiguous FP32"):
+            _bind(plan, **operands, lse_output=external_lse[:, ::2])
