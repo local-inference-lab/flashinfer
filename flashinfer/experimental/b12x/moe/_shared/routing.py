@@ -77,18 +77,29 @@ def _route_topk_values(
         eligible = eligible & (expert_offsets != best_ids)
         remaining = tl.where(eligible, remaining, neg_inf)
 
-    topk_logits = tl.gather(logits, topk_ids, axis=0)
+    # A slot is unfilled (ID -1) when every remaining selection score is NaN.
+    # Gather at a clamped index so the lookup stays in bounds; the slot then
+    # reports a NaN logit and a zero weight.
+    unfilled = topk_ids < 0
+    safe_ids = tl.maximum(topk_ids, 0)
+    topk_logits = tl.where(unfilled, float("nan"), tl.gather(logits, safe_ids, axis=0))
     if SCORE_FUNC == "sqrtsoftplus" or SCORE_FUNC == "sigmoid":
-        topk_weights = tl.where(topk_mask, tl.gather(scores, topk_ids, axis=0), 0.0)
+        topk_weights = tl.where(
+            topk_mask & ~unfilled, tl.gather(scores, safe_ids, axis=0), 0.0
+        )
         if RENORMALIZE and (TOP_K > 1 or SCORE_FUNC == "sigmoid"):
             topk_weights /= tl.sum(topk_weights, axis=0) + 1e-20
     elif RENORMALIZE:
-        masked_logits = tl.where(topk_mask, topk_logits, neg_inf)
+        # Unfilled slots carry a NaN logit; leave them out of the softmax so
+        # they cannot poison the filled slots' weights.
+        filled = topk_mask & ~unfilled
+        masked_logits = tl.where(filled, topk_logits, neg_inf)
         shifted = masked_logits - tl.max(masked_logits, axis=0)
-        exp_logits = tl.where(topk_mask, tl.exp(shifted), 0.0)
+        exp_logits = tl.where(filled, tl.exp(shifted), 0.0)
         topk_weights = exp_logits / tl.sum(exp_logits, axis=0)
     else:
         topk_weights = topk_logits
+    topk_weights = tl.where(unfilled, 0.0, topk_weights)
     topk_weights *= routed_scaling_factor
 
     return topk_logits, topk_ids, topk_weights
@@ -192,7 +203,9 @@ def route_topk(
     Correction tensors steer selection but do not alter selected logits. The
     Selected softmax, sigmoid, or sqrt-softplus weights receive the scale last.
     Rows at or beyond the device-side valid-token count receive ID -1 and zero
-    logits and weights without reading their input logits.
+    logits and weights without reading their input logits. A slot with no
+    selectable expert, because every remaining selection score is NaN, receives
+    ID -1, a NaN logit and zero weight.
     """
     if router_logits.ndim != 2:
         raise ValueError(
