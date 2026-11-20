@@ -167,6 +167,16 @@ _W13_LAYOUTS = {
 _DEVICE_CAPABILITY_CACHE: dict[int, tuple[int, int]] = {}
 
 
+def _w4a16_flow_workspace_extra() -> int:
+    """kernel_workspace words added for B12X_TRELLIS_FLOW_FLAGS (0 when off)."""
+    from b12x.moe._shared.kernels.w4a16.kernel.types import (
+        W4A16_FLOW_WORKSPACE_EXTRA,
+        w4a16_flow_flags_requested,
+    )
+
+    return W4A16_FLOW_WORKSPACE_EXTRA if w4a16_flow_flags_requested() else 0
+
+
 def _current_compute_capability() -> tuple[int, int] | None:
     """Return the active CUDA device capability without repeated driver queries."""
 
@@ -3585,7 +3595,7 @@ def _plan_core_workspace(
                 ),
                 _TensorAllocSpec(
                     "kernel_workspace",
-                    (sms * 4 + 2,),
+                    (sms * 4 + 2 + _w4a16_flow_workspace_extra(),),
                     torch.int32,
                     init="zeros",
                 ),
@@ -3833,7 +3843,11 @@ def _plan_core_workspace(
                         (routed_capacity, int(k)),
                         torch.float16,
                     ),
-                    _TensorAllocSpec("kernel_workspace", (sms * 4 + 2,), torch.int32),
+                    _TensorAllocSpec(
+                        "kernel_workspace",
+                        (sms * 4 + 2 + _w4a16_flow_workspace_extra(),),
+                        torch.int32,
+                    ),
                 )
             )
             if not intermediate_hadamard:
@@ -8608,6 +8622,20 @@ def _plan_full_rotation_w4a16_launches(
             else (capacity_tokens,)
         )
 
+        # Bench-only small-M tuning knobs (plan-time, full-rotation Trellis
+        # only): B12X_TRELLIS_TILE_CONFIG="fc1_k,fc1_n,fc2_k,fc2_n" and
+        # B12X_TRELLIS_PIPELINE_STAGES=2..5 replace the weight plan's fixed
+        # launch geometry. Native t256 storage is tile-independent, so any
+        # tile that divides the projections reads the same bytes.
+        tile_env = os.environ.get("B12X_TRELLIS_TILE_CONFIG", "")
+        tile_config = (
+            tuple(int(v) for v in tile_env.split(","))
+            if tile_env
+            else core_plan.trellis_tile_config
+        )
+        stages_env = os.environ.get("B12X_TRELLIS_PIPELINE_STAGES", "")
+        pipeline_stages = int(stages_env) if stages_env else None
+
         def compile_fused(token_count: int, broadcast_suh: bool) -> object:
             return compile_w4a16_fused_moe(
                 size_m=token_count,
@@ -8638,7 +8666,8 @@ def _plan_full_rotation_w4a16_launches(
                 trellis_decode_table=caps.trellis_decode_table,
                 skip_empty_m_blocks=caps.w4a16_skip_empty_m_blocks,
                 small_m_occupancy=caps.w4a16_small_m_occupancy,
-                force_tile_config=core_plan.trellis_tile_config,
+                force_tile_config=tile_config,
+                pipeline_stages=pipeline_stages,
                 intermediate_rotation=True,
                 full_rotation=True,
                 intermediate_hadamard=core_plan.intermediate_hadamard,
