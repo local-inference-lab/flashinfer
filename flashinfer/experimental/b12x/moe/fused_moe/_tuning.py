@@ -409,7 +409,13 @@ def _csf_inline_eligible(query, config):
             and query.intermediate_size % 64 == 0
             and query.w4a16_weight_layout == "packed"
             and (
-                query.a4_prefill is False
+                (
+                    query.w4a16_scale_format == "e4m3_k16"
+                    and query.io_dtype == "bfloat16"
+                    and query.hidden_size % 256 == 0
+                    and query.intermediate_size % 128 == 0
+                )
+                or query.a4_prefill is False
                 or (
                     query.a4_prefill is None
                     and not query.controls.get("w4a16_a4_prefill_enabled", False)
@@ -1193,7 +1199,7 @@ TUNING = TuningContract(
     validate_query=_validate_query,
     validate_config=validate_moe_decode_config,
     default_config=_default_config,
-    candidate_contract_version=72,
+    candidate_contract_version=73,
     knobs=(
         Knob(
             name="backend",

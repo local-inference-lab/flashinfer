@@ -358,6 +358,7 @@ class A4PackedPrefillGemm:
         warps: int = NUM_WARPS,
         swiglu_limit: float | None = None,
         swiglu_clamp_after_silu: bool = False,
+        csf_geometry: tuple | None = None,
     ):
         if phase not in ("fc1", "fc2"):
             raise ValueError(f"unknown A4 prefill phase {phase!r}")
@@ -372,6 +373,15 @@ class A4PackedPrefillGemm:
         self.hidden_size = int(hidden_size)
         self.intermediate_size = int(intermediate_size)
         self.fc1_half_slab = self.fc1 and self.intermediate_size % 128 != 0
+        self.csf_geometry = csf_geometry
+        self.csf_inline_scales = csf_geometry is not None
+        self.scale_stride = 128 if self.csf_inline_scales else 256
+        if self.csf_inline_scales:
+            from b12x._lib.quant.csf_inline import CsfInlineReader
+
+            if self.intermediate_size % 128:
+                raise ValueError("Inline A4 scales require I % 128 == 0")
+            self.csf_reader = CsfInlineReader(csf_geometry)
         self.top_k = int(top_k)
         self.stages = int(stages)
         self.fast_math = bool(fast_math)
@@ -421,6 +431,7 @@ class A4PackedPrefillGemm:
             BLOCK_M,
             TILE_K,
             self.warps,
+            self.csf_geometry,
         )
 
     @cute.jit
@@ -513,6 +524,8 @@ class A4PackedPrefillGemm:
         scales_u8,
         expert: Int32,
         n_tile: Int32,
+        csf_row: Int32,
+        csf_base: Uint32,
     ):
         """Stage one K64 slice of live activations, packed weights, and scales."""
         for src, dst, live in a_desc:
@@ -532,7 +545,23 @@ class A4PackedPrefillGemm:
                 n_tile,
                 chunk,
             )
-        if tid < Int32((TILE_K // 16) * 4 * 4):
+        if cutlass.const_expr(self.csf_inline_scales):
+            if tid < Int32(64):
+                warp, lane = tid // Int32(32), tid % Int32(32)
+                group = (
+                    csf_row * Int32(self.csf_reader.plane.storage.column_groups)
+                    + k_tile
+                )
+                target = cute.make_ptr(
+                    cutlass.Uint8,
+                    stage_base + Int32(self.s_off) + warp * Int32(512),
+                    cute.AddressSpace.smem,
+                    assumed_align=16,
+                )
+                self.csf_reader.stage_compressed(
+                    scales_u8.iterator, expert, group, target, lane, base_word=csf_base
+                )
+        elif tid < Int32((TILE_K // 16) * 4 * 4):
             self._copy_chunk(
                 stage_base + s_dst,
                 s_src + Int64(k_tile) * Int64((TILE_K // 16) * self.size_n),
@@ -639,20 +668,32 @@ class A4PackedPrefillGemm:
                 + ((b_vec ^ (b_k16 & Int32(1))) << Int32(4))
             )
             b_desc.append((src, dst, b_chunk))
-        s_k16 = (tid >> Int32(4)) & Int32(3)
-        s_chunk = (tid >> Int32(2)) & Int32(3)
-        s_part = tid & Int32(3)
-        s_src = get_ptr_as_int64(
-            scales_u8,
-            (Int64(expert) * Int64(k16_rows) + Int64(s_k16)) * Int64(self.size_n)
-            + Int64(self._chunk_n64(n_tile, s_chunk) * Int32(64))
-            + Int64(s_part * Int32(16)),
-        )
-        s_dst = (
-            Int32(self.s_off)
-            + ((s_k16 * Int32(4) + s_chunk) << Int32(6))
-            + (s_part << Int32(4))
-        )
+        s_src, s_dst = Int64(0), Int32(0)
+        csf_row, csf_base = Int32(0), Uint32(0)
+        if cutlass.const_expr(self.csf_inline_scales):
+            if tid < Int32(64):
+                # FC1 slots are gate/up; FC2 slots are adjacent 128-column groups.
+                csf_row = self._chunk_n64(n_tile, tid // Int32(32) * Int32(2)) // Int32(
+                    2
+                )
+                csf_base = self.csf_reader.prefetch_row_bases(
+                    scales_u8.iterator, expert, csf_row, lane
+                )
+        else:
+            s_k16 = (tid >> Int32(4)) & Int32(3)
+            s_chunk = (tid >> Int32(2)) & Int32(3)
+            s_part = tid & Int32(3)
+            s_src = get_ptr_as_int64(
+                scales_u8,
+                (Int64(expert) * Int64(k16_rows) + Int64(s_k16)) * Int64(self.size_n)
+                + Int64(self._chunk_n64(n_tile, s_chunk) * Int32(64))
+                + Int64(s_part * Int32(16)),
+            )
+            s_dst = (
+                Int32(self.s_off)
+                + ((s_k16 * Int32(4) + s_chunk) << Int32(6))
+                + (s_part << Int32(4))
+            )
 
         # Fragment offsets inside a stage. B: lane (q, c) reads the vectors of BF16
         # lanes 4q + 2h + e of K16 rows 2j + c/2.
@@ -666,6 +707,14 @@ class A4PackedPrefillGemm:
                 pair.append(row_base + ((vec ^ (g & Int32(1))) << Int32(4)))
             b_frag.append(pair)
         s_frag = Int32(self.s_off) + (slot << Int32(6)) + (q << Int32(3))
+        if cutlass.const_expr(self.csf_inline_scales):
+            # Read each decoded 512-byte slot directly, without a transpose.
+            s_frag = (
+                Int32(self.s_off)
+                + (slot // Int32(2)) * Int32(512)
+                + (slot % Int32(2)) * Int32(64)
+                + q * Int32(8)
+            )
         row0 = m_warp * Int32(self.rows_per_warp) + q
         a_frag = row0 * Int32(32) + (c << Int32(3))
         sfa_frag = Int32(A_STAGE_BYTES) + ((row0 + (h << Int32(3))) << Int32(2))
@@ -686,6 +735,8 @@ class A4PackedPrefillGemm:
                     scales_u8,
                     expert,
                     n_tile,
+                    csf_row,
+                    csf_base,
                 )
             cute.arch.cp_async_commit_group()
         rd_base = smem_base
@@ -709,8 +760,21 @@ class A4PackedPrefillGemm:
                     scales_u8,
                     expert,
                     n_tile,
+                    csf_row,
+                    csf_base,
                 )
             cute.arch.cp_async_commit_group()
+            if cutlass.const_expr(self.csf_inline_scales):
+                # The wait/barrier above completes staging; publish decoded bytes
+                # before any consuming warp loads them. Future copies are disjoint.
+                self.csf_reader.expand_slots(
+                    scales_u8.iterator,
+                    rd_base + Int32(self.s_off),
+                    tid,
+                    self.threads,
+                    2,
+                )
+                cute.arch.sync_threads()
             if warp_live > Int32(0):
                 self._compute_stage(
                     rd_base, b_frag, s_frag, a_frag, sfa_frag, warp_live, acc
@@ -748,7 +812,9 @@ class A4PackedPrefillGemm:
         lo = cute.make_rmem_tensor((4,), Uint32)
         hi = cute.make_rmem_tensor((4,), Uint32)
         for g in cutlass.range_constexpr(4):
-            w_lo, w_hi = ld_shared_v2_u32(rd_base + s_frag + Int32(g * 4 * 64))
+            w_lo, w_hi = ld_shared_v2_u32(
+                rd_base + s_frag + Int32(g * self.scale_stride)
+            )
             lo[g] = _lifted_to_e4m3(w_lo)
             hi[g] = _lifted_to_e4m3(w_hi)
         for half in cutlass.range_constexpr(2):
@@ -1189,6 +1255,7 @@ class W4A16A4PrefillLaunches:
     topk: int
     grid: int
     terms: int
+    csf_inline_scales: bool
     quant: object
     fc1: object
     fc2: object
@@ -1232,6 +1299,7 @@ def _compile_a4_kernels(
     warps: int,
     swiglu_limit: float | None,
     swiglu_clamp_after_silu: bool = False,
+    csf_geometries: tuple | None = None,
 ):
     from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
     from b12x._lib.utils.device import current_cuda_stream
@@ -1261,7 +1329,7 @@ def _compile_a4_kernels(
         compile_spec=KernelCompileSpec.from_key("moe.w4a16.a4_prefill.quant", 3, key),
     )
     gemms = []
-    for phase in ("fc1", "fc2"):
+    for index, phase in enumerate(("fc1", "fc2")):
         gemms.append(
             b12x_compile(
                 A4PackedPrefillGemm(
@@ -1274,6 +1342,9 @@ def _compile_a4_kernels(
                     warps=warps,
                     swiglu_limit=swiglu_limit,
                     swiglu_clamp_after_silu=swiglu_clamp_after_silu,
+                    csf_geometry=None
+                    if csf_geometries is None
+                    else csf_geometries[index],
                 ),
                 _fake(cutlass.Uint32),
                 _fake(cutlass.Uint32, 4),
@@ -1297,7 +1368,7 @@ def _compile_a4_kernels(
                 Int32(1),
                 stream,
                 compile_spec=KernelCompileSpec.from_key(
-                    f"moe.w4a16.a4_prefill.{phase}", 5, key
+                    f"moe.w4a16.a4_prefill.{phase}", 6, (*key, csf_geometries)
                 ),
             )
         )
@@ -1318,6 +1389,7 @@ def compile_w4a16_a4_prefill(
     warps: int = NUM_WARPS,
     swiglu_limit: float | None = None,
     swiglu_clamp_after_silu: bool = False,
+    csf_geometries: tuple | None = None,
 ) -> W4A16A4PrefillLaunches:
     from b12x.moe._shared.kernels.w4a16.kernel.sum_launch import compile_w4a16_topk_sum
     from b12x.moe._shared.kernels.w4a16.route_pack import (
@@ -1333,6 +1405,7 @@ def compile_w4a16_a4_prefill(
         warps=warps,
         swiglu_limit=swiglu_limit,
         swiglu_clamp_after_silu=swiglu_clamp_after_silu,
+        csf_geometries=csf_geometries,
     )
     topk_sum = {
         ids_dtype: compile_w4a16_topk_sum(
@@ -1360,6 +1433,7 @@ def compile_w4a16_a4_prefill(
         topk=int(topk),
         grid=int(sms),
         terms=int(terms),
+        csf_inline_scales=csf_geometries is not None,
         quant=quant,
         fc1=fc1,
         fc2=fc2,
@@ -1427,6 +1501,7 @@ def run_w4a16_a4_prefill(
     intermediate_cache2: torch.Tensor,
     output: torch.Tensor,
     launches: W4A16A4PrefillLaunches,
+    inline_scales: tuple | None = None,
 ) -> torch.Tensor:
     """Route pack (128) -> NVFP4 quant -> A4 FC1 -> A4 FC2 -> FP32-weighted top-k sum.
 
@@ -1481,6 +1556,8 @@ def run_w4a16_a4_prefill(
     w2 = prepared.w2.view(torch.int32)
     s13 = prepared.w13_scale.view(torch.uint8)
     s2 = prepared.w2_scale.view(torch.uint8)
+    if launches.csf_inline_scales:
+        s13, s2 = (p.storage for p in inline_scales)
     u32 = cutlass.Uint32
     launches.quant(
         ptr(cutlass.BFloat16, a),
