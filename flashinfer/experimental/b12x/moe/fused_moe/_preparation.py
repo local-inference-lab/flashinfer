@@ -1106,11 +1106,7 @@ def _program_carriers(
                     _impl._get_activation_kernel_spec(
                         plan.activation, quant_mode=plan.quant_mode
                     ).is_gated
-                    and dynamic["n"] % 128 != 0
-                    and (
-                        not caps.weight_plan.csf_inline_scales
-                        or dynamic["n"] % 32 == 16
-                    )
+                    and dynamic["n"] % 32 == 16
                     if plan.quant_mode == "nvfp4"
                     else None
                 ),

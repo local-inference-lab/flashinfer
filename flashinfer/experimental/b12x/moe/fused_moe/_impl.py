@@ -6334,7 +6334,10 @@ def _ensure_dynamic_nvfp4_tail_views(
     activation_spec: _ActivationKernelSpec,
     immutable_scales: bool,
 ) -> None:
-    if n % 128 == 0 or (not immutable_scales and n % 32 != 16):
+    del immutable_scales
+    # 32-aligned widths run the swapped FC1, which reads the gate half from the
+    # joint scale plane; only 16-mod-32 widths need independently aligned halves.
+    if n % 32 != 16:
         return
     if activation_spec.is_gated and views.w13_up_sf is None:
         views.w13_up_sf, views.w13_gate_sf = _split_gated_nvfp4_scale_views(
