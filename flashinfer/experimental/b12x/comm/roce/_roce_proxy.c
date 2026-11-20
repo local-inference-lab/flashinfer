@@ -954,13 +954,21 @@ static int ring_service_slot(roce_ctx_t* c, int origin, int rail, int slot) {
 // through it, so the order comes from the serials that have arrived: slots
 // holding an unforwarded packet are forwarded in ascending serial order, and
 // forwarding stops at the first that has no queue capacity.
+//
+// Reading the slots is not a snapshot: one slot's serial can land between the
+// reads of two others, so a pass that forwarded everything it saw would send a
+// stripe's flag ahead of that stripe's earlier chunk, and a receiver that trusts
+// the flag reads a row the earlier chunk has not reached. Writes of one queue
+// pair land in posting order, so every serial below the highest one a pass saw
+// reached the mailbox no later than that one; the second pass therefore holds
+// them all. Each call forwards the second pass's candidates up to that highest
+// serial and leaves the rest to the next one.
 static int ring_service(roce_ctx_t* c) {
   if (c->ring == NULL) return 0;
   for (int origin = 0; origin < c->world; origin++) {
     if (origin == c->rank) continue;
     for (int rail = 0; rail < c->n_rail; rail++) {
-      int ready[RING_WINDOW], count = 0;
-      uint64_t serials[RING_WINDOW];
+      uint64_t top = 0;
       for (int slot = 0; slot < RING_WINDOW; slot++) {
         if (c->ring_pending[origin][rail][slot]) {
           if (ring_service_slot(c, origin, rail, slot) < 0) return -1;
@@ -968,7 +976,15 @@ static int ring_service(roce_ctx_t* c) {
         }
         uint64_t serial = __atomic_load_n(&ring_inbox(c, origin, rail, slot)->descriptor.serial,
                                           __ATOMIC_ACQUIRE);
-        if (serial == c->ring_seen[origin][rail][slot]) continue;
+        if (serial > top) top = serial;
+      }
+      int ready[RING_WINDOW], count = 0;
+      uint64_t serials[RING_WINDOW];
+      for (int slot = 0; slot < RING_WINDOW; slot++) {
+        if (c->ring_pending[origin][rail][slot]) continue;
+        uint64_t serial = __atomic_load_n(&ring_inbox(c, origin, rail, slot)->descriptor.serial,
+                                          __ATOMIC_ACQUIRE);
+        if (serial == c->ring_seen[origin][rail][slot] || serial > top) continue;
         int at = count++;
         while (at > 0 && serials[at - 1] > serial) {
           serials[at] = serials[at - 1];
