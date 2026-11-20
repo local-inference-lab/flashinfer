@@ -402,6 +402,9 @@ class W4A16GemmKernel:
         self.scale_k_groups = _covering_count(self.size_k, self.scale_group_size)
         self.n_tiles = _covering_count(self.size_n, self.tile_n)
         self.k_tiles = _covering_count(self.size_k, self.tile_k)
+        self.k_slice_counts = tuple(
+            count for count in range(2, self.k_tiles + 1) if self.k_tiles % count == 0
+        )
         self.covered_size_n = self.n_tiles * self.tile_n
         self.covered_size_k = self.k_tiles * self.tile_k
         self.has_n_tile_tail = bool(has_n_tile_tail)
@@ -1115,15 +1118,55 @@ class W4A16GemmKernel:
         global_mn_tiles = route_blocks * n_tiles
 
         tail_mn_tiles = global_mn_tiles
+        full_columns = n_tiles
+        tail_columns = n_tiles
         full_grid_mn_iters = Int32(0)
-        force_one_tile_per_cta = Int32(0)
+        iters = Int32(0)
         if cutlass.const_expr(self.schedule_whole_tiles):
             # Whole-tile waves: one CTA computes each mn-tile over the full K,
             # task = cta + wave * grid_x, ragged last wave skipped through the
             # route_block_idx bound below. No split-K tail, no lock traffic.
             tail_mn_tiles = Int32(0)
             full_grid_mn_iters = (global_mn_tiles + grid_x - Int32(1)) // grid_x
-        if cutlass.const_expr(not self.schedule_whole_tiles):
+        elif cutlass.const_expr(
+            not self.direct_topk_routes and not self.dense_route_fast_path
+        ):
+            # Reserve split-K work by output column and input shape. Moving an
+            # expert to another packed block must preserve its dot-product tree.
+            max_blocks = active_size_m * Int32(self.top_k)
+            max_tiles = max_blocks * n_tiles
+            split_columns = Int32(0)
+            if max_tiles > grid_x:
+                # Split a band of columns across at least two CTAs per tile.
+                # All packed blocks in the band must fit in one resident wave.
+                if max_tiles % grid_x != Int32(0):
+                    split_columns = grid_x // (Int32(2) * max_blocks)
+            elif cutlass.const_expr(not self.uses_m_block_8 or self.small_m_splitk):
+                split_columns = n_tiles
+            if cutlass.const_expr(
+                self.weight_layout == "modelopt"
+                and self.scale_format == "e8m0_k32"
+                and self.k_tiles <= 3
+            ):
+                if max_tiles >= grid_x:
+                    split_columns = Int32(0)
+            slices = Int32(1)
+            if split_columns > Int32(0):
+                max_tail = max_blocks * split_columns
+                for index in cutlass.range_constexpr(len(self.k_slice_counts)):
+                    count = Int32(self.k_slice_counts[index])
+                    if max_tail <= grid_x // count:
+                        slices = count
+            tail_mn_tiles = Int32(0)
+            if slices > Int32(1):
+                full_columns = n_tiles - split_columns
+                tail_columns = split_columns
+                tail_mn_tiles = route_blocks * tail_columns
+                iters = k_tiles // slices
+            full_tiles = route_blocks * full_columns
+            full_grid_mn_iters = (full_tiles + grid_x - Int32(1)) // grid_x
+        else:
+            force_one_tile_per_cta = Int32(0)
             if cutlass.const_expr(self.uses_m_block_8 and not self.small_m_splitk):
                 # TC-decode small-M: when every mn-tile fits inside the launched grid
                 # (FC1 has only route_blocks*n_tiles tiles, far fewer than grid_x),
@@ -1169,7 +1212,7 @@ class W4A16GemmKernel:
                     tail_mn_tiles += grid_x
                 full_grid_mn_iters = (global_mn_tiles - tail_mn_tiles) // grid_x
 
-        iters = (k_tiles * tail_mn_tiles + grid_x - Int32(1)) // grid_x
+            iters = (k_tiles * tail_mn_tiles + grid_x - Int32(1)) // grid_x
 
         lock_slot = Int32(0)
         if tail_mn_tiles >= grid_x:
@@ -1192,8 +1235,8 @@ class W4A16GemmKernel:
             reduce_slice_idx = Int32(0)
 
             if in_tail_region == Int32(0) and full_grid_mn_iters > Int32(0):
-                route_block_idx = work_mn_tile // n_tiles
-                output_n_tile = work_mn_tile - route_block_idx * n_tiles
+                route_block_idx = work_mn_tile // full_columns
+                output_n_tile = work_mn_tile - route_block_idx * full_columns
                 reduce_k_tile = Int32(0)
                 reduce_tile_count = k_tiles
                 full_grid_mn_iters -= Int32(1)
@@ -1204,9 +1247,17 @@ class W4A16GemmKernel:
                     cta_iter_start = iters * cta
                     work_mn_tile = cta_iter_start // k_tiles
                     reduce_k_tile = cta_iter_start - work_mn_tile * k_tiles
-                    global_mn_tile = work_mn_tile + tail_mn_base
-                    route_block_idx = global_mn_tile // n_tiles
-                    output_n_tile = global_mn_tile - route_block_idx * n_tiles
+                    if cutlass.const_expr(
+                        not self.direct_topk_routes
+                        and not self.dense_route_fast_path
+                        and not self.schedule_whole_tiles
+                    ):
+                        route_block_idx = work_mn_tile // tail_columns
+                        output_n_tile = full_columns + work_mn_tile - route_block_idx * tail_columns
+                    else:
+                        global_mn_tile = work_mn_tile + tail_mn_base
+                        route_block_idx = global_mn_tile // n_tiles
+                        output_n_tile = global_mn_tile - route_block_idx * n_tiles
 
                 if work_mn_tile < tail_mn_tiles and iters > Int32(0):
                     reduce_tile_count = iters * (cta + Int32(1)) - (
@@ -1319,7 +1370,7 @@ class W4A16GemmKernel:
                     work_mn_tile += Int32(1)
                     output_n_tile += Int32(1)
                     if output_n_tile == n_tiles:
-                        output_n_tile = Int32(0)
+                        output_n_tile = n_tiles - tail_columns
                         route_block_idx += Int32(1)
 
     @cute.jit
