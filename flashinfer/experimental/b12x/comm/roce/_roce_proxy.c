@@ -113,6 +113,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#if defined(__aarch64__)
+#include <sys/auxv.h>
+#ifndef HWCAP2_WFXT
+#define HWCAP2_WFXT (1UL << 31)
+#endif
+#endif
 
 #define ROCE_MAX_PEERS 16
 #define ROCE_MAX_HCAS 4
@@ -1471,6 +1477,53 @@ static int run_varlen_op(roce_ctx_t* c, uint32_t seq, uint32_t nbytes, uint32_t 
   return drain_all(c);
 }
 
+// Idle doorbell wait.  On aarch64 cores with FEAT_WFxT (HWCAP2_WFXT, e.g. the
+// Cortex-X925/A725 CPUs of GB10), the proxy parks in WFET with the exclusive
+// monitor armed on the doorbell's cache line instead of spinning on it.  This
+// relies on the GPU's store of the next sequence to the coherent pinned host
+// region clearing the monitor, which wakes the core.  WFET's absolute deadline
+// (1 ms) bounds every park, so a missed wake costs at most that, and before the
+// nap the running flag is checked about every 1 ms and the CQs and errors about
+// every 8 ms, excluding scheduling and drain work.  Other CPUs
+// and the ring transports, whose idle loop also forwards neighbors' mailbox
+// traffic that never touches the doorbell line, keep the spin unchanged.
+#if defined(__aarch64__)
+// After this many parks without a doorbell the proxy naps between polls instead,
+// exactly as the spinning loop does after ROCE_IDLE_SPINS, so a long idle stretch
+// leaves the core to the kernel's idle states: 8192 nominal 1 ms park budgets,
+// excluding scheduling and drain time; early wakes shorten the stretch.
+#define ROCE_WFE_IDLE_PARKS 8192
+static inline uint64_t roce_cntvct(void) {
+  uint64_t t;
+  __asm__ volatile("isb\n\tmrs %0, cntvct_el0" : "=r"(t)::"memory");
+  return t;
+}
+static inline uint64_t roce_cntfrq(void) {
+  uint64_t f;
+  __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(f));
+  return f;
+}
+// Same sequence as Linux __cmpwait_case_32, with WFET bounded by an absolute CNTVCT deadline.
+static inline void roce_wait_change(volatile uint32_t* p, uint32_t old, uint64_t deadline) {
+  uint32_t tmp;
+  __asm__ volatile(
+      "mov x9, %[dl]\n\t"
+      "sevl\n\t"
+      "wfe\n\t"
+      "ldxr %w[tmp], %[v]\n\t"
+      "eor %w[tmp], %w[tmp], %w[old]\n\t"
+      "cbnz %w[tmp], 1f\n\t"
+      ".inst 0xd5031009\n"  // wfet x9
+      "1:"
+      : [tmp] "=&r"(tmp), [v] "+Q"(*p)
+      : [old] "r"(old), [dl] "r"(deadline)
+      : "x9", "memory");
+}
+static int roce_use_wfe(const roce_ctx_t* c) {
+  return c->ring == NULL && (getauxval(AT_HWCAP2) & HWCAP2_WFXT) != 0;
+}
+#endif
+
 static void* proxy_main(void* arg) {
   roce_ctx_t* c = (roce_ctx_t*)arg;
   volatile uint32_t* ctrl = (volatile uint32_t*)(c->region + c->ctrl_off);
@@ -1481,6 +1534,12 @@ static void* proxy_main(void* arg) {
   // correct however long the thread is away.
   uint64_t idle = 0;
   const struct timespec nap = {0, 20000};
+#if defined(__aarch64__)
+  const int use_wfe = roce_use_wfe(c);
+  const uint64_t wfe_slice = roce_cntfrq() / 1000;  // bounded park: 1 ms
+#else
+  const int use_wfe = 0;
+#endif
   while (atomic_load_explicit(&c->running, memory_order_relaxed)) {
     uint32_t seq = __atomic_load_n(&ctrl[CTRL_SEQ], __ATOMIC_ACQUIRE);
     // Dormant chunk-ready words remain zero. Signed ready/sequence comparisons
@@ -1494,12 +1553,25 @@ static void* proxy_main(void* arg) {
     }
     if (seq == c->last_seq) {
       idle++;
-      if (idle % 64 == 0) {
+      // A parked iteration lasts until the next store to the line, an event-stream
+      // event (~100-130 us on GB10) or the 1 ms WFET deadline; a spin iteration ~1 us.
+      // Parked, drain every 8 iterations instead of every 64.
+      if (use_wfe ? (idle & 7) == 0 : idle % 64 == 0) {
         if (drain_all(c) != 0) {
           atomic_store(&c->failed, 1);
           return NULL;
         }
       }
+#if defined(__aarch64__)
+      if (use_wfe) {
+        if (idle > ROCE_WFE_IDLE_PARKS) {
+          nanosleep(&nap, NULL);  // a long idle stretch naps, as the spinning loop does
+        } else {
+          roce_wait_change(&ctrl[CTRL_SEQ], seq, roce_cntvct() + wfe_slice);
+        }
+        continue;
+      }
+#endif
       if (idle >= ROCE_IDLE_SPINS) {
         nanosleep(&nap, NULL);
       }
