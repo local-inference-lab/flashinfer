@@ -570,6 +570,10 @@ class _PackedExecutionState:
                 self.programs["dequant"][
                     (q.out_features, triton.cdiv(k, DEQUANT_BLOCK_K), 1)
                 ](values, scale_bytes, weight, k, DEQUANT_BLOCK_K)
+                if q.in_features != k:
+                    # K-padded weight (B12X_MXFP8_A16_DEQUANT_PADDED_K): GEMM
+                    # over the logical columns of the expanded weight.
+                    weight = weight[:, : q.in_features]
                 torch.mm(
                     source.view(m, q.in_features),
                     weight.t(),

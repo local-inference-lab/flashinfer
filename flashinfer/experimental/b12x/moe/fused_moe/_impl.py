@@ -167,6 +167,16 @@ _W13_LAYOUTS = {
 _DEVICE_CAPABILITY_CACHE: dict[int, tuple[int, int]] = {}
 
 
+def _w4a16_flow_workspace_extra() -> int:
+    """kernel_workspace words added for B12X_TRELLIS_FLOW_FLAGS (0 when off)."""
+    from b12x.moe._shared.kernels.w4a16.kernel.types import (
+        W4A16_FLOW_WORKSPACE_EXTRA,
+        w4a16_flow_flags_requested,
+    )
+
+    return W4A16_FLOW_WORKSPACE_EXTRA if w4a16_flow_flags_requested() else 0
+
+
 def _current_compute_capability() -> tuple[int, int] | None:
     """Return the active CUDA device capability without repeated driver queries."""
 
@@ -3585,7 +3595,7 @@ def _plan_core_workspace(
                 ),
                 _TensorAllocSpec(
                     "kernel_workspace",
-                    (sms * 4 + 2,),
+                    (sms * 4 + 2 + _w4a16_flow_workspace_extra(),),
                     torch.int32,
                     init="zeros",
                 ),
@@ -3833,7 +3843,11 @@ def _plan_core_workspace(
                         (routed_capacity, int(k)),
                         torch.float16,
                     ),
-                    _TensorAllocSpec("kernel_workspace", (sms * 4 + 2,), torch.int32),
+                    _TensorAllocSpec(
+                        "kernel_workspace",
+                        (sms * 4 + 2 + _w4a16_flow_workspace_extra(),),
+                        torch.int32,
+                    ),
                 )
             )
             if not intermediate_hadamard:
@@ -8550,6 +8564,10 @@ def _plan_full_rotation_w4a16_launches(
         raise RuntimeError("Trellis launch planning cannot run during capture")
 
     from b12x.moe._shared.kernels.w4a16.host import route_pack_capacity
+    from b12x.moe.fused_moe._prefill_shapes import (
+        trellis_prefill_launch_shape,
+        trellis_prefill_native_tile,
+    )
     from b12x.moe._shared.kernels.w4a16.kernel.config import _DEFAULT_MAX_SHARED_MEM
     from b12x.moe._shared.kernels.w4a16.kernel.fused_launch import (
         compile_w4a16_fused_moe,
@@ -8608,7 +8626,54 @@ def _plan_full_rotation_w4a16_launches(
             else (capacity_tokens,)
         )
 
+        # Bench-only small-M tuning knobs (plan-time, full-rotation Trellis
+        # only): B12X_TRELLIS_TILE_CONFIG="fc1_k,fc1_n,fc2_k,fc2_n" and
+        # B12X_TRELLIS_PIPELINE_STAGES=2..5 replace the weight plan's fixed
+        # launch geometry. Native t256 storage is tile-independent, so any
+        # tile that divides the projections reads the same bytes.
+        tile_env = os.environ.get("B12X_TRELLIS_TILE_CONFIG", "")
+        tile_config = (
+            tuple(int(v) for v in tile_env.split(","))
+            if tile_env
+            else core_plan.trellis_tile_config
+        )
+        stages_env = os.environ.get("B12X_TRELLIS_PIPELINE_STAGES", "")
+        pipeline_stages = int(stages_env) if stages_env else None
+
         def compile_fused(token_count: int, broadcast_suh: bool) -> object:
+            measured_table = (trellis_prefill_launch_shape(token_count) or {}).get(
+                "trellis_decode_table"
+            )
+            try:
+                return _compile_fused(token_count, broadcast_suh, measured_table)
+            except ValueError as exc:
+                # The direct ("full") table needs 1 CTA/SM and 64 KiB of shared
+                # memory beside the staging; fall back to the plan's table when
+                # this geometry cannot hold it (prefill-shape launches only).
+                if measured_table not in ("full", "full1") or "decode table" not in str(exc):
+                    raise
+                return _compile_fused(token_count, broadcast_suh, None)
+
+        def _compile_fused(
+            token_count: int, broadcast_suh: bool, measured_table: str | None
+        ) -> object:
+            # Prefill launch shapes (B12X_W4A16_PREFILL_SHAPES, M >= 128 only;
+            # ported from tunamitom/flashinfer@2676f2beae6a/@14369ed04566).
+            # The route block itself comes from _resolve_trellis_route_block_size
+            # (arena sizing and binding share it); stages and the decode table
+            # are compile-time only. An explicit B12X_TRELLIS_PIPELINE_STAGES wins.
+            measured = trellis_prefill_launch_shape(token_count) or {}
+            launch_stages = (
+                pipeline_stages
+                if pipeline_stages is not None
+                else measured.get("pipeline_stages")
+            )
+            launch_table = measured_table or caps.trellis_decode_table
+            launch_tiles = measured.get("tile_config") or (
+                core_plan.trellis_tile_config
+                if trellis_prefill_native_tile(token_count)
+                else tile_config
+            )
             return compile_w4a16_fused_moe(
                 size_m=token_count,
                 hidden_size=core_plan.k,
@@ -8635,10 +8700,11 @@ def _plan_full_rotation_w4a16_launches(
                 w13_layout=w13_layout,
                 trellis_bits=core_plan.trellis_bits,
                 trellis_codebook=core_plan.trellis_codebook or LUT_E4M3,
-                trellis_decode_table=caps.trellis_decode_table,
+                trellis_decode_table=launch_table,
                 skip_empty_m_blocks=caps.w4a16_skip_empty_m_blocks,
                 small_m_occupancy=caps.w4a16_small_m_occupancy,
-                force_tile_config=core_plan.trellis_tile_config,
+                force_tile_config=launch_tiles,
+                pipeline_stages=launch_stages,
                 intermediate_rotation=True,
                 full_rotation=True,
                 intermediate_hadamard=core_plan.intermediate_hadamard,
@@ -9044,6 +9110,21 @@ def _resolve_trellis_route_block_size(caps: TPMoEScratchCaps) -> int | None:
         bucket_w4a16_tokens=False,
     )
     route_experts = caps.route_num_experts or caps.weight_E
+    # Prefill launch shapes (B12X_W4A16_PREFILL_SHAPES; ported from
+    # tunamitom/flashinfer@14369ed04566): the measured block feeds the shared
+    # resolver (arena sizing AND launch binding). Keyed by the arena's largest
+    # token count and asserted like an explicit knob (the heuristic tile-fit
+    # check prices 4-stage staging and would fall back to 48 rows). Only
+    # arenas whose max token count is >= 128 can be affected.
+    from b12x.moe.fused_moe._prefill_shapes import trellis_prefill_launch_shape
+
+    measured = (
+        trellis_prefill_launch_shape(max(token_counts))
+        if caps.weight_plan.trellis_pair_kinds is None
+        else None
+    ) or {}
+    if measured.get("block_size_m"):
+        return int(measured["block_size_m"])
     preferred = select_route_block_size_m(
         max(token_counts),
         caps.num_topk,
@@ -9301,6 +9382,7 @@ def _prewarm_w4a16_planned_launches(
         route_pack_capacity,
         select_route_block_size_m,
     )
+    from b12x.moe.fused_moe._prefill_shapes import trellis_prefill_launch_shape
     from b12x.moe._shared.kernels.w4a16.kernel.config import (
         _DEFAULT_MAX_SHARED_MEM,
         _MAX_DIRECT_TOPK_ROUTE_M,
@@ -9349,6 +9431,17 @@ def _prewarm_w4a16_planned_launches(
         )
         for token_count in token_counts:
             t_token = time.perf_counter() if _B12X_TIMING else 0.0
+            # Prefill launch shapes (B12X_W4A16_PREFILL_SHAPES, M >= 128, full-
+            # rotation Trellis without per-pair extents only; ported from
+            # tunamitom/flashinfer@14369ed04566). Block from the arena resolver;
+            # stages and decode table are compile-time only.
+            measured = (
+                trellis_prefill_launch_shape(token_count)
+                if full_rotation and _fc_trellis_pair_kind(workspace) is None
+                else None
+            ) or {}
+            launch_stages = measured.get("pipeline_stages")
+            launch_table = measured.get("trellis_decode_table", "auto")
             block_size_m = workspace.route_block_size_m or select_route_block_size_m(
                 token_count, workspace.num_topk, workspace.route_E
             )
@@ -9408,7 +9501,11 @@ def _prewarm_w4a16_planned_launches(
                     trellis_codebook=workspace.trellis_codebook or LUT_E4M3,
                     fc1_trellis_pair_kind=_fc_trellis_pair_kind(workspace),
                     fc2_trellis_pair_kind=_fc_trellis_pair_kind(workspace),
-                    force_tile_config=workspace.trellis_tile_config,
+                    force_tile_config=(
+                        measured.get("tile_config") or workspace.trellis_tile_config
+                    ),
+                    pipeline_stages=launch_stages,
+                    trellis_decode_table=launch_table,
                     intermediate_rotation=full_rotation,
                     full_rotation=full_rotation,
                     intermediate_hadamard=workspace.intermediate_hadamard,
