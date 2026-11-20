@@ -27,14 +27,30 @@ def _invalid_row_trap(*, loc=None, ip=None):
 
 
 class WindowStageKernel:
-    def __init__(self, *, heads, dim, capacity, window, first_position=0):
+    """Stage each row's history and candidates in position order.
+
+    The history holds ``window`` positions, position ``p`` at slot ``p mod window``.
+    Output index ``i`` is position ``max(start - lookback, first_position) + i``.
+    ``lookback`` defaults to ``window``; a smaller value stages fewer preceding
+    positions from a history that retains more than the consumer reads.
+    """
+
+    def __init__(
+        self, *, heads, dim, capacity, window, first_position=0, lookback=None
+    ):
+        lookback = window if lookback is None else lookback
         if dim % 4 or min(heads, dim, capacity, window) <= 0:
             raise ValueError(
                 "window staging requires positive geometry and head dimensions divisible by four"
             )
+        if type(lookback) is not int or not 0 < lookback <= window:
+            raise ValueError(
+                "window staging looks back over a positive count of at most the history's positions"
+            )
         self.heads, self.dim = heads, dim
         self.capacity, self.window = capacity, window
         self.first_position = first_position
+        self.lookback = lookback
 
     @cute.jit
     def __call__(
@@ -92,7 +108,7 @@ class WindowStageKernel:
             state = cutlass.select_(state < 0, state + Int64(hk.shape[0]), state)
             if (state < 0) | (state >= Int64(hk.shape[0])):
                 _invalid_row_trap()
-            first = cutlass.max(start - self.window, Int64(self.first_position))
+            first = cutlass.max(start - self.lookback, Int64(self.first_position))
             absolute = first + position
             ring = absolute % self.window
             ring = cutlass.select_(ring < 0, ring + self.window, ring)
