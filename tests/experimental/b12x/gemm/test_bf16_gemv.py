@@ -962,3 +962,37 @@ def test_tensor_core_gemv_replays_live_rows(n, k, output_dtype):
                         assert state.launcher is launcher
                 finally:
                     graph.reset()
+
+
+@cuda_required
+@pytest.mark.parametrize("rows", [8, 4096])
+def test_fp32_accumulation_router_matches_the_fp32_operand_product_class(rows):
+    """BF16 operands under FP32 accumulation stay within the FP32-operand product's error."""
+    from b12x.gemm import bf16_gemv
+
+    torch.manual_seed(5)
+    source = torch.randn(rows, 4608, device="cuda").bfloat16()
+    weight = (torch.randn(384, 4608, device="cuda") * 0.02).bfloat16()
+    oracle = source.double() @ weight.double().T
+    widened = torch.empty(rows, 384, device="cuda")
+    _mm(source.float(), weight.float(), out=widened)
+    output = torch.empty(rows, 384, device="cuda")
+    plan = bf16_gemv.plan(
+        bf16_gemv.query_from_call(source, weight, out=output, accumulation="fp32")
+    )
+    with PreparationSession(
+        device=source.device, autotune=False, compile_workers=2
+    ) as session:
+        session.prepare(
+            (
+                plan.request(
+                    name="router",
+                    prepare_call=lambda state: PreparedCall(
+                        run=lambda: state.run(source, weight, out=output, bias=None),
+                    ),
+                ),
+            )
+        )
+        bf16_gemv.mm(source, weight, out=output, plan=plan)
+    reference_error = (widened.double() - oracle).abs().max()
+    assert (output.double() - oracle).abs().max() <= 2 * reference_error

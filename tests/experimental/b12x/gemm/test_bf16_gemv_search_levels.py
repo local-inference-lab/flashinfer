@@ -182,3 +182,42 @@ def test_tensor_core_projection_needs_no_workspace(output_dtype):
     )
     assert requirements.scratch_nbytes == 0
     assert not requirements.persistent
+
+
+@pytest.mark.parametrize("effort", ["off", "default", "audit"])
+@pytest.mark.parametrize("rows", [1, 8, 256, 8192])
+def test_fp32_accumulation_races_only_backends_that_carry_the_sum_in_fp32(effort, rows):
+    q = replace(
+        query(accumulation="fp32"),
+        out_features=384,
+        in_features=4608,
+        max_rows=rows,
+        output_dtype="float32",
+        autotune_effort=effort,
+    )
+    default = TUNING.default_config(q, None)
+    assert default.backend == ("prefill" if rows > 8 else "simt")
+    selected = choices(q)
+    assert default in selected
+    assert {config.backend for config in selected} <= {"simt", "prefill"}
+    if effort != "off":
+        assert {config.backend for config in selected} == {"simt", "prefill"}
+
+
+@pytest.mark.parametrize("backend", ["torch", "mma", "tc"])
+def test_fp32_accumulation_rejects_tensor_core_and_library_accumulation(backend):
+    q = replace(query(accumulation="fp32"), max_rows=8, in_features=4608)
+    with pytest.raises(ValueError, match="does not carry the sum in FP32"):
+        TUNING.validate_config(q, GemvConfig(backend=backend), None)
+    TUNING.validate_config(
+        replace(q, accumulation="any"), GemvConfig(backend=backend), None
+    )
+
+
+def test_accumulation_requirement_is_validated_and_keeps_mixed_operands():
+    with pytest.raises(ValueError, match="accumulation"):
+        TUNING.validate_query(query(accumulation="exact"), None)
+    mixed = replace(
+        query(accumulation="fp32"), weight_dtype="float32", output_dtype="float32"
+    )
+    assert {config.backend for config in choices(mixed)} <= {"simt", "mixed_vector"}

@@ -18,8 +18,14 @@ def _is_aligned(tensor):
     return tensor.data_ptr() % 16 == 0
 
 
-def query_from_call(x, weight, *, bias=None, out=None, output_dtype=None):
-    """Capture geometry, numerical types and layout eligibility without GPU work."""
+def query_from_call(
+    x, weight, *, bias=None, out=None, output_dtype=None, accumulation="any"
+):
+    """Capture geometry, numerical types and layout eligibility without GPU work.
+
+    ``accumulation="fp32"`` restricts the plan to backends that carry the whole
+    sum of products in FP32.
+    """
     if x.ndim != 2 or weight.ndim != 2 or x.shape[1] != weight.shape[1]:
         raise ValueError("projection requires source[M,K] and weight[N,K]")
     if weight.device != x.device or (bias is not None and bias.device != x.device):
@@ -43,6 +49,7 @@ def query_from_call(x, weight, *, bias=None, out=None, output_dtype=None):
         output_contiguous=out is None or out.is_contiguous(),
         output_aligned=out is None or _is_aligned(out),
         bias_dtype=None if bias is None else str(bias.dtype).removeprefix("torch."),
+        accumulation=accumulation,
     )
     TUNING.validate_query(query, None)
     return query

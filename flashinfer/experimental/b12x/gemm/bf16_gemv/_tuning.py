@@ -24,6 +24,10 @@ class GemvQuery:
     output_contiguous: bool = True
     output_aligned: bool = True
     bias_dtype: str | None = None
+    # "fp32" requires the whole sum of products to be carried in FP32 (ordered or
+    # compensated), as the FP32-operand product does; "any" also admits backends
+    # whose tensor-core or library accumulation is looser.
+    accumulation: str = "any"
     autotune_effort: str = field(default_factory=capture_autotune_effort)
 
     def __post_init__(self):
@@ -51,6 +55,8 @@ def validate_query(query):
         )
     ) or query.bias_dtype not in (None, "bfloat16", "float32"):
         raise ValueError("unquantized projection requires BF16 or FP32 operands")
+    if query.accumulation not in ("any", "fp32"):
+        raise ValueError("projection accumulation must be 'any' or 'fp32'")
     if (
         not 0 < query.max_rows < 2**31
         or min(query.in_features, query.out_features) <= 0
@@ -68,6 +74,17 @@ def validate_query(query):
     ):
         if type(getattr(query, name)) is not bool:
             raise TypeError(f"projection {name} must be a boolean")
+
+
+# Backends whose complete K reduction is an FP32 sum: the SIMT kernels add FP32
+# products in a fixed order and the prefill GEMM adds 16-product tensor-core
+# segments with compensated FP32 addition. The warp-MMA, small-row tensor-core
+# and library backends accumulate longer runs inside tensor cores.
+FP32_ACCUMULATION_BACKENDS = frozenset({"simt", "mixed_vector", "prefill"})
+
+
+def _accumulation_admits(query, backend):
+    return query.accumulation == "any" or backend in FP32_ACCUMULATION_BACKENDS
 
 
 def _mma_eligible(query):
@@ -124,6 +141,10 @@ def _prefill_eligible(query):
 
 
 def default_config(query, device):
+    if query.accumulation == "fp32":
+        if _prefill_eligible(query) and query.max_rows > 8:
+            return GemvConfig(backend="prefill")
+        return GemvConfig(backend="simt")
     if _torch_eligible(query) and query.max_rows > 8:
         return GemvConfig(backend="torch")
     n_tiles = (query.out_features + 63) // 64
@@ -156,6 +177,10 @@ def _validate_query(query, device):
 def validate_config(query, config, device):
     if not isinstance(config, GemvConfig):
         raise TypeError("projection config must be GemvConfig")
+    if not _accumulation_admits(query, config.backend):
+        raise ValueError(
+            f"projection backend {config.backend!r} does not carry the sum in FP32"
+        )
     if config.backend in ("simt", "mixed_vector"):
         if config.backend == "mixed_vector" and not (
             query.source_dtype == "bfloat16" and query.weight_dtype == "float32"
@@ -205,16 +230,18 @@ def _parameters(query, device):
         backends.append("prefill")
     if _torch_eligible(query):
         backends.append("torch")
+    backends = [backend for backend in backends if _accumulation_admits(query, backend)]
     return ParameterSpace.create(
         TUNING.knobs,
         values={"backend": tuple(backends)},
         predicates=(_eligible,),
-        # The prefill GEMM is raced only by the audit; it never came within 2%
-        # of a winner on the shapes it was preferred for.
+        # Without an accumulation requirement the prefill GEMM is raced only by
+        # the audit: it never came within 2% of a winner that may accumulate in
+        # tensor cores. Under FP32 accumulation it races the SIMT kernels.
         efficiency_predicates=(
             lambda choice: (
                 (choice["backend"] != "mma" or _mma_preferred(query))
-                and choice["backend"] != "prefill"
+                and (choice["backend"] != "prefill" or query.accumulation == "fp32")
             ),
         ),
         autotune_effort=query.autotune_effort,
@@ -229,7 +256,7 @@ def _eligible(choice):
 
 TUNING = TuningContract(
     component_id="gemm.bf16_gemv",
-    query_schema_version=23,
+    query_schema_version=24,
     config_schema_version=23,
     query_fields=frozenset(field.name for field in fields(GemvQuery)),
     config_fields=frozenset(field.name for field in fields(GemvConfig)),
