@@ -49,7 +49,7 @@ from b12x.attention.dsa_indexer.tiled_topk import (
     _THREADS_PER_CTA as _RADIX_THREADS,
     _convert_to_uint8,
     _convert_to_uint32,
-    _exact_overflow_fallback,
+    _select_score_position_cutoff,
     _smem_ld,
     _smem_red_add,
     _smem_st,
@@ -411,6 +411,22 @@ def _page_id_or_invalid(
 
 
 @cute.jit
+def _output_position(
+    page_table, row, position, physical: cutlass.Constexpr[bool]
+) -> Int32:
+    result = Int32(position)
+    if cutlass.const_expr(physical):
+        if result >= Int32(0):
+            page = Int32(page_table[row, result // Int32(_PAGE_SIZE)])
+            result = (
+                page * Int32(_PAGE_SIZE) + result % Int32(_PAGE_SIZE)
+                if page >= Int32(0)
+                else Int32(-1)
+            )
+    return result
+
+
+@cute.jit
 def _k_stage_addr(stage: Int32, stage0: Int32, stage1: Int32, stage2: Int32) -> Int32:
     """Shared-memory base of K ring stage ``stage`` (0, 1, or 2)."""
     addr = stage0
@@ -540,6 +556,8 @@ def _coop_narrow_round(
     digit_shift: cutlass.Constexpr[int] = 0,
     read_total: cutlass.Constexpr[bool] = False,
     threads: cutlass.Constexpr[int] = 1024,
+    positions=None,
+    tied_score=Uint32(0),
 ) -> Int32:
     """One byte-wide cooperative radix round over the selected key byte.
 
@@ -551,7 +569,11 @@ def _coop_narrow_round(
     i = Int32(tx)
     while i < carry_count:
         key = _convert_to_uint32(Float32(s_c0_values[i]))
-        if (key & key_mask) == key_prefix:
+        eligible = cutlass.Boolean(True)
+        if cutlass.const_expr(positions is not None):
+            eligible = key == tied_score
+            key = ~Uint32(positions[i])
+        if eligible & ((key & key_mask) == key_prefix):
             _smem_red_add(
                 coarse_hist_addr,
                 Int32((key >> Uint32(digit_shift)) & Uint32(0xFF)),
@@ -2223,37 +2245,31 @@ def _fused_radix_select(
                             pos = _smem_xadd(ctr, Int32(0), Int32(1))
                             s_out[pos] = c_idx
                         else:
-                            if Int32(bin) == sub_threshold:
-                                if cutlass.const_expr(round_idx == 3):
-                                    old_rem = _smem_xadd(lr, Int32(0), Int32(-1))
-                                    if old_rem > Int32(0):
-                                        s_out[topk_static - old_rem] = c_idx
-                                else:
-                                    cand_pos = (
-                                        _smem_xadd(ni0, Int32(0), Int32(1))
-                                        if cutlass.const_expr(r_idx_next_is_0)
-                                        else _smem_xadd(ni1, Int32(0), Int32(1))
-                                    )
-                                    if cand_pos < Int32(cands):
-                                        if cutlass.const_expr(r_idx_next_is_0):
-                                            s_cand0[cand_pos] = c_idx
-                                        else:
-                                            s_cand1[cand_pos] = c_idx
-                                        sub_bin = (
-                                            key32 >> Uint32(24 - (round_idx + 1) * 8)
-                                        ) & Uint32(0xFF)
-                                        _smem_red_add(h0, Int32(sub_bin), Int32(1))
+                            if Int32(bin) == sub_threshold and cutlass.const_expr(
+                                round_idx < 3
+                            ):
+                                cand_pos = (
+                                    _smem_xadd(ni0, Int32(0), Int32(1))
+                                    if cutlass.const_expr(r_idx_next_is_0)
+                                    else _smem_xadd(ni1, Int32(0), Int32(1))
+                                )
+                                if cand_pos < Int32(cands):
+                                    if cutlass.const_expr(r_idx_next_is_0):
+                                        s_cand0[cand_pos] = c_idx
+                                    else:
+                                        s_cand1[cand_pos] = c_idx
+                                    sub_bin = (
+                                        key32 >> Uint32(24 - (round_idx + 1) * 8)
+                                    ) & Uint32(0xFF)
+                                    _smem_red_add(h0, Int32(sub_bin), Int32(1))
+
                         i += Int32(threads)
                     cute.arch.sync_threads()
 
-    # ---- exact overflow fallback ----
-    # The buffered coarse+refine above drops winners when more than `cands`
-    # candidates share the coarse threshold bucket (clustered scores; the
-    # cross-CTA merge can pack up to ctas_per_group*topk candidates). Redo the
-    # selection exactly by re-scanning vin -- see _exact_overflow_fallback. The
-    # single contiguous vin_v source uses the flat=True load path.
-    if bin_count > Int32(cands):
-        _exact_overflow_fallback(
+    # A partial full-score tie or a truncated candidate bucket needs the
+    # complete score/position key across the original candidates.
+    if (bin_count > Int32(cands)) | (topk > Int32(0)):
+        _select_score_position_cutoff(
             tx,
             n_total,
             topk_static,
@@ -2262,12 +2278,16 @@ def _fused_radix_select(
             s_out,
             h0,
             ctr,
-            thr,
-            ni0,
             ni1,
             lr,
             flat=True,
             flat_values=vin_v,
+            index_table=vin_g,
+            gather_table=vin_g,
+            gather_stride=Int32(0),
+            row=Int32(0),
+            index_offset=Int32(0),
+            gathered_ids=False,
             input_tensor=vin_v,
             carry_values=vin_v,
             row_base=Int32(0),
@@ -4591,10 +4611,7 @@ class DSAFusedIndexerKernel:
                                     + Int64(tip0 + col),
                                 )
                                 val = Float32(tsel * ld_global_nc_f32(scale_addr))
-                                if cutlass.const_expr(self.paged_output):
-                                    gidx = pid * Int32(_PAGE_SIZE) + tip0 + col
-                                else:
-                                    gidx = span_first + tok_rel
+                                gidx = span_first + tok_rel
                             s_c0_values[carry_count + tok_rel - round_base] = val
                             s_c0_gindex[carry_count + tok_rel - round_base] = gidx
                 carry_count = carry_count + round_valid
@@ -4825,8 +4842,6 @@ class DSAFusedIndexerKernel:
                         prev_pl2 = cur_pl2
                         cur_pl2 = cur_pl2 ^ Int32(1)
                         prev_out_base = abs_start + page_base
-                        if cutlass.const_expr(self.paged_output):
-                            prev_out_base = page_id * Int32(_PAGE_SIZE)
                     else:
                         split_idx = Int32(0)
                         while split_idx < Int32(self.page_splits):
@@ -4881,13 +4896,6 @@ class DSAFusedIndexerKernel:
                                             )
                                         )
                                         output_idx = abs_start + page_base + slot_idx
-                                        if cutlass.const_expr(
-                                            self.kv_layout == KV_LAYOUT_PAGED
-                                            and self.paged_output
-                                        ):
-                                            output_idx = (
-                                                page_id * Int32(_PAGE_SIZE) + slot_idx
-                                            )
                                         s_c0_gindex[carry_count + slot_idx] = output_idx
                             # page_splits==1 (always for 1/2/4 head tiles): no post-reduce
                             # barrier — the next page's load barrier (or the trim's leading
@@ -5045,7 +5053,14 @@ class DSAFusedIndexerKernel:
                         else Float32(float("-inf"))
                     )
                     out_indices[group_id, single_out] = (
-                        Int32(s_c0_gindex[single_out]) if single_valid else Int32(-1)
+                        _output_position(
+                            real_page_table,
+                            q_idx,
+                            s_c0_gindex[single_out],
+                            self.paged_output,
+                        )
+                        if single_valid
+                        else Int32(-1)
                     )
                     single_out += Int32(self.radix_threads)
                 _exit_thread()
@@ -5077,7 +5092,11 @@ class DSAFusedIndexerKernel:
                         Float32(s_c0_values[i]) if is_valid else Float32(float("-inf"))
                     )
                     out_indices[group_id, i] = (
-                        Int32(s_c0_gindex[i]) if is_valid else Int32(-1)
+                        _output_position(
+                            real_page_table, q_idx, s_c0_gindex[i], self.paged_output
+                        )
+                        if is_valid
+                        else Int32(-1)
                     )
                     i += Int32(self.radix_threads)
         else:
@@ -5275,7 +5294,9 @@ class DSAFusedIndexerKernel:
                     i = Int32(tx)
                     while i < carry_count:
                         out_values[group_id, base + i] = Float32(s_c0_values[i])
-                        out_indices[group_id, base + i] = Int32(s_c0_gindex[i])
+                        out_indices[group_id, base + i] = _output_position(
+                            real_page_table, q_idx, s_c0_gindex[i], self.paged_output
+                        )
                         i += Int32(self.radix_threads)
                     if cta_in_group == Int32(0):
                         i = total + Int32(tx)
@@ -5385,9 +5406,59 @@ class DSAFusedIndexerKernel:
                         mask = Uint32(0xFFFFFFFF)
                         winners = winners + count_gt
                         remaining_k = remaining_k - count_gt
-                    # Count this CTA's winners and pivot ties, then reserve
-                    # their group slots: winners fill [0, winners), ties fill
-                    # [winners, topk) in arrival order.
+                    position_prefix = Uint32(0)
+                    position_mask = Uint32(0)
+                    if cutlass.const_expr(not self.mxfp4):
+                        if bin_count > remaining_k:
+                            # Four disjoint 256-bin histograms fit in the first
+                            # fine-score histogram after every CTA reads its pivot.
+                            barrier_phase = _fused_group_barrier(
+                                merge_state, group_id, barrier_phase, ctas_pg, tx
+                            )
+                            if cta_in_group == Int32(0):
+                                merge_state[
+                                    _fused_state_offset(
+                                        group_id, Int32(_FUSED_FINE0) + tx
+                                    )
+                                ] = Int32(0)
+                            barrier_phase = _fused_group_barrier(
+                                merge_state, group_id, barrier_phase, ctas_pg, tx
+                            )
+                            position_remaining = remaining_k
+                            for digit in cutlass.range_constexpr(4):
+                                barrier_phase = _coop_narrow_round(
+                                    merge_state,
+                                    group_id,
+                                    _FUSED_FINE0 + 256 * digit,
+                                    s_c0_values,
+                                    carry_count,
+                                    position_mask,
+                                    position_prefix,
+                                    coop_hist_addr,
+                                    s_hist0,
+                                    position_remaining,
+                                    barrier_phase,
+                                    ctas_pg,
+                                    tx,
+                                    lane,
+                                    warp_idx,
+                                    s_coop_scalars,
+                                    24 - 8 * digit,
+                                    threads=self.radix_threads,
+                                    positions=s_c0_gindex,
+                                    tied_score=prefix,
+                                )
+                                position_prefix = position_prefix | (
+                                    Uint32(s_coop_scalars[0]) << Uint32(24 - 8 * digit)
+                                )
+                                position_mask = position_mask | (
+                                    Uint32(255) << Uint32(24 - 8 * digit)
+                                )
+                                position_remaining = position_remaining - Int32(
+                                    s_coop_scalars[1]
+                                )
+                    # All admitted ties fit in the remaining slots. Atomics order
+                    # their output enumeration only.
                     if tx == Int32(0):
                         s_coop_counters[0] = Int32(0)
                         s_coop_counters[1] = Int32(0)
@@ -5398,7 +5469,10 @@ class DSAFusedIndexerKernel:
                         if key > prefix:
                             _smem_xadd(coop_ctr_addr, Int32(0), Int32(1))
                         else:
-                            if key == prefix:
+                            if (key == prefix) & (
+                                (~Uint32(s_c0_gindex[i]) & position_mask)
+                                >= position_prefix
+                            ):
                                 _smem_xadd(coop_ctr_addr, Int32(1), Int32(1))
                         i += Int32(self.radix_threads)
                     cute.arch.sync_threads()
@@ -5432,15 +5506,28 @@ class DSAFusedIndexerKernel:
                                 coop_ctr_addr, Int32(0), Int32(1)
                             )
                             out_values[group_id, pos] = Float32(s_c0_values[i])
-                            out_indices[group_id, pos] = Int32(s_c0_gindex[i])
+                            out_indices[group_id, pos] = _output_position(
+                                real_page_table,
+                                q_idx,
+                                s_c0_gindex[i],
+                                self.paged_output,
+                            )
                         else:
-                            if key == prefix:
+                            if (key == prefix) & (
+                                (~Uint32(s_c0_gindex[i]) & position_mask)
+                                >= position_prefix
+                            ):
                                 pos = eq_base + _smem_xadd(
                                     coop_ctr_addr, Int32(1), Int32(1)
                                 )
                                 if pos < topk_static:
                                     out_values[group_id, pos] = Float32(s_c0_values[i])
-                                    out_indices[group_id, pos] = Int32(s_c0_gindex[i])
+                                    out_indices[group_id, pos] = _output_position(
+                                        real_page_table,
+                                        q_idx,
+                                        s_c0_gindex[i],
+                                        self.paged_output,
+                                    )
                         i += Int32(self.radix_threads)
                 # Departure: once its output is placed, every CTA publishes
                 # that it is done with the group state, and the last one
@@ -5553,14 +5640,24 @@ class DSAFusedIndexerKernel:
                         i = Int32(tx)
                         while i < topk_static:
                             out_values[group_id, i] = Float32(s_c1_values[i])
-                            out_indices[group_id, i] = Int32(s_c1_gindex[i])
+                            out_indices[group_id, i] = _output_position(
+                                real_page_table,
+                                q_idx,
+                                s_c1_gindex[i],
+                                self.paged_output,
+                            )
                             i += Int32(self.radix_threads)
                     else:
                         i = Int32(tx)
                         while i < topk_static:
                             if i < total:
                                 out_values[group_id, i] = Float32(pack_v_row[i])
-                                out_indices[group_id, i] = Int32(pack_i_row[i])
+                                out_indices[group_id, i] = _output_position(
+                                    real_page_table,
+                                    q_idx,
+                                    pack_i_row[i],
+                                    self.paged_output,
+                                )
                             else:
                                 out_values[group_id, i] = Float32(float("-inf"))
                                 out_indices[group_id, i] = Int32(-1)
@@ -5665,14 +5762,14 @@ def _launch_fused(kernel, cute_args, key_tensors, policy, *, launcher=None):
         # so this keeps its historical key. The suffix keeps the key honest (no trace
         # collision) if a <16-SM device ever oversubscribes a direct-K build.
         variant = (
-            "fused_indexer_v12_live_ctas_directk64"
+            "fused_indexer_v13_logical_cutoff_directk64"
             if kernel.coop_co_resident
-            else "fused_indexer_v12_live_ctas_directk64_oversub_serial"
+            else "fused_indexer_v13_logical_cutoff_directk64_oversub_serial"
         )
     elif kernel.coop_co_resident:
-        variant = "fused_indexer_v12_live_ctas_coop"
+        variant = "fused_indexer_v13_logical_cutoff_coop"
     else:
-        variant = "fused_indexer_v12_live_ctas_oversub_serial"
+        variant = "fused_indexer_v13_logical_cutoff_oversub_serial"
     cache_key = tuple(_fused_indexer_tensor_key(name, t) for name, t in key_tensors) + (
         (variant,) + tuple(policy),
     )
