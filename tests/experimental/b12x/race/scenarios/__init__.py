@@ -13,11 +13,11 @@ curated cases) and ``FUZZ`` (name -> function drawing a random case from a
 ``random.Random``), and may define ``MUTATIONS`` (fixed races that
 ``mutations.py`` puts back to prove a scenario catches them; see there).
 Family modules must not import b12x at module level, because mutations are
-applied before b12x is first imported. Outputs must be bit-exact functions of the inputs: sort
-or otherwise canonicalize results whose order depends on atomics, and pick
-deterministic options where a kernel offers them; ``ReplayCheck`` rejects a
-scenario whose quiet replays disagree. Size grids from the SM count (see
-``_rows_for_waves``), since races between CTAs need several waves.
+applied before b12x is first imported. Use serving configurations: floating
+outputs may vary with arithmetic order (``ReplayCheck`` calibrates that), but
+integer outputs are compared exactly, so canonicalize any whose order depends
+on atomics (or expose the values they select instead). Size grids from the SM
+count (see ``_rows_for_waves``), since races between CTAs need several waves.
 """
 
 from __future__ import annotations
