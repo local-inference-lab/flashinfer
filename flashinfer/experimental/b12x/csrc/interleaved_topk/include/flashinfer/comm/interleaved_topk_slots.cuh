@@ -1,0 +1,229 @@
+// SPDX-License-Identifier: Apache-2.0
+#pragma once
+
+// Select the attention records consumed by one interleaved DCP shard (World = 4, 8, or 16; 1..32 rows).
+// Input is the captured rank-major candidate contract: each rank contributes
+// up to 2048 (FP32 score bits, shard-local token index) pairs. Padding may
+// appear anywhere. A valid token's ordinal in the candidate row breaks ties.
+#include <cuda_runtime.h>
+
+#include <cstdint>
+#include <cub/block/block_scan.cuh>
+
+#include "interleaved_topk_cutoff.cuh"
+
+namespace flashinfer::interleaved_topk {
+constexpr int k = 2048, threads = 256, max_rows = 32;
+constexpr unsigned pad = 0x007fffffu;  // ordered(-infinity)
+
+template <int World>
+struct Peers {
+  unsigned char* stage[World];
+  unsigned* flags[World];
+};
+
+__device__ __forceinline__ unsigned key(unsigned raw) {
+  return (raw & 0x80000000u) ? ~raw : (raw ^ 0x80000000u);
+}
+__device__ __forceinline__ unsigned load_gpu(unsigned* p) {
+  unsigned v;
+  asm volatile("ld.relaxed.gpu.global.u32 %0,[%1];" : "=r"(v) : "l"(p) : "memory");
+  return v;
+}
+__device__ __forceinline__ void publish(unsigned long long* p, unsigned long long value) {
+  asm volatile("st.release.sys.global.u64 [%0],%1;" ::"l"(p), "l"(value) : "memory");
+}
+__device__ __forceinline__ unsigned long long receive(unsigned long long* p, unsigned gen) {
+  unsigned long long v;
+  do {
+    asm volatile("ld.acquire.sys.global.u64 %0,[%1];" : "=l"(v) : "l"(p) : "memory");
+  } while (unsigned(v >> 32) != gen);
+  return v;
+}
+__device__ __forceinline__ unsigned long long* mailbox(unsigned* base, int bank, int row,
+                                                       int sender) {
+  // The common DCP signal layout uses word zero in each 32-word record.
+  // The graph epoch and block arrival counter use words 1 and 2 of record 0.
+  return reinterpret_cast<unsigned long long*>(base + 1024 +
+                                               ((bank * 64 + row) * 16 + sender) * 32 + 8);
+}
+__device__ __forceinline__ uint2 local_pair(const int* ids, const unsigned* scores, int j) {
+  const int i = ids[j];
+  return i < 0 ? make_uint2(0xff800000u, 0xffffffffu) : make_uint2(scores[j], unsigned(i));
+}
+
+template <int World>
+__global__ void local_candidate_slots(const int* local_ids, const unsigned* local_scores,
+                                      const long long* positions, const int* tables, int* owners,
+                                      int* slots, int* counts, Peers<World> peers, long long stride,
+                                      int rank, long long table_stride, long long table_columns,
+                                      int cache_pages) {
+  using Scan = cub::BlockScan<int, threads>;
+  __shared__ typename Scan::TempStorage scan;
+  __shared__ unsigned gen, graph_epoch;
+  __shared__ int above, below, local_ties, remaining, preceding, nout, staging, extent;
+  __shared__ unsigned cutoff, peer_counts[World];
+  __shared__ sampled::Storage<World> boundary;
+  sampled::Key threshold = 0;
+  int tid = threadIdx.x, row = blockIdx.x;
+  const long long position = positions[row];
+  // Each peer supplies at most k entries, including for an int64 absolute position.
+  const long long total = max(0ll, min(position, static_cast<long long>(World * k)) + 1);
+  const bool short_row = total <= k;
+  unsigned* header = peers.flags[rank];
+  if (tid == 0) {
+    graph_epoch = load_gpu(header + 1025);
+    above = below = local_ties = nout = preceding = extent = 0;
+    // Short invocations never borrow a payload bank. Leave its parity
+    // unchanged so two regular bank users always have an intervening
+    // all-rank arrival before either can overwrite an earlier payload.
+    staging = 0;
+    for (unsigned r = 0; r < gridDim.x; ++r) staging |= positions[r] >= k;
+    // Per-row sequence counters occupy words 4 (short) and 5 (staging) of each row's
+    // (bank=0, row, sender=0) 32-word record, disjoint for all 0 <= row < 64.
+    auto& sequence = header[1024 + (row * 16) * 32 + 4 + (staging ? 1 : 0)];
+    gen = sequence == 0xffffff80u ? 1u : sequence + 1u;
+    sequence = gen;
+    cutoff = 0;
+    remaining = k;
+  }
+  __syncthreads();
+  const long long bank_offset = (graph_epoch & 1u) * stride;
+  sampled::Key* local_stage =
+      reinterpret_cast<sampled::Key*>(peers.stage[rank] + bank_offset) + row * sampled::stage_items;
+  int hi = 0, lo = 0, special = 0, last = 0;
+  if (short_row) {
+    for (int j = tid; position >= 0 && j < k; j += threads) {
+      if (local_ids[row * k + j] >= 0) {
+        const unsigned v = key(local_scores[row * k + j]);
+        hi += (v > pad);
+        lo += (v < pad);
+        special += (v == pad);
+        last = j + 1;
+      }
+    }
+  } else {
+    sampled::Key vals[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      int j = tid * 8 + i;
+      const int id = local_ids[row * k + j];
+      if (id >= 0) last = j + 1;
+      const unsigned v = id < 0 ? pad : key(local_scores[row * k + j]);
+      vals[i] = sampled::tie_key(v, rank, j);
+    }
+    sampled::publish_sorted<World>(boundary, local_stage, vals);
+  }
+  if (hi) atomicAdd(&above, hi);
+  if (lo) atomicAdd(&below, lo);
+  if (special) atomicAdd(&local_ties, special);
+  // The indexer can leave padding among valid entries. Token counts bound
+  // their cardinality, while the last nonnegative ID bounds this scan.
+  if (last) atomicMax(&extent, last);
+  __syncthreads();
+  const unsigned summary = unsigned(above) | (unsigned(below) << 16);
+  if (!staging) {
+    // Keep 64 generations x 32 rows of local metadata in words 20..21 across all 2048 records.
+    const unsigned seq = gen - 1;
+    if (!(seq & 63u) && tid < World) {
+      int bank = (seq >> 6) & 1u;
+      auto wrap = [&](unsigned* base, int sender) {
+        return reinterpret_cast<unsigned long long*>(base + 1024 +
+                                                     ((bank * 64 + row) * 16 + sender) * 32 + 16);
+      };
+      publish(wrap(peers.flags[tid], rank), static_cast<unsigned long long>(gen) << 32);
+      receive(wrap(header, tid), gen);
+    }
+    __syncthreads();
+    const int index = 1024 + ((seq & 63u) * 32 + row) * 32 + 20;
+    if (!tid)
+      publish(reinterpret_cast<unsigned long long*>(header + index),
+              (static_cast<unsigned long long>(gen) << 32) | summary);
+    __syncthreads();
+    if (local_ties && tid < World)
+      peer_counts[tid] =
+          unsigned(receive(reinterpret_cast<unsigned long long*>(peers.flags[tid] + index), gen));
+  } else if (tid < World) {
+    publish(mailbox(peers.flags[tid], gen & 1, row, rank),
+            (static_cast<unsigned long long>(gen) << 32) | summary);
+    peer_counts[tid] = unsigned(receive(mailbox(header, gen & 1, row, tid), gen));
+  }
+  __syncthreads();
+  if (short_row) {
+    // With at most k valid candidates, every key above padding survives.
+    // The unused slots go to the first padding-key entries in input order,
+    // including invalid entries, exactly as in the full-width stable fold.
+    if (tid == 0) {
+      cutoff = pad;
+      preceding = rank * k;
+      if (!staging && !local_ties)
+        remaining = 0;
+      else
+        for (int p = 0; p < World; ++p) {
+          int greater = int(peer_counts[p] & 65535u), lower = int(peer_counts[p] >> 16);
+          remaining -= greater;
+          if (p < rank) preceding -= greater + lower;
+        }
+    }
+  } else {
+    threshold = sampled::select<World>(boundary, peers, bank_offset, row);
+  }
+  __syncthreads();
+  // Keep the original local indexer's order, including its cutoff ties.
+  // Page filtering follows score selection, so an invalid page still
+  // occupies its score rank in the cutoff calculation.
+  const int local_count = extent;
+  const bool need_ties = short_row && (local_ties > 0);
+  const int local_remaining = remaining;
+  int local_preceding = preceding;
+  int local_nout = 0;
+  for (int j0 = 0; j0 < local_count; j0 += threads) {
+    int j = j0 + tid;
+    uint2 pair = j < local_count ? local_pair(local_ids, local_scores, row * k + j)
+                                 : make_uint2(0xff800000u, 0xffffffffu);
+    unsigned v = int(pair.y) < 0 ? pad : key(pair.x);
+    bool chosen;
+    if (short_row) {
+      int ties_before = 0, ties = 0;
+      if (need_ties) {
+        Scan(scan).ExclusiveSum(int(j < local_count && v == cutoff), ties_before, ties);
+        __syncthreads();
+      }
+      chosen = (v > cutoff || (v == cutoff && local_preceding + ties_before < local_remaining));
+      local_preceding += ties;
+    } else {
+      chosen = sampled::tie_key(v, rank, j) >= threshold;
+    }
+    const int local = int(pair.y);
+    const long long token = static_cast<long long>(local) * World + rank;
+    int mapped = -1;
+    if (j < local_count && chosen && local >= 0 && token <= position) {
+      const int col = local / 128;
+      if (col < table_columns) {
+        int page = tables[row * table_stride + col];
+        if (page >= 0 && page < cache_pages) mapped = page * 128 + local % 128;
+      }
+    }
+    int prior, count;
+    Scan(scan).ExclusiveSum(int(mapped >= 0), prior, count);
+    __syncthreads();
+    if (mapped >= 0) {
+      slots[row * k + local_nout + prior] = mapped;
+      owners[row * k + local_nout + prior] = rank;
+    }
+    local_nout += count;
+  }
+  for (int j = local_nout + tid; j < k; j += threads) {
+    owners[row * k + j] = -1;
+    slots[row * k + j] = -1;
+  }
+  if (tid == 0) {
+    counts[row] = local_nout;
+    if (staging && atomicAdd(header + 1026, 1u) + 1 == gridDim.x) {
+      atomicExch(header + 1026, 0u);
+      atomicAdd(header + 1025, 1u);
+    }
+  }
+}
+
+}  // namespace flashinfer::interleaved_topk
