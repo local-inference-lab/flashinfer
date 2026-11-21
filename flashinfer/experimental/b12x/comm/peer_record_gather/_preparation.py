@@ -91,6 +91,9 @@ class _State:
     query: PeerRecordGatherQuery
     device: torch.device
     launcher: object
+    word_mode: int = 0
+    grid: int = 0
+    tile: int = 8
 
     def run(self, peer_bases, owners, slots, counts, out):
         import triton
@@ -98,28 +101,109 @@ class _State:
         _validate(self.query, self.device, peer_bases, owners, slots, counts, out)
         q = self.query
         with torch.cuda.device(self.device):
-            self.launcher[(q.rows * q.topk, 1, 1)](
-                peer_bases.view(torch.int64),
-                owners,
-                slots,
-                counts,
-                out.view(torch.uint8),
-                q.topk,
-                q.world_size,
-                q.peer_records,
-                q.record_bytes,
-                triton.next_power_of_2(q.record_bytes),
-            )
+            if self.word_mode == 1:
+                words = q.record_bytes // 4
+                self.launcher[(self.grid, 1, 1)](
+                    peer_bases.view(torch.int64),
+                    owners,
+                    slots,
+                    counts,
+                    out.view(torch.int32),
+                    q.rows * q.topk,
+                    q.topk,
+                    q.world_size,
+                    q.peer_records,
+                    words,
+                    self.tile,
+                    triton.next_power_of_2(words),
+                )
+            elif self.word_mode == 2:
+                words = q.record_bytes // 4
+                splits = triton.cdiv(words, self.tile)
+                self.launcher[(q.rows * q.topk, splits, 1)](
+                    peer_bases.view(torch.int64),
+                    owners,
+                    slots,
+                    counts,
+                    out.view(torch.int32),
+                    q.topk,
+                    q.world_size,
+                    q.peer_records,
+                    words,
+                    self.tile,
+                )
+            else:
+                self.launcher[(q.rows * q.topk, 1, 1)](
+                    peer_bases.view(torch.int64),
+                    owners,
+                    slots,
+                    counts,
+                    out.view(torch.uint8),
+                    q.topk,
+                    q.world_size,
+                    q.peer_records,
+                    q.record_bytes,
+                    triton.next_power_of_2(q.record_bytes),
+                )
         return out
 
 
 @program_cache(scope="preparation")
 def compile_gather(payload, ordinal):
     import triton
-    from ._kernel import _gather_records
+    from ._kernel import (
+        _gather_records,
+        _gather_records_words,
+        _gather_records_words_chunked,
+    )
 
     q = PeerRecordGatherQuery(**dict(payload))
     with torch.cuda.device(ordinal):
+        device = torch.device("cuda", ordinal)
+        if q.record_bytes % 4 == 0 and q.record_bytes <= 4096:
+            words = q.record_bytes // 4
+            tile = 8
+            total = q.rows * q.topk
+            waves = torch.cuda.get_device_properties(device).multi_processor_count
+            grid = min(triton.cdiv(total, tile), 4 * waves)
+            launcher = _gather_records_words.warmup(
+                torch.int64,
+                torch.int32,
+                torch.int32,
+                torch.int32,
+                torch.int32,
+                total,
+                q.topk,
+                q.world_size,
+                q.peer_records,
+                words,
+                tile,
+                triton.next_power_of_2(words),
+                grid=(grid,),
+                num_warps=4,
+            )
+            return attach_programs(_State(q, device, launcher, 1, grid, tile), launcher)
+        if q.record_bytes % 4 == 0:
+            words = q.record_bytes // 4
+            chunk = 4096
+            splits = triton.cdiv(words, chunk)
+            launcher = _gather_records_words_chunked.warmup(
+                torch.int64,
+                torch.int32,
+                torch.int32,
+                torch.int32,
+                torch.int32,
+                q.topk,
+                q.world_size,
+                q.peer_records,
+                words,
+                chunk,
+                grid=(q.rows * q.topk, splits, 1),
+                num_warps=8,
+            )
+            return attach_programs(
+                _State(q, device, launcher, 2, q.rows * q.topk, chunk), launcher
+            )
         launcher = _gather_records.warmup(
             torch.int64,
             torch.int32,
@@ -134,7 +218,7 @@ def compile_gather(payload, ordinal):
             grid=(q.rows * q.topk,),
             num_warps=4,
         )
-    return attach_programs(_State(q, torch.device("cuda", ordinal), launcher), launcher)
+    return attach_programs(_State(q, device, launcher), launcher)
 
 
 def plan(
