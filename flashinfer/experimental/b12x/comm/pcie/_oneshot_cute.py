@@ -1784,10 +1784,17 @@ class _FusedOneshotLaunch(_PackedMath):
             owner = index // packs_per_owner
             for lane in cutlass.range_constexpr(self._pack_elems):
                 accumulator[lane] = Float32(0.0)
+            # Independent peer reads can be outstanding together. Accumulate their
+            # results in shard-owner order to retain the two-shot BF16 rounding.
+            offset = index * Int64(16)
+            peer_words = []
             for step in cutlass.range_constexpr(self._world_size):
                 peer = (owner + Int64(step)) % Int64(self._world_size)
-                self._load_accumulate(
-                    accumulator, Int64(peer_ptrs[peer]) + index * Int64(16), False
+                peer_words.append(ld_global_v4_u32(Int64(peer_ptrs[peer]) + offset))
+            for step in cutlass.range_constexpr(self._world_size):
+                words = peer_words[step]
+                self._accumulate_words(
+                    accumulator, words[0], words[1], words[2], words[3], False
                 )
         else:
             for peer_index in cutlass.range_constexpr(self._world_size):
@@ -2671,7 +2678,7 @@ def get_fused_oneshot_launcher(
         _dummy(cutlass.Uint32, 4),
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
-            "comm.pcie.oneshot_fused_rmsnorm", 10, cache_key
+            "comm.pcie.oneshot_fused_rmsnorm", 11, cache_key
         ),
     )
 
