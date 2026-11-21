@@ -746,7 +746,10 @@ def oneshot_alternatives(query, runtime):
     field = "transport" if query.surface.endswith(".all_reduce") else "mode"
     selected = query.call[field]
     alternatives[selected] = (query, runtime)
-    if not query.call["stage_input"]:
+    if (
+        not query.call["stage_input"]
+        or query.call.get("reduction_order") == "shard_owner"
+    ):
         return alternatives
     modes = ["pull"] if field == "transport" else ["stage_pull"]
     if field == "transport":

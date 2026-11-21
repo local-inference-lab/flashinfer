@@ -1089,6 +1089,9 @@ class _FusedOneshotLaunch(_PackedMath):
         group_id_limit: int = 0,
         group_ids_dtype: str = "int32",
         normalize: bool = True,
+        round_before_weight: bool = False,
+        reduction_order: str = "local",
+        trigger_dependents: bool = False,
     ) -> None:
         super().__init__(dtype_name)
         self._residual_dtype = residual_dtype or dtype_name
@@ -1107,6 +1110,15 @@ class _FusedOneshotLaunch(_PackedMath):
         self._group_ids_dtype = group_ids_dtype
         self._input_addend = bool(input_addend)
         self._apply_norm = bool(normalize)
+        self._round_before_weight = round_before_weight
+        self._shard_order = reduction_order == "shard_owner"
+        self._trigger_dependents = trigger_dependents
+        if reduction_order not in ("local", "shard_owner") or (
+            self._shard_order and mode not in ("registered", "stage_pull")
+        ):
+            raise ValueError(
+                "shard-owner summation requires readable contributions from every rank"
+            )
         if (self._input_addend or self._group_size) and mode == "registered":
             raise ValueError("input addend requires staged collective storage")
         if mode not in (
@@ -1221,6 +1233,15 @@ class _FusedOneshotLaunch(_PackedMath):
 
     @cute.jit
     def _normalize(self, value: Float32, scale: Float32, inv_rms: Float32) -> Float32:
+        if cutlass.const_expr(self._round_before_weight):
+            normalized = value * inv_rms
+            if cutlass.const_expr(self._residual_dtype == "bfloat16"):
+                normalized = normalized.to(cutlass.BFloat16).to(Float32)
+            elif cutlass.const_expr(self._residual_dtype == "float16"):
+                normalized = normalized.to(cutlass.Float16).to(Float32)
+            if cutlass.const_expr(self._zero_centered):
+                return normalized * (Float32(1.0) + scale)
+            return normalized * scale
         if cutlass.const_expr(self._zero_centered):
             return (value * inv_rms) * (Float32(1.0) + scale)
         return value * (inv_rms * scale)
@@ -1754,6 +1775,20 @@ class _FusedOneshotLaunch(_PackedMath):
                         not initialized,
                     )
                     initialized = True
+        elif cutlass.const_expr(self._shard_order):
+            # A two-shot reduce-scatter starts with each element's shard owner,
+            # then visits the other ranks in cyclic order before rounding to BF16.
+            packs_per_owner = (total_packs + Int64(self._world_size - 1)) // Int64(
+                self._world_size
+            )
+            owner = index // packs_per_owner
+            for lane in cutlass.range_constexpr(self._pack_elems):
+                accumulator[lane] = Float32(0.0)
+            for step in cutlass.range_constexpr(self._world_size):
+                peer = (owner + Int64(step)) % Int64(self._world_size)
+                self._load_accumulate(
+                    accumulator, Int64(peer_ptrs[peer]) + index * Int64(16), False
+                )
         else:
             for peer_index in cutlass.range_constexpr(self._world_size):
                 peer_rank = (self._rank + peer_index) % self._world_size
@@ -1817,6 +1852,8 @@ class _FusedOneshotLaunch(_PackedMath):
         group_weights_ptr: cute.Pointer,
         group_ids_ptr: cute.Pointer,
     ) -> None:
+        if cutlass.const_expr(self._trigger_dependents):
+            cute.arch.griddepcontrol_launch_dependents()
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
         gdim, _, _ = cute.arch.grid_dim()
@@ -2421,6 +2458,9 @@ def _fused_oneshot_process_key(
     group_id_limit: int = 0,
     group_ids_dtype: str = "int32",
     normalize: bool = True,
+    round_before_weight: bool = False,
+    reduction_order: str = "local",
+    trigger_dependents: bool = False,
 ) -> tuple[object, ...]:
     return (
         str(dtype_name),
@@ -2443,6 +2483,9 @@ def _fused_oneshot_process_key(
         int(group_id_limit),
         group_ids_dtype,
         bool(normalize),
+        round_before_weight,
+        reduction_order,
+        trigger_dependents,
     )
 
 
@@ -2467,6 +2510,9 @@ def is_fused_oneshot_launcher_prepared(
     group_id_limit: int = 0,
     group_ids_dtype: str = "int32",
     normalize: bool = True,
+    round_before_weight: bool = False,
+    reduction_order: str = "local",
+    trigger_dependents: bool = False,
 ) -> bool:
     """Return whether this exact fused graph launcher is already loaded."""
 
@@ -2492,6 +2538,9 @@ def is_fused_oneshot_launcher_prepared(
             group_id_limit,
             group_ids_dtype,
             bool(normalize),
+            round_before_weight,
+            reduction_order,
+            trigger_dependents,
         )
         in _PREPARED_FUSED_ONESHOT_LAUNCHERS
     )
@@ -2519,6 +2568,9 @@ def get_fused_oneshot_launcher(
     group_id_limit: int = 0,
     group_ids_dtype: str = "int32",
     normalize: bool = True,
+    round_before_weight: bool = False,
+    reduction_order: str = "local",
+    trigger_dependents: bool = False,
 ) -> Callable[..., None]:
     process_key = _fused_oneshot_process_key(
         dtype_name,
@@ -2541,6 +2593,9 @@ def get_fused_oneshot_launcher(
         int(group_id_limit),
         group_ids_dtype,
         bool(normalize),
+        round_before_weight,
+        reduction_order,
+        trigger_dependents,
     )
     del device_index
     slot_bias = int(slot_bias) & 1 if device_slot_selection else 0
@@ -2564,6 +2619,9 @@ def get_fused_oneshot_launcher(
         int(group_id_limit),
         group_ids_dtype,
         bool(normalize),
+        round_before_weight,
+        reduction_order,
+        trigger_dependents,
     )
     cache_key = (
         dtype_name,
@@ -2585,6 +2643,9 @@ def get_fused_oneshot_launcher(
         int(group_id_limit),
         group_ids_dtype,
         bool(normalize),
+        round_before_weight,
+        reduction_order,
+        trigger_dependents,
     )
     raise_if_kernel_resolution_frozen(
         "cute.compile", target=launch, cache_key=cache_key

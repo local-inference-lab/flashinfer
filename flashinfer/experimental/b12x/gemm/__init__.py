@@ -27,6 +27,7 @@ _OP_MODULES = (
     "mla_query_projection",
     "trellis_linear",
     "wo_projection",
+    "weight_first_projection",
 )
 _FUNCTIONS = {
     "mm": ("._preparation", "mm"),
