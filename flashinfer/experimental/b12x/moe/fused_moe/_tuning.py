@@ -120,6 +120,7 @@ class MoeDecodeConfig:
     compact_fuse_input_quantization: bool = False
     micro_fc1_pipeline_stages: int = 2
     w4a16_direct_schedule: str = "fused"
+    w4a16_packed_schedule: str = "fused"
 
     @classmethod
     def from_config(cls, payload: FrozenMapping) -> "MoeDecodeConfig":
@@ -145,7 +146,7 @@ class MoeDecodeConfig:
             "w4a16_fc1_pipeline_stages",
             "w4a16_direct_schedule",
         }
-        if set(payload) != expected:
+        if set(payload) - {"w4a16_packed_schedule"} != expected:
             raise ValueError(
                 "MoE decode config fields must be exactly "
                 f"{sorted(expected)}; got {sorted(payload)}"
@@ -235,6 +236,7 @@ class MoeDecodeConfig:
             w4a16_pipeline_stages=payload["w4a16_pipeline_stages"],
             w4a16_fc1_pipeline_stages=payload["w4a16_fc1_pipeline_stages"],
             w4a16_direct_schedule=payload["w4a16_direct_schedule"],
+            w4a16_packed_schedule=payload.get("w4a16_packed_schedule", "fused"),
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -259,6 +261,7 @@ class MoeDecodeConfig:
             "w4a16_pipeline_stages": self.w4a16_pipeline_stages,
             "w4a16_fc1_pipeline_stages": self.w4a16_fc1_pipeline_stages,
             "w4a16_direct_schedule": self.w4a16_direct_schedule,
+            "w4a16_packed_schedule": self.w4a16_packed_schedule,
         }
 
 
@@ -266,6 +269,17 @@ class MoeDecodeConfig:
 # counts must match; their tile shapes may differ. These are existing kernel
 # geometries, independent of the codec's packed storage and live token count.
 _W4A16_MOE_TILES = ((128, 64), (64, 128), (128, 128), (64, 256))
+
+
+def _split_packed_projections_supported(query):
+    return (
+        query.w4a16_weight_layout == "packed"
+        and query.w4a16_scale_format == "e8m0_k32"
+        and query.io_dtype == "bfloat16"
+        and query.activation in {"silu", "situ", "swigluoai_uninterleave"}
+        and not query.collect_activation_amax
+        and not query.controls.get("w4a16_prefill_fused_sum", False)
+    )
 
 
 def _validate_w4a16_launch(query, config):
@@ -634,6 +648,17 @@ def validate_moe_decode_config(
         )
     if config.backend not in {"micro", "dynamic", "w4a16"}:
         raise ValueError(f"unsupported MoE backend {config.backend!r}")
+    if config.w4a16_packed_schedule not in {"fused", "split"}:
+        raise ValueError("W4A16 packed schedule must be 'fused' or 'split'")
+    if config.w4a16_packed_schedule == "split" and not (
+        config.backend == "w4a16"
+        and config.w4a16_route_mode == "packed"
+        and not config.csf_inline_scales
+        and _split_packed_projections_supported(query)
+    ):
+        raise ValueError(
+            "split packed projections require BF16 gated MXFP4 with separate route reduction"
+        )
     if config.w4a16_direct_schedule not in {"fused", "split"}:
         raise ValueError("W4A16 direct schedule must be 'fused' or 'split'")
     if config.w4a16_direct_schedule == "split" and not (
@@ -1049,6 +1074,8 @@ def _tuning_parameters(query, device):
         and w4a16_values
     ):
         w4a16_values["w4a16_fc1_pipeline_stages"] = (None, 2, 3, 4, 5)
+    if _split_packed_projections_supported(query):
+        w4a16_values["w4a16_packed_schedule"] = ("fused", "split")
     # Compact W4A8 backend, tile, and inline-scale choices are measured, not
     # pruned. The per-row micro kernel, the M16 dynamic kernel, and inline
     # scales each win in a band that depends on the device and routing density;
@@ -1075,6 +1102,35 @@ def _tuning_parameters(query, device):
             return True
         return launch_query.num_tokens * micro_z_factor <= 65535
 
+    def compact_packed_search(choice):
+        if (
+            not _split_packed_projections_supported(query)
+            or choice["w4a16_route_mode"] != "packed"
+        ):
+            return True
+        # In small top-k calls each token contributes at most one route to
+        # each selected expert. Wider padded blocks can still be audited.
+        block = choice["w4a16_block_size_m"]
+        if query.num_tokens <= 16 and block is not None and block > 16:
+            return False
+        # Vary the shared pipeline depth and the FC1-only override on separate
+        # axes. Audit effort retains their full Cartesian product.
+        from b12x.moe._shared.kernels.w4a16.kernel.config import _STAGES
+
+        first = choice["w4a16_fc1_pipeline_stages"]
+        if first is not None:
+            return (
+                choice["w4a16_pipeline_stages"] == _STAGES
+                and first != _STAGES
+                and choice["w4a16_packed_schedule"] == "fused"
+            )
+        if choice["w4a16_packed_schedule"] == "split":
+            # Ordered launches primarily reduce grid rendezvous cost when the
+            # intermediate activation fits in one vectorized CTA wave.
+            elements = query.routed_rows * query.intermediate_size
+            return elements <= device.sm_count * 128 * 8
+        return True
+
     grid_knob = next(knob for knob in space.knobs if knob.name == "max_active_clusters")
     top_cap = max((value for value in grid_knob.values if value is not None), default=0)
     return ParameterSpace.create(
@@ -1086,6 +1142,7 @@ def _tuning_parameters(query, device):
             micro_grid_fits,
         ),
         efficiency_predicates=(
+            compact_packed_search,
             # Caps below a quarter of the ladder's top rung never win a race.
             lambda p: (
                 p["max_active_clusters"] is None
@@ -1184,7 +1241,7 @@ FC2_TUNING = replace(FC2_TUNING, validate_query=_validate_fc2_query)
 TUNING = TuningContract(
     component_id="moe.decode",
     query_schema_version=33,
-    config_schema_version=33,
+    config_schema_version=34,
     query_fields=frozenset(MoeDecodeQuery.__dataclass_fields__),
     config_fields=frozenset(MoeDecodeConfig.__dataclass_fields__),
     encode_query=MoeDecodeQuery.to_dict,
@@ -1193,7 +1250,7 @@ TUNING = TuningContract(
     validate_query=_validate_query,
     validate_config=validate_moe_decode_config,
     default_config=_default_config,
-    candidate_contract_version=72,
+    candidate_contract_version=73,
     knobs=(
         Knob(
             name="backend",
@@ -1296,6 +1353,13 @@ TUNING = TuningContract(
             values=(None,),
             binding=ParameterBinding.COMPILE,
             when=FrozenMapping({"backend": "w4a16"}),
+        ),
+        Knob(
+            name="w4a16_packed_schedule",
+            values=("fused",),
+            binding=ParameterBinding.COMPILE,
+            when=FrozenMapping({"backend": "w4a16", "w4a16_route_mode": "packed"}),
+            otherwise="fused",
         ),
         Knob(
             name="w4a16_direct_schedule",

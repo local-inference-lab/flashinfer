@@ -22,7 +22,7 @@ _SMALL_PREFIX_MAX_ROUTE_BLOCKS = 512
 
 
 _FAST_COUNT_BLOCK_T = 1024
-_SORTED_PACK_MAX_ROUTES = 128
+_SORTED_PACK_MAX_ROUTES = 512
 
 
 @triton.jit
@@ -462,7 +462,15 @@ def compile_w4a16_route_pack_launches(
                         BLOCK_M=block_m,
                         SEARCH_STEPS=block_e.bit_length(),
                         COUNTS_ALIAS_PACKED=False,
-                        num_warps=1 if numel_capacity <= _SORTED_PACK_MAX_ROUTES else 8,
+                        num_warps=(
+                            1
+                            if numel_capacity <= 128
+                            else 2
+                            if numel_capacity <= 256
+                            else 4
+                            if numel_capacity <= _SORTED_PACK_MAX_ROUTES
+                            else 8
+                        ),
                         grid=(1, 1, 1),
                     )
                 if not use_small_prefix:
@@ -747,7 +755,15 @@ def pack_topk_routes_by_expert(
                 BLOCK_M=block_m,
                 SEARCH_STEPS=block_e.bit_length(),
                 COUNTS_ALIAS_PACKED=counts_alias_packed,
-                num_warps=1 if numel_capacity <= _SORTED_PACK_MAX_ROUTES else 8,
+                num_warps=(
+                    1
+                    if numel_capacity <= 128
+                    else 2
+                    if numel_capacity <= 256
+                    else 4
+                    if numel_capacity <= _SORTED_PACK_MAX_ROUTES
+                    else 8
+                ),
             )
         else:
             _launch_prepared(

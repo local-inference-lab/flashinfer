@@ -178,7 +178,9 @@ def default_config(query: PagedDecodeQuery, device=None) -> PagedDecodeConfig:
             split, hs = True, 1
         else:
             split, hs = False, 2
-    elif query.window_left < 0:
+    elif query.window_left < 0 or (
+        query.window_left >= 1024 and query.max_batch * query.num_kv_heads <= 8
+    ):
         split, hs = True, 1
     else:
         split, hs = False, 4
@@ -266,7 +268,7 @@ TUNING = TuningContract(
     validate_config=validate_config,
     default_config=default_config,
     knobs=(Knob(name="head_splits", values=None, binding=ParameterBinding.COMPILE),),
-    candidate_contract_version=6,
+    candidate_contract_version=7,
     parameters=_parameters,
     materialize=_materialize,
 )

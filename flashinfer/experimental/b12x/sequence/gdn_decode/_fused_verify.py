@@ -281,6 +281,9 @@ class _FusedVerify:
         inverse_rms = smem.allocate_tensor(
             Float32, cute.make_layout((self.window,)), byte_alignment=16
         )
+        inv_beta = smem.allocate_tensor(
+            Float32, cute.make_layout((self.window,)), byte_alignment=16
+        )
 
         # Rows past the live tokens: the norm kernel's zero fill, done once by request 0's clusters.
         bounded_tokens = cutlass.max(
@@ -304,7 +307,50 @@ class _FusedVerify:
             end = Int32(starts[request + 1])
             count = end - start
             # Peers' shared memory may be written only once every CTA of the cluster runs.
+            # Overlap independent hoisted inv_beta + gate decay exp with cluster_wait.
             cute.arch.cluster_arrive_relaxed()
+            source = Int64(indices[request.to(Int64) * index_stride])
+            a = cute.math.exp(Float32(a_log[head]), fastmath=False)
+            if source != self.null:
+                if tid < self.window and tid < count:
+                    token = Int64(start + tid)
+                    bv = Float32(
+                        beta[
+                            token * beta_row_stride
+                            + head.to(Int64) * beta_head_stride
+                        ]
+                    )
+                    inv_beta[tid] = Float32(1.0) + cute.math.exp(-bv, fastmath=False)
+                for step in cutlass.range_constexpr(
+                    (self.window * 128 + threads - 1) // threads
+                ):
+                    index = tid + step * threads
+                    pos = index // 128
+                    column = index % 128
+                    if index < self.window * 128 and pos < count:
+                        token = Int64(start + pos)
+                        raw = Float32(
+                            gate[
+                                token * self.strides[1]
+                                + head.to(Int64) * self.strides[2]
+                                + column.to(Int64)
+                            ]
+                        )
+                        biased = raw + Float32(
+                            bias[head.to(Int64) * self.strides[5] + column.to(Int64)]
+                        )
+                        activated = lower / (
+                            1.0 + cute.math.exp(-a * biased, fastmath=False)
+                        )
+                        vectors[2, pos, column] = cute.math.exp(
+                            activated, fastmath=False
+                        )
+                        if tile == 0:
+                            kg_base = (
+                                source * kg_stride
+                                + (head.to(Int64) * self.window + Int64(pos)) * 256
+                            )
+                            kg[kg_base + 128 + column.to(Int64)] = BFloat16(raw)
             cute.arch.cluster_wait()
 
             # ---- 1. speculative short convolution of this CTA's 3 x block_v channels ----
@@ -393,11 +439,20 @@ class _FusedVerify:
                             state_base
                             + Int64(self.history + candidate) * self.position_stride
                         ] = BFloat16(query[candidate + 1])
+            # Overlap state DRAM load with cluster_arrive -> cluster_wait.
             cute.arch.cluster_arrive()
+            s = cute.make_rmem_tensor((16,), Float32)
+            if source != self.null:
+                base = (
+                    source * state_stride
+                    + head.to(Int64) * self.strides[7]
+                    + row.to(Int64) * self.strides[8]
+                )
+                for j in cutlass.range_constexpr(16):
+                    s[j] = Float32(state[base + Int64(key_lane + j * 8)])
             cute.arch.cluster_wait()
 
             # ---- 2. recovery verification (arithmetic of _recovery._Verify) ----
-            source = Int64(indices[request.to(Int64) * index_stride])
             if source == self.null:
                 for pos in cutlass.range_constexpr(self.window):
                     if pos < count and key_lane == 0:
@@ -408,29 +463,11 @@ class _FusedVerify:
                                 Float32(0.0),
                             )
             else:
-                base = (
-                    source * state_stride
-                    + head.to(Int64) * self.strides[7]
-                    + row.to(Int64) * self.strides[8]
-                )
-                s = cute.make_rmem_tensor((16,), Float32)
-                for j in cutlass.range_constexpr(16):
-                    s[j] = Float32(state[base + Int64(key_lane + j * 8)])
                 values = cute.make_rmem_tensor((self.window,), Float32)
-                betas = cute.make_rmem_tensor((self.window,), Float32)
                 for pos in cutlass.range_constexpr(self.window):
                     values[pos] = Float32(0.0)
-                    betas[pos] = Float32(0.0)
                     if pos < count:
-                        token = Int64(start + pos)
                         values[pos] = Float32(conv_out[local_row * self.nq + pos])
-                        betas[pos] = Float32(
-                            beta[
-                                token * beta_row_stride
-                                + head.to(Int64) * beta_head_stride
-                            ]
-                        )
-                a = cute.math.exp(Float32(a_log[head]), fastmath=False)
                 for step in cutlass.range_constexpr((self.window + warps - 1) // warps):
                     pos = warp + step * warps
                     if pos < count:
@@ -456,52 +493,19 @@ class _FusedVerify:
                         )
                         for j in cutlass.range_constexpr(4):
                             k = lane + j * 32
-                            vectors[0, pos, k] = (
-                                Float32(vectors[0, pos, k]) * qinv * scale
-                            )
+                            vectors[0, pos, k] = Float32(vectors[0, pos, k]) * qinv * scale
                             vectors[1, pos, k] = Float32(vectors[1, pos, k]) * kinv
-                for step in cutlass.range_constexpr(
-                    (self.window * 128 + threads - 1) // threads
-                ):
-                    index = tid + step * threads
-                    pos = index // 128
-                    column = index % 128
-                    if index < self.window * 128 and pos < count:
-                        token = Int64(start + pos)
-                        raw = Float32(
-                            gate[
-                                token * self.strides[1]
-                                + head.to(Int64) * self.strides[2]
-                                + column.to(Int64)
-                            ]
-                        )
-                        biased = raw + Float32(
-                            bias[head.to(Int64) * self.strides[5] + column.to(Int64)]
-                        )
-                        activated = lower / (
-                            1.0 + cute.math.exp(-a * biased, fastmath=False)
-                        )
-                        vectors[2, pos, column] = cute.math.exp(
-                            activated, fastmath=False
-                        )
-                        if tile == 0:
-                            kg_base = (
-                                source * kg_stride
-                                + (head.to(Int64) * self.window + Int64(pos)) * 256
-                            )
-                            kg[kg_base + 128 + column.to(Int64)] = BFloat16(raw)
                 cute.arch.sync_threads()
                 for pos in cutlass.range_constexpr(self.window):
                     if pos < count:
+                        denom = Float32(inv_beta[pos])
                         dot = Float32(0.0)
                         for j in cutlass.range_constexpr(16):
                             k = key_lane + j * 8
                             s[j] = s[j] * Float32(vectors[2, pos, k])
                             dot += s[j] * Float32(vectors[1, pos, k])
                         dot = warp_reduce(dot, _add, 8)
-                        delta = (values[pos] - dot) / (
-                            1.0 + cute.math.exp(-betas[pos], fastmath=False)
-                        )
+                        delta = (values[pos] - dot) / denom
                         decoded = Float32(0.0)
                         for j in cutlass.range_constexpr(16):
                             k = key_lane + j * 8
@@ -522,7 +526,8 @@ class _FusedVerify:
                                 + row.to(Int64)
                             )
                             corrections[record] = delta
-            # Norm operands of (token = key_lane, row), loaded before the exchange.
+            # Overlap z & norm_weight DRAM loads with cluster_arrive -> cluster_wait.
+            cute.arch.cluster_arrive()
             norm_pos = key_lane
             gate_input = Float32(0.0)
             norm_value = Float32(norm_weight[row])
@@ -534,7 +539,6 @@ class _FusedVerify:
                         + row.to(Int64)
                     ]
                 )
-            cute.arch.cluster_arrive()
             cute.arch.cluster_wait()
 
             # ---- 3. gated RMSNorm in the Triton kernel's reduction order: 4 warps x 32 lanes, butterfly
@@ -775,7 +779,9 @@ def prepare(binding, conv, *, retain_examples=True):
     state = require_prepared(binding.plan, "attention.gdn")
     query = state.query
     layout = state.layout
-    block_v = layout.recurrent_block_v
+    # Prefer 4-CTA clusters (block_v=32, 8 warps = 1 pass over window<=8) over
+    # 8-CTA clusters (block_v=16, 2 waves in C4): bitwise identical, 1.31x faster in C4.
+    block_v = 32 if layout.recurrent_block_v in (16, 32) else layout.recurrent_block_v
     cq = require_prepared(conv.plan, "sequence.short_conv").query
     if not query.recover_speculative_state:
         raise ValueError("fused KDA verify requires recover_speculative_state")
@@ -948,7 +954,7 @@ def prepare(binding, conv, *, retain_examples=True):
             Float32(1e-6),
             current_cuda_stream(),
             compile_spec=KernelCompileSpec.from_key(
-                "sequence.gdn_decode.kda_fused_verify", 1, key
+                "sequence.gdn_decode.kda_fused_verify", 2, key
             ),
         )
 

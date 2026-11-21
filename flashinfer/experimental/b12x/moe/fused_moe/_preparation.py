@@ -680,12 +680,14 @@ def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
         )
         packed = compile_w4a16_fused_moe(
             **compiler_args,
+            split_projections=caps.decode_config.w4a16_packed_schedule == "split",
             zero_fc2_output=False,
             max_m_blocks=packed_blocks,
             prefill_fused_sum_fp32=core.prefill_fused_sum_fp32,
         )
         packed_mapped = compile_w4a16_fused_moe(
             **compiler_args,
+            split_projections=caps.decode_config.w4a16_packed_schedule == "split",
             zero_fc2_output=True,
             max_m_blocks=packed_blocks,
             prefill_fused_sum_fp32=core.prefill_fused_sum_fp32,
@@ -1653,9 +1655,9 @@ def plan(
                 for plane in (first, second)
             )
             if (
-                not 0 < routes <= 128
+                not 0 < routes <= 512
                 or slots > 4096
-                or rounded > threads
+                or rounded > 2 * threads
                 or core.route_E != first.num_experts
                 or routes >= 16 * core.route_E
                 or (routes >= 64 and not direct_routes)

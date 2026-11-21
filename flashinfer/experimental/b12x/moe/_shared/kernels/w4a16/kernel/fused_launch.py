@@ -104,6 +104,7 @@ def compile_w4a16_fused_moe(
     _require_cached: bool = False,
     small_m_occupancy: int | None = None,
     csf_inline_scales: bool = False,
+    split_projections: bool = False,
 ) -> W4A16FusedMoeCompileResult:
     if small_m_occupancy is None:
         small_m_occupancy = _w4a16_small_m_occupancy()
@@ -219,15 +220,12 @@ def compile_w4a16_fused_moe(
         )
     fc1_cols = int(intermediate_size) * (2 if is_gated else 1)
     routed_rows = int(size_m) * int(top_k)
-    # Logical K/N tails are needed for every shard the tile table can't
-    # divide, not just sub-32 ones: 2048/TP6 = 352 and 3072/TP16 = 192 are
-    # 32-aligned yet have no dividing tile_k/tile_n. %32 shards are the
-    # ceil-scale-grid subset of the same machinery (%32 != 0 implies
-    # %128 != 0).
+    # Source-native MXFP4 can cover compact shards with logical K/N tails.
+    # Matrix-packed weights require both projections to admit complete tiles.
     allow_native_logical_tail = (
         weight_layout == "modelopt"
         and scale_format == "e8m0_k32"
-        and int(intermediate_size) % 128 != 0
+        and (int(intermediate_size) % 128 != 0 or int(hidden_size) % 128 != 0)
     )
     fc1_tile_k, fc1_tile_n, fc1_cta_threads, _ = _select_tile_config(
         problem_m=size_m,
@@ -522,8 +520,11 @@ def compile_w4a16_fused_moe(
         trellis_decode_table=trellis_decode_table,
         small_m_occupancy=small_m_occupancy,
         csf_inline_scales=csf_inline_scales,
+        split_projections=split_projections,
     )
     compile_key = ("w4a16_fused_moe", kernel.__cache_key__)
+    if split_projections:
+        compile_key += ("split_projections",)
     cache_key = (device, compile_key)
     cached = _FUSED_CACHE.get(cache_key)
     if cached is None and _require_cached:
@@ -754,7 +755,7 @@ def compile_w4a16_fused_moe(
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "moe.w4a16.fused_moe",
-            8,
+            9,
             compile_key,
         ),
         dsl_compile_options=OptLevel(2),
