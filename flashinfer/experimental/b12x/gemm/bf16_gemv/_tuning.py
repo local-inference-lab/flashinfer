@@ -37,6 +37,7 @@ class GemvConfig:
     backend: str
     rows_per_tile: int = 8
     block_threads: int = 128
+    split_k: int = 1
 
 
 def validate_query(query):
@@ -149,11 +150,31 @@ def default_config(query, device):
     return GemvConfig(backend="simt", rows_per_tile=rows_per_tile)
 
 
+def _tc_split_k_candidates(query):
+    from ._tensor_core import TC_K_MULTIPLE, TC_SPLIT_K_VALUES
+
+    n_blocks = (query.out_features + 15) // 16
+    chunks = query.in_features // TC_K_MULTIPLE
+    cands = []
+    if n_blocks >= 32:
+        cands.append(1)
+    for sk in TC_SPLIT_K_VALUES:
+        if sk == 1:
+            continue
+        if chunks % sk == 0 and 32 <= n_blocks * sk <= 1024:
+            cands.append(sk)
+    if not cands:
+        cands.append(1)
+    return tuple(cands)
+
+
 def _validate_query(query, device):
     validate_query(query)
 
 
 def validate_config(query, config, device):
+    from ._tensor_core import TC_K_MULTIPLE, TC_SPLIT_K_VALUES
+
     if not isinstance(config, GemvConfig):
         raise TypeError("projection config must be GemvConfig")
     if config.backend in ("simt", "mixed_vector"):
@@ -175,14 +196,27 @@ def validate_config(query, config, device):
             256,
         ):
             raise ValueError("SIMT projection block_threads must be 128 or 256")
+        if config.split_k != 1:
+            raise ValueError("split_k only configures tensor-core projection")
         return
     if config.rows_per_tile != 8:
         raise ValueError("rows_per_tile only configures SIMT projection")
     if config.block_threads != 128:
         raise ValueError("block_threads only configures SIMT projection")
-    if config.backend == "mma" and _mma_eligible(query):
+    if config.backend == "tc":
+        if not _tc_eligible(query):
+            raise ValueError("projection backend 'tc' is ineligible for this query")
+        chunks = query.in_features // TC_K_MULTIPLE
+        if (
+            type(config.split_k) is not int
+            or config.split_k not in TC_SPLIT_K_VALUES
+            or chunks % config.split_k != 0
+        ):
+            raise ValueError("invalid split_k for tensor-core projection")
         return
-    if config.backend == "tc" and _tc_eligible(query):
+    if config.split_k != 1:
+        raise ValueError("split_k only configures tensor-core projection")
+    if config.backend == "mma" and _mma_eligible(query):
         return
     if config.backend == "torch" and _torch_eligible(query):
         return
@@ -199,38 +233,59 @@ def _parameters(query, device):
         backends.append("mixed_vector")
     if _mma_eligible(query):
         backends.append("mma")
+    tc_splits = (1,)
     if _tc_eligible(query):
         backends.append("tc")
+        tc_splits = _tc_split_k_candidates(query)
     if _prefill_eligible(query):
         backends.append("prefill")
     if _torch_eligible(query):
         backends.append("torch")
+    split_values = tuple(dict.fromkeys((1, *tc_splits)))
+
+    def eligible(choice):
+        if choice["backend"] in ("simt", "mixed_vector"):
+            return choice["split_k"] == 1
+        if choice["backend"] == "tc":
+            return (
+                choice["rows_per_tile"] == 8
+                and choice["block_threads"] == 128
+                and choice["split_k"] in tc_splits
+            )
+        return (
+            choice["rows_per_tile"] == 8
+            and choice["block_threads"] == 128
+            and choice["split_k"] == 1
+        )
+
     return ParameterSpace.create(
         TUNING.knobs,
-        values={"backend": tuple(backends)},
-        predicates=(_eligible,),
+        values={"backend": tuple(backends), "split_k": split_values},
+        predicates=(eligible,),
         # The prefill GEMM is raced only by the audit; it never came within 2%
-        # of a winner on the shapes it was preferred for.
+        # of a winner on the shapes it was preferred for.  Likewise, for
+        # decode shapes with N <= 4096 where single-launch TC-GEMV is eligible,
+        # hot-L2 benchmarking over-favors cuBLASLt two-kernel split-K which is
+        # 1.8x-2.7x slower in cold DRAM across 93 layers.
         efficiency_predicates=(
             lambda choice: (
                 (choice["backend"] != "mma" or _mma_preferred(query))
                 and choice["backend"] != "prefill"
+                and not (
+                    choice["backend"] == "torch"
+                    and _tc_eligible(query)
+                    and query.out_features <= 4096
+                )
             ),
         ),
         autotune_effort=query.autotune_effort,
     )
 
 
-def _eligible(choice):
-    return choice["backend"] in ("simt", "mixed_vector") or (
-        choice["rows_per_tile"] == 8 and choice["block_threads"] == 128
-    )
-
-
 TUNING = TuningContract(
     component_id="gemm.bf16_gemv",
     query_schema_version=23,
-    config_schema_version=23,
+    config_schema_version=24,
     query_fields=frozenset(field.name for field in fields(GemvQuery)),
     config_fields=frozenset(field.name for field in fields(GemvConfig)),
     encode_query=asdict,
@@ -245,8 +300,13 @@ TUNING = TuningContract(
             name="rows_per_tile", values=(1, 2, 4, 8), binding=ParameterBinding.COMPILE
         ),
         Knob(name="block_threads", values=(128, 256), binding=ParameterBinding.COMPILE),
+        Knob(
+            name="split_k",
+            values=(1, 2, 4, 8, 14, 16, 28, 56),
+            binding=ParameterBinding.COMPILE,
+        ),
     ),
-    candidate_contract_version=13,
+    candidate_contract_version=15,
     parameters=_parameters,
     materialize=lambda query, device, choice: GemvConfig(**dict(choice)),
 )

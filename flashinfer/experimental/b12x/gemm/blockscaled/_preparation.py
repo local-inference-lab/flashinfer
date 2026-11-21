@@ -136,6 +136,21 @@ def compile_packed(
                 runtime_int64s=1,
             )
         if config.mode == "a16":
+            if config.a16_backend == "tc_gemv":
+                from ._mxfp8_tc_gemv import compile_mxfp8_tc_gemv
+
+                return {
+                    "gemm": compile_mxfp8_tc_gemv(
+                        ordinal,
+                        query.out_features,
+                        query.in_features,
+                        query.padded_in_features,
+                        query.num_tokens,
+                        config.split_k,
+                        config.mma_warps or 8,
+                    ),
+                    **activation_program,
+                }
             if config.tile_n == 4:
                 from ._iq2_xs_gemv import compile_gemv
 
@@ -189,16 +204,22 @@ def compile_packed(
                     query.out_features, slices, ordinal
                 )
             if mxfp8_a16_dequant(query, config):
-                from ._dequant import DEQUANT_BLOCK_K, _dequantize_mxfp8
+                from ._dequant import DEQUANT_BLOCK_K, DEQUANT_BLOCK_R, _dequantize_mxfp8
 
                 k = query.padded_in_features
                 programs["dequant"] = _dequantize_mxfp8.warmup(
                     torch.float8_e4m3fn,
                     torch.uint8,
                     torch.bfloat16,
+                    query.out_features,
                     K=k,
+                    BLOCK_R=DEQUANT_BLOCK_R,
                     BLOCK_K=DEQUANT_BLOCK_K,
-                    grid=(query.out_features, triton.cdiv(k, DEQUANT_BLOCK_K), 1),
+                    grid=(
+                        triton.cdiv(query.out_features, DEQUANT_BLOCK_R),
+                        triton.cdiv(k, DEQUANT_BLOCK_K),
+                        1,
+                    ),
                     num_warps=4,
                     num_stages=1,
                     enable_fp_fusion=False,
@@ -304,6 +325,12 @@ def _workspace_bytes(query, config, device=None):
 
 def _projection_workspace_bytes(query, config, device):
     if config.mode == "a16":
+        if config.a16_backend == "tc_gemv":
+            from ._mxfp8_tc_gemv import mxfp8_tc_gemv_workspace_bytes
+
+            return mxfp8_tc_gemv_workspace_bytes(
+                query.num_tokens, query.out_features, config.split_k
+            )
         slices = effective_a16_config(query, config)[2]
         partials = (
             slices * query.num_tokens * query.out_features * 4 if slices > 1 else 0
@@ -358,6 +385,7 @@ class _PackedExecutionState:
     mxfp8_bases: tuple | None = None
     short_dense: object | None = None
     iq2_lut: torch.Tensor | None = None
+    tc_flags: torch.Tensor | None = None
 
     @property
     def owned_nbytes(self) -> int:
@@ -423,7 +451,18 @@ class _PackedExecutionState:
             raise ValueError(
                 "packed execution exceeds its capacity or differs from its exact M"
             )
-        if source.is_contiguous() != q.source_contiguous or (
+        is_tc_gemv = config.mode == "a16" and config.a16_backend == "tc_gemv"
+        source_layout_ok = source.is_contiguous() or (
+            is_tc_gemv
+            and source.ndim == 2
+            and source.stride(1) == 1
+            and source.stride(0) % 8 == 0
+        )
+        source_align_ok = bool(source.data_ptr() % 16 == 0) and source_layout_ok
+        if is_tc_gemv:
+            if not source_layout_ok or (source_align_ok != q.source_aligned and m):
+                raise ValueError("packed TC-GEMV source layout differs from preparation")
+        elif source.is_contiguous() != q.source_contiguous or (
             bool(source.data_ptr() % 16 == 0) != q.source_aligned and m
         ):
             raise ValueError("packed source layout differs from preparation")
@@ -507,7 +546,10 @@ class _PackedExecutionState:
                     else workspace.view(torch.float32),
                 )[:, :, 0]
                 return result.view(*source.shape[:-1], q.out_features)
-            _check_tensor("source", source, self.device, torch.bfloat16)
+            if not is_tc_gemv:
+                _check_tensor("source", source, self.device, torch.bfloat16)
+            elif source.numel() and source.data_ptr() % 16:
+                raise ValueError("source must be 16-byte aligned")
             out = _validate_output(source, out, q.out_features)
             reads = (source, values, scale_bytes) + ((global_scale,) if nvfp4 else ())
             if q.recipe in IQ2_CODECS:
@@ -559,7 +601,7 @@ class _PackedExecutionState:
                 and "dequant" in self.programs
                 and m >= MXFP8_A16_DEQUANT_MIN_ROWS
             ):
-                from ._dequant import DEQUANT_BLOCK_K
+                from ._dequant import DEQUANT_BLOCK_K, DEQUANT_BLOCK_R
 
                 k = q.padded_in_features
                 weight = (
@@ -568,12 +610,32 @@ class _PackedExecutionState:
                     .view(q.out_features, k)
                 )
                 self.programs["dequant"][
-                    (q.out_features, triton.cdiv(k, DEQUANT_BLOCK_K), 1)
-                ](values, scale_bytes, weight, k, DEQUANT_BLOCK_K)
+                    (
+                        triton.cdiv(q.out_features, DEQUANT_BLOCK_R),
+                        triton.cdiv(k, DEQUANT_BLOCK_K),
+                        1,
+                    )
+                ](values, scale_bytes, weight, q.out_features, k, DEQUANT_BLOCK_R, DEQUANT_BLOCK_K)
                 torch.mm(
                     source.view(m, q.in_features),
                     weight.t(),
                     out=out.view(m, q.out_features),
+                )
+                return out
+            if config.mode == "a16" and config.a16_backend == "tc_gemv":
+                src_2d = (
+                    source
+                    if source.ndim == 2
+                    else source.view(m, q.in_features)
+                )
+                self.programs["gemm"](
+                    src_2d,
+                    values,
+                    scale_bytes,
+                    out.view(m, q.out_features),
+                    workspace if config.split_k > 1 else None,
+                    self.tc_flags,
+                    cuda_stream_to_int(stream),
                 )
                 return out
             if config.mode == "a16":
@@ -755,6 +817,27 @@ def _plan_bf16(query: BlockscaledQuery, *, invocation=FrozenMapping(), override=
                     else resident.numel() * resident.element_size(),
                 )
             )
+        if (
+            config.mode == "a16"
+            and config.a16_backend == "tc_gemv"
+            and config.split_k > 1
+        ):
+            from ._mxfp8_tc_gemv import _FLAGS_CACHE, mxfp8_tc_gemv_flags_bytes
+
+            fbytes = mxfp8_tc_gemv_flags_bytes(query.out_features, config.split_k)
+            fkey = (
+                device.ordinal,
+                query.out_features,
+                query.padded_in_features,
+                config.split_k,
+            )
+            persistent.append(
+                PersistentMemory(
+                    ("blockscaled.mxfp8_tc_gemv_flags", *fkey),
+                    fbytes,
+                    fbytes if fkey in _FLAGS_CACHE else 0,
+                )
+            )
         return MemoryRequirements(scratch, tuple(persistent))
 
     def materialize(selection, device):
@@ -848,6 +931,20 @@ def _plan_bf16(query: BlockscaledQuery, *, invocation=FrozenMapping(), override=
                 selectors=config.tile_n != 4,
                 codec=query.recipe,
             )
+        tc_flags = None
+        if (
+            config.mode == "a16"
+            and config.a16_backend == "tc_gemv"
+            and config.split_k > 1
+        ):
+            from ._mxfp8_tc_gemv import cached_mxfp8_tc_gemv_flags
+
+            tc_flags = cached_mxfp8_tc_gemv_flags(
+                resolved_device,
+                query.out_features,
+                query.padded_in_features,
+                config.split_k,
+            )
         return _PackedExecutionState(
             query,
             config,
@@ -864,6 +961,7 @@ def _plan_bf16(query: BlockscaledQuery, *, invocation=FrozenMapping(), override=
             bases,
             short_core,
             lut,
+            tc_flags,
         )
 
     return Plan(
@@ -931,7 +1029,17 @@ def _query_bf16_from_call(
         activation_scale_available=activation_global_scale is not None,
         global_scale_kind=weight.global_scale_kind if fp4 else "none",
         source_contiguous=source.is_contiguous(),
-        source_aligned=source.data_ptr() % 16 == 0,
+        source_aligned=(
+            source.data_ptr() % 16 == 0
+            and (
+                source.is_contiguous()
+                or (
+                    source.ndim == 2
+                    and source.stride(1) == 1
+                    and source.stride(0) % 8 == 0
+                )
+            )
+        ),
         output_mode="functional" if out is None else "provided",
         workspace_form="owned" if workspace is None else "provided",
         workspace_nbytes=None if workspace is None else workspace.numel(),

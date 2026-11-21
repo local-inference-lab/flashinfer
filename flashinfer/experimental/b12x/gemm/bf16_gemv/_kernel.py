@@ -654,9 +654,9 @@ def compile_projection(
             block_threads,
         )
     elif backend == "tc":
-        from ._tensor_core import TensorCoreGemvKernel
+        from ._tensor_core import compile_tc_projection
 
-        kernel = TensorCoreGemvKernel(n, k)
+        return compile_tc_projection(ordinal, 8, 1, n, k, output_dtype)
     else:
         kernel = Bf16GemmKernel(n, k, bias_dtype is not None)
     types = (

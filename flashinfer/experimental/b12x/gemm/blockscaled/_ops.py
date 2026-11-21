@@ -45,7 +45,17 @@ def _execute(
                 activation_mode="a16" if required_mode == "a16" else "auto",
                 activation_scale_available=activation_scale is not None,
                 source_contiguous=source.is_contiguous(),
-                source_aligned=source.data_ptr() % 16 == 0,
+                source_aligned=(
+                    source.data_ptr() % 16 == 0
+                    and (
+                        source.is_contiguous()
+                        or (
+                            source.ndim == 2
+                            and source.stride(1) == 1
+                            and source.stride(0) % 8 == 0
+                        )
+                    )
+                ),
                 output_mode="functional" if out is None else "provided",
                 workspace_form="owned" if workspace is None else "provided",
                 workspace_nbytes=None if workspace is None else workspace.numel(),
