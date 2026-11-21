@@ -132,6 +132,39 @@ Partial overlaps remain rejected. Standalone reduce-scatter and all-gather
 require disjoint outputs. All operations and graph replays sharing one runtime
 must remain serialized.
 
+On 16 ranks, static gather tuning also measures acknowledged recursive doubling with
+the higher rank bits first (XOR distances 4, 8, 1, 2). When each group of four
+consecutive ranks shares a physical switch, this order sends three shard-equivalents
+across switches per rank. The lower-bit-first order sends twelve. Both orders
+return the same rank-major rows and share the ordinary per-peer generations.
+The tuning trial chooses the order for its installed rank placement.
+
+For four rows on sixteen ranks, `all_gather_pair_kimi_topk` accepts caller-owned
+`out_logits` in addition to the latent, selected weights and expert IDs. The
+prepared plan measures the paired exchange plus standalone selection against a
+single row CTA that fetches both fields and selects the experts. Every rank
+participates in the same configuration. Both candidates write all gathered
+logits and preserve deterministic lower-ID ties.
+
+### Four-row reduction in a Triton consumer
+
+An SM120 tensor-parallel group can reduce four contiguous BF16 rows of width
+3,584 or 7,168 before running a row-local Triton epilogue in the same CTA.
+`island_row.prepared_rows(plan, rows=4, width=width, threads=threads)`
+returns a layout for an eligible prepared IslandRS owner. The layout borrows
+the local slab and the six remote mappings that the owner already holds.
+Every participating rank must enter its channel serially in the same order.
+
+The enclosing Triton kernel launches `layout.grid`. It calls
+`island_row.reduce_rows` on every physical CTA, passing the aligned input and
+output tensors, the tuple from `layout.arguments(source, destination)`, and the
+rank and width specialization. CTA indices 0–3 write their complete reduced
+row before entering the local epilogue. The other CTAs still advance their bank
+counters. Both reduction stages add four FP32 operands from positive zero
+in rank order and round once to BF16. Interleaved ordinary and fused calls keep
+the native generation and bank protocol. Preparation can measure this combined
+operation against the selected ordinary reduction and the same epilogue.
+
 ## Benchmark and synchronization contract
 
 The `_benchmark.py` fixtures allocate private operands, generate and reset inputs,

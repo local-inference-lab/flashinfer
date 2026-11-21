@@ -97,6 +97,28 @@ def _load_relaxed_sys_u32(
     )
 
 
+@dsl_user_op
+def _load_acquire_sys_u32(
+    ptr: cute.Pointer,
+    *,
+    loc=None,
+    ip=None,
+) -> Uint32:
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [ptr.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip)],
+            "ld.acquire.sys.global.u32 $0, [$1];",
+            "=r,l",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
 @cute.jit
 def block_pair_barrier(
     signals: Sequence[cute.Pointer],

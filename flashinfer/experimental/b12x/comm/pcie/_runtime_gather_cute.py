@@ -217,7 +217,12 @@ class SelectedGather(_AllGatherHeadsLaunch):
 
 @program_cache
 def compile_selected_gather(world, rank, row_words, threads, blocks, chunks, transport):
-    if transport in ("recursive", "recursive_ready"):
+    if transport in (
+        "recursive",
+        "recursive_ready",
+        "recursive_outer_first",
+        "recursive_pix_last",
+    ):
         from ._recursive_gather_cute import RecursiveGather
 
         operation = RecursiveGather(
@@ -227,12 +232,19 @@ def compile_selected_gather(world, rank, row_words, threads, blocks, chunks, tra
             threads,
             blocks,
             chunks,
-            acknowledge_consumption=transport == "recursive",
+            acknowledge_consumption=transport
+            not in ("recursive_ready", "recursive_pix_last"),
+            outer_first=transport == "recursive_outer_first",
+            pix_last=transport == "recursive_pix_last",
         )
     elif transport == "ring":
         from ._ring_gather_cute import RingGather
 
         operation = RingGather(world, rank, row_words, threads, blocks, chunks)
+    elif transport == "switch_push":
+        from ._island_gather_cute import SwitchPushGather
+
+        operation = SwitchPushGather(world, rank, row_words, threads, blocks, chunks)
     elif transport in ("phased_barrier", "phased_push"):
         from ._phased_gather_cute import PhasedGather
 
@@ -269,7 +281,7 @@ def compile_selected_gather(world, rank, row_words, threads, blocks, chunks, tra
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "comm.pcie.selected_gather",
-            12,
+            20,
             (world, rank, row_words, threads, blocks, chunks, transport),
         ),
     )
@@ -284,8 +296,11 @@ def compile_selected_gather(world, rank, row_words, threads, blocks, chunks, tra
                 "phased_barrier",
                 "phased_push",
                 "ring",
+                "switch_push",
                 "recursive",
                 "recursive_ready",
+                "recursive_outer_first",
+                "recursive_pix_last",
             )
             and rows * row_words > chunks * 64
         ):
