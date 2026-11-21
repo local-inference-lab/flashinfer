@@ -18,8 +18,11 @@ GATHER_MODES = {
     "selected_phased_push": ("barrier",),
     "selected_word_exchange": ("word_exchange",),
     "selected_ring": ("barrier",),
+    "selected_switch_push": ("barrier",),
     "selected_recursive": ("barrier",),
     "selected_recursive_ready": ("barrier",),
+    "selected_recursive_outer_first": ("barrier",),
+    "selected_recursive_pix_last": ("barrier",),
 }
 
 
@@ -36,13 +39,27 @@ def selected_gather_profile(transport, blocks, mode, active):
         blocks != 8 or active != 8
     ):
         raise ValueError("phased gather requires one complete eight-CTA cluster")
-    if transport in (
-        "selected_ring",
+    if transport == "selected_recursive_pix_last":
+        if not (
+            (blocks == 8 and active == 8)
+            or (blocks == 16 and active in (8, 16))
+        ):
+            raise ValueError(
+                "pix-last recursive gather requires 8/8 or 16/(8|16) physical/active CTAs"
+            )
+    elif transport == "selected_ring":
+        if not ((blocks == 8 and active == 8) or (blocks == 16 and active == 16)):
+            raise ValueError(
+                "ring gather requires 8/8 or 16/16 physical/active CTAs"
+            )
+    elif transport in (
+        "selected_switch_push",
         "selected_recursive",
         "selected_recursive_ready",
+        "selected_recursive_outer_first",
     ) and (blocks != 8 or active != 8):
         raise ValueError(
-            "ring and recursive gathers require eight active and physical CTAs"
+            "switch_push and recursive gathers require eight active and physical CTAs"
         )
     return (int(mode == "word_exchange") << 16) | active
 
@@ -75,14 +92,34 @@ def validate_query(query):
         transport, call["block_limit"], call["submode"], call["active_blocks"]
     )
     if transport == "selected_ring" and (
-        query.world_size not in (4, 8, 16) or call["threads"] not in (128, 512)
+        query.world_size not in (4, 8, 16)
+        or call["threads"] not in (128, 512)
+        or (query.world_size != 16 and call["block_limit"] != 8)
     ):
         raise ValueError(
-            "ring gather requires DCP4, DCP8 or DCP16 with 128 or 512 threads per CTA"
+            "ring gather requires DCP4/8/16 with 128 or 512 threads per CTA (16 CTAs on DCP16 only)"
         )
-    if transport in ("selected_recursive", "selected_recursive_ready") and (
-        query.world_size not in (8, 16) or call["threads"] != 128
+    if transport == "selected_switch_push" and (
+        query.world_size != 4 or call["threads"] not in (128, 256, 512)
     ):
+        raise ValueError(
+            "switch push gather requires DCP4 with 128, 256, or 512 threads per CTA"
+        )
+    if transport == "selected_recursive_pix_last" and (
+        query.world_size not in (4, 8, 16)
+        or call["threads"] not in (128, 256, 512)
+        or (query.world_size != 8 and call["block_limit"] != 8)
+    ):
+        raise ValueError(
+            "pix-last recursive gather requires DCP4/8/16 with 128, 256, or 512 threads per CTA"
+        )
+    if transport == "selected_recursive_outer_first" and query.world_size != 16:
+        raise ValueError("outer-first recursive doubling requires sixteen ranks")
+    if transport in (
+        "selected_recursive",
+        "selected_recursive_ready",
+        "selected_recursive_outer_first",
+    ) and (query.world_size not in (8, 16) or call["threads"] != 128):
         raise ValueError(
             "recursive gathers require DCP8 or DCP16 with 128 threads per CTA"
         )
@@ -106,8 +143,11 @@ def validate_query(query):
         "selected_phased_barrier",
         "selected_phased_push",
         "selected_ring",
+        "selected_switch_push",
         "selected_recursive",
         "selected_recursive_ready",
+        "selected_recursive_outer_first",
+        "selected_recursive_pix_last",
     ):
         chunks = query.setup["exchange_chunks"]
         if (

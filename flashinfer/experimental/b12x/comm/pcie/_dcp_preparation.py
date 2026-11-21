@@ -171,7 +171,25 @@ def query_from_runtime(runtime, *, surface, call) -> PcieQuery:
             ),
         )
     elif surface.endswith("all_gather_pair_kimi_topk"):
-        metadata["threads"] = 512
+        if (down := call.get("local_down")) is not None and down.shape[0] != 1:
+            from .pcie_dcp_a2a import _check_four_row_route
+
+            _check_four_row_route(
+                runtime,
+                down,
+                call["local_router"],
+                call["correction_bias"],
+                call.get("out_down"),
+                call.get("out_logits"),
+                call.get("topk_weights"),
+                call.get("topk_ids"),
+            )
+            threads, _ = runtime._resolve_launch_config(threads=512, block_limit=1)
+            metadata.update(
+                rows=int(down.shape[0]), route_transport="separate", threads=threads
+            )
+        else:
+            metadata["threads"] = 512
         metadata["row_blocks"] = call.get("row_blocks", 1)
         metadata["load_batch"] = call.get("load_batch", 1)
     elif surface.endswith("kimi_topk16"):
@@ -213,6 +231,12 @@ def compile_dcp_surface(query_payload, ordinal):
         if surface == "kimi_topk16" or surface.endswith("kimi_topk16"):
             return {False: cute._get_compiled_kimi_topk16(int(call["threads"]))}
         if surface.endswith("lse_reduce_scatter"):
+            pairwise = call.get("payload_schedule") == "pairwise"
+            hier_dcp8 = (
+                query.world_size == 8
+                and not pairwise
+                and int(query.setup["head_dim"]) == 512
+            )
             return {
                 slot: cute._get_compiled_lse_reduce_scatter(
                     query.world_size,
@@ -220,7 +244,8 @@ def compile_dcp_surface(query_payload, ordinal):
                     call["dtype"],
                     int(call["threads"]),
                     slot,
-                    call.get("payload_schedule") == "pairwise",
+                    pairwise,
+                    hier_dcp8,
                 )
                 for slot in (False, True)
             }
@@ -246,6 +271,19 @@ def compile_dcp_surface(query_payload, ordinal):
                 for slot in (False, True)
             }
         if surface.endswith("all_gather_pair_kimi_topk"):
+            if (rows := int(call.get("rows", 1))) > 1:
+                from ._kimi_route_cute import compile_four_row_route
+
+                return {
+                    slot: compile_four_row_route(
+                        query.rank,
+                        slot,
+                        call["route_transport"] == "row",
+                        call["threads"],
+                        rows=rows,
+                    )
+                    for slot in (False, True)
+                }
             return {
                 slot: cute._get_compiled_all_gather_pair(
                     query.world_size, query.rank, 512, slot, True
@@ -320,6 +358,7 @@ class _DcpExecutionState:
                 call.get("out_down"),
                 call.get("topk_weights"),
                 call.get("topk_ids"),
+                out_logits=call.get("out_logits"),
                 state=self,
             )
         if surface.endswith("all_gather_pair"):

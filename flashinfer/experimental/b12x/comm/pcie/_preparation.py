@@ -52,7 +52,11 @@ def _selected_gather_query(query, transport, thread_counts):
     if (
         (
             query.world_size not in (8, 16)
-            and not (query.world_size == 4 and transport == "selected_ring")
+            and not (
+                query.world_size == 4
+                and transport
+                in ("selected_ring", "selected_switch_push", "selected_recursive_pix_last")
+            )
         )
         or not query.surface.endswith(".all_gather_heads")
         or not call.get("disjoint_output", False)
@@ -61,6 +65,23 @@ def _selected_gather_query(query, transport, thread_counts):
         or (setup.get("threads_override", 0) and call["threads"] not in thread_counts)
     ):
         return None
+    element_bytes = 1 if call["dtype"] == "torch.float8_e4m3fn" else 2
+    payload_bytes = prod(call["shape"]) * element_bytes
+    default_blocks = (
+        16
+        if (
+            not setup.get("blocks_override", 0)
+            and (
+                (transport == "selected_recursive_pix_last" and query.world_size == 8)
+                or (
+                    transport == "selected_ring"
+                    and query.world_size == 16
+                    and payload_bytes >= 65536
+                )
+            )
+        )
+        else 8
+    )
     selected = replace(
         query,
         call=FrozenMapping(
@@ -70,9 +91,9 @@ def _selected_gather_query(query, transport, thread_counts):
                 threads=call["threads"]
                 if call["threads"] in thread_counts
                 else thread_counts[0],
-                block_limit=8,
+                block_limit=default_blocks,
                 submode="barrier",
-                active_blocks=8,
+                active_blocks=default_blocks,
             )
         ),
     )
@@ -143,6 +164,38 @@ def plan(
             invocation=invocation,
             override=override,
         )
+    if (
+        runtime is not None
+        and query.surface.endswith(".all_gather_pair_kimi_topk")
+        and query.call.get("rows", 1) > 1
+        and not isinstance(override, PcieConfig)
+    ):
+        from ._collective_tuning import plan as collective_plan
+
+        rows = int(query.call["rows"])
+        alternatives = {
+            "dcp_route_separate": (
+                replace(query, call=FrozenMapping(dict(query.call, block_limit=1))),
+                runtime,
+            )
+        }
+        if query.call["threads"] == 512:
+            alternatives["dcp_route_row"] = (
+                replace(
+                    query,
+                    call=FrozenMapping(
+                        dict(query.call, route_transport="row", block_limit=rows)
+                    ),
+                ),
+                runtime,
+            )
+        return collective_plan(
+            alternatives,
+            default="dcp_route_separate",
+            invocation=invocation,
+            override=override,
+        )
+
     from ._gather_preparation import GATHER_MODES
 
     if query.surface.endswith(".all_gather_heads") and (
@@ -189,7 +242,16 @@ def plan(
             ("dcp_ring", "selected_ring", (128, 512)),
             ("dcp_recursive", "selected_recursive", (128,)),
             ("dcp_recursive_ready", "selected_recursive_ready", (128,)),
+            ("dcp_recursive_pix_last", "selected_recursive_pix_last", (128, 256, 512)),
         ]
+        if query.world_size == 4:
+            specializations.append(
+                ("dcp_switch_push", "selected_switch_push", (128, 256, 512))
+            )
+        if query.world_size == 16:
+            specializations.append(
+                ("dcp_recursive_outer_first", "selected_recursive_outer_first", (128,))
+            )
         if query.world_size == 8:
             specializations.append(("dcp_phased_push", "selected_phased_push", (128,)))
         for name, transport, threads in specializations:

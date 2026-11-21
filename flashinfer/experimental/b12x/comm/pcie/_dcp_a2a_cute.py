@@ -16,12 +16,25 @@ from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
 from b12x._lib.compile_plan import attach_programs
 from b12x._lib.program_cache import program_cache
 from b12x._lib.intrinsics.math import fmax_f32
-from b12x._lib.intrinsics.memory import ld_global_v4_u32, st_global_v4_u32, u32_as_f32
+from b12x._lib.intrinsics.memory import (
+    ld_global_cg_v4_u32,
+    ld_global_v4_u32,
+    st_global_v4_u32,
+    u32_as_f32,
+)
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils.device import current_cuda_stream
 from b12x._lib.utils.pointers import make_ptr
 
-from ._dcp_cute_common import _membar_sys, _threadfence_sys, block_pair_barrier
+from ._dcp_cute_common import (
+    _FLAG_STRIDE,
+    _load_acquire_sys_u32,
+    _load_relaxed_sys_u32,
+    _membar_sys,
+    _store_relaxed_sys_u32,
+    _threadfence_sys,
+    block_pair_barrier,
+)
 from ._cute_intrinsics import (
     float_order_key,
     redux_max_u32,
@@ -107,6 +120,108 @@ def _a2a_graph_epoch_arrive(
 def _copy_16b(source: cute.Pointer, destination: cute.Pointer) -> None:
     values = ld_global_v4_u32(source.toint())
     st_global_v4_u32(destination.toint(), *values)
+
+
+@dsl_user_op
+def _ld_cg_f32(addr: Int64, *, loc=None, ip=None) -> Float32:
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Int64(addr).ir_value(loc=loc, ip=ip)],
+            "ld.global.cg.f32 $0, [$1];",
+            "=f,l",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@cute.jit
+def _subset_pair_barrier(
+    signals,
+    self_signal: cute.Pointer,
+    rank: int,
+    peers: tuple[int, ...],
+    max_blocks: int,
+) -> None:
+    """Per-block double-buffered barrier over a fixed rank subset (single-leader fence + acquire)."""
+    cute.arch.sync_threads()
+    tidx, _, _ = cute.arch.thread_idx()
+    bidx, _, _ = cute.arch.block_idx()
+    remote_peers = tuple(p for p in peers if p != rank)
+    if Int32(tidx) == Int32(0):
+        _threadfence_sys()
+        for i in cutlass.range_constexpr(len(remote_peers)):
+            peer = remote_peers[i]
+            self_index = Int64(bidx) * Int64(_MAX_RANKS) + Int64(peer)
+            self_ptr = self_signal + self_index
+            value = Uint32(cute.arch.load(self_ptr, Uint32)) + Uint32(1)
+            cute.arch.store(self_ptr, value)
+            slot = Int64(value % Uint32(2))
+            common_index = Int64(max_blocks * _MAX_RANKS) + (
+                (slot * Int64(max_blocks) + Int64(bidx)) * Int64(_MAX_RANKS * _FLAG_STRIDE)
+            )
+            peer_index = common_index + Int64(rank * _FLAG_STRIDE)
+            _store_relaxed_sys_u32(signals[peer] + peer_index, value)
+        for i in cutlass.range_constexpr(len(remote_peers)):
+            peer = remote_peers[i]
+            self_index = Int64(bidx) * Int64(_MAX_RANKS) + Int64(peer)
+            value = Uint32(cute.arch.load(self_signal + self_index, Uint32))
+            slot = Int64(value % Uint32(2))
+            common_index = Int64(max_blocks * _MAX_RANKS) + (
+                (slot * Int64(max_blocks) + Int64(bidx)) * Int64(_MAX_RANKS * _FLAG_STRIDE)
+            )
+            mine_index = common_index + Int64(peer * _FLAG_STRIDE)
+            observed = _load_acquire_sys_u32(self_signal + mine_index)
+            while observed != value:
+                observed = _load_acquire_sys_u32(self_signal + mine_index)
+    cute.arch.sync_threads()
+
+
+@cute.jit
+def _pair_signal_arrive(
+    signals, self_signal: cute.Pointer, rank: int, partner: int, max_blocks: int
+) -> Uint32:
+    """Post per-block arrival to one cross-switch partner without waiting yet."""
+    cute.arch.sync_threads()
+    tidx, _, _ = cute.arch.thread_idx()
+    bidx, _, _ = cute.arch.block_idx()
+    value = Uint32(0)
+    if Int32(tidx) == Int32(0):
+        _threadfence_sys()
+        self_index = Int64(bidx) * Int64(_MAX_RANKS) + Int64(partner)
+        self_ptr = self_signal + self_index
+        value = Uint32(cute.arch.load(self_ptr, Uint32)) + Uint32(1)
+        cute.arch.store(self_ptr, value)
+        slot = Int64(value % Uint32(2))
+        common_index = Int64(max_blocks * _MAX_RANKS) + (
+            (slot * Int64(max_blocks) + Int64(bidx)) * Int64(_MAX_RANKS * _FLAG_STRIDE)
+        )
+        peer_index = common_index + Int64(rank * _FLAG_STRIDE)
+        _store_relaxed_sys_u32(signals[partner] + peer_index, value)
+    return value
+
+
+@cute.jit
+def _pair_signal_wait(
+    self_signal: cute.Pointer, partner: int, value: Uint32, max_blocks: int
+) -> None:
+    """Complete the cross-switch pair barrier started by ``_pair_signal_arrive``."""
+    tidx, _, _ = cute.arch.thread_idx()
+    bidx, _, _ = cute.arch.block_idx()
+    if Int32(tidx) == Int32(0):
+        slot = Int64(value % Uint32(2))
+        common_index = Int64(max_blocks * _MAX_RANKS) + (
+            (slot * Int64(max_blocks) + Int64(bidx)) * Int64(_MAX_RANKS * _FLAG_STRIDE)
+        )
+        mine_index = common_index + Int64(partner * _FLAG_STRIDE)
+        observed = _load_acquire_sys_u32(self_signal + mine_index)
+        while observed != value:
+            observed = _load_acquire_sys_u32(self_signal + mine_index)
+    cute.arch.sync_threads()
 
 
 @dsl_user_op
@@ -374,6 +489,7 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
         threads: int,
         device_slot_selection: bool,
         pairwise: bool = False,
+        hier_dcp8: bool = False,
     ) -> None:
         super().__init__(
             world_size,
@@ -385,6 +501,7 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
         if pairwise and world_size != 4:
             raise ValueError("pairwise payloads require world size four")
         self._pairwise = bool(pairwise)
+        self._hier_dcp8 = bool(hier_dcp8 and self._world_size == 8 and not self._pairwise)
 
     @cute.jit
     def __call__(
@@ -486,7 +603,7 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
         ).launch(
             grid=(grid_x, 1, 1),
             block=(self._threads, 1, 1),
-            max_number_threads=(512, 1, 1),
+            max_number_threads=(self._threads if self._hier_dcp8 else 512, 1, 1),
             min_blocks_per_mp=1,
             cluster=(8 if self._pairwise else 1, 1, 1),
             stream=stream,
@@ -503,6 +620,365 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
         if cutlass.const_expr(self._dtype_name == "fp16"):
             return pack_f32x2_to_f16x2(lo, hi)
         return pack_f32x2_to_bf16x2(lo, hi)
+
+    @cute.jit
+    def _combine4_local(
+        self,
+        accum0,
+        accum1,
+        batch_index,
+        local_head,
+        hg: int,
+        slot_base: int,
+        total_heads,
+        heads_per_rank,
+        packs_per_head,
+        input_stride_batch,
+        input_stride_head,
+        local_output,
+        local_lse,
+        self_stg,
+        lse_offset,
+        natural_log,
+        lane,
+    ) -> Float32:
+        head = Int32(hg) * heads_per_rank + local_head
+        src_row = Int64(batch_index) * Int64(total_heads) + Int64(head)
+        lane_lse_addr = Int64(local_lse.toint()) + src_row * Int64(4)
+        for idx in cutlass.range_constexpr(3):
+            inc_r = (
+                Int64(batch_index) * Int64(total_heads)
+                + Int64(slot_base + idx) * Int64(heads_per_rank)
+                + Int64(local_head)
+            )
+            addr = Int64(self_stg.toint()) + lse_offset + inc_r * Int64(4)
+            if lane == Int32(idx + 1):
+                lane_lse_addr = addr
+        lane_lse = Float32(float("-inf"))
+        if lane < Int32(4):
+            lane_lse = _ld_cg_f32(lane_lse_addr)
+            if not cute.math.isfinite(lane_lse):
+                lane_lse = Float32(float("-inf"))
+        weights = cute.make_rmem_tensor((4,), Float32)
+        max_lse = Float32(float("-inf"))
+        for i in cutlass.range_constexpr(4):
+            v = cute.arch.shuffle_sync(lane_lse, offset=i)
+            weights[i] = v
+            max_lse = fmax_f32(max_lse, v)
+        has_finite = cute.math.isfinite(max_lse)
+        if not has_finite:
+            max_lse = Float32(0.0)
+        wsum = Float32(0.0)
+        combined_lse = Float32(float("-inf"))
+        if natural_log != Int32(0):
+            for i in cutlass.range_constexpr(4):
+                v = weights[i]
+                w = Float32(0.0)
+                if cute.math.isfinite(v):
+                    w = cute.math.exp(v - max_lse, fastmath=False)
+                weights[i] = w
+                wsum += w
+            if has_finite and wsum > Float32(0.0):
+                combined_lse = max_lse + cute.math.log(wsum, fastmath=False)
+        else:
+            for i in cutlass.range_constexpr(4):
+                v = weights[i]
+                w = Float32(0.0)
+                if cute.math.isfinite(v):
+                    w = cute.math.exp2(v - max_lse, approx=True)
+                weights[i] = w
+                wsum += w
+            if has_finite and wsum > Float32(0.0):
+                combined_lse = max_lse + cute.math.log2(wsum, fastmath=False)
+        inv_w = Float32(1.0) / fmax_f32(wsum, Float32(1.0e-10))
+        for e in cutlass.range_constexpr(8):
+            accum0[e] = Float32(0.0)
+            accum1[e] = Float32(0.0)
+        for i in cutlass.range_constexpr(4):
+            nw = weights[i] * inv_w
+            if nw != Float32(0.0):
+                if cutlass.const_expr(i == 0):
+                    baddr = (
+                        Int64(local_output.toint())
+                        + (
+                            Int64(batch_index) * input_stride_batch
+                            + Int64(head) * input_stride_head
+                        )
+                        * Int64(16)
+                    )
+                    w0 = ld_global_v4_u32(baddr + Int64(lane) * Int64(16))
+                    w1 = ld_global_v4_u32(baddr + Int64(lane + Int32(32)) * Int64(16))
+                else:
+                    inc_r = (
+                        Int64(batch_index) * Int64(total_heads)
+                        + Int64(slot_base + i - 1) * Int64(heads_per_rank)
+                        + Int64(local_head)
+                    )
+                    baddr = _add_u64_opaque(
+                        self_stg.toint(), inc_r * Int64(packs_per_head) * Int64(16)
+                    )
+                    w0 = ld_global_cg_v4_u32(baddr + Int64(lane) * Int64(16))
+                    w1 = ld_global_cg_v4_u32(baddr + Int64(lane + Int32(32)) * Int64(16))
+                for pair in cutlass.range_constexpr(4):
+                    lo0, hi0 = self._unpack_pair(w0[pair])
+                    accum0[pair * 2] = _fma_rn_f32(nw, lo0, accum0[pair * 2])
+                    accum0[pair * 2 + 1] = _fma_rn_f32(nw, hi0, accum0[pair * 2 + 1])
+                    lo1, hi1 = self._unpack_pair(w1[pair])
+                    accum1[pair * 2] = _fma_rn_f32(nw, lo1, accum1[pair * 2])
+                    accum1[pair * 2 + 1] = _fma_rn_f32(nw, hi1, accum1[pair * 2 + 1])
+        return combined_lse
+
+    @cute.jit
+    def _hier_switch4_pair2_dcp8(
+        self,
+        local_output,
+        local_lse,
+        output,
+        staging,
+        signals,
+        slot_offset,
+        lse_offset,
+        rows,
+        total_heads,
+        heads_per_rank,
+        packs_per_head,
+        input_stride_batch,
+        input_stride_head,
+        output_stride_batch,
+        output_stride_head,
+        natural_log,
+        tidx,
+        lane,
+        warp_first,
+        warp_stride,
+    ) -> None:
+        """Hierarchical Switch-4 x Pair-2 DCP8 LSE combine: 4x less cross-root traffic, 100% posted writes."""
+        sw_peers = (self._rank ^ 1, self._rank ^ 2, self._rank ^ 3)
+        partner = self._rank ^ 4
+
+        # Phase 1: Intra-switch posted writes over the 49.6 GB/s physical PCIe switch.
+        # On staging[dest], slots 0..2 receive dest's head-group from dest^(1,2,3);
+        # slots 3..5 receive (dest^4)'s head-group from dest^(1,2,3). Slot 6 stays free.
+        for xor_d in cutlass.range_constexpr(1, 4):
+            dest = self._rank ^ xor_d
+            dst_stg = staging[dest] + slot_offset
+            dst_words = self._staging_words(dst_stg)
+            dst_lse = self._staging_lse(dst_stg, lse_offset)
+            row = warp_first
+            while row < rows:
+                batch_index = row // heads_per_rank
+                local_head = row - batch_index * heads_per_rank
+                for which in cutlass.range_constexpr(2):
+                    hg = dest if which == 0 else (dest ^ 4)
+                    dst_slot = (xor_d - 1) if which == 0 else (3 + xor_d - 1)
+                    src_row = (
+                        Int64(batch_index) * Int64(total_heads)
+                        + Int64(hg) * Int64(heads_per_rank)
+                        + Int64(local_head)
+                    )
+                    in_base = (
+                        Int64(batch_index) * input_stride_batch
+                        + (Int64(hg) * Int64(heads_per_rank) + Int64(local_head))
+                        * input_stride_head
+                    )
+                    inc_row = (
+                        Int64(batch_index) * Int64(total_heads)
+                        + Int64(dst_slot) * Int64(heads_per_rank)
+                        + Int64(local_head)
+                    )
+                    stg_base = inc_row * Int64(packs_per_head)
+                    for k in cutlass.range_constexpr(2):
+                        pack = lane + Int32(k * 32)
+                        _copy_16b(
+                            local_output + (in_base + Int64(pack)) * Int64(4),
+                            dst_words + (stg_base + Int64(pack)) * Int64(4),
+                        )
+                    if lane == Int32(0):
+                        cute.arch.store(
+                            dst_lse + inc_row, cute.arch.load(local_lse + src_row, Float32)
+                        )
+                row += warp_stride
+
+        _subset_pair_barrier(signals, signals[self._rank], self._rank, sw_peers, _MAX_BLOCKS)
+
+        # Phase 2: Combine 4 intra-switch partials for `partner` (= rank^4) from local memory
+        # and push the single combined partial directly to staging[partner] slot 6 (1-to-1 pair).
+        partner_stg = staging[partner] + slot_offset
+        partner_words = self._staging_words(partner_stg)
+        partner_lse = self._staging_lse(partner_stg, lse_offset)
+        self_stg = staging[self._rank] + slot_offset
+        accum0 = cute.make_rmem_tensor((8,), Float32)
+        accum1 = cute.make_rmem_tensor((8,), Float32)
+
+        row = warp_first
+        while row < rows:
+            batch_index = row // heads_per_rank
+            local_head = row - batch_index * heads_per_rank
+            combined_lse = self._combine4_local(
+                accum0,
+                accum1,
+                batch_index,
+                local_head,
+                partner,
+                3,
+                total_heads,
+                heads_per_rank,
+                packs_per_head,
+                input_stride_batch,
+                input_stride_head,
+                local_output,
+                local_lse,
+                self_stg,
+                lse_offset,
+                natural_log,
+                lane,
+            )
+            slot6_row = (
+                Int64(batch_index) * Int64(total_heads)
+                + Int64(6) * Int64(heads_per_rank)
+                + Int64(local_head)
+            )
+            base6 = slot6_row * Int64(packs_per_head)
+            st_global_v4_u32(
+                (partner_words + (base6 + Int64(lane)) * Int64(4)).toint(),
+                self._pack_pair(accum0[0], accum0[1]),
+                self._pack_pair(accum0[2], accum0[3]),
+                self._pack_pair(accum0[4], accum0[5]),
+                self._pack_pair(accum0[6], accum0[7]),
+            )
+            st_global_v4_u32(
+                (partner_words + (base6 + Int64(lane + Int32(32))) * Int64(4)).toint(),
+                self._pack_pair(accum1[0], accum1[1]),
+                self._pack_pair(accum1[2], accum1[3]),
+                self._pack_pair(accum1[4], accum1[5]),
+                self._pack_pair(accum1[6], accum1[7]),
+            )
+            if lane == Int32(0):
+                cute.arch.store(partner_lse + slot6_row, combined_lse)
+            row += warp_stride
+
+        # Post arrival to partner, then overlap our first row's local 4-rank combine while
+        # partner's cross-switch push crosses PCIe!
+        tag = _pair_signal_arrive(signals, signals[self._rank], self._rank, partner, _MAX_BLOCKS)
+        own_lse = Float32(float("-inf"))
+        if warp_first < rows:
+            bi0 = warp_first // heads_per_rank
+            lh0 = warp_first - bi0 * heads_per_rank
+            own_lse = self._combine4_local(
+                accum0,
+                accum1,
+                bi0,
+                lh0,
+                self._rank,
+                0,
+                total_heads,
+                heads_per_rank,
+                packs_per_head,
+                input_stride_batch,
+                input_stride_head,
+                local_output,
+                local_lse,
+                self_stg,
+                lse_offset,
+                natural_log,
+                lane,
+            )
+        _pair_signal_wait(signals[self._rank], partner, tag, _MAX_BLOCKS)
+
+        # Phase 3: Final 2-way local combine (own switch partial + incoming cross-switch slot 6).
+        row = warp_first
+        while row < rows:
+            batch_index = row // heads_per_rank
+            local_head = row - batch_index * heads_per_rank
+            l_own = own_lse
+            if row != warp_first:
+                l_own = self._combine4_local(
+                    accum0,
+                    accum1,
+                    batch_index,
+                    local_head,
+                    self._rank,
+                    0,
+                    total_heads,
+                    heads_per_rank,
+                    packs_per_head,
+                    input_stride_batch,
+                    input_stride_head,
+                    local_output,
+                    local_lse,
+                    self_stg,
+                    lse_offset,
+                    natural_log,
+                    lane,
+                )
+            slot6_row = (
+                Int64(batch_index) * Int64(total_heads)
+                + Int64(6) * Int64(heads_per_rank)
+                + Int64(local_head)
+            )
+            l_rem = Float32(float("-inf"))
+            if lane == Int32(0):
+                l_rem = _ld_cg_f32(
+                    Int64(self_stg.toint()) + lse_offset + slot6_row * Int64(4)
+                )
+                if not cute.math.isfinite(l_rem):
+                    l_rem = Float32(float("-inf"))
+            l_rem = cute.arch.shuffle_sync(l_rem, offset=0)
+            m = fmax_f32(l_own, l_rem)
+            if not cute.math.isfinite(m):
+                m = Float32(0.0)
+            w_own = Float32(0.0)
+            w_rem = Float32(0.0)
+            if natural_log != Int32(0):
+                if cute.math.isfinite(l_own):
+                    w_own = cute.math.exp(l_own - m, fastmath=False)
+                if cute.math.isfinite(l_rem):
+                    w_rem = cute.math.exp(l_rem - m, fastmath=False)
+            else:
+                if cute.math.isfinite(l_own):
+                    w_own = cute.math.exp2(l_own - m, approx=True)
+                if cute.math.isfinite(l_rem):
+                    w_rem = cute.math.exp2(l_rem - m, approx=True)
+            inv = Float32(1.0) / fmax_f32(w_own + w_rem, Float32(1.0e-10))
+            nw_o = w_own * inv
+            nw_r = w_rem * inv
+            out0 = cute.make_rmem_tensor((8,), Float32)
+            out1 = cute.make_rmem_tensor((8,), Float32)
+            for e in cutlass.range_constexpr(8):
+                out0[e] = accum0[e] * nw_o
+                out1[e] = accum1[e] * nw_o
+            if nw_r != Float32(0.0):
+                base6_addr = _add_u64_opaque(
+                    self_stg.toint(), slot6_row * Int64(packs_per_head) * Int64(16)
+                )
+                w0 = ld_global_cg_v4_u32(base6_addr + Int64(lane) * Int64(16))
+                w1 = ld_global_cg_v4_u32(base6_addr + Int64(lane + Int32(32)) * Int64(16))
+                for pair in cutlass.range_constexpr(4):
+                    lo0, hi0 = self._unpack_pair(w0[pair])
+                    out0[pair * 2] = _fma_rn_f32(nw_r, lo0, out0[pair * 2])
+                    out0[pair * 2 + 1] = _fma_rn_f32(nw_r, hi0, out0[pair * 2 + 1])
+                    lo1, hi1 = self._unpack_pair(w1[pair])
+                    out1[pair * 2] = _fma_rn_f32(nw_r, lo1, out1[pair * 2])
+                    out1[pair * 2 + 1] = _fma_rn_f32(nw_r, hi1, out1[pair * 2 + 1])
+            out_base = (
+                Int64(batch_index) * output_stride_batch
+                + Int64(local_head) * output_stride_head
+            )
+            st_global_v4_u32(
+                (output + (out_base + Int64(lane)) * Int64(4)).toint(),
+                self._pack_pair(out0[0], out0[1]),
+                self._pack_pair(out0[2], out0[3]),
+                self._pack_pair(out0[4], out0[5]),
+                self._pack_pair(out0[6], out0[7]),
+            )
+            st_global_v4_u32(
+                (output + (out_base + Int64(lane + Int32(32))) * Int64(4)).toint(),
+                self._pack_pair(out1[0], out1[1]),
+                self._pack_pair(out1[2], out1[3]),
+                self._pack_pair(out1[4], out1[5]),
+                self._pack_pair(out1[6], out1[7]),
+            )
+            row += warp_stride
 
     @cute.jit
     def _push_destination(
@@ -524,9 +1000,7 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
         local_stage_words,
         local_stage_lse,
     ):
-        if cutlass.const_expr(
-            self._world_size not in (2, 4) or destination != self._rank
-        ):
+        if cutlass.const_expr(destination != self._rank):
             source_row = (
                 Int64(batch_index) * Int64(total_heads)
                 + Int64(destination) * Int64(heads_per_rank)
@@ -544,6 +1018,13 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
                     + Int64(self._rank) * Int64(heads_per_rank)
                     + Int64(local_head)
                 )
+                destination_staging = staging[destination] + slot_offset
+                local_stage_words = self._staging_words(destination_staging)
+                local_stage_lse = self._staging_lse(destination_staging, lse_offset)
+            elif cutlass.const_expr(
+                self._world_size == 8 and destination == (self._rank ^ 1)
+            ):
+                # Push PIX partner's shard directly into its unused self-slot at source_row!
                 destination_staging = staging[destination] + slot_offset
                 local_stage_words = self._staging_words(destination_staging)
                 local_stage_lse = self._staging_lse(destination_staging, lse_offset)
@@ -664,6 +1145,86 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
         heads_per_rank = total_heads // Int32(self._world_size)
         packs_per_head = head_dim // Int32(8)
         rows = batch * heads_per_rank
+        if cutlass.const_expr(self._hier_dcp8):
+            self._hier_switch4_pair2_dcp8(
+                local_output,
+                local_lse,
+                output,
+                staging,
+                signals,
+                slot_offset,
+                lse_offset,
+                rows,
+                total_heads,
+                heads_per_rank,
+                packs_per_head,
+                input_stride_batch,
+                input_stride_head,
+                output_stride_batch,
+                output_stride_head,
+                natural_log,
+                tidx,
+                lane,
+                warp_first,
+                warp_stride,
+            )
+        else:
+            self._generic_lse(
+                local_output,
+                local_lse,
+                output,
+                staging,
+                signals,
+                slot_offset,
+                lse_offset,
+                rows,
+                total_heads,
+                heads_per_rank,
+                packs_per_head,
+                input_stride_batch,
+                input_stride_head,
+                output_stride_batch,
+                output_stride_head,
+                natural_log,
+                tidx,
+                lane,
+                warp_first,
+                warp_stride,
+            )
+
+        if cutlass.const_expr(self._device_slot_selection):
+            if Int32(tidx) == Int32(0):
+                self_signal = signals[self._rank]
+                _a2a_graph_epoch_arrive(
+                    (self_signal + Int64(_GRAPH_EPOCH_INDEX)).toint(),
+                    (self_signal + Int64(_GRAPH_ARRIVED_INDEX)).toint(),
+                    Uint32(gdim),
+                )
+
+    @cute.jit
+    def _generic_lse(
+        self,
+        local_output,
+        local_lse,
+        output,
+        staging,
+        signals,
+        slot_offset,
+        lse_offset,
+        rows,
+        total_heads,
+        heads_per_rank,
+        packs_per_head,
+        input_stride_batch,
+        input_stride_head,
+        output_stride_batch,
+        output_stride_head,
+        natural_log,
+        tidx,
+        lane,
+        warp_first,
+        warp_stride,
+    ) -> None:
         # Keep the remote staging bases in their scalar launch parameters.
         # Materializing all eight slot-adjusted pointers here keeps them live
         # through the copy and barrier phases, which materially increases the
@@ -719,7 +1280,7 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
             world_size=self._world_size,
             max_blocks=_MAX_BLOCKS,
         )
-        if cutlass.const_expr(self._world_size in (2, 4)):
+        if cutlass.const_expr(self._world_size in (2, 4, 8)):
             # Acquire the peer's pushed partials before reading them locally.
             if Int32(tidx) == Int32(0):
                 _membar_sys()
@@ -739,7 +1300,14 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
             lane_lse_base = Int64(local_lse.toint())
             for source_index in cutlass.range_constexpr(1, self._world_size):
                 source = (self._rank + source_index) % self._world_size
-                incoming = self._rank if self._world_size in (2, 4) else source
+                incoming = (
+                    self._rank
+                    if (
+                        self._world_size in (2, 4)
+                        or (self._world_size == 8 and source == (self._rank ^ 1))
+                    )
+                    else source
+                )
                 source_lse_base = (
                     Int64(staging[incoming].toint()) + slot_offset + lse_offset
                 )
@@ -801,7 +1369,14 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
                 if cutlass.const_expr(source == self._rank):
                     source_address = local_output.toint() + local_base * Int64(16)
                 else:
-                    incoming = self._rank if self._world_size in (2, 4) else source
+                    incoming = (
+                        self._rank
+                        if (
+                            self._world_size in (2, 4)
+                            or (self._world_size == 8 and source == (self._rank ^ 1))
+                        )
+                        else source
+                    )
                     incoming_pack = staging_base
                     if cutlass.const_expr(self._world_size == 4):
                         incoming_pack += (
@@ -852,15 +1427,6 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
                     result3,
                 )
             row += warp_stride
-
-        if cutlass.const_expr(self._device_slot_selection):
-            if Int32(tidx) == Int32(0):
-                self_signal = signals[self._rank]
-                _a2a_graph_epoch_arrive(
-                    (self_signal + Int64(_GRAPH_EPOCH_INDEX)).toint(),
-                    (self_signal + Int64(_GRAPH_ARRIVED_INDEX)).toint(),
-                    Uint32(gdim),
-                )
 
 
 class _AllGatherHeadsLaunch(_DCPA2ABase):
@@ -2134,8 +2700,10 @@ def _get_compiled_lse_reduce_scatter(
     threads: int,
     device_slot_selection: bool,
     pairwise: bool = False,
+    hier_dcp8: bool = False,
 ) -> Callable:
     """Compile and retain one LSE reduce-scatter launcher specialization."""
+    use_hier = bool(hier_dcp8 and int(world_size) == 8 and not bool(pairwise))
     launch = _LseReduceScatterLaunch(
         world_size,
         rank,
@@ -2143,6 +2711,7 @@ def _get_compiled_lse_reduce_scatter(
         threads,
         device_slot_selection,
         pairwise,
+        use_hier,
     )
     key = (
         int(world_size),
@@ -2151,7 +2720,7 @@ def _get_compiled_lse_reduce_scatter(
         int(threads),
         bool(device_slot_selection),
     )
-    cache_key = (*key, bool(pairwise))
+    cache_key = (*key, bool(pairwise), use_hier)
     raise_if_kernel_resolution_frozen(
         "cute.compile", target=launch, cache_key=cache_key
     )
@@ -2179,7 +2748,7 @@ def _get_compiled_lse_reduce_scatter(
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "comm.pcie.dcp_a2a.lse_reduce_scatter",
-            35,
+            40,
             cache_key,
             labels=(
                 "world_size",
@@ -2188,6 +2757,7 @@ def _get_compiled_lse_reduce_scatter(
                 "threads",
                 "device_slot_selection",
                 "pairwise",
+                "hier_dcp8",
             ),
         ),
     )
@@ -2590,12 +3160,15 @@ def lse_reduce_scatter(
     """Reduce attention LSE values across PCIe ranks using a prepared launcher."""
     slot_delta_256b = _slot_delta_256b(slot_delta_bytes)
     if launcher is None:
+        use_hier = int(world_size) == 8 and int(head_dim) == 512
         launcher = _get_compiled_lse_reduce_scatter(
             world_size,
             rank,
             dtype_name,
             threads,
             device_slot_selection,
+            False,
+            use_hier,
         )
         if not device_slot_selection:
             _get_compiled_lse_reduce_scatter(
@@ -2604,6 +3177,8 @@ def lse_reduce_scatter(
                 dtype_name,
                 threads,
                 True,
+                False,
+                use_hier,
             )
     launcher(
         local_output_ptr,

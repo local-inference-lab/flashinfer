@@ -19,8 +19,10 @@ from ._island_rs_cute import (
     _AG_ARRIVED,
     _RS_ARRIVED,
     _XS_ARRIVED,
+    _accumulate_payload_words,
     _atomic_add_global_u32,
     _load_payload_words,
+    _pack_payload_words,
     _store_payload_words,
     _store_release_sys_u32,
     _wait_for,
@@ -60,7 +62,7 @@ class _Rendezvous:
             _store_release_sys_u32(dest, tag)
         cute.arch.barrier()
         if lane < Int32(self.peers):
-            _wait_for(source, tag, 24)
+            _wait_for(source, tag, 0)
 
 
 class _AdvanceOwnerEpoch:
@@ -111,7 +113,28 @@ class _ReduceFour:
     def kernel(self, inputs: tuple, out: cute.Pointer, words: Int64, blocks: Int32):
         tid, _, _ = cute.arch.thread_idx()
         bid, _, _ = cute.arch.block_idx()
-        i = Int64(bid) * Int64(self.threads) + Int64(tid)
+        thread = Int64(bid) * Int64(self.threads) + Int64(tid)
+        stride = Int64(blocks) * Int64(self.threads)
+        aligned = (
+            Int64(out.toint())
+            | Int64(inputs[0].toint())
+            | Int64(inputs[1].toint())
+            | Int64(inputs[2].toint())
+            | Int64(inputs[3].toint())
+        ) % Int64(16) == Int64(0)
+        i = thread
+        if aligned:
+            v4 = words // Int64(4)
+            while i < v4:
+                base = i * Int64(4)
+                totals = (Float32(0),) * 8
+                for p in cutlass.range_constexpr(4):
+                    w = _load_payload_words(inputs[p], base, 4)
+                    totals = _accumulate_payload_words(totals, w, 4)
+                packed = _pack_payload_words(totals, 4)
+                _store_payload_words(out, base, packed, 4)
+                i += stride
+            i = v4 * Int64(4) + thread
         while i < words:
             lo, hi = Float32(0), Float32(0)
             for p in cutlass.range_constexpr(4):
@@ -119,7 +142,7 @@ class _ReduceFour:
                 lo += x
                 hi += y
             out[i] = pack_f32x2_to_bf16x2(lo, hi)
-            i += Int64(blocks) * Int64(self.threads)
+            i += stride
 
 
 class _LocalTransfer:
@@ -225,15 +248,23 @@ def get_packet_programs(rank, threads, device_index):
     del device_index  # Keep device-local program handles distinct in the process cache.
     ptr = _fake_ptr(Uint32, 4)
     rendezvous = _compile(
-        "comm.pcie.island_ce.parallel_rendezvous",
+        "comm.pcie.island_ce.parallel_rendezvous_v2",
         (6,),
         _Rendezvous(6),
         ptr,
         (ptr,) * 6,
         (ptr,) * 6,
     )
+    rendezvous3 = _compile(
+        "comm.pcie.island_ce.parallel_rendezvous_v2",
+        (3,),
+        _Rendezvous(3),
+        ptr,
+        (ptr,) * 3,
+        (ptr,) * 3,
+    )
     reduce = _compile(
-        "comm.pcie.island_ce.reduce4",
+        "comm.pcie.island_ce.reduce4_v2",
         (threads,),
         _ReduceFour(threads),
         (ptr,) * 4,
@@ -327,9 +358,16 @@ def get_packet_programs(rank, threads, device_index):
         arrivals = tuple(ptr32(local_base + 4 + 4 * p) for p in peers)
         publications = tuple(ptr32(bases[p] + 4 + 4 * rank) for p in peers)
         counter = ptr32(local_base)
+        # Bytes [128..195] inside _FLAG_BYTES=256 hold disjoint 3-peer local rendezvous slots.
+        arrivals3 = tuple(ptr32(local_base + 132 + 4 * p) for p in local)
+        publications3 = tuple(ptr32(bases[p] + 132 + 4 * rank) for p in local)
+        counter3 = ptr32(local_base + 128)
 
         def barrier():
             rendezvous(counter, publications, arrivals, stream)
+
+        def barrier_local():
+            rendezvous3(counter3, publications3, arrivals3, stream)
 
         def reduce_four(inputs, dst, words):
             reduce(
@@ -412,16 +450,22 @@ def get_packet_programs(rank, threads, device_index):
                 copies.append((ptr32(src), ptr32(dst), count))
             sources, destinations, lengths = zip(*copies)
             transfer(sources, destinations, lengths, active_blocks, stream)
+            if batch == 7:
+                # Publish SM owner-epoch updates before the final 6-peer rendezvous so
+                # subsequent SM calls observe updated counters without a 9th barrier.
+                advance_owner(ptr32(slab_addresses[rank]), blocks, active_blocks, stream)
             if 1 <= batch <= 6:
                 main.wait_event(finished)
-            barrier()
+                barrier()
+            elif batch == 0:
+                barrier_local()
+            else:
+                barrier()
 
         link.ipc.cudaMemcpyAsync(
             output_address, local_base + assembled, pairs * 4, int(stream)
         )
-        advance_owner(ptr32(slab_addresses[rank]), blocks, active_blocks, stream)
-        barrier()
 
     return attach_programs(
-        PacketPrograms(run), reduce, advance_owner, transfer, rendezvous
+        PacketPrograms(run), reduce, advance_owner, transfer, rendezvous, rendezvous3
     )
