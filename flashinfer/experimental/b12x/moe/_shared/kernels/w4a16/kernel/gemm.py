@@ -1139,7 +1139,11 @@ class W4A16GemmKernel:
                 # via ``B12X_W4A16_SMALL_M_SPLITK`` (see
                 # ``_w4a16_small_m_splitk_enabled``): idling 5/6 of the grid
                 # through an expensive FC1 costs far more than the finalize.
-                if global_mn_tiles <= grid_x:
+                if global_mn_tiles <= grid_x and (
+                    global_mn_tiles * Int32(2) >= grid_x
+                    or self.weight_layout != "modelopt"
+                    or self.scale_format != "e8m0_k32"
+                ):
                     force_one_tile_per_cta = Int32(1)
             whole_k_waves = Int32(0)
             if cutlass.const_expr(self.weight_layout_block and self.direct_topk_routes):

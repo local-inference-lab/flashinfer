@@ -126,7 +126,7 @@ def compile_w4a16_topk_sum(
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "moe.w4a16.topk_sum",
-            4,
+            7,
             cache_key,
         ),
     )

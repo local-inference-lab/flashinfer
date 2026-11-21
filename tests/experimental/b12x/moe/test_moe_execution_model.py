@@ -338,17 +338,50 @@ def test_storage_policy_has_no_keep_both_state() -> None:
     assert "keep_both" not in {policy.value for policy in WeightStoragePolicy}
 
 
-def test_non_128_aligned_e8m0_w4a16_shards_stay_source_native() -> None:
-    """2048/TP6 = 352 and 3072/TP16 = 192 have no packed tile configs; the
-    planner must route them through the native layout instead of failing at
-    kernel-config time. 128-aligned shards keep the packed fast path."""
-    for shard in (352, 192):
-        plan = _weight_plan("w4a16", source_format="fp4_e8m0_k32", n=shard)
-        assert WeightPreparationTransform.W4A16_NATIVE in plan.transforms
-        assert (
-            plan.required_weight_layout("w4a16") is PreparedWeightLayout.SOURCE_NATIVE
-        )
+@pytest.mark.parametrize(
+    "hidden,intermediate,packed",
+    [
+        (3584, 192, True),
+        (128, 64, True),
+        (192, 256, True),
+        (128, 352, False),
+        (64, 192, False),
+        (96, 256, False),
+    ],
+)
+def test_mxfp4_w4a16_weight_layout_matches_both_projection_tiles(
+    hidden, intermediate, packed
+):
+    plan = _weight_plan("w4a16", source_format="fp4_e8m0_k32", k=hidden, n=intermediate)
+    layout = (
+        PreparedWeightLayout.MMA_PACKED
+        if packed
+        else PreparedWeightLayout.SOURCE_NATIVE
+    )
+    transform = (
+        WeightPreparationTransform.W4A16_PACKED
+        if packed
+        else WeightPreparationTransform.W4A16_NATIVE
+    )
+    assert plan.required_weight_layout("w4a16") is layout
+    assert transform in plan.transforms
+    assert plan.weight_layouts == frozenset((layout,))
 
-    aligned = _weight_plan("w4a16", source_format="fp4_e8m0_k32", n=256)
-    assert WeightPreparationTransform.W4A16_PACKED in aligned.transforms
-    assert aligned.required_weight_layout("w4a16") is PreparedWeightLayout.MMA_PACKED
+
+def test_mxfp4_explicit_layout_preserves_source_and_rejects_a_partial_mma_tile():
+    native = _weight_plan(
+        "w4a16",
+        source_format="fp4_e8m0_k32",
+        k=256,
+        n=192,
+        w4a16_layout=PreparedWeightLayout.SOURCE_NATIVE,
+    )
+    assert native.required_weight_layout("w4a16") is PreparedWeightLayout.SOURCE_NATIVE
+    with pytest.raises(ValueError, match="dividing K64/N128"):
+        _weight_plan(
+            "w4a16",
+            source_format="fp4_e8m0_k32",
+            k=256,
+            n=352,
+            w4a16_layout=PreparedWeightLayout.MMA_PACKED,
+        )

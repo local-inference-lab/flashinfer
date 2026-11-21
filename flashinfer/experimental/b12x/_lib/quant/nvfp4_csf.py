@@ -436,9 +436,9 @@ class _Pair:
         self.threads = max(
             getattr(self.first, "threads", 256), getattr(self.second, "threads", 256)
         )
-        if self.packed_routes is not None and self.packed_routes.rounded > self.threads:
+        if self.packed_routes is not None and self.packed_routes.rounded > 2 * self.threads:
             raise ValueError(
-                "Packed CSF route capacity exceeds the decoder CTA thread count"
+                "Packed CSF route capacity exceeds twice the decoder CTA thread count"
             )
 
     @cute.jit
@@ -594,25 +594,25 @@ class _Pair:
                     expert = Int32(-1)
                     if raw >= Int64(0) and raw < Int64(experts):
                         expert = raw.to(Int32)
-                    if mode == Int32(0) or self.mapped:
+                    if expert >= Int32(0) and (mode == Int32(0) or self.mapped):
                         duplicate = Boolean(False)
                         if cutlass.const_expr(self.packed_routes is not None):
-                            # Fused route capacity never exceeds the CTA thread count.
+                            # Fused route capacity fits in <= 2 passes of the CTA threads.
                             prior = Int32(tid)
-                            if prior < slot:
-                                duplicate = ids[prior].to(Int64) == raw
+                            while prior < slot:
+                                duplicate = duplicate | (ids[prior].to(Int64) == raw)
+                                prior += Int32(self.threads)
                         else:
-                            if Int32(tid) < Int32(32):
-                                prior = Int32(tid)
-                                while prior < slot:
-                                    previous = ids[prior].to(Int64)
-                                    if cutlass.const_expr(self.mapped):
-                                        previous = mapped_expert_id(
-                                            previous, mapping, route_experts, experts
-                                        )
-                                    duplicate = duplicate | (previous == raw)
-                                    prior += Int32(32)
-                        # Every thread participates, including invalid and first routes.
+                            prior = Int32(tid)
+                            while prior < slot:
+                                previous = ids[prior].to(Int64)
+                                if cutlass.const_expr(self.mapped):
+                                    previous = mapped_expert_id(
+                                        previous, mapping, route_experts, experts
+                                    )
+                                duplicate = duplicate | (previous == raw)
+                                prior += Int32(self.threads)
+                        # Every thread participates when this slot maps to a local expert.
                         if _cta_any(duplicate, self.threads):
                             expert = Int32(-1)
             if expert >= Int32(0) and expert < experts:
@@ -711,7 +711,7 @@ def compile_nvfp4_csf_pair(
         make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4),
         make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4),
         current_cuda_stream(),
-        compile_spec=KernelCompileSpec.from_key("quant.nvfp4_csf_pair", 10, key),
+        compile_spec=KernelCompileSpec.from_key("quant.nvfp4_csf_pair", 12, key),
     )
 
 

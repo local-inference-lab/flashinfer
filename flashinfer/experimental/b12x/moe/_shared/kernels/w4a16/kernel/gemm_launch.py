@@ -197,7 +197,7 @@ def compile_w4a16_gemm(
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "moe.w4a16.gemm",
-            4,
+            5,
             compile_key,
         ),
     )

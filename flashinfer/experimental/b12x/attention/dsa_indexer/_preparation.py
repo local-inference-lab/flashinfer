@@ -57,8 +57,8 @@ class _DsaIndexerState:
         **_ignored,
     ):
         if runtime.route == "paged_fused":
-            # Serialized operators may overwrite every byte of shared scratch.
-            runtime.scratch.fused_indexer_merge_state.zero_()
+            # ``run_fused_paged_indexer`` zeroes the exact ``state_need`` slice
+            # when ``merge_state_preinitialized=False``.
             if output_scores is None:
                 output_scores = runtime.scratch.indexer_contiguous_topk_values[
                     : q_fp8.shape[0]

@@ -43,3 +43,23 @@ def test_native_direct_schedules_are_tuning_candidates(activation, rows):
             DEVICE,
             TUNING.config_payload(split),
         )
+
+
+@pytest.mark.parametrize(
+    "layout,rows,expected",
+    [("modelopt", 4, "direct"), ("packed", 4, "packed"), ("packed", 1, "direct")],
+)
+def test_mxfp4_k64_shard_route_heuristic_uses_the_prepared_layout(
+    layout, rows, expected
+):
+    query = replace(
+        _nvfp4_a16_query(rows),
+        source_format="fp4_e8m0_k32",
+        w4a16_scale_format="e8m0_k32",
+        w4a16_weight_layout=layout,
+        weight_layouts=("mma_packed" if layout == "packed" else "source_native",),
+        activation="situ",
+        hidden_size=256,
+        intermediate_size=192,
+    )
+    assert TUNING.default_config(query, DEVICE).w4a16_route_mode == expected

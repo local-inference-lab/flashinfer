@@ -11,6 +11,13 @@ from b12x.moe._shared.kernels.w4a16.kernel.config import (
     _covering_count,
     _materialize_w4a16_topk_route_f32,
 )
+from b12x._lib.intrinsics.memory import ld_global_v4_u32, st_global_v4_u32
+from b12x.comm.pcie._cute_intrinsics import (
+    pack_f32x2_to_bf16x2,
+    pack_f32x2_to_f16x2,
+    unpack_bf16x2,
+    unpack_f16x2,
+)
 
 
 class W4A16TopKSumKernel:
@@ -76,6 +83,32 @@ class W4A16TopKSumKernel:
                 )
         self.route_warps = 8
         self.cta_threads = 256
+        self.vec8_fast_path = bool(
+            not self.full_rotation
+            and not self.float32_output
+            and self.hidden_size % 8 == 0
+            and self.topk <= 32
+        )
+        packs = self.hidden_size // 8
+        self.vec8_tiles_h = 14 if packs >= 256 else 4 if packs >= 128 else 1
+        self.vec8_packs_per_tile = (packs + self.vec8_tiles_h - 1) // self.vec8_tiles_h
+        self.vec8_threads = (
+            64
+            if self.vec8_packs_per_tile <= 64
+            else 128 if self.vec8_packs_per_tile <= 128 else 256
+        )
+
+    @cute.jit
+    def _unpack_pair(self, value: cutlass.Uint32):
+        if cutlass.const_expr(self.is_fp16):
+            return unpack_f16x2(value)
+        return unpack_bf16x2(value)
+
+    @cute.jit
+    def _pack_pair(self, lo: cutlass.Float32, hi: cutlass.Float32):
+        if cutlass.const_expr(self.is_fp16):
+            return pack_f32x2_to_f16x2(lo, hi)
+        return pack_f32x2_to_bf16x2(lo, hi)
 
     @cute.jit
     def _cast_elem(self, x: cutlass.Float32):
@@ -142,9 +175,14 @@ class W4A16TopKSumKernel:
             # consequently launched only 28 active warps and serialized all
             # 16 routes in each of them.
             grid = (total, 1, 1)
+        elif cutlass.const_expr(self.vec8_fast_path):
+            grid = (active_m, self.vec8_tiles_h, 1)
         else:
             total = active_m * Int32(self.hidden_size)
             grid = (_covering_count(total, self.cta_threads), 1, 1)
+        launch_threads = (
+            self.vec8_threads if self.vec8_fast_path else self.cta_threads
+        )
         self.kernel(
             fc2_flat,
             output_flat,
@@ -157,7 +195,7 @@ class W4A16TopKSumKernel:
             active_m,
         ).launch(
             grid=grid,
-            block=[self.cta_threads, 1, 1],
+            block=[launch_threads, 1, 1],
             stream=stream,
         )
 
@@ -175,7 +213,7 @@ class W4A16TopKSumKernel:
         active_m: cutlass.Int32,
     ):
         tidx, _, _ = cute.arch.thread_idx()
-        bidx, _, _ = cute.arch.block_idx()
+        bidx, bidy, _ = cute.arch.block_idx()
         if cutlass.const_expr(self.intermediate_hadamard and self.broadcast_svh):
             # The output scale is shared by every expert.  Linearity therefore
             # permits route reduction before the ordinary H128 cancellation:
@@ -479,6 +517,88 @@ class W4A16TopKSumKernel:
                     output_flat[out_base + Int32(1)] = acc1
                     output_flat[out_base + Int32(2)] = acc2
                     output_flat[out_base + Int32(3)] = acc3
+            return
+        if cutlass.const_expr(self.vec8_fast_path):
+            # One CTA per token: compact valid local-expert routes once into shared memory
+            # in ascending route order (exact FP32 accumulation), then vectorize 128-bit loads/stores.
+            tid = Int32(tidx)
+            tok = Int32(bidx)
+            smem = cutlass.utils.SmemAllocator()
+
+            @cute.struct
+            class RouteShm:
+                active_rows: cute.struct.Align[cute.struct.MemRange[Int32, 32], 16]
+                active_w: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, 32], 16]
+                count: cute.struct.Align[cute.struct.MemRange[Int32, 4], 16]
+
+            st = smem.allocate(RouteShm)
+            arows = st.active_rows.get_tensor(cute.make_layout((32,), stride=(1,)))
+            aw = st.active_w.get_tensor(cute.make_layout((32,), stride=(1,)))
+            cnt_t = st.count.get_tensor(cute.make_layout((4,), stride=(1,)))
+
+            if tid == Int32(0):
+                cnt = Int32(0)
+                for route in cutlass.range_constexpr(self.topk):
+                    row = tok * Int32(self.topk) + Int32(route)
+                    valid_route = Int32(1)
+                    raw_expert = route_expert_ids_flat[row].to(Int32)
+                    if cutlass.const_expr(self.use_expert_map):
+                        expert = Int32(-1)
+                        if raw_expert >= Int32(0) and raw_expert < route_num_experts:
+                            expert = expert_map_flat[raw_expert].to(Int32)
+                        if expert < Int32(0) or expert >= weight_num_experts:
+                            valid_route = Int32(0)
+                    elif raw_expert < Int32(0):
+                        valid_route = Int32(0)
+                    elif weight_num_experts > Int32(0):
+                        if route_expert_ids_flat[row] >= weight_num_experts:
+                            valid_route = Int32(0)
+                    if valid_route != Int32(0):
+                        arows[cnt] = row
+                        if cutlass.const_expr(self.apply_topk_weights):
+                            aw[cnt] = topk_weights_flat[row].to(cutlass.Float32)
+                        cnt += Int32(1)
+                cnt_t[0] = cnt
+            cute.arch.sync_threads()
+
+            n_act = cnt_t[0]
+            packs = Int32(self.hidden_size // 8)
+            tile_start = Int32(bidy) * Int32(self.vec8_packs_per_tile)
+            tile_end = cutlass.min(
+                tile_start + Int32(self.vec8_packs_per_tile), packs
+            )
+            fc2_base_addr = Int64(fc2_flat.iterator.toint())
+            out_base_addr = Int64(output_flat.iterator.toint())
+            pack = tile_start + tid
+            while pack < tile_end:
+                acc = cute.make_rmem_tensor((8,), cutlass.Float32)
+                for e in cutlass.range_constexpr(8):
+                    acc[e] = cutlass.Float32(0.0)
+                i = Int32(0)
+                while i < n_act:
+                    row = arows[i]
+                    addr = fc2_base_addr + (Int64(row) * Int64(packs) + Int64(pack)) * Int64(16)
+                    words = ld_global_v4_u32(addr)
+                    if cutlass.const_expr(self.apply_topk_weights):
+                        wt = aw[i]
+                        for p in cutlass.range_constexpr(4):
+                            lo, hi = self._unpack_pair(words[p])
+                            acc[p * 2] = acc[p * 2] + _materialize_w4a16_topk_route_f32(lo) * wt
+                            acc[p * 2 + 1] = acc[p * 2 + 1] + _materialize_w4a16_topk_route_f32(hi) * wt
+                    else:
+                        for p in cutlass.range_constexpr(4):
+                            lo, hi = self._unpack_pair(words[p])
+                            acc[p * 2] = acc[p * 2] + _materialize_w4a16_topk_route_f32(lo)
+                            acc[p * 2 + 1] = acc[p * 2 + 1] + _materialize_w4a16_topk_route_f32(hi)
+                    i += Int32(1)
+                st_global_v4_u32(
+                    out_base_addr + (Int64(tok) * Int64(packs) + Int64(pack)) * Int64(16),
+                    self._pack_pair(acc[0], acc[1]),
+                    self._pack_pair(acc[2], acc[3]),
+                    self._pack_pair(acc[4], acc[5]),
+                    self._pack_pair(acc[6], acc[7]),
+                )
+                pack += Int32(self.vec8_threads)
             return
         idx = Int32(bidx) * Int32(self.cta_threads) + Int32(tidx)
         total = active_m * Int32(self.hidden_size)

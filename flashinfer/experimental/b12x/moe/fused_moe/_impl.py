@@ -85,6 +85,7 @@ from b12x.moe._shared.execution import (
     WorkScheduler,
     lower_moe_execution,
     make_moe_spec,
+    mxfp4_mma_tiles_cover,
     plan_moe_weight_preparation,
 )
 from b12x.moe._shared.execution import (
@@ -1647,7 +1648,8 @@ def _w4a16_scale_format_for_source(source_format: str) -> str:
 def _w4a16_weight_layout_for_source(
     source_format: str,
     *,
-    intermediate_size: int | None = None,
+    hidden_size: int,
+    intermediate_size: int,
 ) -> str:
     """Return the default W4A16 layout selected by weight preparation."""
     source_format = _normalize_fp4_source_format(source_format)
@@ -1655,10 +1657,8 @@ def _w4a16_weight_layout_for_source(
         return source_format
     if source_format in _TRELLIS_SOURCE_FORMATS:
         return "trellis_t256"
-    if (
-        source_format == "fp4_e8m0_k32"
-        and intermediate_size is not None
-        and int(intermediate_size) % 128 != 0
+    if source_format == "fp4_e8m0_k32" and not mxfp4_mma_tiles_cover(
+        hidden_size, intermediate_size
     ):
         return "modelopt"
     return "packed"
@@ -2764,6 +2764,7 @@ def _heuristic_dynamic_route_mode(
 def _w4a16_direct_routing_supported(query: MoeDecodeQuery) -> bool:
     weight_layout = query.w4a16_weight_layout or _w4a16_weight_layout_for_source(
         query.source_format,
+        hidden_size=query.hidden_size,
         intermediate_size=query.intermediate_size,
     )
     if weight_layout in BLOCK_CODECS:
@@ -2827,14 +2828,21 @@ def _heuristic_w4a16_route_mode(
         )
     if not _w4a16_direct_routing_supported(query):
         return "packed"
-    if (
-        _w4a16_weight_layout_for_source(
-            query.source_format,
-            intermediate_size=query.intermediate_size,
-        )
-        == "modelopt"
-    ):
+    layout = query.w4a16_weight_layout or _w4a16_weight_layout_for_source(
+        query.source_format,
+        hidden_size=query.hidden_size,
+        intermediate_size=query.intermediate_size,
+    )
+    if layout == "modelopt":
         return "direct"
+    if (
+        query.source_format == "fp4_e8m0_k32"
+        and query.intermediate_size % 128 == 64
+        and query.num_tokens > 1
+    ):
+        # Packing combines repeated experts across rows. A direct tile for
+        # each assignment repeats the same K64-tail projection weights.
+        return "packed"
     from b12x.moe._shared.kernels.w4a16.kernel.config import (
         _MAX_DIRECT_TOPK_ROUTE_M,
         _TC_DECODE_MAX_M,
@@ -3450,6 +3458,7 @@ def _plan_core_workspace(
             if w4a16_weight_layout is not None
             else _w4a16_weight_layout_for_source(
                 source_format,
+                hidden_size=k,
                 intermediate_size=n,
             )
         )
@@ -8566,6 +8575,7 @@ def _plan_full_rotation_w4a16_launches(
         caps.w4a16_weight_layout
         or _w4a16_weight_layout_for_source(
             caps.source_format,
+            hidden_size=caps.k,
             intermediate_size=caps.n,
         )
     )
@@ -9754,6 +9764,7 @@ def materialize_tp_moe_arena_workspaces(
     )
     w4a16_weight_layout = caps.w4a16_weight_layout or _w4a16_weight_layout_for_source(
         source_format,
+        hidden_size=caps.k,
         intermediate_size=caps.n,
     )
     core_token_counts = _arena_core_token_counts(
@@ -10099,6 +10110,7 @@ def build_tp_moe_fp4_binding(
             else:
                 weight_layout = _w4a16_weight_layout_for_source(
                     source_format,
+                    hidden_size=plan.k,
                     intermediate_size=plan.n,
                 )
                 scale_format = _w4a16_scale_format_for_source(source_format)
@@ -10171,6 +10183,7 @@ def build_tp_moe_fp4_binding(
         elif quant_mode == "w4a16":
             weight_layout = _w4a16_weight_layout_for_source(
                 source_format,
+                hidden_size=plan.k,
                 intermediate_size=plan.n,
             )
             scale_format = _w4a16_scale_format_for_source(source_format)
