@@ -25,6 +25,7 @@ from b12x._lib.compiler import KernelCompileSpec
 from b12x._lib.compiler import compile as b12x_compile
 from b12x._lib.compile_plan import attach_programs
 from b12x._lib.intrinsics.memory import ld_global_v4_u32, st_global_v4_u32
+from b12x._lib.intrinsics.reduction import warp_reduce
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils.device import (
     cuda_stream_from_int_or_current,
@@ -129,6 +130,24 @@ def _store_release_sys_u32(address: Int64, value: Uint32, *, loc=None, ip=None) 
 
 
 @dsl_user_op
+def _store_relaxed_sys_u32(address: Int64, value: Uint32, *, loc=None, ip=None) -> None:
+    llvm.inline_asm(
+        None,
+        [
+            Int64(address).ir_value(loc=loc, ip=ip),
+            Uint32(value).ir_value(loc=loc, ip=ip),
+        ],
+        "st.relaxed.sys.global.u32 [$0], $1;",
+        "l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def _fence_sc_sys(*, loc=None, ip=None) -> None:
     llvm.inline_asm(
         None,
@@ -156,6 +175,298 @@ def _nanosleep(cycles: Uint32, *, loc=None, ip=None) -> None:
         loc=loc,
         ip=ip,
     )
+
+
+@dsl_user_op
+def _ld_nc_v4_u32(address: Int64, *, loc=None, ip=None):
+    res = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
+        [Int64(address).ir_value(loc=loc, ip=ip)],
+        "ld.global.nc.v4.u32 {$0,$1,$2,$3}, [$4];",
+        "=r,=r,=r,=r,l",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return tuple(
+        Uint32(llvm.extractvalue(T.i32(), res, [i], loc=loc, ip=ip)) for i in range(4)
+    )
+
+
+@dsl_user_op
+def _ld_cg_v4_u32(address: Int64, *, loc=None, ip=None):
+    res = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
+        [Int64(address).ir_value(loc=loc, ip=ip)],
+        "ld.global.cg.v4.u32 {$0,$1,$2,$3}, [$4];",
+        "=r,=r,=r,=r,l",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return tuple(
+        Uint32(llvm.extractvalue(T.i32(), res, [i], loc=loc, ip=ip)) for i in range(4)
+    )
+
+
+@dsl_user_op
+def _atom_acqrel_gpu_add_u32(
+    address: Int64, value: Uint32, *, loc=None, ip=None
+) -> Uint32:
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                Int64(address).ir_value(loc=loc, ip=ip),
+                Uint32(value).ir_value(loc=loc, ip=ip),
+            ],
+            "atom.acq_rel.gpu.global.add.u32 $0, [$1], $2;",
+            "=r,l,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _store_release_gpu_u32(address: Int64, value: Uint32, *, loc=None, ip=None) -> None:
+    llvm.inline_asm(
+        None,
+        [
+            Int64(address).ir_value(loc=loc, ip=ip),
+            Uint32(value).ir_value(loc=loc, ip=ip),
+        ],
+        "st.release.gpu.global.u32 [$0], $1;",
+        "l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _store_relaxed_gpu_u32(address: Int64, value: Uint32, *, loc=None, ip=None) -> None:
+    llvm.inline_asm(
+        None,
+        [
+            Int64(address).ir_value(loc=loc, ip=ip),
+            Uint32(value).ir_value(loc=loc, ip=ip),
+        ],
+        "st.relaxed.gpu.global.u32 [$0], $1;",
+        "l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _load_acquire_gpu_u32(address: Int64, *, loc=None, ip=None) -> Uint32:
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Int64(address).ir_value(loc=loc, ip=ip)],
+            "ld.acquire.gpu.global.u32 $0, [$1];",
+            "=r,l",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _rsqrt_approx_ftz(x: Float32, *, loc=None, ip=None) -> Float32:
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Float32(x).ir_value(loc=loc, ip=ip)],
+            "rsqrt.approx.ftz.f32 $0, $1;",
+            "=f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _mul_rn_f32(a: Float32, b: Float32, *, loc=None, ip=None) -> Float32:
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip)],
+            "mul.rn.f32 $0, $1, $2;",
+            "=f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _add_rn_f32(a: Float32, b: Float32, *, loc=None, ip=None) -> Float32:
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip)],
+            "add.rn.f32 $0, $1, $2;",
+            "=f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _div_full_f32(a: Float32, b: Float32, *, loc=None, ip=None) -> Float32:
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip)],
+            "div.full.f32 $0, $1, $2;",
+            "=f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _fma_rn_f32(a: Float32, b: Float32, c: Float32, *, loc=None, ip=None) -> Float32:
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [
+                Float32(a).ir_value(loc=loc, ip=ip),
+                Float32(b).ir_value(loc=loc, ip=ip),
+                Float32(c).ir_value(loc=loc, ip=ip),
+            ],
+            "fma.rn.f32 $0, $1, $2, $3;",
+            "=f,f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _triton_rsqrt_3584(ss: Float32, eps: Float32, *, loc=None, ip=None) -> Float32:
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Float32(ss).ir_value(loc=loc, ip=ip), Float32(eps).ir_value(loc=loc, ip=ip)],
+            "{ .reg .f32 %t0, %t1, %t2; mov.b32 %t0, 0f45600000; div.full.f32 %t1, $1, %t0; add.f32 %t2, $2, %t1; rsqrt.approx.ftz.f32 $0, %t2; }",
+            "=f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _triton_rsqrt_7168(ss: Float32, eps: Float32, *, loc=None, ip=None) -> Float32:
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Float32(ss).ir_value(loc=loc, ip=ip), Float32(eps).ir_value(loc=loc, ip=ip)],
+            "{ .reg .f32 %t0, %t1, %t2; mov.b32 %t0, 0f45E00000; div.full.f32 %t1, $1, %t0; add.f32 %t2, $2, %t1; rsqrt.approx.ftz.f32 $0, %t2; }",
+            "=f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+def _pair_tree_dot_fma_f32(a, b, n: int) -> Float32:
+    """Exact binary-tree dot sum matching Triton PTX + SM120 ptxas FFMA contraction."""
+    evens = [
+        _fma_rn_f32(a[4 * k], b[4 * k], _mul_rn_f32(a[4 * k + 2], b[4 * k + 2]))
+        for k in range(n // 4)
+    ]
+    odds = [
+        _fma_rn_f32(a[4 * k + 1], b[4 * k + 1], _mul_rn_f32(a[4 * k + 3], b[4 * k + 3]))
+        for k in range(n // 4)
+    ]
+    while len(evens) > 1:
+        evens = [_add_rn_f32(evens[i], evens[i + 1]) for i in range(0, len(evens), 2)]
+        odds = [_add_rn_f32(odds[i], odds[i + 1]) for i in range(0, len(odds), 2)]
+    return _add_rn_f32(evens[0], odds[0])
+
+
+def _pair_tree_sum_f32(vals, n: int) -> Float32:
+    """Exact compile-time unrolled binary-tree reduction matching Triton's add.f32x2 reduction."""
+    evens = [vals[i] for i in range(0, n, 2)]
+    odds = [vals[i + 1] for i in range(0, n, 2)]
+    while len(evens) > 1:
+        evens = [_add_rn_f32(evens[i], evens[i + 1]) for i in range(0, len(evens), 2)]
+        odds = [_add_rn_f32(odds[i], odds[i + 1]) for i in range(0, len(odds), 2)]
+    return _add_rn_f32(evens[0], odds[0])
+
+
+@cute.jit
+def _triton_bfly_reduce_8warps(ss: Float32, sh_red, tidx: Int32) -> Float32:
+    """Bit-exact 256-thread (8-warp) butterfly reduction matching Triton tl.sum(num_warps=8)."""
+    lane = tidx % Int32(32)
+    warp = tidx // Int32(32)
+    if tidx < Int32(256):
+        ss = _add_rn_f32(ss, cute.arch.shuffle_sync_bfly(ss, offset=16))
+        ss = _add_rn_f32(ss, cute.arch.shuffle_sync_bfly(ss, offset=8))
+        ss = _add_rn_f32(ss, cute.arch.shuffle_sync_bfly(ss, offset=4))
+        ss = _add_rn_f32(ss, cute.arch.shuffle_sync_bfly(ss, offset=2))
+        ss = _add_rn_f32(ss, cute.arch.shuffle_sync_bfly(ss, offset=1))
+        if lane == Int32(0):
+            sh_red[warp] = ss
+    cute.arch.barrier()
+    if warp == Int32(0):
+        v = sh_red[lane] if lane < Int32(8) else Float32(0.0)
+        v = _add_rn_f32(v, cute.arch.shuffle_sync_bfly(v, offset=4))
+        v = _add_rn_f32(v, cute.arch.shuffle_sync_bfly(v, offset=2))
+        v = _add_rn_f32(v, cute.arch.shuffle_sync_bfly(v, offset=1))
+        if lane == Int32(0):
+            sh_red[16] = v
+    cute.arch.barrier()
+    return sh_red[16]
+
+
+@cute.jit
+def _wait_nosleep(address: Int64, generation: Uint32) -> None:
+    observed = _load_acquire_sys_u32(address)
+    while Int32(observed - generation) < Int32(0):
+        observed = _load_acquire_sys_u32(address)
 
 
 @cute.jit
@@ -568,7 +879,7 @@ class _IslandRSLaunch:
                 else:
                     destination = self._island * 4 + peer
                     sender = self._lane
-                _store_release_sys_u32(
+                _store_relaxed_sys_u32(
                     _flag_address(
                         Int64(slabs[destination].toint()), region, bidx, Int32(sender)
                     )
@@ -1031,23 +1342,265 @@ class _IslandRSLaunch:
             for peer in cutlass.range_constexpr(4):
                 if cutlass.const_expr(peer != self._lane):
                     base = Int64(slabs[self._island * 4 + peer].toint())
-                    _store_release_sys_u32(
+                    _store_relaxed_sys_u32(
                         _flag_address(base, _RS_ARRIVED, bidx, Int32(self._lane)),
                         generation,
                     )
-                    _store_release_sys_u32(
+                    _store_relaxed_sys_u32(
                         _flag_address(base, _AG_ARRIVED, bidx, Int32(self._lane)),
                         generation,
                     )
                 if cutlass.const_expr(peer != self._island):
                     base = Int64(slabs[peer * 4 + self._lane].toint())
-                    _store_release_sys_u32(
+                    _store_relaxed_sys_u32(
                         _flag_address(base, _XS_ARRIVED, bidx, Int32(self._island)),
                         generation * Uint32(2) + Uint32(1),
                     )
 
     @cute.jit
+    def _participate_push_v4(
+        self,
+        slabs,
+        input_ptr,
+        output_ptr,
+        stage_offset,
+        part_offset,
+        final_offset,
+        quarter_capacity,
+        elements,
+        data_generation,
+        generation,
+        self_base,
+        tidx,
+        bidx,
+        gdim,
+    ):
+        if data_generation % Uint32(2) != Uint32(0):
+            stage_offset += quarter_capacity * Int64(_ISLAND_SIZE * 4)
+            part_offset += quarter_capacity * Int64(4)
+            final_offset += quarter_capacity * Int64(_ISLAND_SIZE * 4)
+
+        pairs = elements // Int64(2)
+        quarter = pairs // Int64(_ISLAND_SIZE)
+        q_v4 = quarter // Int64(4)
+        qbytes = quarter * Int64(4)
+        stride = Int64(gdim) * Int64(self._threads)
+        start = Int64(bidx) * Int64(self._threads) + Int64(tidx)
+        in_addr = Int64(input_ptr.toint())
+        out_addr = Int64(output_ptr.toint())
+
+        # Phase 1: Intra-switch local push (XOR rotation, 16-byte v4.u32).
+        for d in cutlass.range_constexpr(1, _ISLAND_SIZE):
+            dlane = self._lane ^ d
+            peer = self._island * _ISLAND_SIZE + dlane
+            dst_base = Int64(slabs[peer].toint()) + stage_offset + Int64(self._lane) * qbytes
+            src_base = in_addr + Int64(dlane) * qbytes
+            idx = start
+            while idx < q_v4:
+                w = ld_global_v4_u32(src_base + idx * Int64(16))
+                st_global_v4_u32(dst_base + idx * Int64(16), w[0], w[1], w[2], w[3])
+                idx += stride
+        cute.arch.barrier()
+        if tidx == Int32(0):
+            _fence_sc_sys()
+            for d in cutlass.range_constexpr(1, _ISLAND_SIZE):
+                peer = self._island * _ISLAND_SIZE + (self._lane ^ d)
+                _store_relaxed_sys_u32(
+                    _flag_address(
+                        Int64(slabs[peer].toint()),
+                        _RS_ARRIVED,
+                        bidx,
+                        Int32(self._lane),
+                    ),
+                    generation,
+                )
+            for d in cutlass.range_constexpr(1, _ISLAND_SIZE):
+                _wait_nosleep(
+                    _flag_address(self_base, _RS_ARRIVED, bidx, Int32(self._lane ^ d)),
+                    generation,
+                )
+        cute.arch.barrier()
+
+        # Phase 2: Local 4-way reduce -> self_part (canonical lane order 0..3).
+        mine_in = in_addr + Int64(self._lane) * qbytes
+        self_st = self_base + stage_offset
+        self_pt = self_base + part_offset
+        idx = start
+        while idx < q_v4:
+            totals = (Float32(0.0),) * 8
+            for p in cutlass.range_constexpr(_ISLAND_SIZE):
+                if cutlass.const_expr(p == self._lane):
+                    w = ld_global_v4_u32(mine_in + idx * Int64(16))
+                else:
+                    w = _ld_cg_v4_u32(self_st + Int64(p) * qbytes + idx * Int64(16))
+                totals = _accumulate_payload_words(totals, w, 4)
+            pk = _pack_payload_words(totals, 4)
+            st_global_v4_u32(self_pt + idx * Int64(16), pk[0], pk[1], pk[2], pk[3])
+            idx += stride
+        cute.arch.barrier()
+        if tidx == Int32(0):
+            _fence_sc_sys()
+            for d in cutlass.range_constexpr(1, _MAX_ISLANDS):
+                partner = (self._island ^ d) * _ISLAND_SIZE + self._lane
+                _store_relaxed_sys_u32(
+                    _flag_address(
+                        Int64(slabs[partner].toint()),
+                        _XS_ARRIVED,
+                        bidx,
+                        Int32(self._island),
+                    ),
+                    generation * Uint32(2),
+                )
+            for d in cutlass.range_constexpr(1, _MAX_ISLANDS):
+                _wait_nosleep(
+                    _flag_address(self_base, _XS_ARRIVED, bidx, Int32(self._island ^ d)),
+                    generation * Uint32(2),
+                )
+        cute.arch.barrier()
+
+        # Phase 3: Cross-island PULL (XOR-rotated ld.global.nc.v4, canonical island sum 0..3)
+        # + local output write + XOR-rotated intra-switch push.
+        mine_out = out_addr + Int64(self._lane) * qbytes
+        idx = start
+        while idx < q_v4:
+            loaded = [None, None, None, None]
+            for d in cutlass.range_constexpr(_MAX_ISLANDS):
+                isl = self._island ^ d
+                if cutlass.const_expr(isl == self._island):
+                    loaded[isl] = ld_global_v4_u32(self_pt + idx * Int64(16))
+                else:
+                    loaded[isl] = _ld_nc_v4_u32(
+                        Int64(slabs[isl * _ISLAND_SIZE + self._lane].toint())
+                        + part_offset
+                        + idx * Int64(16)
+                    )
+            totals = (Float32(0.0),) * 8
+            for isl in cutlass.range_constexpr(_MAX_ISLANDS):
+                totals = _accumulate_payload_words(totals, loaded[isl], 4)
+            pk = _pack_payload_words(totals, 4)
+            st_global_v4_u32(mine_out + idx * Int64(16), pk[0], pk[1], pk[2], pk[3])
+            for d in cutlass.range_constexpr(1, _ISLAND_SIZE):
+                peer = self._island * _ISLAND_SIZE + (self._lane ^ d)
+                st_global_v4_u32(
+                    Int64(slabs[peer].toint())
+                    + final_offset
+                    + Int64(self._lane) * qbytes
+                    + idx * Int64(16),
+                    pk[0],
+                    pk[1],
+                    pk[2],
+                    pk[3],
+                )
+            idx += stride
+        cute.arch.barrier()
+        if tidx == Int32(0):
+            _fence_sc_sys()
+            for d in cutlass.range_constexpr(1, _ISLAND_SIZE):
+                peer = self._island * _ISLAND_SIZE + (self._lane ^ d)
+                _store_relaxed_sys_u32(
+                    _flag_address(
+                        Int64(slabs[peer].toint()),
+                        _AG_ARRIVED,
+                        bidx,
+                        Int32(self._lane),
+                    ),
+                    generation,
+                )
+            for d in cutlass.range_constexpr(1, _ISLAND_SIZE):
+                _wait_nosleep(
+                    _flag_address(self_base, _AG_ARRIVED, bidx, Int32(self._lane ^ d)),
+                    generation,
+                )
+        cute.arch.barrier()
+
+        # Phase 4: Copy 3 received quarters from local L2-coherent final plane -> output.
+        for d in cutlass.range_constexpr(1, _ISLAND_SIZE):
+            sl = self._lane ^ d
+            src_base = self_base + final_offset + Int64(sl) * qbytes
+            dst_base = out_addr + Int64(sl) * qbytes
+            idx = start
+            while idx < q_v4:
+                w = _ld_cg_v4_u32(src_base + idx * Int64(16))
+                st_global_v4_u32(dst_base + idx * Int64(16), w[0], w[1], w[2], w[3])
+                idx += stride
+
+    @cute.jit
     def _participate(
+        self,
+        slabs,
+        input_ptr,
+        output_ptr,
+        stage_offset,
+        part_offset,
+        final_offset,
+        quarter_capacity,
+        elements,
+        data_generation,
+        generation,
+        self_base,
+        tidx,
+        bidx,
+        gdim,
+    ):
+        if cutlass.const_expr(self._local_push and not self._cross_island_rsag):
+            if (
+                Int64(input_ptr.toint()) % Int64(16) == Int64(0)
+                and Int64(output_ptr.toint()) % Int64(16) == Int64(0)
+                and elements % Int64(32) == Int64(0)
+            ):
+                self._participate_push_v4(
+                    slabs,
+                    input_ptr,
+                    output_ptr,
+                    stage_offset,
+                    part_offset,
+                    final_offset,
+                    quarter_capacity,
+                    elements,
+                    data_generation,
+                    generation,
+                    self_base,
+                    tidx,
+                    bidx,
+                    gdim,
+                )
+            else:
+                self._participate_scalar(
+                    slabs,
+                    input_ptr,
+                    output_ptr,
+                    stage_offset,
+                    part_offset,
+                    final_offset,
+                    quarter_capacity,
+                    elements,
+                    data_generation,
+                    generation,
+                    self_base,
+                    tidx,
+                    bidx,
+                    gdim,
+                )
+        else:
+            self._participate_scalar(
+                slabs,
+                input_ptr,
+                output_ptr,
+                stage_offset,
+                part_offset,
+                final_offset,
+                quarter_capacity,
+                elements,
+                data_generation,
+                generation,
+                self_base,
+                tidx,
+                bidx,
+                gdim,
+            )
+
+    @cute.jit
+    def _participate_scalar(
         self,
         slabs,
         input_ptr,
@@ -1130,7 +1683,7 @@ class _IslandRSLaunch:
             for p in cutlass.range_constexpr(_ISLAND_SIZE):
                 if cutlass.const_expr(p != self._lane):
                     peer = self._island * _ISLAND_SIZE + p
-                    _store_release_sys_u32(
+                    _store_relaxed_sys_u32(
                         _flag_address(
                             Int64(slabs[peer].toint()),
                             _RS_ARRIVED,
@@ -1243,7 +1796,7 @@ class _IslandRSLaunch:
             for j in cutlass.range_constexpr(_MAX_ISLANDS):
                 if cutlass.const_expr(j != self._island):
                     partner = j * _ISLAND_SIZE + self._lane
-                    _store_release_sys_u32(
+                    _store_relaxed_sys_u32(
                         _flag_address(
                             Int64(slabs[partner].toint()),
                             _XS_ARRIVED,
@@ -1376,7 +1929,7 @@ class _IslandRSLaunch:
                 for j in cutlass.range_constexpr(_MAX_ISLANDS):
                     if cutlass.const_expr(j != self._island):
                         partner = j * _ISLAND_SIZE + self._lane
-                        _store_release_sys_u32(
+                        _store_relaxed_sys_u32(
                             _flag_address(
                                 Int64(slabs[partner].toint()),
                                 _XS_ARRIVED,
@@ -1441,7 +1994,7 @@ class _IslandRSLaunch:
             for p in cutlass.range_constexpr(_ISLAND_SIZE):
                 if cutlass.const_expr(p != self._lane):
                     peer = self._island * _ISLAND_SIZE + p
-                    _store_release_sys_u32(
+                    _store_relaxed_sys_u32(
                         _flag_address(
                             Int64(slabs[peer].toint()),
                             _AG_ARRIVED,
@@ -1542,7 +2095,7 @@ def get_island_rs_launcher(
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "comm.pcie.island_rs.bf16",
-            3,
+            5,
             cache_key,
             labels=(
                 "world_size",
@@ -1638,4 +2191,762 @@ def get_island_rs_launcher(
     return attach_programs(run, raw)
 
 
-__all__ = ["HEADER_BYTES", "MAX_BLOCKS", "get_island_rs_launcher", "island_rs_peers"]
+# Unused words [112..119] inside _AG_ARRIVED[0, 0]'s 128-byte line hold the
+# GPU-local monotonic arrival/done counters for fused CuTe epilogues.
+# (Bytes [64..71] and [96..99] are used by island_row.py grid syncs.)
+_LOCAL_BAR_CNT_OFFSET = _AG_ARRIVED + 112
+_LOCAL_BAR_DONE_OFFSET = _AG_ARRIVED + 116
+
+
+class _IslandV4Norm3584Launch:
+    """Fused TP16 v4 island all-reduce + inline RMSNorm(3584 -> 224) reading straight from L2."""
+
+    def __init__(self, rank: int, rows: int, active_blocks: int) -> None:
+        self._rank = int(rank)
+        self._island = self._rank // _ISLAND_SIZE
+        self._lane = self._rank % _ISLAND_SIZE
+        self._rows = int(rows)
+        self._ab = int(active_blocks)
+        self._threads = 512
+        self._warps = 16
+
+    @cute.jit
+    def _sync3(
+        self,
+        slabs,
+        self_base,
+        region: cutlass.Constexpr[int],
+        cross: cutlass.Constexpr[bool],
+        bidx,
+        tidx,
+        tag,
+    ):
+        cute.arch.barrier()
+        if tidx == Int32(0):
+            _fence_sc_sys()
+            for d in cutlass.range_constexpr(1, 4):
+                peer = (
+                    ((self._island ^ d) * 4 + self._lane)
+                    if cutlass.const_expr(cross)
+                    else (self._island * 4 + (self._lane ^ d))
+                )
+                sender = self._island if cutlass.const_expr(cross) else self._lane
+                _store_relaxed_sys_u32(
+                    _flag_address(
+                        Int64(slabs[peer].toint()), region, bidx, Int32(sender)
+                    ),
+                    tag,
+                )
+            for d in cutlass.range_constexpr(1, 4):
+                w = (self._island ^ d) if cutlass.const_expr(cross) else (self._lane ^ d)
+                _wait_nosleep(_flag_address(self_base, region, bidx, Int32(w)), tag)
+        cute.arch.barrier()
+
+    @cute.jit
+    def __call__(
+        self,
+        s0: cute.Pointer, s1: cute.Pointer, s2: cute.Pointer, s3: cute.Pointer,
+        s4: cute.Pointer, s5: cute.Pointer, s6: cute.Pointer, s7: cute.Pointer,
+        s8: cute.Pointer, s9: cute.Pointer, s10: cute.Pointer, s11: cute.Pointer,
+        s12: cute.Pointer, s13: cute.Pointer, s14: cute.Pointer, s15: cute.Pointer,
+        inp: cute.Pointer,
+        weight: cute.Pointer,
+        out: cute.Pointer,
+        begin_ptr: cute.Pointer,
+        stage_off: Int64,
+        part_off: Int64,
+        final_off: Int64,
+        qcap: Int64,
+        eps: Float32,
+        blocks: Int32,
+        stream: cuda.CUstream,
+    ) -> None:
+        self.kernel(
+            s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12, s13, s14, s15,
+            inp, weight, out, begin_ptr, stage_off, part_off, final_off, qcap, eps,
+        ).launch(grid=(blocks, 1, 1), block=(512, 1, 1), stream=stream)
+
+    @cute.kernel
+    def kernel(
+        self,
+        s0: cute.Pointer, s1: cute.Pointer, s2: cute.Pointer, s3: cute.Pointer,
+        s4: cute.Pointer, s5: cute.Pointer, s6: cute.Pointer, s7: cute.Pointer,
+        s8: cute.Pointer, s9: cute.Pointer, s10: cute.Pointer, s11: cute.Pointer,
+        s12: cute.Pointer, s13: cute.Pointer, s14: cute.Pointer, s15: cute.Pointer,
+        inp: cute.Pointer,
+        weight: cute.Pointer,
+        out: cute.Pointer,
+        begin_ptr: cute.Pointer,
+        stage_off: Int64,
+        part_off: Int64,
+        final_off: Int64,
+        qcap: Int64,
+        eps: Float32,
+    ) -> None:
+        slabs = (s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12, s13, s14, s15)
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        self_base = Int64(slabs[self._rank].toint())
+        alloc = cutlass.utils.SmemAllocator()
+        sh_gen = alloc.allocate_tensor(
+            element_type=Uint32, layout=cute.make_layout((2,)), byte_alignment=4
+        )
+        sh_red = alloc.allocate_tensor(
+            element_type=Float32, layout=cute.make_layout((32,)), byte_alignment=16
+        )
+        if tidx == Int32(0):
+            sh_gen[0] = (
+                _atomic_add_global_u32(
+                    self_base + Int64(bidx) * Int64(4), Uint32(1)
+                )
+                + Uint32(1)
+            )
+            ep = Uint32(0)
+            if bidx < Int32(self._ab):
+                ep = (
+                    _atomic_add_global_u32(
+                        self_base
+                        + Int64(_ACTIVE_EPOCH_OFFSET)
+                        + Int64(bidx) * Int64(4),
+                        Uint32(1),
+                    )
+                    + Uint32(1)
+                )
+            sh_gen[1] = ep
+        cute.arch.barrier()
+        call_no = Uint32(sh_gen[0])
+        if call_no % Uint32(2) != Uint32(0):
+            stage_off += qcap * Int64(16)
+            part_off += qcap * Int64(4)
+            final_off += qcap * Int64(16)
+
+        if bidx < Int32(self._ab):
+            gen = Uint32(sh_gen[1])
+            q_v4 = Int64(self._rows * 112)
+            qbytes = Int64(self._rows * 1792)
+            stride = Int64(self._ab * 512)
+            start = Int64(bidx) * Int64(512) + Int64(tidx)
+            in_addr = Int64(inp.toint())
+            for d in cutlass.range_constexpr(1, 4):
+                dl = self._lane ^ d
+                peer = self._island * 4 + dl
+                dst = Int64(slabs[peer].toint()) + stage_off + Int64(self._lane) * qbytes
+                src = in_addr + Int64(dl) * qbytes
+                idx = start
+                while idx < q_v4:
+                    w = ld_global_v4_u32(src + idx * Int64(16))
+                    st_global_v4_u32(dst + idx * Int64(16), w[0], w[1], w[2], w[3])
+                    idx += stride
+            self._sync3(slabs, self_base, _RS_ARRIVED, False, bidx, tidx, gen)
+
+            mine_in = in_addr + Int64(self._lane) * qbytes
+            self_st = self_base + stage_off
+            self_pt = self_base + part_off
+            idx = start
+            while idx < q_v4:
+                totals = (Float32(0.0),) * 8
+                for p in cutlass.range_constexpr(4):
+                    if cutlass.const_expr(p == self._lane):
+                        w = ld_global_v4_u32(mine_in + idx * Int64(16))
+                    else:
+                        w = _ld_cg_v4_u32(self_st + Int64(p) * qbytes + idx * Int64(16))
+                    totals = _accumulate_payload_words(totals, w, 4)
+                pk = _pack_payload_words(totals, 4)
+                st_global_v4_u32(self_pt + idx * Int64(16), pk[0], pk[1], pk[2], pk[3])
+                idx += stride
+            self._sync3(slabs, self_base, _XS_ARRIVED, True, bidx, tidx, gen * Uint32(2))
+
+            idx = start
+            while idx < q_v4:
+                loaded = [None, None, None, None]
+                for d in cutlass.range_constexpr(4):
+                    isl = self._island ^ d
+                    if cutlass.const_expr(isl == self._island):
+                        loaded[isl] = ld_global_v4_u32(self_pt + idx * Int64(16))
+                    else:
+                        loaded[isl] = _ld_nc_v4_u32(
+                            Int64(slabs[isl * 4 + self._lane].toint())
+                            + part_off
+                            + idx * Int64(16)
+                        )
+                totals = (Float32(0.0),) * 8
+                for isl in cutlass.range_constexpr(4):
+                    totals = _accumulate_payload_words(totals, loaded[isl], 4)
+                pk = _pack_payload_words(totals, 4)
+                st_global_v4_u32(
+                    self_base + final_off + Int64(self._lane) * qbytes + idx * Int64(16),
+                    pk[0], pk[1], pk[2], pk[3],
+                )
+                for d in cutlass.range_constexpr(1, 4):
+                    peer = self._island * 4 + (self._lane ^ d)
+                    st_global_v4_u32(
+                        Int64(slabs[peer].toint())
+                        + final_off
+                        + Int64(self._lane) * qbytes
+                        + idx * Int64(16),
+                        pk[0], pk[1], pk[2], pk[3],
+                    )
+                idx += stride
+            self._sync3(slabs, self_base, _AG_ARRIVED, False, bidx, tidx, gen)
+
+        if bidx < Int32(max(self._ab, self._rows)):
+            if tidx == Int32(0):
+                acnt = self_base + Int64(_LOCAL_BAR_CNT_OFFSET)
+                adone = self_base + Int64(_LOCAL_BAR_DONE_OFFSET)
+                if bidx < Int32(self._ab):
+                    old = _atom_acqrel_gpu_add_u32(acnt, Uint32(1))
+                    if old + Uint32(1) == Uint32(self._ab):
+                        _store_relaxed_gpu_u32(acnt, Uint32(0))
+                        _store_release_gpu_u32(adone, call_no)
+                obs = _load_acquire_gpu_u32(adone)
+                while Int32(obs - call_no) < Int32(0):
+                    obs = _load_acquire_gpu_u32(adone)
+            cute.arch.barrier()
+
+        if bidx < Int32(self._rows):
+            row_addr = self_base + final_off + Int64(bidx) * Int64(3584 * 2)
+            ss = Float32(0.0)
+            if tidx < Int32(256):
+                u = cute.make_rmem_tensor((16,), Float32)
+                w0 = _ld_cg_v4_u32(row_addr + Int64(tidx) * Int64(16))
+                for j in cutlass.range_constexpr(4):
+                    lo, hi = unpack_bf16x2(w0[j])
+                    u[j * 2] = lo
+                    u[j * 2 + 1] = hi
+                for k in cutlass.range_constexpr(8, 16):
+                    u[k] = Float32(0.0)
+                if tidx < Int32(192):
+                    w1 = _ld_cg_v4_u32(
+                        row_addr + Int64(tidx + Int32(256)) * Int64(16)
+                    )
+                    for j in cutlass.range_constexpr(4):
+                        lo, hi = unpack_bf16x2(w1[j])
+                        u[8 + j * 2] = lo
+                        u[8 + j * 2 + 1] = hi
+                ss = _pair_tree_dot_fma_f32(u, u, 16)
+            tot = _triton_bfly_reduce_8warps(ss, sh_red, tidx)
+            rstd = _triton_rsqrt_3584(tot, eps)
+            if tidx < Int32(28):
+                begin_pack = Int32(cute.arch.load(begin_ptr, Int32)) // Int32(8)
+                col_pack = begin_pack + tidx
+                x = _ld_cg_v4_u32(row_addr + Int64(col_pack) * Int64(16))
+                wt = ld_global_v4_u32(Int64(weight.toint()) + Int64(tidx) * Int64(16))
+                ow = []
+                for j in cutlass.range_constexpr(4):
+                    xl, xh = unpack_bf16x2(x[j])
+                    wl, wh = unpack_bf16x2(wt[j])
+                    np = pack_f32x2_to_bf16x2(_mul_rn_f32(xl, rstd), _mul_rn_f32(xh, rstd))
+                    nl, nh = unpack_bf16x2(np)
+                    ow.append(pack_f32x2_to_bf16x2(_mul_rn_f32(nl, wl), _mul_rn_f32(nh, wh)))
+                st_global_v4_u32(
+                    Int64(out.toint()) + (Int64(bidx) * Int64(28) + Int64(tidx)) * Int64(16),
+                    ow[0], ow[1], ow[2], ow[3],
+                )
+
+
+class _IslandV4ResNorm7168Launch:
+    """Fused TP16 v4 island all-reduce + ResidualAdd + RMSNorm(7168) reading straight from L2."""
+
+    def __init__(self, rank: int, rows: int, active_blocks: int) -> None:
+        self._rank = int(rank)
+        self._island = self._rank // _ISLAND_SIZE
+        self._lane = self._rank % _ISLAND_SIZE
+        self._rows = int(rows)
+        self._ab = int(active_blocks)
+        self._threads = 512
+
+    @cute.jit
+    def _sync3(
+        self,
+        slabs,
+        self_base,
+        region: cutlass.Constexpr[int],
+        cross: cutlass.Constexpr[bool],
+        bidx,
+        tidx,
+        tag,
+    ):
+        cute.arch.barrier()
+        if tidx == Int32(0):
+            _fence_sc_sys()
+            for d in cutlass.range_constexpr(1, 4):
+                peer = (
+                    ((self._island ^ d) * 4 + self._lane)
+                    if cutlass.const_expr(cross)
+                    else (self._island * 4 + (self._lane ^ d))
+                )
+                sender = self._island if cutlass.const_expr(cross) else self._lane
+                _store_relaxed_sys_u32(
+                    _flag_address(
+                        Int64(slabs[peer].toint()), region, bidx, Int32(sender)
+                    ),
+                    tag,
+                )
+            for d in cutlass.range_constexpr(1, 4):
+                w = (self._island ^ d) if cutlass.const_expr(cross) else (self._lane ^ d)
+                _wait_nosleep(_flag_address(self_base, region, bidx, Int32(w)), tag)
+        cute.arch.barrier()
+
+    @cute.jit
+    def __call__(
+        self,
+        s0: cute.Pointer, s1: cute.Pointer, s2: cute.Pointer, s3: cute.Pointer,
+        s4: cute.Pointer, s5: cute.Pointer, s6: cute.Pointer, s7: cute.Pointer,
+        s8: cute.Pointer, s9: cute.Pointer, s10: cute.Pointer, s11: cute.Pointer,
+        s12: cute.Pointer, s13: cute.Pointer, s14: cute.Pointer, s15: cute.Pointer,
+        inp: cute.Pointer,
+        residual: cute.Pointer,
+        weight: cute.Pointer,
+        res_out: cute.Pointer,
+        norm_out: cute.Pointer,
+        stage_off: Int64,
+        part_off: Int64,
+        final_off: Int64,
+        qcap: Int64,
+        res_stride: Int64,
+        res_out_stride: Int64,
+        norm_out_stride: Int64,
+        eps: Float32,
+        blocks: Int32,
+        stream: cuda.CUstream,
+    ) -> None:
+        self.kernel(
+            s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12, s13, s14, s15,
+            inp, residual, weight, res_out, norm_out,
+            stage_off, part_off, final_off, qcap,
+            res_stride, res_out_stride, norm_out_stride, eps,
+        ).launch(grid=(blocks, 1, 1), block=(512, 1, 1), stream=stream)
+
+    @cute.kernel
+    def kernel(
+        self,
+        s0: cute.Pointer, s1: cute.Pointer, s2: cute.Pointer, s3: cute.Pointer,
+        s4: cute.Pointer, s5: cute.Pointer, s6: cute.Pointer, s7: cute.Pointer,
+        s8: cute.Pointer, s9: cute.Pointer, s10: cute.Pointer, s11: cute.Pointer,
+        s12: cute.Pointer, s13: cute.Pointer, s14: cute.Pointer, s15: cute.Pointer,
+        inp: cute.Pointer,
+        residual: cute.Pointer,
+        weight: cute.Pointer,
+        res_out: cute.Pointer,
+        norm_out: cute.Pointer,
+        stage_off: Int64,
+        part_off: Int64,
+        final_off: Int64,
+        qcap: Int64,
+        res_stride: Int64,
+        res_out_stride: Int64,
+        norm_out_stride: Int64,
+        eps: Float32,
+    ) -> None:
+        slabs = (s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12, s13, s14, s15)
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        self_base = Int64(slabs[self._rank].toint())
+        alloc = cutlass.utils.SmemAllocator()
+        sh_gen = alloc.allocate_tensor(
+            element_type=Uint32, layout=cute.make_layout((2,)), byte_alignment=4
+        )
+        sh_red = alloc.allocate_tensor(
+            element_type=Float32, layout=cute.make_layout((32,)), byte_alignment=16
+        )
+        if tidx == Int32(0):
+            sh_gen[0] = (
+                _atomic_add_global_u32(
+                    self_base + Int64(bidx) * Int64(4), Uint32(1)
+                )
+                + Uint32(1)
+            )
+            ep = Uint32(0)
+            if bidx < Int32(self._ab):
+                ep = (
+                    _atomic_add_global_u32(
+                        self_base
+                        + Int64(_ACTIVE_EPOCH_OFFSET)
+                        + Int64(bidx) * Int64(4),
+                        Uint32(1),
+                    )
+                    + Uint32(1)
+                )
+            sh_gen[1] = ep
+        cute.arch.barrier()
+        call_no = Uint32(sh_gen[0])
+        if call_no % Uint32(2) != Uint32(0):
+            stage_off += qcap * Int64(16)
+            part_off += qcap * Int64(4)
+            final_off += qcap * Int64(16)
+
+        if bidx < Int32(self._ab):
+            gen = Uint32(sh_gen[1])
+            q_v4 = Int64(self._rows * 224)
+            qbytes = Int64(self._rows * 3584)
+            stride = Int64(self._ab * 512)
+            start = Int64(bidx) * Int64(512) + Int64(tidx)
+            in_addr = Int64(inp.toint())
+            for d in cutlass.range_constexpr(1, 4):
+                dl = self._lane ^ d
+                peer = self._island * 4 + dl
+                dst = Int64(slabs[peer].toint()) + stage_off + Int64(self._lane) * qbytes
+                src = in_addr + Int64(dl) * qbytes
+                idx = start
+                while idx < q_v4:
+                    w = ld_global_v4_u32(src + idx * Int64(16))
+                    st_global_v4_u32(dst + idx * Int64(16), w[0], w[1], w[2], w[3])
+                    idx += stride
+            self._sync3(slabs, self_base, _RS_ARRIVED, False, bidx, tidx, gen)
+
+            mine_in = in_addr + Int64(self._lane) * qbytes
+            self_st = self_base + stage_off
+            self_pt = self_base + part_off
+            idx = start
+            while idx < q_v4:
+                totals = (Float32(0.0),) * 8
+                for p in cutlass.range_constexpr(4):
+                    if cutlass.const_expr(p == self._lane):
+                        w = ld_global_v4_u32(mine_in + idx * Int64(16))
+                    else:
+                        w = _ld_cg_v4_u32(self_st + Int64(p) * qbytes + idx * Int64(16))
+                    totals = _accumulate_payload_words(totals, w, 4)
+                pk = _pack_payload_words(totals, 4)
+                st_global_v4_u32(self_pt + idx * Int64(16), pk[0], pk[1], pk[2], pk[3])
+                idx += stride
+            self._sync3(slabs, self_base, _XS_ARRIVED, True, bidx, tidx, gen * Uint32(2))
+
+            idx = start
+            while idx < q_v4:
+                loaded = [None, None, None, None]
+                for d in cutlass.range_constexpr(4):
+                    isl = self._island ^ d
+                    if cutlass.const_expr(isl == self._island):
+                        loaded[isl] = ld_global_v4_u32(self_pt + idx * Int64(16))
+                    else:
+                        loaded[isl] = _ld_nc_v4_u32(
+                            Int64(slabs[isl * 4 + self._lane].toint())
+                            + part_off
+                            + idx * Int64(16)
+                        )
+                totals = (Float32(0.0),) * 8
+                for isl in cutlass.range_constexpr(4):
+                    totals = _accumulate_payload_words(totals, loaded[isl], 4)
+                pk = _pack_payload_words(totals, 4)
+                st_global_v4_u32(
+                    self_base + final_off + Int64(self._lane) * qbytes + idx * Int64(16),
+                    pk[0], pk[1], pk[2], pk[3],
+                )
+                for d in cutlass.range_constexpr(1, 4):
+                    peer = self._island * 4 + (self._lane ^ d)
+                    st_global_v4_u32(
+                        Int64(slabs[peer].toint())
+                        + final_off
+                        + Int64(self._lane) * qbytes
+                        + idx * Int64(16),
+                        pk[0], pk[1], pk[2], pk[3],
+                    )
+                idx += stride
+            self._sync3(slabs, self_base, _AG_ARRIVED, False, bidx, tidx, gen)
+
+        if bidx < Int32(max(self._ab, self._rows)):
+            if tidx == Int32(0):
+                acnt = self_base + Int64(_LOCAL_BAR_CNT_OFFSET)
+                adone = self_base + Int64(_LOCAL_BAR_DONE_OFFSET)
+                if bidx < Int32(self._ab):
+                    old = _atom_acqrel_gpu_add_u32(acnt, Uint32(1))
+                    if old + Uint32(1) == Uint32(self._ab):
+                        _store_relaxed_gpu_u32(acnt, Uint32(0))
+                        _store_release_gpu_u32(adone, call_no)
+                obs = _load_acquire_gpu_u32(adone)
+                while Int32(obs - call_no) < Int32(0):
+                    obs = _load_acquire_gpu_u32(adone)
+            cute.arch.barrier()
+
+        if bidx < Int32(self._rows):
+            red_addr = self_base + final_off + Int64(bidx) * Int64(7168 * 2)
+            res_addr = Int64(residual.toint()) + Int64(bidx) * res_stride * Int64(2)
+            rout_addr = Int64(res_out.toint()) + Int64(bidx) * res_out_stride * Int64(2)
+            nout_addr = Int64(norm_out.toint()) + Int64(bidx) * norm_out_stride * Int64(2)
+            w_addr = Int64(weight.toint())
+            ss = Float32(0.0)
+            u = cute.make_rmem_tensor((32,), Float32)
+
+            if tidx < Int32(256):
+                for seg in cutlass.range_constexpr(3):
+                    pidx = tidx + Int32(seg * 256)
+                    rd = _ld_cg_v4_u32(red_addr + Int64(pidx) * Int64(16))
+                    rs = ld_global_v4_u32(res_addr + Int64(pidx) * Int64(16))
+                    pk = []
+                    for j in cutlass.range_constexpr(4):
+                        rl, rh = unpack_bf16x2(rd[j])
+                        sl, sh = unpack_bf16x2(rs[j])
+                        p = pack_f32x2_to_bf16x2(_add_rn_f32(sl, rl), _add_rn_f32(sh, rh))
+                        pk.append(p)
+                        ul, uh = unpack_bf16x2(p)
+                        u[seg * 8 + j * 2] = ul
+                        u[seg * 8 + j * 2 + 1] = uh
+                    st_global_v4_u32(
+                        rout_addr + Int64(pidx) * Int64(16), pk[0], pk[1], pk[2], pk[3]
+                    )
+                for k in cutlass.range_constexpr(24, 32):
+                    u[k] = Float32(0.0)
+                if tidx < Int32(128):
+                    pidx = tidx + Int32(768)
+                    rd = _ld_cg_v4_u32(red_addr + Int64(pidx) * Int64(16))
+                    rs = ld_global_v4_u32(res_addr + Int64(pidx) * Int64(16))
+                    pk = []
+                    for j in cutlass.range_constexpr(4):
+                        rl, rh = unpack_bf16x2(rd[j])
+                        sl, sh = unpack_bf16x2(rs[j])
+                        p = pack_f32x2_to_bf16x2(_add_rn_f32(sl, rl), _add_rn_f32(sh, rh))
+                        pk.append(p)
+                        ul, uh = unpack_bf16x2(p)
+                        u[24 + j * 2] = ul
+                        u[24 + j * 2 + 1] = uh
+                    st_global_v4_u32(
+                        rout_addr + Int64(pidx) * Int64(16), pk[0], pk[1], pk[2], pk[3]
+                    )
+                ss = _pair_tree_dot_fma_f32(u, u, 32)
+
+            tot = _triton_bfly_reduce_8warps(ss, sh_red, tidx)
+            rstd = _triton_rsqrt_7168(tot, eps)
+
+            if tidx < Int32(256):
+                for seg in cutlass.range_constexpr(3):
+                    pidx = tidx + Int32(seg * 256)
+                    wt = ld_global_v4_u32(w_addr + Int64(pidx) * Int64(16))
+                    ow = []
+                    for j in cutlass.range_constexpr(4):
+                        wl, wh = unpack_bf16x2(wt[j])
+                        np = pack_f32x2_to_bf16x2(
+                            _mul_rn_f32(u[seg * 8 + j * 2], rstd),
+                            _mul_rn_f32(u[seg * 8 + j * 2 + 1], rstd),
+                        )
+                        nl, nh = unpack_bf16x2(np)
+                        ow.append(
+                            pack_f32x2_to_bf16x2(
+                                _mul_rn_f32(nl, wl), _mul_rn_f32(nh, wh)
+                            )
+                        )
+                    st_global_v4_u32(
+                        nout_addr + Int64(pidx) * Int64(16), ow[0], ow[1], ow[2], ow[3]
+                    )
+                if tidx < Int32(128):
+                    pidx = tidx + Int32(768)
+                    wt = ld_global_v4_u32(w_addr + Int64(pidx) * Int64(16))
+                    ow = []
+                    for j in cutlass.range_constexpr(4):
+                        wl, wh = unpack_bf16x2(wt[j])
+                        np = pack_f32x2_to_bf16x2(
+                            _mul_rn_f32(u[24 + j * 2], rstd),
+                            _mul_rn_f32(u[24 + j * 2 + 1], rstd),
+                        )
+                        nl, nh = unpack_bf16x2(np)
+                        ow.append(
+                            pack_f32x2_to_bf16x2(
+                                _mul_rn_f32(nl, wl), _mul_rn_f32(nh, wh)
+                            )
+                        )
+                    st_global_v4_u32(
+                        nout_addr + Int64(pidx) * Int64(16), ow[0], ow[1], ow[2], ow[3]
+                    )
+
+
+@program_cache
+def get_island_norm3584_launcher(
+    rank: int, rows: int, device_index: int, *, blocks: int = MAX_BLOCKS
+) -> Callable[..., None]:
+    del device_index
+    ab = min(2 if int(rows) <= 6 else 4, int(blocks))
+    launch = _IslandV4Norm3584Launch(rank, rows, ab)
+    slab_ph = make_ptr(cutlass.Uint8, 256, cute.AddressSpace.gmem, assumed_align=256)
+    bf_ph = make_ptr(cutlass.BFloat16, 16, cute.AddressSpace.gmem, assumed_align=16)
+    i32_ph = make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4)
+    raw = b12x_compile(
+        launch,
+        *(slab_ph for _ in range(_MAX_WORLD_SIZE)),
+        bf_ph,
+        bf_ph,
+        bf_ph,
+        i32_ph,
+        1,
+        1,
+        1,
+        1,
+        Float32(1e-6),
+        1,
+        current_cuda_stream(),
+        compile_spec=KernelCompileSpec.from_key(
+            "comm.pcie.island_v4_norm3584.bf16",
+            4,
+            (int(rank), int(rows), int(ab)),
+            labels=("rank", "rows", "active_blocks"),
+        ),
+    )
+
+    def run(
+        slab_addresses,
+        input_address,
+        weight_address,
+        output_address,
+        begin_address,
+        stage_offset,
+        part_offset,
+        final_offset,
+        quarter_capacity,
+        eps,
+        blocks,
+        stream=None,
+    ):
+        raw(
+            *(
+                make_ptr(
+                    cutlass.Uint8, int(a), cute.AddressSpace.gmem, assumed_align=256
+                )
+                for a in slab_addresses
+            ),
+            make_ptr(
+                cutlass.BFloat16,
+                int(input_address),
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            ),
+            make_ptr(
+                cutlass.BFloat16,
+                int(weight_address),
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            ),
+            make_ptr(
+                cutlass.BFloat16,
+                int(output_address),
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            ),
+            make_ptr(
+                cutlass.Int32,
+                int(begin_address),
+                cute.AddressSpace.gmem,
+                assumed_align=4,
+            ),
+            int(stage_offset),
+            int(part_offset),
+            int(final_offset),
+            int(quarter_capacity),
+            Float32(float(eps)),
+            int(blocks),
+            cuda_stream_from_int_or_current(cuda_stream_to_int(stream)),
+        )
+
+    return attach_programs(run, raw)
+
+
+@program_cache
+def get_island_resnorm7168_launcher(
+    rank: int, rows: int, device_index: int, *, blocks: int = MAX_BLOCKS
+) -> Callable[..., None]:
+    del device_index
+    ab = min(2 if int(rows) <= 6 else (4 if int(rows) <= 16 else 8), int(blocks))
+    launch = _IslandV4ResNorm7168Launch(rank, rows, ab)
+    slab_ph = make_ptr(cutlass.Uint8, 256, cute.AddressSpace.gmem, assumed_align=256)
+    bf_ph = make_ptr(cutlass.BFloat16, 16, cute.AddressSpace.gmem, assumed_align=16)
+    raw = b12x_compile(
+        launch,
+        *(slab_ph for _ in range(_MAX_WORLD_SIZE)),
+        bf_ph,
+        bf_ph,
+        bf_ph,
+        bf_ph,
+        bf_ph,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        Float32(1e-6),
+        1,
+        current_cuda_stream(),
+        compile_spec=KernelCompileSpec.from_key(
+            "comm.pcie.island_v4_resnorm7168.bf16",
+            4,
+            (int(rank), int(rows), int(ab)),
+            labels=("rank", "rows", "active_blocks"),
+        ),
+    )
+
+    def run(
+        slab_addresses,
+        input_address,
+        residual_address,
+        weight_address,
+        res_out_address,
+        norm_out_address,
+        stage_offset,
+        part_offset,
+        final_offset,
+        quarter_capacity,
+        res_stride,
+        res_out_stride,
+        norm_out_stride,
+        eps,
+        blocks,
+        stream=None,
+    ):
+        raw(
+            *(
+                make_ptr(
+                    cutlass.Uint8, int(a), cute.AddressSpace.gmem, assumed_align=256
+                )
+                for a in slab_addresses
+            ),
+            make_ptr(
+                cutlass.BFloat16,
+                int(input_address),
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            ),
+            make_ptr(
+                cutlass.BFloat16,
+                int(residual_address),
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            ),
+            make_ptr(
+                cutlass.BFloat16,
+                int(weight_address),
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            ),
+            make_ptr(
+                cutlass.BFloat16,
+                int(res_out_address),
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            ),
+            make_ptr(
+                cutlass.BFloat16,
+                int(norm_out_address),
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            ),
+            int(stage_offset),
+            int(part_offset),
+            int(final_offset),
+            int(quarter_capacity),
+            int(res_stride),
+            int(res_out_stride),
+            int(norm_out_stride),
+            Float32(float(eps)),
+            int(blocks),
+            cuda_stream_from_int_or_current(cuda_stream_to_int(stream)),
+        )
+
+    return attach_programs(run, raw)
+
+
+__all__ = [
+    "HEADER_BYTES",
+    "MAX_BLOCKS",
+    "get_island_rs_launcher",
+    "get_island_norm3584_launcher",
+    "get_island_resnorm7168_launcher",
+    "island_rs_peers",
+]
