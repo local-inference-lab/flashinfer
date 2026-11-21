@@ -245,9 +245,28 @@ def _automatic_a16(query, device):
     )
 
 
+def _tc_gemv_default_config(query):
+    sk = mxfp8_a16_tc_gemv_splits(query)[0]
+    chunks_per_split = (query.padded_in_features // 64) // sk
+    warps = 2 if chunks_per_split <= 4 else 4
+    return BlockscaledConfig(
+        mode="a16",
+        tile_m=16,
+        tile_n=16,
+        tile_k=64,
+        split_k=sk,
+        mma_warps=warps,
+        a16_backend="tc_gemv",
+    )
+
+
 def _default_config(query, device):
     if query.activation_mode == "quantized" or query.recipe == "mxfp4":
         return BlockscaledConfig(mode="quantized")
+    if mxfp8_a16_tc_gemv_eligible(query, device) and (
+        not query.source_contiguous or query.num_tokens <= 28
+    ):
+        return _tc_gemv_default_config(query)
     if _automatic_a16(query, device) or (
         query.recipe == "nvfp4" and not query.activation_scale_available
     ):
@@ -374,6 +393,45 @@ def effective_a16_config(query, config):
     )
 
 
+def mxfp8_a16_tc_gemv_eligible(query, device):
+    from ._mxfp8_tc_gemv import MXFP8_TC_GEMV_MAX_ROWS
+
+    return (
+        device is not None
+        and device.compute_capability in ((12, 0), (12, 1))
+        and query.recipe == "mxfp8"
+        and query.num_tokens <= MXFP8_TC_GEMV_MAX_ROWS
+        and query.in_features % 16 == 0
+        and query.padded_in_features % 64 == 0
+        and query.out_features % 8 == 0
+        and query.source_aligned
+    )
+
+
+def mxfp8_a16_tc_gemv_splits(query):
+    from ._mxfp8_tc_gemv import mxfp8_tc_gemv_workspace_bytes
+
+    n_blocks = (query.out_features + 15) // 16
+    chunks = query.padded_in_features // 64
+    cands = []
+    if n_blocks >= 48 or chunks <= 2:
+        cands.append(1)
+    for sk in (2, 4, 8, 16):
+        if chunks % sk != 0:
+            continue
+        if query.workspace_nbytes is not None:
+            needed = mxfp8_tc_gemv_workspace_bytes(
+                query.num_tokens, query.out_features, sk
+            )
+            if query.workspace_nbytes < needed:
+                continue
+        if 64 <= n_blocks * sk <= 448 or (sk == 2 and n_blocks <= 224):
+            cands.append(sk)
+    if not cands:
+        cands.append(1)
+    return tuple(cands)
+
+
 def _validate_config(query, config, device):
     if not isinstance(config, BlockscaledConfig) or config.mode not in (
         "a16",
@@ -389,11 +447,35 @@ def _validate_config(query, config, device):
         )
     if query.activation_mode != "auto" and config.mode != query.activation_mode:
         raise ValueError("configuration conflicts with caller activation precision")
-    if config.a16_backend not in ("auto", "packed") or (
+    if config.a16_backend not in ("auto", "packed", "tc_gemv") or (
         config.a16_backend != "auto"
         and (config.mode != "a16" or query.recipe != "mxfp8")
     ):
         raise ValueError("explicit packed A16 backend requires MXFP8 A16 execution")
+    if config.a16_backend == "tc_gemv":
+        from ._mxfp8_tc_gemv import mxfp8_tc_gemv_workspace_bytes
+
+        if not mxfp8_a16_tc_gemv_eligible(query, device):
+            raise ValueError("MXFP8 TC-GEMV A16 backend is ineligible for this query")
+        if (
+            config.tile_m not in (None, 16)
+            or config.tile_n != 16
+            or config.tile_k != 64
+            or type(config.split_k) is not int
+            or config.split_k not in (1, 2, 4, 8, 16)
+            or (query.padded_in_features // 64) % config.split_k != 0
+            or type(config.mma_warps) is not int
+            or config.mma_warps not in (2, 4, 8)
+            or config.dense_config is not None
+        ):
+            raise ValueError("invalid MXFP8 TC-GEMV A16 configuration")
+        if query.workspace_nbytes is not None:
+            needed = mxfp8_tc_gemv_workspace_bytes(
+                query.num_tokens, query.out_features, config.split_k
+            )
+            if query.workspace_nbytes < needed:
+                raise ValueError("caller workspace is too small for MXFP8 TC-GEMV split-K")
+        return
     if config.dense_config is not None:
         if config.mode != "quantized" or query.recipe not in (
             "nvfp4",
@@ -535,6 +617,8 @@ def _tuning_parameters(query, device):
             )
 
     expanded = mxfp8_a16_dequant(query, BlockscaledConfig(mode="a16"))
+    tc_gemv = mxfp8_a16_tc_gemv_eligible(query, device)
+    tc_splits = mxfp8_a16_tc_gemv_splits(query) if tc_gemv else ()
 
     def eligible(parameters):
         if (
@@ -551,6 +635,21 @@ def _tuning_parameters(query, device):
             ) == (16, 64, 64, 1, 4)
         if parameters["mode"] != "a16":
             return True
+        if parameters["a16_backend"] == "tc_gemv":
+            if not (
+                tc_gemv
+                and parameters["tile_m"] == 16
+                and parameters["tile_n"] == 16
+                and parameters["tile_k"] == 64
+                and parameters["split_k"] in tc_splits
+            ):
+                return False
+            chunks_per_split = (query.padded_in_features // 64) // parameters["split_k"]
+            if chunks_per_split <= 4:
+                return parameters["mma_warps"] in (2, 4)
+            return parameters["mma_warps"] in (4, 8)
+        if parameters["tile_n"] == 16 or parameters["mma_warps"] == 8:
+            return False
         if parameters["tile_n"] == 32 and not (
             query.recipe == "mxfp8"
             or query.recipe == "q8_0"
@@ -603,11 +702,32 @@ def _tuning_parameters(query, device):
         )
 
     def expanded_a16(parameters):
-        return parameters["a16_backend"] == "auto"
+        return parameters["a16_backend"] in ("auto", "tc_gemv")
 
     def dense_tile_n(parameters):
         dense = parameters["dense_config"]
         return dense is None or dense["tile_n"] != 16
+
+    def prefer_tc_gemv(parameters):
+        # Single-launch TC-GEMV streams MXFP8 weights once directly from DRAM
+        # without separate activation quantization or SplitKReduce, beating
+        # quantized/A16 dense GEMMs under cold-DRAM decode/draft replay (M <= 28)
+        # even when hot-L2 single-layer autotuning favors dense GEMM.
+        return (
+            not tc_gemv
+            or query.num_tokens > 28
+            or query.activation_mode == "quantized"
+            or (
+                parameters["mode"] == "a16"
+                and parameters["a16_backend"] == "tc_gemv"
+            )
+        )
+
+    a16_backends = ("auto",)
+    if expanded:
+        a16_backends = (*a16_backends, "packed")
+    if tc_gemv:
+        a16_backends = (*a16_backends, "tc_gemv")
 
     return ParameterSpace.create(
         TUNING.knobs,
@@ -619,12 +739,16 @@ def _tuning_parameters(query, device):
             else ("a16", "quantized")
             if query.activation_mode == "auto"
             else (query.activation_mode,),
-            "mma_warps": (2, 4) if query.recipe == "mxfp8" else (None,),
+            "mma_warps": (
+                (2, 4, 8) if tc_gemv else (2, 4)
+            )
+            if query.recipe == "mxfp8"
+            else (None,),
             "dense_config": dense_configs,
             "fuse_swiglu": (False, True)
             if query.source_activation == "swiglu_bf16"
             else (False,),
-            "a16_backend": ("auto", "packed") if expanded else ("auto",),
+            "a16_backend": a16_backends,
         },
         predicates=(
             eligible,
@@ -635,7 +759,13 @@ def _tuning_parameters(query, device):
             ),
         ),
         autotune_effort=query.autotune_effort,
-        efficiency_predicates=(row_padding, narrow_output, expanded_a16, dense_tile_n),
+        efficiency_predicates=(
+            row_padding,
+            narrow_output,
+            expanded_a16,
+            dense_tile_n,
+            prefer_tc_gemv,
+        ),
     )
 
 
@@ -654,6 +784,17 @@ def _equivalence(query, device, config):
             "fuse_swiglu": config.fuse_swiglu,
             "dense_config": None if dense is None else dense.to_dict(),
         }
+    if config.a16_backend == "tc_gemv":
+        from ._mxfp8_tc_gemv import effective_mxfp8_tc_gemv_warps
+
+        return {
+            "mode": "a16",
+            "backend": "tc_gemv",
+            "split_k": config.split_k,
+            "warps": effective_mxfp8_tc_gemv_warps(
+                query.padded_in_features, config.split_k, config.mma_warps or 8
+            ),
+        }
     if mxfp8_a16_dequant(query, config):
         return {"mode": "a16", "backend": "dequant"}
     n, k, split = effective_a16_config(query, config)
@@ -670,7 +811,7 @@ def _equivalence(query, device, config):
 TUNING = TuningContract(
     component_id="gemm.blockscaled_precision",
     query_schema_version=25,
-    config_schema_version=26,
+    config_schema_version=27,
     query_fields=frozenset(BlockscaledQuery.__dataclass_fields__),
     config_fields=frozenset(BlockscaledConfig.__dataclass_fields__),
     encode_query=lambda query: {
@@ -681,7 +822,7 @@ TUNING = TuningContract(
     validate_query=_validate_query,
     validate_config=_validate_config,
     default_config=_default_config,
-    candidate_contract_version=56,
+    candidate_contract_version=58,
     knobs=(
         Knob(
             name="mode", values=("a16", "quantized"), binding=ParameterBinding.COMPILE
@@ -692,7 +833,9 @@ TUNING = TuningContract(
             when=FrozenMapping({"mode": "a16"}),
         ),
         Knob(
-            name="tile_n", values=(4, 32, 64, 128), when=FrozenMapping({"mode": "a16"})
+            name="tile_n",
+            values=(4, 16, 32, 64, 128),
+            when=FrozenMapping({"mode": "a16"}),
         ),
         Knob(name="tile_k", values=(64, 128, 256), when=FrozenMapping({"mode": "a16"})),
         Knob(

@@ -8,7 +8,7 @@ import torch
 from b12x._lib.compile_plan import attach_programs, load_programs
 from b12x._lib.compile_pool import CompileJob
 from b12x._lib.program_cache import program_cache
-from b12x.preparation import FrozenMapping, MemoryRequirements, Plan
+from b12x.preparation import FrozenMapping, MemoryRequirements, PersistentMemory, Plan
 from b12x.preparation.types import plan_from_handle, require_prepared
 
 from ._tuning import TUNING, GemvConfig, GemvQuery
@@ -67,6 +67,17 @@ def compile_gemv(query_payload, config_payload, ordinal):
             query.in_features,
             query.output_dtype,
         )
+    elif config.backend == "tc":
+        from ._tensor_core import compile_tc_projection
+
+        launcher = compile_tc_projection(
+            ordinal,
+            query.max_rows,
+            config.split_k,
+            query.out_features,
+            query.in_features,
+            query.output_dtype,
+        )
     else:
         from ._kernel import compile_projection
 
@@ -99,6 +110,8 @@ class _GemvExecutionState:
     query: GemvQuery
     device: torch.device
     launcher: object
+    tc_scratch: torch.Tensor | None = None
+    tc_flags: torch.Tensor | None = None
 
     def run(self, x, weight, *, out=None, bias=None):
         from ._kernel import _validate
@@ -138,7 +151,12 @@ class _GemvExecutionState:
                 raise ValueError(f"projection {name} must retain 16-byte alignment")
         _validate(x, weight, out, bias)
         if x.shape[0]:
-            self.launcher(x, weight, out, bias)
+            if self.tc_scratch is not None:
+                self.launcher(
+                    x, weight, out, bias, scratch=self.tc_scratch, flags=self.tc_flags
+                )
+            else:
+                self.launcher(x, weight, out, bias)
         return out
 
 
@@ -164,6 +182,29 @@ def plan(query: GemvQuery, *, invocation=FrozenMapping(), override=None) -> Plan
 
     def memory(config, device):
         TUNING.validate_config(query, config, device)
+        if config.backend == "tc" and config.split_k > 1:
+            from ._tensor_core import (
+                _TC_SPLITK_BUFFERS,
+                tc_splitk_flags_bytes,
+                tc_splitk_scratch_bytes,
+            )
+
+            m_tiles = (query.max_rows + 7) // 8
+            total = tc_splitk_scratch_bytes(
+                query.max_rows, query.out_features, config.split_k
+            ) + tc_splitk_flags_bytes(query.out_features, config.split_k)
+            key = (
+                device.ordinal,
+                query.out_features,
+                query.in_features,
+                m_tiles,
+                config.split_k,
+            )
+            resident = total if key in _TC_SPLITK_BUFFERS else 0
+            return MemoryRequirements(
+                (),
+                (PersistentMemory(("bf16_gemv.tc_splitk", *key), total, resident),),
+            )
         return MemoryRequirements()
 
     def materialize(selection, device):
@@ -177,9 +218,21 @@ def plan(query: GemvQuery, *, invocation=FrozenMapping(), override=None) -> Plan
             device.ordinal,
         )
         load_programs(programs)
+        resolved = torch.device("cuda", device.ordinal)
+        tc_scratch = tc_flags = None
+        if selection.config.backend == "tc" and selection.config.split_k > 1:
+            from ._tensor_core import tc_splitk_buffers
+
+            tc_scratch, tc_flags = tc_splitk_buffers(
+                resolved,
+                query.max_rows,
+                query.out_features,
+                query.in_features,
+                selection.config.split_k,
+            )
         return attach_programs(
             _GemvExecutionState(
-                query, torch.device("cuda", device.ordinal), programs["gemv"]
+                query, resolved, programs["gemv"], tc_scratch, tc_flags
             ),
             programs,
         )
