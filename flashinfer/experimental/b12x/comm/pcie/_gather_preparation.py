@@ -52,14 +52,18 @@ def selected_gather_profile(transport, blocks, mode, active):
             raise ValueError(
                 "ring gather requires 8/8 or 16/16 physical/active CTAs"
             )
+    elif transport == "selected_switch_push":
+        if not ((blocks == 8 and active == 8) or (blocks == 16 and active in (8, 16))):
+            raise ValueError(
+                "switch_push gather requires 8/8 or 16/(8|16) physical/active CTAs"
+            )
     elif transport in (
-        "selected_switch_push",
         "selected_recursive",
         "selected_recursive_ready",
         "selected_recursive_outer_first",
     ) and (blocks != 8 or active != 8):
         raise ValueError(
-            "switch_push and recursive gathers require eight active and physical CTAs"
+            "recursive gathers require eight active and physical CTAs"
         )
     return (int(mode == "word_exchange") << 16) | active
 

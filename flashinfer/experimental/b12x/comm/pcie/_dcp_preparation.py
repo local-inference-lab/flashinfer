@@ -233,7 +233,7 @@ def compile_dcp_surface(query_payload, ordinal):
         if surface.endswith("lse_reduce_scatter"):
             pairwise = call.get("payload_schedule") == "pairwise"
             hier_dcp8 = (
-                query.world_size == 8
+                query.world_size in (4, 8)
                 and not pairwise
                 and int(query.setup["head_dim"]) == 512
             )

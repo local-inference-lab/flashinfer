@@ -73,6 +73,7 @@ def _selected_gather_query(query, transport, thread_counts):
             not setup.get("blocks_override", 0)
             and (
                 (transport == "selected_recursive_pix_last" and query.world_size == 8)
+                or (transport == "selected_switch_push" and query.world_size == 4)
                 or (
                     transport == "selected_ring"
                     and query.world_size == 16

@@ -220,7 +220,7 @@ def _validate_query(query: PcieQuery, device) -> None:
     if query.surface.endswith(".all_gather_pair_kimi_topk"):
         if "rows" in query.call and (
             type(query.call["rows"]) is not int
-            or not 2 <= query.call["rows"] <= 32
+            or not 2 <= query.call["rows"] <= 64
             or query.world_size != 16
             or query.setup.get("max_batch_size", 0) < query.call["rows"]
             or query.setup.get("query_head_dim") != 672

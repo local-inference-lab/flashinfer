@@ -1582,7 +1582,7 @@ def prepared_rows(plan, *, rows, width, threads):
     from .pcie_island_rs import PCIeIslandRSAllReduce
     from ._tuning import pairwise_device
 
-    if plan.prepared is None or not 1 <= rows <= 32 or width not in (3584, 7168):
+    if plan.prepared is None or not 1 <= rows <= 64 or width not in (3584, 7168):
         return None
     if not pairwise_device(plan.prepared.device.identity):
         return None

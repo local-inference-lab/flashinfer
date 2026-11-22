@@ -502,6 +502,7 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
             raise ValueError("pairwise payloads require world size four")
         self._pairwise = bool(pairwise)
         self._hier_dcp8 = bool(hier_dcp8 and self._world_size == 8 and not self._pairwise)
+        self._fast_dcp4 = bool(hier_dcp8 and self._world_size == 4 and not self._pairwise)
 
     @cute.jit
     def __call__(
@@ -603,7 +604,11 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
         ).launch(
             grid=(grid_x, 1, 1),
             block=(self._threads, 1, 1),
-            max_number_threads=(self._threads if self._hier_dcp8 else 512, 1, 1),
+            max_number_threads=(
+                self._threads if (self._hier_dcp8 or self._fast_dcp4) else 512,
+                1,
+                1,
+            ),
             min_blocks_per_mp=1,
             cluster=(8 if self._pairwise else 1, 1, 1),
             stream=stream,
@@ -981,6 +986,118 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
             row += warp_stride
 
     @cute.jit
+    def _fast_switch4_dcp4(
+        self,
+        local_output,
+        local_lse,
+        output,
+        staging,
+        signals,
+        slot_offset,
+        lse_offset,
+        rows,
+        total_heads,
+        heads_per_rank,
+        packs_per_head,
+        input_stride_batch,
+        input_stride_head,
+        output_stride_batch,
+        output_stride_head,
+        natural_log,
+        tidx,
+        lane,
+        warp_first,
+        warp_stride,
+    ) -> None:
+        """XOR-staggered 1-to-1 intra-switch DCP4 LSE reduce-scatter with single-leader acquire barrier."""
+        sw_peers = (self._rank ^ 1, self._rank ^ 2, self._rank ^ 3)
+        for xor_d in cutlass.range_constexpr(1, 4):
+            dest = self._rank ^ xor_d
+            dst_stg = staging[dest] + slot_offset
+            dst_words = self._staging_words(dst_stg)
+            dst_lse = self._staging_lse(dst_stg, lse_offset)
+            dst_slot = xor_d - 1
+            row = warp_first
+            while row < rows:
+                batch_index = row // heads_per_rank
+                local_head = row - batch_index * heads_per_rank
+                src_row = (
+                    Int64(batch_index) * Int64(total_heads)
+                    + Int64(dest) * Int64(heads_per_rank)
+                    + Int64(local_head)
+                )
+                in_base = (
+                    Int64(batch_index) * input_stride_batch
+                    + (Int64(dest) * Int64(heads_per_rank) + Int64(local_head))
+                    * input_stride_head
+                )
+                inc_row = (
+                    Int64(batch_index) * Int64(total_heads)
+                    + Int64(dst_slot) * Int64(heads_per_rank)
+                    + Int64(local_head)
+                )
+                stg_base = inc_row * Int64(packs_per_head)
+                for k in cutlass.range_constexpr(2):
+                    pack = lane + Int32(k * 32)
+                    _copy_16b(
+                        local_output + (in_base + Int64(pack)) * Int64(4),
+                        dst_words + (stg_base + Int64(pack)) * Int64(4),
+                    )
+                if lane == Int32(0):
+                    cute.arch.store(
+                        dst_lse + inc_row, cute.arch.load(local_lse + src_row, Float32)
+                    )
+                row += warp_stride
+
+        _subset_pair_barrier(signals, signals[self._rank], self._rank, sw_peers, _MAX_BLOCKS)
+
+        self_stg = staging[self._rank] + slot_offset
+        accum0 = cute.make_rmem_tensor((8,), Float32)
+        accum1 = cute.make_rmem_tensor((8,), Float32)
+        row = warp_first
+        while row < rows:
+            batch_index = row // heads_per_rank
+            local_head = row - batch_index * heads_per_rank
+            self._combine4_local(
+                accum0,
+                accum1,
+                batch_index,
+                local_head,
+                self._rank,
+                0,
+                total_heads,
+                heads_per_rank,
+                packs_per_head,
+                input_stride_batch,
+                input_stride_head,
+                local_output,
+                local_lse,
+                self_stg,
+                lse_offset,
+                natural_log,
+                lane,
+            )
+            out_base = (
+                Int64(batch_index) * output_stride_batch
+                + Int64(local_head) * output_stride_head
+            )
+            st_global_v4_u32(
+                (output + (out_base + Int64(lane)) * Int64(4)).toint(),
+                self._pack_pair(accum0[0], accum0[1]),
+                self._pack_pair(accum0[2], accum0[3]),
+                self._pack_pair(accum0[4], accum0[5]),
+                self._pack_pair(accum0[6], accum0[7]),
+            )
+            st_global_v4_u32(
+                (output + (out_base + Int64(lane + Int32(32))) * Int64(4)).toint(),
+                self._pack_pair(accum1[0], accum1[1]),
+                self._pack_pair(accum1[2], accum1[3]),
+                self._pack_pair(accum1[4], accum1[5]),
+                self._pack_pair(accum1[6], accum1[7]),
+            )
+            row += warp_stride
+
+    @cute.jit
     def _push_destination(
         self,
         destination: cutlass.Constexpr,
@@ -1147,6 +1264,29 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
         rows = batch * heads_per_rank
         if cutlass.const_expr(self._hier_dcp8):
             self._hier_switch4_pair2_dcp8(
+                local_output,
+                local_lse,
+                output,
+                staging,
+                signals,
+                slot_offset,
+                lse_offset,
+                rows,
+                total_heads,
+                heads_per_rank,
+                packs_per_head,
+                input_stride_batch,
+                input_stride_head,
+                output_stride_batch,
+                output_stride_head,
+                natural_log,
+                tidx,
+                lane,
+                warp_first,
+                warp_stride,
+            )
+        elif cutlass.const_expr(self._fast_dcp4):
+            self._fast_switch4_dcp4(
                 local_output,
                 local_lse,
                 output,
@@ -2703,7 +2843,7 @@ def _get_compiled_lse_reduce_scatter(
     hier_dcp8: bool = False,
 ) -> Callable:
     """Compile and retain one LSE reduce-scatter launcher specialization."""
-    use_hier = bool(hier_dcp8 and int(world_size) == 8 and not bool(pairwise))
+    use_hier = bool(hier_dcp8 and int(world_size) in (4, 8) and not bool(pairwise))
     launch = _LseReduceScatterLaunch(
         world_size,
         rank,
@@ -2748,7 +2888,7 @@ def _get_compiled_lse_reduce_scatter(
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "comm.pcie.dcp_a2a.lse_reduce_scatter",
-            40,
+            41,
             cache_key,
             labels=(
                 "world_size",
@@ -3160,7 +3300,7 @@ def lse_reduce_scatter(
     """Reduce attention LSE values across PCIe ranks using a prepared launcher."""
     slot_delta_256b = _slot_delta_256b(slot_delta_bytes)
     if launcher is None:
-        use_hier = int(world_size) == 8 and int(head_dim) == 512
+        use_hier = int(world_size) in (4, 8) and int(head_dim) == 512
         launcher = _get_compiled_lse_reduce_scatter(
             world_size,
             rank,

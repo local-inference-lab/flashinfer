@@ -83,12 +83,12 @@ def _check_four_row_route(runtime, down, router, bias, latent, logits, weights, 
     rows = int(down.shape[0]) if down is not None and down.ndim == 2 else 0
     if (
         runtime.world_size != 16
-        or not 2 <= rows <= 32
+        or not 2 <= rows <= 64
         or runtime.max_batch_size < rows
         or runtime.query_head_dim != 672
     ):
         raise ValueError(
-            "multi-row Kimi expert selection requires a sixteen-rank 672-byte channel (2..32 rows)"
+            "multi-row Kimi expert selection requires a sixteen-rank 672-byte channel (2..64 rows)"
         )
     expected = (
         ("down", down, (rows, 224), torch.bfloat16),
