@@ -210,6 +210,7 @@ def bind(
         expected_num_q_heads=caps.num_q_heads,
         shared_page_table=caps.shared_page_table,
         output_physical_slots=caps.output_physical_slots,
+        _initialize=caps.route != "paged_fused",
     )
     return Binding(
         plan=plan,

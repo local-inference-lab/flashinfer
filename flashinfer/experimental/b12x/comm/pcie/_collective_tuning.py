@@ -143,9 +143,7 @@ def _configs(query, device=None):
             )
             phys_blocks = 16 if (is_dcp8_pix or is_tp16_ring16) else 8
             active_choices = (
-                (8, 16)
-                if is_dcp8_pix
-                else ((16,) if is_tp16_ring16 else (8,))
+                (8, 16) if is_dcp8_pix else ((16,) if is_tp16_ring16 else (8,))
             )
             for active in active_choices:
                 for count in counts:
@@ -440,7 +438,8 @@ def _validate_query(query, device):
                 query.world_size not in (8, 16)
                 and not (
                     query.world_size == 4
-                    and name in ("dcp_ring", "dcp_switch_push", "dcp_recursive_pix_last")
+                    and name
+                    in ("dcp_ring", "dcp_switch_push", "dcp_recursive_pix_last")
                 )
             )
             or (name == "dcp_recursive_outer_first" and query.world_size != 16)
@@ -623,7 +622,7 @@ def _bucket(query):
 TUNING = TuningContract(
     component_id="comm.pcie",
     query_schema_version=8,
-    candidate_contract_version=13,
+    candidate_contract_version=14,
     config_schema_version=2,
     query_fields=frozenset(
         ("operation", "world_size", "rank", "alternatives", "default", "inplace")
@@ -746,10 +745,49 @@ def oneshot_alternatives(query, runtime):
     field = "transport" if query.surface.endswith(".all_reduce") else "mode"
     selected = query.call[field]
     alternatives[selected] = (query, runtime)
+    if not query.call["stage_input"]:
+        return alternatives
     if (
-        not query.call["stage_input"]
-        or query.call.get("reduction_order") == "shard_owner"
+        field == "mode"
+        and query.call.get("reduction_order") == "shard_owner"
+        and query.world_size in (2, 4, 8)
     ):
+        dtype = query.call["dtype"]
+        reduction_dtype = query.call["reduction_dtype"]
+        hidden_packs = int(query.call["hidden_packs"])
+        rows = int(query.call["rows"])
+        shard_packs = int(query.setup.get("eager_buffer_bytes") or 0) // 16
+        packed = reduction_dtype == dtype
+        unpacked = reduction_dtype is None
+        if (
+            dtype in ("float16", "bfloat16")
+            and query.call["group_size"] == 0
+            and hidden_packs <= 768
+            and hidden_packs % query.world_size == 0
+            and 1 <= rows <= 36
+            and (packed or unpacked)
+        ):
+            slice_packs = hidden_packs // query.world_size
+            required = rows * hidden_packs + rows * slice_packs * (1 if packed else 2)
+            if required <= shard_packs:
+                sg_mode = (
+                    "stage_scatter_gather_packed" if packed else "stage_scatter_gather"
+                )
+                sg_call = {
+                    **query.call,
+                    "mode": sg_mode,
+                    "threads": 768,
+                    "reg_packs": 1,
+                    "single_cta": True,
+                    "register_normalize": True,
+                    "ctas_per_row": 1,
+                    "blocks": rows,
+                }
+                alternatives[sg_mode] = (
+                    replace(query, call=FrozenMapping(sg_call)),
+                    runtime,
+                )
+    if query.call.get("reduction_order") == "shard_owner":
         return alternatives
     modes = ["pull"] if field == "transport" else ["stage_pull"]
     if field == "transport":

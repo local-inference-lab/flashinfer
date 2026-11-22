@@ -276,7 +276,14 @@ class _SparseMlaState:
                 )
         object.__setattr__(self, "prepared", prepared)
 
-    def run(self, binding: B12XSparseMLABinding, *, kv_cache, attention_sink=None):
+    def run(
+        self,
+        binding: B12XSparseMLABinding,
+        *,
+        kv_cache,
+        attention_sink=None,
+        out: torch.Tensor | None = None,
+    ):
         if self.prepared is None:
             # A plan materialized on first use resolves its launchers from its
             # first binding; under a kernel resolution guard this raises.
@@ -295,6 +302,7 @@ class _SparseMlaState:
                 attn_sink=attention_sink,
                 return_lse=self.caps.return_lse,
                 lse_scale=self.caps.lse_scale,
+                out=out,
                 prepared=self.prepared,
             )
         from b12x.attention._shared.mla.prefill import run_unified_prefill

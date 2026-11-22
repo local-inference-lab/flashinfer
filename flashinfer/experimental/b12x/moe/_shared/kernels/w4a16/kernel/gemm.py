@@ -1253,7 +1253,9 @@ class W4A16GemmKernel:
                         and not self.schedule_whole_tiles
                     ):
                         route_block_idx = work_mn_tile // tail_columns
-                        output_n_tile = full_columns + work_mn_tile - route_block_idx * tail_columns
+                        output_n_tile = (
+                            full_columns + work_mn_tile - route_block_idx * tail_columns
+                        )
                     else:
                         global_mn_tile = work_mn_tile + tail_mn_base
                         route_block_idx = global_mn_tile // n_tiles

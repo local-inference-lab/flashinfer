@@ -44,6 +44,52 @@ def _fake_attention(
     pass
 
 
+@torch.library.custom_op("b12x::sparse_mla_bound_out", mutates_args=("out", "scratch"))
+def attention_out(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    selected: torch.Tensor,
+    cache_lengths: torch.Tensor,
+    selected_lengths: torch.Tensor,
+    attention_sink: torch.Tensor | None,
+    out: torch.Tensor,
+    scratch: torch.Tensor,
+    plan_handle: int,
+) -> None:
+    from ._preparation import state
+
+    prepared = state(plan_from_handle(plan_handle), device=q.device)
+    runtime = prepared.bind(
+        scratch=scratch,
+        q=q,
+        selected_indices=selected,
+        cache_seqlens_int32=cache_lengths,
+        nsa_cache_seqlens_int32=selected_lengths,
+        kv_cache=kv_cache,
+    )
+    prepared.run(
+        runtime,
+        kv_cache=kv_cache,
+        attention_sink=attention_sink,
+        out=out,
+    )
+
+
+@attention_out.register_fake
+def _fake_attention_out(
+    q,
+    kv_cache,
+    selected,
+    cache_lengths,
+    selected_lengths,
+    attention_sink,
+    out,
+    scratch,
+    plan_handle,
+):
+    pass
+
+
 @torch.library.custom_op("b12x::glm_mla_cache_write", mutates_args=("kv_cache",))
 def cache_write(
     latent: torch.Tensor,

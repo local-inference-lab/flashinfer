@@ -374,15 +374,27 @@ def query_from_metadata(
         mode, single_cta, register_normalize, threads = backend._fused_launch_config(
             native, tensor, reduction_dtype=reduction_dtype
         )
-        if reduction_order == "shard_owner":
-            mode = "stage_pull" if stage_input else "registered"
         pack_elems = 16 // tensor.element_size()
         hidden_packs = int(tensor.shape[-1]) // pack_elems
         rows = tensor.numel() // int(tensor.shape[-1])
-        min_ctas = (hidden_packs + threads * 3 - 1) // (threads * 3)
-        override = int(os.getenv("B12X_PCIE_FUSED_CTAS_PER_ROW", "0"))
-        ctas = override if override > 0 else max(max(1, 3 // rows), min_ctas)
-        ctas = max(1, min(ctas, 36 // rows))
+        reg_packs = 3
+        if reduction_order == "shard_owner":
+            mode = "stage_pull" if stage_input else "registered"
+            if (
+                hidden_packs <= 768
+                and int(os.getenv("B12X_PCIE_FUSED_THREADS", "0")) == 0
+                and int(os.getenv("B12X_PCIE_FUSED_CTAS_PER_ROW", "0")) == 0
+            ):
+                threads = 768
+                reg_packs = 1
+                ctas = 1
+                single_cta = True
+                register_normalize = True
+        if reg_packs == 3:
+            min_ctas = (hidden_packs + threads * 3 - 1) // (threads * 3)
+            override = int(os.getenv("B12X_PCIE_FUSED_CTAS_PER_ROW", "0"))
+            ctas = override if override > 0 else max(max(1, 3 // rows), min_ctas)
+            ctas = max(1, min(ctas, 36 // rows))
         launcher = {
             **_fused_semantics(
                 dtype,
@@ -405,6 +417,7 @@ def query_from_metadata(
             "single_cta": single_cta,
             "register_normalize": register_normalize,
             "threads": threads,
+            **({"reg_packs": reg_packs} if reg_packs != 3 else {}),
             "device_index": backend._device_index(runtime.device),
             "payload_ready_region_packs": native.plain_payload_ready_region_packs,
             "hidden_packs": hidden_packs,
@@ -497,15 +510,27 @@ def query_from_runtime(runtime, *, surface, call) -> PcieQuery:
         mode, single_cta, register_normalize, threads = backend._fused_launch_config(
             native, inp, reduction_dtype=values.get("reduction_dtype")
         )
-        if values.get("reduction_order", "local") == "shard_owner":
-            mode = "stage_pull" if stage_input else "registered"
         pack_elems = 16 // inp.element_size()
         hidden_packs = int(inp.shape[-1]) // pack_elems
         rows = inp.numel() // int(inp.shape[-1])
-        min_ctas = (hidden_packs + threads * 3 - 1) // (threads * 3)
-        override = int(os.getenv("B12X_PCIE_FUSED_CTAS_PER_ROW", "0"))
-        ctas = override if override > 0 else max(max(1, 3 // rows), min_ctas)
-        ctas = max(1, min(ctas, 36 // rows))
+        reg_packs = 3
+        if values.get("reduction_order", "local") == "shard_owner":
+            mode = "stage_pull" if stage_input else "registered"
+            if (
+                hidden_packs <= 768
+                and int(os.getenv("B12X_PCIE_FUSED_THREADS", "0")) == 0
+                and int(os.getenv("B12X_PCIE_FUSED_CTAS_PER_ROW", "0")) == 0
+            ):
+                threads = 768
+                reg_packs = 1
+                ctas = 1
+                single_cta = True
+                register_normalize = True
+        if reg_packs == 3:
+            min_ctas = (hidden_packs + threads * 3 - 1) // (threads * 3)
+            override = int(os.getenv("B12X_PCIE_FUSED_CTAS_PER_ROW", "0"))
+            ctas = override if override > 0 else max(max(1, 3 // rows), min_ctas)
+            ctas = max(1, min(ctas, 36 // rows))
         launcher = {
             **_fused_semantics(
                 inp.dtype,
@@ -528,6 +553,7 @@ def query_from_runtime(runtime, *, surface, call) -> PcieQuery:
             "single_cta": single_cta,
             "register_normalize": register_normalize,
             "threads": threads,
+            **({"reg_packs": reg_packs} if reg_packs != 3 else {}),
             "device_index": backend._device_index(inp.device),
             "payload_ready_region_packs": native.plain_payload_ready_region_packs,
             "hidden_packs": hidden_packs,
@@ -635,6 +661,7 @@ def compile_oneshot_surface(query_payload, ordinal):
                     round_before_weight=call.get("round_before_weight", False),
                     reduction_order=call.get("reduction_order", "local"),
                     trigger_dependents=call.get("trigger_dependents", False),
+                    reg_packs=call.get("reg_packs", 3),
                 )
                 for variant in variants
             }

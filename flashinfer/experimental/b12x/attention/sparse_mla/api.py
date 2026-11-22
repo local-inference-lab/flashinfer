@@ -119,17 +119,35 @@ def bind(
     )
 
 
-def run(binding: Binding) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+def run(
+    binding: Binding,
+    *,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Execute a complete binding through the route selected by its plan.
 
     Decode returns output, or (output, LSE) when return_lse is enabled.
-    Extend modes return (output, LSE). Both tensors alias planned scratch.
+    Extend modes return (output, LSE). Both tensors alias planned scratch
+    unless decode writes directly into caller-supplied ``out``.
     """
 
     if not isinstance(binding, Binding):
         raise TypeError("binding must be sparse_mla.Binding")
     state = _state(binding.plan, device=binding.kv_cache.device)
     runtime = binding.runtime
+    if out is not None and state.caps.mode == "decode" and not state.caps.return_lse:
+        _ops.attention_out(
+            runtime.q,
+            binding.kv_cache,
+            runtime.selected_indices,
+            runtime.cache_seqlens_int32,
+            runtime.nsa_cache_seqlens_int32,
+            binding.attention_sink,
+            out,
+            runtime.scratch.shared_scratch,
+            binding.plan.handle,
+        )
+        return out
     _ops.attention(
         runtime.q,
         binding.kv_cache,
