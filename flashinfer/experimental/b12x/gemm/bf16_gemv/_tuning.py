@@ -151,18 +151,19 @@ def default_config(query, device):
 
 
 def _tc_split_k_candidates(query):
-    from ._tensor_core import TC_K_MULTIPLE, TC_SPLIT_K_VALUES
+    from ._tensor_core import TC_SPLIT_K_VALUES, tc_chunk_k
 
     n_blocks = (query.out_features + 15) // 16
-    chunks = query.in_features // TC_K_MULTIPLE
+    chunks = query.in_features // tc_chunk_k(query.in_features)
     cands = []
     if n_blocks >= 32:
         cands.append(1)
-    for sk in TC_SPLIT_K_VALUES:
-        if sk == 1:
-            continue
-        if chunks % sk == 0 and 32 <= n_blocks * sk <= 1024:
-            cands.append(sk)
+    if n_blocks < 256:
+        for sk in TC_SPLIT_K_VALUES:
+            if sk == 1:
+                continue
+            if chunks % sk == 0 and 32 <= n_blocks * sk <= 1024:
+                cands.append(sk)
     if not cands:
         cands.append(1)
     return tuple(cands)
@@ -173,7 +174,7 @@ def _validate_query(query, device):
 
 
 def validate_config(query, config, device):
-    from ._tensor_core import TC_K_MULTIPLE, TC_SPLIT_K_VALUES
+    from ._tensor_core import TC_SPLIT_K_VALUES, tc_chunk_k
 
     if not isinstance(config, GemvConfig):
         raise TypeError("projection config must be GemvConfig")
@@ -206,7 +207,7 @@ def validate_config(query, config, device):
     if config.backend == "tc":
         if not _tc_eligible(query):
             raise ValueError("projection backend 'tc' is ineligible for this query")
-        chunks = query.in_features // TC_K_MULTIPLE
+        chunks = query.in_features // tc_chunk_k(query.in_features)
         if (
             type(config.split_k) is not int
             or config.split_k not in TC_SPLIT_K_VALUES
@@ -264,9 +265,10 @@ def _parameters(query, device):
         predicates=(eligible,),
         # The prefill GEMM is raced only by the audit; it never came within 2%
         # of a winner on the shapes it was preferred for.  Likewise, for
-        # decode shapes with N <= 4096 where single-launch TC-GEMV is eligible,
-        # hot-L2 benchmarking over-favors cuBLASLt two-kernel split-K which is
-        # 1.8x-2.7x slower in cold DRAM across 93 layers.
+        # small-M decode shapes (M <= 16, N <= 4096) where single-launch
+        # TC-GEMV is eligible, hot-L2 benchmarking over-favors cuBLASLt
+        # two-kernel split-K which is slower in cold DRAM across 93 layers.
+        # At M >= 17 cuBLASLt TMA beats TC-GEMV even in cold DRAM.
         efficiency_predicates=(
             lambda choice: (
                 (choice["backend"] != "mma" or _mma_preferred(query))
@@ -274,6 +276,7 @@ def _parameters(query, device):
                 and not (
                     choice["backend"] == "torch"
                     and _tc_eligible(query)
+                    and query.max_rows <= 16
                     and query.out_features <= 4096
                 )
             ),
@@ -302,11 +305,11 @@ TUNING = TuningContract(
         Knob(name="block_threads", values=(128, 256), binding=ParameterBinding.COMPILE),
         Knob(
             name="split_k",
-            values=(1, 2, 4, 8, 14, 16, 28, 56),
+            values=(1, 2, 3, 4, 6, 7, 8, 12, 14, 16, 28, 56),
             binding=ParameterBinding.COMPILE,
         ),
     ),
-    candidate_contract_version=15,
+    candidate_contract_version=16,
     parameters=_parameters,
     materialize=lambda query, device, choice: GemvConfig(**dict(choice)),
 )

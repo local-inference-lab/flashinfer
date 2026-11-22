@@ -1,14 +1,15 @@
 """Single-launch SM120a MXFP8 A16 Tensor-Core GEMV for up to 32 BF16 rows.
 
 Streams packed E4M3 weights + F8_128x4 UE8M0 block scales directly from global
-memory, dequantizes 16 weights per thread on-the-fly with native SM120a PTX
+memory, dequantizes 8 weights per half-step on-the-fly with native SM120a PTX
 (``cvt.rn.bf16x2.e4m3x2`` + ``cvt.rn.bf16x2.ue8m0x2`` + ``mul.bf16x2`` —
 lossless in BF16 and sharing 1 scale byte across all 16 weights), and contracts
 against up to 4×8 = 32 BF16 activation rows via ``bf16_mma_m16n8k16_f32``.
 
 When ``split_k > 1``, partials are written to caller-provided workspace scratch
-with L2-coherent stores/loads and reduced inside the same launch by the last
-arriving CTA per 16-row N-tile, eliminating a separate SplitKReduce kernel.
+with coalesced 128-bit L2-coherent vector stores/loads and reduced inside the
+same launch by the last arriving CTA per 16-row N-tile, eliminating a separate
+SplitKReduce kernel.
 """
 
 from __future__ import annotations
@@ -145,12 +146,27 @@ def _ld_global_nc_u8(addr: Int64, *, loc=None, ip=None) -> Uint32:
 
 
 @dsl_user_op
-def _st_global_wb_f32(addr: Int64, val: Float32, *, loc=None, ip=None) -> None:
+def _st_global_wb_v4_f32(
+    addr: Int64,
+    v0: Float32,
+    v1: Float32,
+    v2: Float32,
+    v3: Float32,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
     llvm.inline_asm(
         None,
-        [Int64(addr).ir_value(loc=loc, ip=ip), Float32(val).ir_value(loc=loc, ip=ip)],
-        "st.global.wb.f32 [$0], $1;",
-        "l,f",
+        [
+            Int64(addr).ir_value(loc=loc, ip=ip),
+            Float32(v0).ir_value(loc=loc, ip=ip),
+            Float32(v1).ir_value(loc=loc, ip=ip),
+            Float32(v2).ir_value(loc=loc, ip=ip),
+            Float32(v3).ir_value(loc=loc, ip=ip),
+        ],
+        "st.global.wb.v4.f32 [$0], {$1, $2, $3, $4};",
+        "l,f,f,f,f",
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -160,19 +176,23 @@ def _st_global_wb_f32(addr: Int64, val: Float32, *, loc=None, ip=None) -> None:
 
 
 @dsl_user_op
-def _ld_global_cg_f32(addr: Int64, *, loc=None, ip=None) -> Float32:
-    return Float32(
-        llvm.inline_asm(
-            T.f32(),
-            [Int64(addr).ir_value(loc=loc, ip=ip)],
-            "ld.global.cg.f32 $0, [$1];",
-            "=f,l",
-            has_side_effects=True,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-            loc=loc,
-            ip=ip,
-        )
+def _ld_global_cg_v4_f32(addr: Int64, *, loc=None, ip=None):
+    res = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32(), T.f32(), T.f32(), T.f32()]),
+        [Int64(addr).ir_value(loc=loc, ip=ip)],
+        "ld.global.cg.v4.f32 {$0, $1, $2, $3}, [$4];",
+        "=f,=f,=f,=f,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return (
+        Float32(llvm.extractvalue(T.f32(), res, [0], loc=loc, ip=ip)),
+        Float32(llvm.extractvalue(T.f32(), res, [1], loc=loc, ip=ip)),
+        Float32(llvm.extractvalue(T.f32(), res, [2], loc=loc, ip=ip)),
+        Float32(llvm.extractvalue(T.f32(), res, [3], loc=loc, ip=ip)),
     )
 
 
@@ -345,48 +365,42 @@ class MXFP8MultiRowTCGemvKernel:
             sb = _ue8m0_to_bf16x2_sm120(
                 _ld_global_nc_u8(s_base + _f8_128x4_offset(row_b, g, self.k_blocks4))
             )
-            wa0, wa1 = _e4m3x4_scaled_to_bf16x2x2_sm120(pa0, sa)
-            wa2, wa3 = _e4m3x4_scaled_to_bf16x2x2_sm120(pa1, sa)
-            wa4, wa5 = _e4m3x4_scaled_to_bf16x2x2_sm120(pa2, sa)
-            wa6, wa7 = _e4m3x4_scaled_to_bf16x2x2_sm120(pa3, sa)
-            wb0, wb1 = _e4m3x4_scaled_to_bf16x2x2_sm120(pb0, sb)
-            wb2, wb3 = _e4m3x4_scaled_to_bf16x2x2_sm120(pb1, sb)
-            wb4, wb5 = _e4m3x4_scaled_to_bf16x2x2_sm120(pb2, sb)
-            wb6, wb7 = _e4m3x4_scaled_to_bf16x2x2_sm120(pb3, sb)
-            wa = (wa0, wa1, wa2, wa3, wa4, wa5, wa6, wa7)
-            wb = (wb0, wb1, wb2, wb3, wb4, wb5, wb6, wb7)
-            for mt in cutlass.range_constexpr(self.max_m_tiles):
-                token = cutlass.min(Int32(mt * 8) + group, rows - 1)
-                px = x_base + Int64(token) * (x_stride_elems * Int64(2)) + x_off
-                x0 = Uint32(0)
-                x1 = Uint32(0)
-                x2 = Uint32(0)
-                x3 = Uint32(0)
-                x4 = Uint32(0)
-                x5 = Uint32(0)
-                x6 = Uint32(0)
-                x7 = Uint32(0)
-                if cutlass.const_expr(self.in_features == self.k) or k_col < Int32(
-                    self.in_features
-                ):
-                    x0, x1, x2, x3 = ld_global_nc_v4_u32(px)
-                    x4, x5, x6, x7 = ld_global_nc_v4_u32(px + Int64(16))
-                xs = (x0, x1, x2, x3, x4, x5, x6, x7)
-                a0, a1, a2, a3 = acc[mt, 0], acc[mt, 1], acc[mt, 2], acc[mt, 3]
-                for s in cutlass.range_constexpr(4):
+            # Dequantize 8 weights (2 MMAs) per half-step to cut live BF16 weight
+            # registers in half while keeping 128-bit v4 activation loads.
+            for half in cutlass.range_constexpr(2):
+                wa0, wa1 = _e4m3x4_scaled_to_bf16x2x2_sm120(
+                    pa0 if cutlass.const_expr(half == 0) else pa2, sa
+                )
+                wa2, wa3 = _e4m3x4_scaled_to_bf16x2x2_sm120(
+                    pa1 if cutlass.const_expr(half == 0) else pa3, sa
+                )
+                wb0, wb1 = _e4m3x4_scaled_to_bf16x2x2_sm120(
+                    pb0 if cutlass.const_expr(half == 0) else pb2, sb
+                )
+                wb2, wb3 = _e4m3x4_scaled_to_bf16x2x2_sm120(
+                    pb1 if cutlass.const_expr(half == 0) else pb3, sb
+                )
+                h_off = x_off + Int64(half * 16)
+                for mt in cutlass.range_constexpr(self.max_m_tiles):
+                    token = cutlass.min(Int32(mt * 8) + group, rows - 1)
+                    px = x_base + Int64(token) * (x_stride_elems * Int64(2)) + h_off
+                    x0 = Uint32(0)
+                    x1 = Uint32(0)
+                    x2 = Uint32(0)
+                    x3 = Uint32(0)
+                    if cutlass.const_expr(self.in_features == self.k) or k_col < Int32(
+                        self.in_features
+                    ):
+                        x0, x1, x2, x3 = ld_global_nc_v4_u32(px)
                     a0, a1, a2, a3 = bf16_mma_m16n8k16_f32(
-                        a0,
-                        a1,
-                        a2,
-                        a3,
-                        wa[2 * s],
-                        wb[2 * s],
-                        wa[2 * s + 1],
-                        wb[2 * s + 1],
-                        xs[2 * s],
-                        xs[2 * s + 1],
+                        acc[mt, 0], acc[mt, 1], acc[mt, 2], acc[mt, 3],
+                        wa0, wb0, wa1, wb1, x0, x1,
                     )
-                acc[mt, 0], acc[mt, 1], acc[mt, 2], acc[mt, 3] = a0, a1, a2, a3
+                    a0, a1, a2, a3 = bf16_mma_m16n8k16_f32(
+                        a0, a1, a2, a3,
+                        wa2, wb2, wa3, wb3, x2, x3,
+                    )
+                    acc[mt, 0], acc[mt, 1], acc[mt, 2], acc[mt, 3] = a0, a1, a2, a3
 
         storage = cutlass.utils.SmemAllocator().allocate(self._shared_storage_cls())
         partials = storage.partials.get_tensor(
@@ -400,8 +414,8 @@ class MXFP8MultiRowTCGemvKernel:
             cute.arch.sync_threads()
 
         if cutlass.const_expr(self.split_k == 1):
-            if warp == 0:
-                for mt in cutlass.range_constexpr(self.max_m_tiles):
+            for mt in cutlass.range_constexpr(self.max_m_tiles):
+                if warp == Int32(mt % self.warps):
                     for e in cutlass.range_constexpr(4):
                         total = (
                             acc[mt, e]
@@ -426,28 +440,22 @@ class MXFP8MultiRowTCGemvKernel:
         else:
             tile_elems = self.max_m_tiles * 128
             scratch_base = Int64(scratch.toint())
-            if warp == 0:
-                sbase = (Int64(n_tile) * self.split_k + Int64(k_split)) * tile_elems
-                for mt in cutlass.range_constexpr(self.max_m_tiles):
-                    for e in cutlass.range_constexpr(4):
-                        total = (
-                            acc[mt, e]
-                            if cutlass.const_expr(self.warps == 1)
-                            else Float32(0.0)
-                        )
-                        if cutlass.const_expr(self.warps > 1):
-                            for w_i in cutlass.range_constexpr(self.warps):
-                                total = (
-                                    total
-                                    + partials[
-                                        ((mt * self.warps + w_i) * _LANES + lane) * 4
-                                        + e
-                                    ]
-                                )
-                        local_row = Int32(mt * 8) + quad * 2 + (e % 2)
-                        local_col = group + (8 if e >= 2 else 0)
-                        elem_idx = sbase + Int64(local_row * 16 + local_col)
-                        _st_global_wb_f32(scratch_base + elem_idx * Int64(4), total)
+            sbase = (Int64(n_tile) * self.split_k + Int64(k_split)) * tile_elems
+            for mt in cutlass.range_constexpr(self.max_m_tiles):
+                if warp == Int32(mt % self.warps):
+                    t0 = acc[mt, 0] if cutlass.const_expr(self.warps == 1) else Float32(0.0)
+                    t1 = acc[mt, 1] if cutlass.const_expr(self.warps == 1) else Float32(0.0)
+                    t2 = acc[mt, 2] if cutlass.const_expr(self.warps == 1) else Float32(0.0)
+                    t3 = acc[mt, 3] if cutlass.const_expr(self.warps == 1) else Float32(0.0)
+                    if cutlass.const_expr(self.warps > 1):
+                        for w_i in cutlass.range_constexpr(self.warps):
+                            pbase = ((mt * self.warps + w_i) * _LANES + lane) * 4
+                            t0 = t0 + partials[pbase + 0]
+                            t1 = t1 + partials[pbase + 1]
+                            t2 = t2 + partials[pbase + 2]
+                            t3 = t3 + partials[pbase + 3]
+                    vaddr = scratch_base + (sbase + Int64((mt * _LANES + lane) * 4)) * Int64(4)
+                    _st_global_wb_v4_f32(vaddr, t0, t1, t2, t3)
             cute.arch.sync_threads()
             last_flag = storage.last.get_tensor(cute.make_layout((1,)))
             flag_addr = Int64(flags.toint()) + Int64(n_tile) * Int64(4)
@@ -458,23 +466,38 @@ class MXFP8MultiRowTCGemvKernel:
                 )
             cute.arch.sync_threads()
             if last_flag[Int32(0)] == Uint32(1):
-                elem = Int32(tid)
                 tbase = Int64(n_tile) * self.split_k * tile_elems
-                while elem < Int32(tile_elems):
-                    total = Float32(0.0)
-                    for sp in cutlass.range_constexpr(self.split_k):
-                        elem_idx = tbase + Int64(sp) * tile_elems + Int64(elem)
-                        total = total + _ld_global_cg_f32(
-                            scratch_base + elem_idx * Int64(4)
-                        )
-                    local_row = elem // 16
-                    local_col = elem % 16
-                    feature = first_n + local_col
-                    if feature < self.n and local_row < rows:
-                        out[Int64(local_row) * Int64(self.n) + Int64(feature)] = (
-                            total.to(BFloat16)
-                        )
-                    elem += Int32(self.warps * _LANES)
+                for mt in cutlass.range_constexpr(self.max_m_tiles):
+                    if warp == Int32(mt % self.warps):
+                        s0 = Float32(0.0)
+                        s1 = Float32(0.0)
+                        s2 = Float32(0.0)
+                        s3 = Float32(0.0)
+                        lane_off = Int64((mt * _LANES + lane) * 4)
+                        for sp in cutlass.range_constexpr(self.split_k):
+                            raddr = (
+                                scratch_base
+                                + (tbase + Int64(sp) * tile_elems + lane_off) * Int64(4)
+                            )
+                            v0, v1, v2, v3 = _ld_global_cg_v4_f32(raddr)
+                            s0 = s0 + v0
+                            s1 = s1 + v1
+                            s2 = s2 + v2
+                            s3 = s3 + v3
+                        f_lo = first_n + group
+                        f_hi = first_n + group + 8
+                        r0 = Int32(mt * 8) + quad * 2
+                        r1 = r0 + 1
+                        if f_lo < self.n:
+                            if r0 < rows:
+                                out[Int64(r0) * Int64(self.n) + Int64(f_lo)] = s0.to(BFloat16)
+                            if r1 < rows:
+                                out[Int64(r1) * Int64(self.n) + Int64(f_lo)] = s1.to(BFloat16)
+                        if f_hi < self.n:
+                            if r0 < rows:
+                                out[Int64(r0) * Int64(self.n) + Int64(f_hi)] = s2.to(BFloat16)
+                            if r1 < rows:
+                                out[Int64(r1) * Int64(self.n) + Int64(f_hi)] = s3.to(BFloat16)
                 cute.arch.sync_threads()
                 if Int32(tid) == 0:
                     _st_global_release_u32(flag_addr, Uint32(0))
@@ -512,7 +535,7 @@ def compile_mxfp8_tc_gemv(
             Int64(in_features),
             current_cuda_stream(),
             compile_spec=KernelCompileSpec.from_key(
-                "gemm.blockscaled.mxfp8_tc_gemv", 3, key
+                "gemm.blockscaled.mxfp8_tc_gemv", 4, key
             ),
         )
 

@@ -416,7 +416,7 @@ def mxfp8_a16_tc_gemv_splits(query):
     cands = []
     if n_blocks >= 48 or chunks <= 2:
         cands.append(1)
-    for sk in (2, 4, 8, 16):
+    for sk in (2, 4, 7, 8, 16):
         if chunks % sk != 0:
             continue
         if query.workspace_nbytes is not None:
@@ -425,7 +425,11 @@ def mxfp8_a16_tc_gemv_splits(query):
             )
             if query.workspace_nbytes < needed:
                 continue
-        if 64 <= n_blocks * sk <= 448 or (sk == 2 and n_blocks <= 224):
+        if (
+            64 <= n_blocks * sk <= 448
+            or (sk == 2 and n_blocks <= 224)
+            or (sk == 7 and query.num_tokens >= 17 and n_blocks <= 224)
+        ):
             cands.append(sk)
     if not cands:
         cands.append(1)
@@ -462,7 +466,7 @@ def _validate_config(query, config, device):
             or config.tile_n != 16
             or config.tile_k != 64
             or type(config.split_k) is not int
-            or config.split_k not in (1, 2, 4, 8, 16)
+            or config.split_k not in (1, 2, 4, 7, 8, 16)
             or (query.padded_in_features // 64) % config.split_k != 0
             or type(config.mma_warps) is not int
             or config.mma_warps not in (2, 4, 8)
@@ -648,7 +652,7 @@ def _tuning_parameters(query, device):
             if chunks_per_split <= 4:
                 return parameters["mma_warps"] in (2, 4)
             return parameters["mma_warps"] in (4, 8)
-        if parameters["tile_n"] == 16 or parameters["mma_warps"] == 8:
+        if parameters["tile_n"] == 16 or parameters["mma_warps"] == 8 or parameters["split_k"] == 7:
             return False
         if parameters["tile_n"] == 32 and not (
             query.recipe == "mxfp8"
@@ -822,7 +826,7 @@ TUNING = TuningContract(
     validate_query=_validate_query,
     validate_config=_validate_config,
     default_config=_default_config,
-    candidate_contract_version=58,
+    candidate_contract_version=59,
     knobs=(
         Knob(
             name="mode", values=("a16", "quantized"), binding=ParameterBinding.COMPILE
@@ -839,7 +843,7 @@ TUNING = TuningContract(
         ),
         Knob(name="tile_k", values=(64, 128, 256), when=FrozenMapping({"mode": "a16"})),
         Knob(
-            name="split_k", values=(1, 2, 4, 8, 16), when=FrozenMapping({"mode": "a16"})
+            name="split_k", values=(1, 2, 4, 7, 8, 16), when=FrozenMapping({"mode": "a16"})
         ),
         Knob(
             name="mma_warps",

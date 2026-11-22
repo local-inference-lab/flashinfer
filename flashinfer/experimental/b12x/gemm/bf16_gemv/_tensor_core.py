@@ -2,12 +2,13 @@
 
 At decode row counts the projection streams the weight once, so its cost is
 the weight read.  Each CTA owns 16 output features and its warps split K into
-64-wide chunks.  Weights are the ``m16n8k16`` MMA's 16-row A operand and each
-8-row slice of the live rows its 8-column B operand, so one weight fragment
-serves up to 32 rows (four 8-row tiles).  For skinny N, ``split_k > 1`` fans K
-across multiple CTAs per 16-row N tile and reduces FP32 partials inside the
-same launch via L2-coherent loads and an atomic arrival counter reset by the
-last CTA before exit (CUDA-graph safe).
+64-wide (or 32-wide for K % 64 == 32 or K == 128) chunks.  Weights are the
+``m16n8k16`` MMA's 16-row A operand and each 8-row slice of the live rows its
+8-column B operand, so one weight fragment serves up to 32 rows (four 8-row
+tiles).  For skinny N, ``split_k > 1`` fans K across multiple CTAs per 16-row
+N tile and reduces FP32 partials inside the same launch via coalesced 128-bit
+L2-coherent vector loads/stores and an atomic arrival counter reset by the last
+CTA before exit (CUDA-graph safe).
 """
 
 from __future__ import annotations
@@ -30,11 +31,16 @@ from b12x._lib.utils.pointers import make_ptr
 
 TC_MAX_ROWS = 32
 TC_MAX_WARPS = 8
-TC_K_MULTIPLE = 64
-TC_SPLIT_K_VALUES = (1, 2, 4, 8, 14, 16, 28, 56)
+TC_K_MULTIPLE = 32
+TC_SPLIT_K_VALUES = (1, 2, 3, 4, 6, 7, 8, 12, 14, 16, 28, 56)
 _LANES = 32
 
 _TC_SPLITK_BUFFERS: dict[tuple[int, int, int, int, int], tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def tc_chunk_k(k: int) -> int:
+    """Return K-elements per warp chunk (64 when K >= 256 and K % 64 == 0, else 32)."""
+    return 64 if (int(k) >= 256 and int(k) % 64 == 0) else 32
 
 
 def tc_splitk_scratch_bytes(max_rows: int, n: int, split_k: int) -> int:
@@ -70,12 +76,27 @@ def tc_splitk_buffers(
 
 
 @dsl_user_op
-def _st_global_wb_f32(addr: Int64, val: Float32, *, loc=None, ip=None) -> None:
+def _st_global_wb_v4_f32(
+    addr: Int64,
+    v0: Float32,
+    v1: Float32,
+    v2: Float32,
+    v3: Float32,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
     llvm.inline_asm(
         None,
-        [Int64(addr).ir_value(loc=loc, ip=ip), Float32(val).ir_value(loc=loc, ip=ip)],
-        "st.global.wb.f32 [$0], $1;",
-        "l,f",
+        [
+            Int64(addr).ir_value(loc=loc, ip=ip),
+            Float32(v0).ir_value(loc=loc, ip=ip),
+            Float32(v1).ir_value(loc=loc, ip=ip),
+            Float32(v2).ir_value(loc=loc, ip=ip),
+            Float32(v3).ir_value(loc=loc, ip=ip),
+        ],
+        "st.global.wb.v4.f32 [$0], {$1, $2, $3, $4};",
+        "l,f,f,f,f",
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -85,19 +106,23 @@ def _st_global_wb_f32(addr: Int64, val: Float32, *, loc=None, ip=None) -> None:
 
 
 @dsl_user_op
-def _ld_global_cg_f32(addr: Int64, *, loc=None, ip=None) -> Float32:
-    return Float32(
-        llvm.inline_asm(
-            T.f32(),
-            [Int64(addr).ir_value(loc=loc, ip=ip)],
-            "ld.global.cg.f32 $0, [$1];",
-            "=f,l",
-            has_side_effects=True,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-            loc=loc,
-            ip=ip,
-        )
+def _ld_global_cg_v4_f32(addr: Int64, *, loc=None, ip=None):
+    res = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32(), T.f32(), T.f32(), T.f32()]),
+        [Int64(addr).ir_value(loc=loc, ip=ip)],
+        "ld.global.cg.v4.f32 {$0, $1, $2, $3}, [$4];",
+        "=f,=f,=f,=f,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return (
+        Float32(llvm.extractvalue(T.f32(), res, [0], loc=loc, ip=ip)),
+        Float32(llvm.extractvalue(T.f32(), res, [1], loc=loc, ip=ip)),
+        Float32(llvm.extractvalue(T.f32(), res, [2], loc=loc, ip=ip)),
+        Float32(llvm.extractvalue(T.f32(), res, [3], loc=loc, ip=ip)),
     )
 
 
@@ -148,9 +173,10 @@ class TensorCoreGemvKernel:
             )
         if not 1 <= max_rows <= TC_MAX_ROWS:
             raise ValueError(f"tensor-core GEMV supports 1..{TC_MAX_ROWS} rows")
-        chunks = int(k) // TC_K_MULTIPLE
+        self.chunk_k = tc_chunk_k(k)
+        chunks = int(k) // self.chunk_k
         if split_k <= 0 or chunks % int(split_k):
-            raise ValueError(f"split_k={split_k} must divide K/64={chunks}")
+            raise ValueError(f"split_k={split_k} must divide K/{self.chunk_k}={chunks}")
         self.n, self.k = int(n), int(k)
         self.max_m_tiles = (int(max_rows) + 7) // 8
         self.split_k = int(split_k)
@@ -239,36 +265,65 @@ class TensorCoreGemvKernel:
         split_chunk_base = Int32(k_split) * self.chunks_per_split
         for step in cutlass.range_constexpr(self.chunks_per_warp):
             chunk = split_chunk_base + warp * self.chunks_per_warp + step
-            offset = Int64(chunk * 128 + quad * 32)
-            pa = weight_base + Int64(row_a) * weight_stride * 2 + offset
-            pb = weight_base + Int64(row_b) * weight_stride * 2 + offset
-            wa0, wa1, wa2, wa3 = ld_global_nc_v4_u32(pa)
-            wa4, wa5, wa6, wa7 = ld_global_nc_v4_u32(pa + Int64(16))
-            wb0, wb1, wb2, wb3 = ld_global_nc_v4_u32(pb)
-            wb4, wb5, wb6, wb7 = ld_global_nc_v4_u32(pb + Int64(16))
-            wa = (wa0, wa1, wa2, wa3, wa4, wa5, wa6, wa7)
-            wb = (wb0, wb1, wb2, wb3, wb4, wb5, wb6, wb7)
-            for mt in cutlass.range_constexpr(self.max_m_tiles):
-                token = cutlass.min(Int32(mt * 8) + group, rows - 1)
-                px = x_base + Int64(token) * x_stride * 2 + offset
-                x0, x1, x2, x3 = ld_global_nc_v4_u32(px)
-                x4, x5, x6, x7 = ld_global_nc_v4_u32(px + Int64(16))
-                xs = (x0, x1, x2, x3, x4, x5, x6, x7)
-                a0, a1, a2, a3 = acc[mt, 0], acc[mt, 1], acc[mt, 2], acc[mt, 3]
-                for s in cutlass.range_constexpr(4):
-                    a0, a1, a2, a3 = bf16_mma_m16n8k16_f32(
-                        a0,
-                        a1,
-                        a2,
-                        a3,
-                        wa[2 * s],
-                        wb[2 * s],
-                        wa[2 * s + 1],
-                        wb[2 * s + 1],
-                        xs[2 * s],
-                        xs[2 * s + 1],
-                    )
-                acc[mt, 0], acc[mt, 1], acc[mt, 2], acc[mt, 3] = a0, a1, a2, a3
+            if cutlass.const_expr(self.chunk_k == 64):
+                offset = Int64(chunk * 128 + quad * 32)
+                pa = weight_base + Int64(row_a) * weight_stride * 2 + offset
+                pb = weight_base + Int64(row_b) * weight_stride * 2 + offset
+                wa0, wa1, wa2, wa3 = ld_global_nc_v4_u32(pa)
+                wa4, wa5, wa6, wa7 = ld_global_nc_v4_u32(pa + Int64(16))
+                wb0, wb1, wb2, wb3 = ld_global_nc_v4_u32(pb)
+                wb4, wb5, wb6, wb7 = ld_global_nc_v4_u32(pb + Int64(16))
+                wa = (wa0, wa1, wa2, wa3, wa4, wa5, wa6, wa7)
+                wb = (wb0, wb1, wb2, wb3, wb4, wb5, wb6, wb7)
+                for mt in cutlass.range_constexpr(self.max_m_tiles):
+                    token = cutlass.min(Int32(mt * 8) + group, rows - 1)
+                    px = x_base + Int64(token) * x_stride * 2 + offset
+                    x0, x1, x2, x3 = ld_global_nc_v4_u32(px)
+                    x4, x5, x6, x7 = ld_global_nc_v4_u32(px + Int64(16))
+                    xs = (x0, x1, x2, x3, x4, x5, x6, x7)
+                    a0, a1, a2, a3 = acc[mt, 0], acc[mt, 1], acc[mt, 2], acc[mt, 3]
+                    for s in cutlass.range_constexpr(4):
+                        a0, a1, a2, a3 = bf16_mma_m16n8k16_f32(
+                            a0,
+                            a1,
+                            a2,
+                            a3,
+                            wa[2 * s],
+                            wb[2 * s],
+                            wa[2 * s + 1],
+                            wb[2 * s + 1],
+                            xs[2 * s],
+                            xs[2 * s + 1],
+                        )
+                    acc[mt, 0], acc[mt, 1], acc[mt, 2], acc[mt, 3] = a0, a1, a2, a3
+            else:
+                offset = Int64(chunk * 64 + quad * 16)
+                pa = weight_base + Int64(row_a) * weight_stride * 2 + offset
+                pb = weight_base + Int64(row_b) * weight_stride * 2 + offset
+                wa0, wa1, wa2, wa3 = ld_global_nc_v4_u32(pa)
+                wb0, wb1, wb2, wb3 = ld_global_nc_v4_u32(pb)
+                wa = (wa0, wa1, wa2, wa3)
+                wb = (wb0, wb1, wb2, wb3)
+                for mt in cutlass.range_constexpr(self.max_m_tiles):
+                    token = cutlass.min(Int32(mt * 8) + group, rows - 1)
+                    px = x_base + Int64(token) * x_stride * 2 + offset
+                    x0, x1, x2, x3 = ld_global_nc_v4_u32(px)
+                    xs = (x0, x1, x2, x3)
+                    a0, a1, a2, a3 = acc[mt, 0], acc[mt, 1], acc[mt, 2], acc[mt, 3]
+                    for s in cutlass.range_constexpr(2):
+                        a0, a1, a2, a3 = bf16_mma_m16n8k16_f32(
+                            a0,
+                            a1,
+                            a2,
+                            a3,
+                            wa[2 * s],
+                            wb[2 * s],
+                            wa[2 * s + 1],
+                            wb[2 * s + 1],
+                            xs[2 * s],
+                            xs[2 * s + 1],
+                        )
+                    acc[mt, 0], acc[mt, 1], acc[mt, 2], acc[mt, 3] = a0, a1, a2, a3
 
         storage = cutlass.utils.SmemAllocator().allocate(self._shared_storage_cls())
         partials = storage.partials.get_tensor(
@@ -282,8 +337,8 @@ class TensorCoreGemvKernel:
             cute.arch.sync_threads()
 
         if cutlass.const_expr(self.split_k == 1):
-            if warp == 0:
-                for mt in cutlass.range_constexpr(self.max_m_tiles):
+            for mt in cutlass.range_constexpr(self.max_m_tiles):
+                if warp == Int32(mt % self.warps):
                     for e in cutlass.range_constexpr(4):
                         total = (
                             acc[mt, e]
@@ -307,27 +362,22 @@ class TensorCoreGemvKernel:
         else:
             tile_elems = self.max_m_tiles * 128
             scratch_base = Int64(scratch.toint())
-            if warp == 0:
-                sbase = (Int64(n_tile) * self.split_k + Int64(k_split)) * tile_elems
-                for mt in cutlass.range_constexpr(self.max_m_tiles):
-                    for e in cutlass.range_constexpr(4):
-                        total = (
-                            acc[mt, e]
-                            if cutlass.const_expr(self.warps == 1)
-                            else Float32(0.0)
-                        )
-                        if cutlass.const_expr(self.warps > 1):
-                            for w in cutlass.range_constexpr(self.warps):
-                                total = (
-                                    total
-                                    + partials[
-                                        ((mt * self.warps + w) * _LANES + lane) * 4 + e
-                                    ]
-                                )
-                        local_row = Int32(mt * 8) + quad * 2 + (e % 2)
-                        local_col = group + (8 if e >= 2 else 0)
-                        elem_idx = sbase + Int64(local_row * 16 + local_col)
-                        _st_global_wb_f32(scratch_base + elem_idx * Int64(4), total)
+            sbase = (Int64(n_tile) * self.split_k + Int64(k_split)) * tile_elems
+            for mt in cutlass.range_constexpr(self.max_m_tiles):
+                if warp == Int32(mt % self.warps):
+                    t0 = acc[mt, 0] if cutlass.const_expr(self.warps == 1) else Float32(0.0)
+                    t1 = acc[mt, 1] if cutlass.const_expr(self.warps == 1) else Float32(0.0)
+                    t2 = acc[mt, 2] if cutlass.const_expr(self.warps == 1) else Float32(0.0)
+                    t3 = acc[mt, 3] if cutlass.const_expr(self.warps == 1) else Float32(0.0)
+                    if cutlass.const_expr(self.warps > 1):
+                        for w in cutlass.range_constexpr(self.warps):
+                            pbase = ((mt * self.warps + w) * _LANES + lane) * 4
+                            t0 = t0 + partials[pbase + 0]
+                            t1 = t1 + partials[pbase + 1]
+                            t2 = t2 + partials[pbase + 2]
+                            t3 = t3 + partials[pbase + 3]
+                    vaddr = scratch_base + (sbase + Int64((mt * _LANES + lane) * 4)) * Int64(4)
+                    _st_global_wb_v4_f32(vaddr, t0, t1, t2, t3)
             cute.arch.sync_threads()
             last_flag = storage.last.get_tensor(cute.make_layout((1,)))
             flag_addr = Int64(flags.toint()) + Int64(n_tile) * Int64(4)
@@ -338,23 +388,38 @@ class TensorCoreGemvKernel:
                 )
             cute.arch.sync_threads()
             if last_flag[Int32(0)] == Uint32(1):
-                elem = Int32(thread)
                 tbase = Int64(n_tile) * self.split_k * tile_elems
-                while elem < Int32(tile_elems):
-                    total = Float32(0.0)
-                    for sp in cutlass.range_constexpr(self.split_k):
-                        elem_idx = tbase + Int64(sp) * tile_elems + Int64(elem)
-                        total = total + _ld_global_cg_f32(
-                            scratch_base + elem_idx * Int64(4)
-                        )
-                    local_row = elem // 16
-                    local_col = elem % 16
-                    feature = first + local_col
-                    if feature < self.n and local_row < rows:
-                        output[Int64(local_row) * output_stride + Int64(feature)] = (
-                            total.to(result_dtype)
-                        )
-                    elem += Int32(self.warps * _LANES)
+                for mt in cutlass.range_constexpr(self.max_m_tiles):
+                    if warp == Int32(mt % self.warps):
+                        s0 = Float32(0.0)
+                        s1 = Float32(0.0)
+                        s2 = Float32(0.0)
+                        s3 = Float32(0.0)
+                        lane_off = Int64((mt * _LANES + lane) * 4)
+                        for sp in cutlass.range_constexpr(self.split_k):
+                            raddr = (
+                                scratch_base
+                                + (tbase + Int64(sp) * tile_elems + lane_off) * Int64(4)
+                            )
+                            v0, v1, v2, v3 = _ld_global_cg_v4_f32(raddr)
+                            s0 = s0 + v0
+                            s1 = s1 + v1
+                            s2 = s2 + v2
+                            s3 = s3 + v3
+                        f_lo = first + group
+                        f_hi = first + group + 8
+                        r0 = Int32(mt * 8) + quad * 2
+                        r1 = r0 + 1
+                        if f_lo < self.n:
+                            if r0 < rows:
+                                output[Int64(r0) * output_stride + Int64(f_lo)] = s0.to(result_dtype)
+                            if r1 < rows:
+                                output[Int64(r1) * output_stride + Int64(f_lo)] = s1.to(result_dtype)
+                        if f_hi < self.n:
+                            if r0 < rows:
+                                output[Int64(r0) * output_stride + Int64(f_hi)] = s2.to(result_dtype)
+                            if r1 < rows:
+                                output[Int64(r1) * output_stride + Int64(f_hi)] = s3.to(result_dtype)
                 cute.arch.sync_threads()
                 if Int32(thread) == 0:
                     _st_global_release_u32(flag_addr, Uint32(0))
@@ -394,7 +459,7 @@ def compile_tc_projection(
             Int64(n),
             current_cuda_stream(),
             compile_spec=KernelCompileSpec.from_key(
-                "gemm.bf16_projection.tc_multirow", 1, key
+                "gemm.bf16_projection.tc_multirow", 2, key
             ),
         )
 
