@@ -38,7 +38,6 @@ from b12x.gemm.blockscaled._mxfp8_tc_gemv import (
 )
 
 _LANES = 32
-_WOA_FLAGS_CACHE: dict[tuple[int, int, int, int, int], torch.Tensor] = {}
 
 
 def _align_up(value: int, alignment: int = 256) -> int:
@@ -59,37 +58,33 @@ def wo_a16_tc_gemv_splitk_bytes(
     return _align_up(n_blocks * int(split_k) * m_tiles * 128 * 4, 256)
 
 
-def wo_a16_tc_gemv_scratch_bytes(
-    max_tokens: int, groups: int, rank: int, split_k: int = 1
-) -> int:
-    return wo_a16_tc_gemv_tmp_bytes(
-        max_tokens, groups, rank
-    ) + wo_a16_tc_gemv_splitk_bytes(max_tokens, groups, rank, split_k)
-
-
 def wo_a16_tc_gemv_flags_bytes(groups: int, rank: int, split_k: int) -> int:
     if int(split_k) <= 1:
         return 0
-    return int(groups) * ((int(rank) + 15) // 16) * 4
+    return _align_up(int(groups) * ((int(rank) + 15) // 16) * 4, 256)
+
+
+def wo_a16_tc_gemv_scratch_bytes(
+    max_tokens: int, groups: int, rank: int, split_k: int = 1
+) -> int:
+    return (
+        wo_a16_tc_gemv_tmp_bytes(max_tokens, groups, rank)
+        + wo_a16_tc_gemv_splitk_bytes(max_tokens, groups, rank, split_k)
+        + wo_a16_tc_gemv_flags_bytes(groups, rank, split_k)
+    )
 
 
 def cached_wo_a16_tc_gemv_flags(
     device: torch.device, groups: int, rank: int, group_width: int, split_k: int
 ) -> torch.Tensor:
-    key = (
-        int(device.index or 0),
-        int(groups),
-        int(rank),
-        int(group_width),
-        int(split_k),
-    )
-    cached = _WOA_FLAGS_CACHE.get(key)
-    if cached is not None:
-        return cached
+    """Allocate a zeroed split-K completion-counter tensor for standalone callers.
+
+    Prepared WO projections place invocation-private completion flags inside
+    their caller-owned scratch buffer rather than sharing a process-global
+    tensor across concurrent streams.
+    """
     n_blocks = int(groups) * ((int(rank) + 15) // 16)
-    flags = torch.zeros((n_blocks,), dtype=torch.uint32, device=device)
-    _WOA_FLAGS_CACHE[key] = flags
-    return flags
+    return torch.zeros((n_blocks,), dtype=torch.uint32, device=device)
 
 
 @dsl_user_op
@@ -220,9 +215,7 @@ class GroupedWoaTCGemvKernel:
     ):
         self.kernel(
             x,
-            cute.make_tensor(
-                positions, cute.make_layout((Int64(1) << Int64(30),))
-            ),
+            cute.make_tensor(positions, cute.make_layout((Int64(1) << Int64(30),))),
             cos_sin,
             w_u8,
             s_u8,
@@ -331,12 +324,28 @@ class GroupedWoaTCGemvKernel:
                             x2 = _inv_rotate_bf16x2(x2, c2, s2)
                             x3 = _inv_rotate_bf16x2(x3, c3, s3)
                     a0, a1, a2, a3 = bf16_mma_m16n8k16_f32(
-                        acc[mt, 0], acc[mt, 1], acc[mt, 2], acc[mt, 3],
-                        wa0, wb0, wa1, wb1, x0, x1,
+                        acc[mt, 0],
+                        acc[mt, 1],
+                        acc[mt, 2],
+                        acc[mt, 3],
+                        wa0,
+                        wb0,
+                        wa1,
+                        wb1,
+                        x0,
+                        x1,
                     )
                     a0, a1, a2, a3 = bf16_mma_m16n8k16_f32(
-                        a0, a1, a2, a3,
-                        wa2, wb2, wa3, wb3, x2, x3,
+                        a0,
+                        a1,
+                        a2,
+                        a3,
+                        wa2,
+                        wb2,
+                        wa3,
+                        wb3,
+                        x2,
+                        x3,
                     )
                     acc[mt, 0], acc[mt, 1], acc[mt, 2], acc[mt, 3] = a0, a1, a2, a3
 
@@ -366,7 +375,8 @@ class GroupedWoaTCGemvKernel:
                                 total = (
                                     total
                                     + partials[
-                                        ((mt * self.warps + w_i) * _LANES + lane) * 4 + e
+                                        ((mt * self.warps + w_i) * _LANES + lane) * 4
+                                        + e
                                     ]
                                 )
                         feature = first_n + group + (8 if e >= 2 else 0)
@@ -382,10 +392,26 @@ class GroupedWoaTCGemvKernel:
             sbase = (Int64(gn_tile) * self.split_k + Int64(k_split)) * tile_elems
             for mt in cutlass.range_constexpr(self.max_m_tiles):
                 if warp == Int32(mt % self.warps):
-                    t0 = acc[mt, 0] if cutlass.const_expr(self.warps == 1) else Float32(0.0)
-                    t1 = acc[mt, 1] if cutlass.const_expr(self.warps == 1) else Float32(0.0)
-                    t2 = acc[mt, 2] if cutlass.const_expr(self.warps == 1) else Float32(0.0)
-                    t3 = acc[mt, 3] if cutlass.const_expr(self.warps == 1) else Float32(0.0)
+                    t0 = (
+                        acc[mt, 0]
+                        if cutlass.const_expr(self.warps == 1)
+                        else Float32(0.0)
+                    )
+                    t1 = (
+                        acc[mt, 1]
+                        if cutlass.const_expr(self.warps == 1)
+                        else Float32(0.0)
+                    )
+                    t2 = (
+                        acc[mt, 2]
+                        if cutlass.const_expr(self.warps == 1)
+                        else Float32(0.0)
+                    )
+                    t3 = (
+                        acc[mt, 3]
+                        if cutlass.const_expr(self.warps == 1)
+                        else Float32(0.0)
+                    )
                     if cutlass.const_expr(self.warps > 1):
                         for w_i in cutlass.range_constexpr(self.warps):
                             pbase = ((mt * self.warps + w_i) * _LANES + lane) * 4
@@ -393,7 +419,9 @@ class GroupedWoaTCGemvKernel:
                             t1 = t1 + partials[pbase + 1]
                             t2 = t2 + partials[pbase + 2]
                             t3 = t3 + partials[pbase + 3]
-                    vaddr = scratch_base + (sbase + Int64((mt * _LANES + lane) * 4)) * Int64(4)
+                    vaddr = scratch_base + (
+                        sbase + Int64((mt * _LANES + lane) * 4)
+                    ) * Int64(4)
                     _st_global_wb_v4_f32(vaddr, t0, t1, t2, t3)
             cute.arch.sync_threads()
             last_flag = storage.last.get_tensor(cute.make_layout((1,)))
@@ -414,10 +442,9 @@ class GroupedWoaTCGemvKernel:
                         s3 = Float32(0.0)
                         lane_off = Int64((mt * _LANES + lane) * 4)
                         for sp in cutlass.range_constexpr(self.split_k):
-                            raddr = (
-                                scratch_base
-                                + (tbase + Int64(sp) * tile_elems + lane_off) * Int64(4)
-                            )
+                            raddr = scratch_base + (
+                                tbase + Int64(sp) * tile_elems + lane_off
+                            ) * Int64(4)
                             v0, v1, v2, v3 = _ld_global_cg_v4_f32(raddr)
                             s0 = s0 + v0
                             s1 = s1 + v1
@@ -501,7 +528,12 @@ def compile_grouped_woa_tc_gemv(
     )
     fake = (
         make_ptr(BFloat16, 16, cute.AddressSpace.gmem, assumed_align=16),
-        make_ptr(pos_ct, 16, cute.AddressSpace.gmem, assumed_align=8 if positions_dtype == "int64" else 4),
+        make_ptr(
+            pos_ct,
+            16,
+            cute.AddressSpace.gmem,
+            assumed_align=8 if positions_dtype == "int64" else 4,
+        ),
         make_ptr(Float32, 16, cute.AddressSpace.gmem, assumed_align=16),
         make_ptr(Uint8, 16, cute.AddressSpace.gmem, assumed_align=16),
         make_ptr(Uint8, 16, cute.AddressSpace.gmem, assumed_align=16),
@@ -540,33 +572,62 @@ def compile_grouped_woa_tc_gemv(
                 assumed_align=8 if positions_dtype == "int64" else 4,
             )
             if positions is not None
-            else make_ptr(pos_ct, tmp_out.data_ptr(), cute.AddressSpace.gmem, assumed_align=8)
+            else make_ptr(
+                pos_ct, tmp_out.data_ptr(), cute.AddressSpace.gmem, assumed_align=8
+            )
         )
         cs_ptr = (
-            make_ptr(Float32, cos_sin.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
+            make_ptr(
+                Float32, cos_sin.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
+            )
             if cos_sin is not None
-            else make_ptr(Float32, tmp_out.data_ptr(), cute.AddressSpace.gmem, assumed_align=4)
+            else make_ptr(
+                Float32, tmp_out.data_ptr(), cute.AddressSpace.gmem, assumed_align=4
+            )
         )
         cs_stride = Int64(cos_sin.stride(0)) if cos_sin is not None else Int64(rope_dim)
         sc_ptr = (
-            make_ptr(Float32, scratch.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
+            make_ptr(
+                Float32, scratch.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
+            )
             if scratch is not None
-            else make_ptr(Float32, tmp_out.data_ptr(), cute.AddressSpace.gmem, assumed_align=4)
+            else make_ptr(
+                Float32, tmp_out.data_ptr(), cute.AddressSpace.gmem, assumed_align=4
+            )
         )
         fl_ptr = (
             make_ptr(Uint32, flags.data_ptr(), cute.AddressSpace.gmem, assumed_align=4)
             if flags is not None
-            else make_ptr(Uint32, tmp_out.data_ptr(), cute.AddressSpace.gmem, assumed_align=4)
+            else make_ptr(
+                Uint32, tmp_out.data_ptr(), cute.AddressSpace.gmem, assumed_align=4
+            )
         )
         run_compiled(
             raw,
             (
-                make_ptr(BFloat16, source.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+                make_ptr(
+                    BFloat16,
+                    source.data_ptr(),
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                ),
                 pos_ptr,
                 cs_ptr,
-                make_ptr(Uint8, w_values.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
-                make_ptr(Uint8, w_scale_mma.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
-                make_ptr(BFloat16, tmp_out.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+                make_ptr(
+                    Uint8, w_values.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
+                ),
+                make_ptr(
+                    Uint8,
+                    w_scale_mma.data_ptr(),
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                ),
+                make_ptr(
+                    BFloat16,
+                    tmp_out.data_ptr(),
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                ),
                 sc_ptr,
                 fl_ptr,
                 Int32(source.shape[0]),

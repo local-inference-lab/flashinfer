@@ -266,11 +266,7 @@ def plan(caps: WOProjectionScratchCaps, *, invocation=FrozenMapping(), override=
     def memory(config, device):
         if config.backend == "a16_tc_gemv":
             from b12x._lib.scratch import scratch_buffer_spec
-            from ._tc_gemv import (
-                _WOA_FLAGS_CACHE,
-                wo_a16_tc_gemv_flags_bytes,
-                wo_a16_tc_gemv_scratch_bytes,
-            )
+            from ._tc_gemv import wo_a16_tc_gemv_scratch_bytes
 
             nbytes = wo_a16_tc_gemv_scratch_bytes(
                 caps.max_tokens, caps.groups, caps.rank, config.wo_a_split_k
@@ -282,26 +278,7 @@ def plan(caps: WOProjectionScratchCaps, *, invocation=FrozenMapping(), override=
                     device=torch.device("cuda", device.ordinal),
                 ),
             )
-            persistent = ()
-            if config.wo_a_split_k > 1:
-                fbytes = wo_a16_tc_gemv_flags_bytes(
-                    caps.groups, caps.rank, config.wo_a_split_k
-                )
-                fkey = (
-                    device.ordinal,
-                    caps.groups,
-                    caps.rank,
-                    caps.group_width,
-                    config.wo_a_split_k,
-                )
-                persistent = (
-                    PersistentMemory(
-                        ("wo_projection.a16_woa_flags", *fkey),
-                        fbytes,
-                        fbytes if fkey in _WOA_FLAGS_CACHE else 0,
-                    ),
-                )
-            return MemoryRequirements(scratch=scratch, persistent=persistent)
+            return MemoryRequirements(scratch=scratch, persistent=())
         scratch = _materialize_wo_projection_scratch(
             caps, config=config
         ).scratch_specs()
@@ -391,25 +368,10 @@ def plan(caps: WOProjectionScratchCaps, *, invocation=FrozenMapping(), override=
         config = selection.config
         if config.backend == "a16_tc_gemv":
             from b12x.gemm.blockscaled._mxfp8_tc_gemv import compile_mxfp8_tc_gemv
-            from ._tc_gemv import (
-                cached_wo_a16_tc_gemv_flags,
-                compile_grouped_woa_tc_gemv,
-            )
+            from ._tc_gemv import compile_grouped_woa_tc_gemv
 
-            resolved = torch.device("cuda", device.ordinal)
             a_fn = compile_grouped_woa_tc_gemv(device.ordinal, *_a16_woa_args(config))
             b_fn = compile_mxfp8_tc_gemv(device.ordinal, *_a16_wob_args(config))
-            woa_flags = (
-                cached_wo_a16_tc_gemv_flags(
-                    resolved,
-                    caps.groups,
-                    caps.rank,
-                    caps.group_width,
-                    config.wo_a_split_k,
-                )
-                if config.wo_a_split_k > 1
-                else None
-            )
             return _PreparedWO(
                 _A16WOScratchState(caps, config),
                 query,
@@ -419,7 +381,7 @@ def plan(caps: WOProjectionScratchCaps, *, invocation=FrozenMapping(), override=
                 None,
                 a16_wo_a=a_fn,
                 a16_wo_b=b_fn,
-                a16_woa_flags=woa_flags,
+                a16_woa_flags=None,
                 a16_split_k=config.wo_a_split_k,
             )
         from b12x._lib.dense_gemm.preparation import (
@@ -479,9 +441,22 @@ class _A16WOScratchState:
     def scratch_specs(self):
         return self._specs
 
+    def _check_caps(self, weights):
+        if (
+            weights.groups != self.caps.groups
+            or weights.group_width != self.caps.group_width
+            or weights.rank != self.caps.rank
+            or weights.hidden != self.caps.hidden
+        ):
+            raise ValueError(
+                "WO weights geometry differs from prepared caps: "
+                f"got {(weights.groups, weights.group_width, weights.rank, weights.hidden)}, "
+                f"expected {(self.caps.groups, self.caps.group_width, self.caps.rank, self.caps.hidden)}"
+            )
+
     def _slice_scratch(self, scratch, tokens, out):
         from b12x._lib.scratch import scratch_tensor
-        from ._tc_gemv import wo_a16_tc_gemv_tmp_bytes
+        from ._tc_gemv import wo_a16_tc_gemv_splitk_bytes, wo_a16_tc_gemv_tmp_bytes
 
         storage = scratch_tensor(scratch, self._specs, owner="WO A16 projection")
         tmp_bytes = wo_a16_tc_gemv_tmp_bytes(
@@ -492,17 +467,32 @@ class _A16WOScratchState:
             .view(torch.bfloat16)
             .view(tokens, self.caps.groups * self.caps.rank)
         )
-        splitk_scratch = (
-            storage[tmp_bytes:].view(torch.float32)
-            if self.config.wo_a_split_k > 1
-            else None
-        )
+        if self.config.wo_a_split_k > 1:
+            splitk_bytes = wo_a16_tc_gemv_splitk_bytes(
+                self.caps.max_tokens,
+                self.caps.groups,
+                self.caps.rank,
+                self.config.wo_a_split_k,
+            )
+            splitk_scratch = storage[tmp_bytes : tmp_bytes + splitk_bytes].view(
+                torch.float32
+            )
+            n_blocks = self.caps.groups * ((self.caps.rank + 15) // 16)
+            flags_start = tmp_bytes + splitk_bytes
+            splitk_flags = storage[flags_start : flags_start + n_blocks * 4].view(
+                torch.uint32
+            )
+        else:
+            splitk_scratch = None
+            splitk_flags = None
         if out is None:
             out = torch.empty(
                 (tokens, self.caps.hidden),
                 dtype=torch.bfloat16,
                 device=storage.device,
             )
+        if out.dtype != torch.bfloat16:
+            raise ValueError(f"WO output must be torch.bfloat16, got {out.dtype}")
         if out.device != storage.device or not out.is_contiguous():
             raise ValueError("WO output must be contiguous on the scratch device")
         if out.shape not in ((tokens, self.caps.hidden), (tokens, self.caps.hidden, 1)):
@@ -513,7 +503,7 @@ class _A16WOScratchState:
             (tokens, self.caps.hidden, 1),
             (self.caps.hidden, 1, tokens * self.caps.hidden),
         )
-        return tmp, splitk_scratch, output
+        return tmp, splitk_scratch, splitk_flags, output
 
     def bind(
         self,
@@ -530,14 +520,17 @@ class _A16WOScratchState:
             _validate_wo_projection_inputs,
         )
 
+        self._check_caps(weights)
         tokens = _validate_wo_projection_inputs(source_tgd, weights)
-        tmp, splitk_scratch, output = self._slice_scratch(scratch, tokens, out)
+        tmp, splitk_scratch, splitk_flags, output = self._slice_scratch(
+            scratch, tokens, out
+        )
         return WOProjectionBinding(
             source_tgd=source_tgd,
             weights=weights,
             x_q=splitk_scratch,
             tmp=tmp,
-            tmp_q=None,
+            tmp_q=splitk_flags,
             output=output,
             return_3d=return_3d,
             expected_m=expected_m,
@@ -563,6 +556,7 @@ class _A16WOScratchState:
             _validate_wo_projection_inv_rope_inputs,
         )
 
+        self._check_caps(weights)
         tokens = _validate_wo_projection_inv_rope_inputs(
             o=o,
             weights=weights,
@@ -570,7 +564,31 @@ class _A16WOScratchState:
             nope_dim=nope_dim,
             rope_dim=rope_dim,
         )
-        tmp, splitk_scratch, output = self._slice_scratch(scratch, tokens, out)
+        if (
+            positions.device != o.device
+            or positions.ndim != 1
+            or not positions.is_contiguous()
+            or positions.shape[0] < tokens
+        ):
+            raise ValueError(
+                "WO inverse-RoPE positions must be a contiguous 1D tensor on the input device with at least tokens entries"
+            )
+        if (
+            cos_sin_cache.device != o.device
+            or cos_sin_cache.ndim != 2
+            or cos_sin_cache.shape[1] < rope_dim
+            or cos_sin_cache.stride(1) != 1
+            or cos_sin_cache.data_ptr() % 16 != 0
+            or (cos_sin_cache.stride(0) * cos_sin_cache.element_size()) % 16 != 0
+            or rope_dim % 8 != 0
+            or nope_dim % 8 != 0
+        ):
+            raise ValueError(
+                "WO inverse-RoPE cos_sin_cache must be a 16-byte aligned 2D tensor with unit inner stride and 16-byte aligned row stride on the input device"
+            )
+        tmp, splitk_scratch, splitk_flags, output = self._slice_scratch(
+            scratch, tokens, out
+        )
         return WOProjectionInvRopeBinding(
             o=o,
             positions=positions,
@@ -578,7 +596,7 @@ class _A16WOScratchState:
             weights=weights,
             x_q=splitk_scratch,
             tmp=tmp,
-            tmp_q=None,
+            tmp_q=splitk_flags,
             output=output,
             heads_per_group=heads_per_group,
             nope_dim=nope_dim,
@@ -739,7 +757,12 @@ class _PreparedWO:
             from b12x._lib.utils.device import cuda_stream_to_int
 
             stream_int = cuda_stream_to_int(stream)
-            tokens = binding.source_tgd.shape[0]
+            flags = binding.tmp_q if self.a16_split_k > 1 else None
+            if flags is not None:
+                with torch.cuda.stream(
+                    torch.cuda.ExternalStream(stream_int, device=flags.device)
+                ):
+                    flags.zero_()
             self.a16_wo_a(
                 binding.source_tgd,
                 None,
@@ -748,7 +771,7 @@ class _PreparedWO:
                 binding.weights.wo_a.scale_mma,
                 binding.tmp,
                 binding.x_q if self.a16_split_k > 1 else None,
-                self.a16_woa_flags,
+                flags,
                 stream_int,
             )
             self.a16_wo_b(
@@ -819,6 +842,12 @@ class _PreparedWO:
             from b12x._lib.utils.device import cuda_stream_to_int
 
             stream_int = cuda_stream_to_int(stream)
+            flags = binding.tmp_q if self.a16_split_k > 1 else None
+            if flags is not None:
+                with torch.cuda.stream(
+                    torch.cuda.ExternalStream(stream_int, device=flags.device)
+                ):
+                    flags.zero_()
             self.a16_wo_a(
                 binding.o,
                 binding.positions,
@@ -827,7 +856,7 @@ class _PreparedWO:
                 binding.weights.wo_a.scale_mma,
                 binding.tmp,
                 binding.x_q if self.a16_split_k > 1 else None,
-                self.a16_woa_flags,
+                flags,
                 stream_int,
             )
             self.a16_wo_b(

@@ -68,19 +68,20 @@ class _GroupedRmsNorm:
     _PACK_ELEMENTS = 8
 
     def __init__(
-        self, streams: int, hidden_size: int, zero_centered: bool = True
+        self,
+        streams: int,
+        hidden_size: int,
+        zero_centered: bool = True,
+        fp32_weight: bool = False,
     ) -> None:
         self.streams = int(streams)
         self.hidden_size = int(hidden_size)
+        self.fp32_weight = bool(fp32_weight)
         self.vectorized = (self.hidden_size % self._PACK_ELEMENTS) == 0
         self.packs = self.hidden_size // self._PACK_ELEMENTS
         if self.vectorized:
             self.threads = (
-                64
-                if self.packs <= 64
-                else 128
-                if self.packs <= 160
-                else _THREADS
+                64 if self.packs <= 64 else 128 if self.packs <= 160 else _THREADS
             )
             self.warps = self.threads // 32
             self.pack_items = (self.packs + self.threads - 1) // self.threads
@@ -142,7 +143,8 @@ class _GroupedRmsNorm:
             ) and ((state_row_stride & Int64(7)) == Int64(0))
             if aligned:
                 src_row_bytes = state_addr + source_base * Int64(2)
-                wt_row_bytes = weight_addr + weight_base * Int64(2)
+                wt_elem_bytes = 4 if self.fp32_weight else 2
+                wt_row_bytes = weight_addr + weight_base * Int64(wt_elem_bytes)
                 out_row_bytes = output_addr + base * Int64(2)
                 v_vals = cute.make_rmem_tensor(
                     (self.pack_items, self._PACK_ELEMENTS), Float32
@@ -155,9 +157,7 @@ class _GroupedRmsNorm:
                             src_row_bytes + pack.to(Int64) * Int64(16)
                         )
                         for word in cutlass.range_constexpr(4):
-                            lo, hi = bfloat2_to_float2_scaled(
-                                words[word], Float32(1.0)
-                            )
+                            lo, hi = bfloat2_to_float2_scaled(words[word], Float32(1.0))
                             v_vals[item, word * 2] = lo
                             v_vals[item, word * 2 + 1] = hi
                             square_sum += lo * lo + hi * hi
@@ -170,19 +170,44 @@ class _GroupedRmsNorm:
                     pack = thread_i + Int32(item * self.threads)
                     if pack < Int32(self.packs):
                         byte_off = pack.to(Int64) * Int64(16)
-                        w_words = ld_global_v4_u32(wt_row_bytes + byte_off)
                         out_words = cute.make_rmem_tensor((4,), Uint32)
-                        for word in cutlass.range_constexpr(4):
-                            w_lo, w_hi = bfloat2_to_float2_scaled(
-                                w_words[word], Float32(1.0)
+                        if cutlass.const_expr(self.fp32_weight):
+                            w_off = pack.to(Int64) * Int64(32)
+                            w_lo = ld_global_v4_u32(wt_row_bytes + w_off)
+                            w_hi = ld_global_v4_u32(wt_row_bytes + w_off + Int64(16))
+                            ws = (
+                                u32_as_f32(w_lo[0]),
+                                u32_as_f32(w_lo[1]),
+                                u32_as_f32(w_lo[2]),
+                                u32_as_f32(w_lo[3]),
+                                u32_as_f32(w_hi[0]),
+                                u32_as_f32(w_hi[1]),
+                                u32_as_f32(w_hi[2]),
+                                u32_as_f32(w_hi[3]),
                             )
-                            if cutlass.const_expr(self.zero_centered):
-                                w_lo += Float32(1.0)
-                                w_hi += Float32(1.0)
-                            out_words[word] = pack_f32x2_to_bfloat2(
-                                v_vals[item, word * 2] * scale * w_lo,
-                                v_vals[item, word * 2 + 1] * scale * w_hi,
-                            )
+                            for word in cutlass.range_constexpr(4):
+                                gain_lo = ws[word * 2]
+                                gain_hi = ws[word * 2 + 1]
+                                if cutlass.const_expr(self.zero_centered):
+                                    gain_lo += Float32(1.0)
+                                    gain_hi += Float32(1.0)
+                                out_words[word] = pack_f32x2_to_bfloat2(
+                                    v_vals[item, word * 2] * scale * gain_lo,
+                                    v_vals[item, word * 2 + 1] * scale * gain_hi,
+                                )
+                        else:
+                            w_words = ld_global_v4_u32(wt_row_bytes + byte_off)
+                            for word in cutlass.range_constexpr(4):
+                                w_lo, w_hi = bfloat2_to_float2_scaled(
+                                    w_words[word], Float32(1.0)
+                                )
+                                if cutlass.const_expr(self.zero_centered):
+                                    w_lo += Float32(1.0)
+                                    w_hi += Float32(1.0)
+                                out_words[word] = pack_f32x2_to_bfloat2(
+                                    v_vals[item, word * 2] * scale * w_lo,
+                                    v_vals[item, word * 2 + 1] * scale * w_hi,
+                                )
                         st_global_v4_u32(
                             out_row_bytes + byte_off,
                             out_words[0],
@@ -1004,16 +1029,16 @@ def grouped_rmsnorm(
     zero_centered: bool = True,
 ) -> None:
     rows = int(state.shape[0]) * int(streams)
+    fp32_weight = weight.dtype == torch.float32
     key = (
         "norm" if zero_centered else "rmsnorm",
         int(streams),
         int(hidden_size),
+        str(weight.dtype),
     )
-    if not zero_centered:
-        key += (str(weight.dtype),)
     _run(
         key,
-        _GroupedRmsNorm(streams, hidden_size, zero_centered),
+        _GroupedRmsNorm(streams, hidden_size, zero_centered, fp32_weight=fp32_weight),
         (state, weight, output),
         eps=eps,
         runtime_ints=(rows,),

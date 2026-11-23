@@ -769,18 +769,28 @@ class SnapshotAndCacheDsv41SwaKernel(ConcatAndCacheGlmNextMlaKernel):
             if (state >= Int64(0)) & (state < history_capacity):
                 if cutlass.const_expr(self.wide_copy):
                     offset = Int64(tile) * Int64(2048) + Int64(tid) * Int64(16)
-                    source = get_ptr_as_int64(history, 0) + state * history_stride + offset
+                    source = (
+                        get_ptr_as_int64(history, 0) + state * history_stride + offset
+                    )
                     destination = (
-                        get_ptr_as_int64(cache, 0) + Int64(request) * cache_stride + offset
+                        get_ptr_as_int64(cache, 0)
+                        + Int64(request) * cache_stride
+                        + offset
                     )
                     v0, v1, v2, v3 = ld_global_nc_v4_u32(source)
                     st_global_v4_u32(destination, v0, v1, v2, v3)
                 else:
                     if Int32(tid) < Int32(64):
                         offset = Int64(tile) * Int64(1024) + Int64(tid) * Int64(16)
-                        source = get_ptr_as_int64(history, 0) + state * history_stride + offset
+                        source = (
+                            get_ptr_as_int64(history, 0)
+                            + state * history_stride
+                            + offset
+                        )
                         destination = (
-                            get_ptr_as_int64(cache, 0) + Int64(request) * cache_stride + offset
+                            get_ptr_as_int64(cache, 0)
+                            + Int64(request) * cache_stride
+                            + offset
                         )
                         v0, v1, v2, v3 = ld_global_nc_v4_u32(source)
                         st_global_v4_u32(destination, v0, v1, v2, v3)

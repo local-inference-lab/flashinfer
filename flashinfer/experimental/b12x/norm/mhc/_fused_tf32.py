@@ -457,10 +457,11 @@ class _FusedFinalize:
             nthreads = (self.num_warps - 1) * 32
             total_packs = self.hidden // 8
             pack_iters = (total_packs + nthreads - 1) // nthreads
-            y_row_base = (
-                get_ptr_as_int64(y, Int64(0)) + Int64(row) * Int64(self.hidden * 2)
+            y_row_base = get_ptr_as_int64(y, Int64(0)) + Int64(row) * Int64(
+                self.hidden * 2
             )
             norm_base = get_ptr_as_int64(norm, Int64(0))
+            norm_aligned = (norm_base & Int64(15)) == Int64(0)
             for chunk in cutlass.range_constexpr(pack_iters):
                 pack = chunk * nthreads + ntid
                 if pack < total_packs:
@@ -468,38 +469,50 @@ class _FusedFinalize:
                     yaddr = y_row_base + byte_off
                     yw = ld_global_v4_u32(yaddr)
                     outw = cute.make_rmem_tensor((4,), Uint32)
-                    if const_expr(norm.element_type == cutlass.BFloat16):
-                        ww = ld_global_v4_u32(norm_base + byte_off)
+                    if norm_aligned:
+                        if const_expr(norm.element_type == cutlass.BFloat16):
+                            ww = ld_global_v4_u32(norm_base + byte_off)
+                            for wd in cutlass.range_constexpr(4):
+                                v0 = u32_as_f32(yw[wd] << Uint32(16))
+                                v1 = u32_as_f32(yw[wd] & Uint32(0xFFFF0000))
+                                w0 = u32_as_f32(ww[wd] << Uint32(16))
+                                w1 = u32_as_f32(ww[wd] & Uint32(0xFFFF0000))
+                                outw[wd] = _pack_bf16_pair(
+                                    v0 * inv * w0,
+                                    v1 * inv * w1,
+                                )
+                        else:
+                            wlo = ld_global_v4_u32(norm_base + Int64(pack) * Int64(32))
+                            whi = ld_global_v4_u32(
+                                norm_base + Int64(pack) * Int64(32) + Int64(16)
+                            )
+                            ws = (
+                                u32_as_f32(wlo[0]),
+                                u32_as_f32(wlo[1]),
+                                u32_as_f32(wlo[2]),
+                                u32_as_f32(wlo[3]),
+                                u32_as_f32(whi[0]),
+                                u32_as_f32(whi[1]),
+                                u32_as_f32(whi[2]),
+                                u32_as_f32(whi[3]),
+                            )
+                            for wd in cutlass.range_constexpr(4):
+                                v0 = u32_as_f32(yw[wd] << Uint32(16))
+                                v1 = u32_as_f32(yw[wd] & Uint32(0xFFFF0000))
+                                outw[wd] = _pack_bf16_pair(
+                                    v0 * inv * ws[wd * 2],
+                                    v1 * inv * ws[wd * 2 + 1],
+                                )
+                    else:
+                        col_base = pack * 8
                         for wd in cutlass.range_constexpr(4):
                             v0 = u32_as_f32(yw[wd] << Uint32(16))
                             v1 = u32_as_f32(yw[wd] & Uint32(0xFFFF0000))
-                            w0 = u32_as_f32(ww[wd] << Uint32(16))
-                            w1 = u32_as_f32(ww[wd] & Uint32(0xFFFF0000))
+                            w0 = Float32(norm[col_base + wd * 2])
+                            w1 = Float32(norm[col_base + wd * 2 + 1])
                             outw[wd] = _pack_bf16_pair(
                                 v0 * inv * w0,
                                 v1 * inv * w1,
-                            )
-                    else:
-                        wlo = ld_global_v4_u32(norm_base + Int64(pack) * Int64(32))
-                        whi = ld_global_v4_u32(
-                            norm_base + Int64(pack) * Int64(32) + Int64(16)
-                        )
-                        ws = (
-                            u32_as_f32(wlo[0]),
-                            u32_as_f32(wlo[1]),
-                            u32_as_f32(wlo[2]),
-                            u32_as_f32(wlo[3]),
-                            u32_as_f32(whi[0]),
-                            u32_as_f32(whi[1]),
-                            u32_as_f32(whi[2]),
-                            u32_as_f32(whi[3]),
-                        )
-                        for wd in cutlass.range_constexpr(4):
-                            v0 = u32_as_f32(yw[wd] << Uint32(16))
-                            v1 = u32_as_f32(yw[wd] & Uint32(0xFFFF0000))
-                            outw[wd] = _pack_bf16_pair(
-                                v0 * inv * ws[wd * 2],
-                                v1 * inv * ws[wd * 2 + 1],
                             )
                     st_global_v4_u32(yaddr, outw[0], outw[1], outw[2], outw[3])
         if const_expr(_MHC_PDL):

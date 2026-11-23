@@ -167,11 +167,7 @@ def _validate(query, config, device):
         ):
             raise ValueError("invalid WO A16 TC-GEMV configuration")
         return
-    if (
-        config.wo_a_split_k != 1
-        or config.wo_a_warps != 4
-        or config.wo_b_warps != 4
-    ):
+    if config.wo_a_split_k != 1 or config.wo_a_warps != 4 or config.wo_b_warps != 4:
         raise ValueError("WO A16 TC-GEMV knobs require backend='a16_tc_gemv'")
     if type(config.decode_tile_n) is not int or config.decode_tile_n not in (
         0,
@@ -251,11 +247,7 @@ def _parameters(query, device):
         # Single-launch grouped A16 TC-GEMV streams WO-A and WO-B once from DRAM
         # without activation quantization, consistently beating MXFP8 DenseGemm
         # in cold DRAM for M <= 32 even when hot-L2 single-layer tuning prefers MXFP8.
-        return (
-            not a16_ok
-            or query.dynamic_tokens
-            or choice["backend"] == "a16_tc_gemv"
-        )
+        return not a16_ok or query.dynamic_tokens or choice["backend"] == "a16_tc_gemv"
 
     return ParameterSpace.create(
         TUNING.knobs,
@@ -287,7 +279,11 @@ TUNING = TuningContract(
     validate_config=_validate,
     default_config=_default,
     knobs=(
-        Knob(name="backend", values=("mxfp8", "a16_tc_gemv"), binding=ParameterBinding.COMPILE),
+        Knob(
+            name="backend",
+            values=("mxfp8", "a16_tc_gemv"),
+            binding=ParameterBinding.COMPILE,
+        ),
         Knob(name="decode_tile_n", values=None, binding=ParameterBinding.COMPILE),
         Knob(name="wo_a_split_k", values=(1, 2), binding=ParameterBinding.COMPILE),
         Knob(name="wo_a_warps", values=(4, 8), binding=ParameterBinding.COMPILE),

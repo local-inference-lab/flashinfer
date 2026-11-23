@@ -214,12 +214,16 @@ class _JointExecutionState(_OneshotExecutionState):
         has_addend = bool(self.query.call.get("has_addend", False))
         if has_addend:
             if addend is None:
-                raise ValueError("fused-addend joint all-reduce requires an addend tensor")
+                raise ValueError(
+                    "fused-addend joint all-reduce requires an addend tensor"
+                )
             _validate_plain_io(addend, out)
             add_ptr = addend.data_ptr()
         else:
             if addend is not None:
-                raise ValueError("plain joint all-reduce does not accept an addend tensor")
+                raise ValueError(
+                    "plain joint all-reduce does not accept an addend tensor"
+                )
             add_ptr = inp.data_ptr()
         work = self.workspace
         with torch.cuda.device(self.runtime.device):

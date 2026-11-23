@@ -1645,15 +1645,17 @@ def _check_mxfp8_rows_storage(
     m: int,
     k: int,
     num_groups: int,
+    require_scale_rows: bool = True,
 ) -> None:
-    if out.scale_rows is None:
+    if require_scale_rows and out.scale_rows is None:
         raise ValueError("MXFP8 quantization destinations require compact row scales")
     _check_gpu_tensor("out.values", out.values)
-    _check_gpu_tensor("out.scale_rows", out.scale_rows)
+    if out.scale_rows is not None:
+        _check_gpu_tensor("out.scale_rows", out.scale_rows)
     _check_gpu_tensor("out.scale_mma", out.scale_mma)
     if out.values.dtype != torch.float8_e4m3fn:
         raise ValueError(f"out.values must be float8_e4m3fn, got {out.values.dtype}")
-    if out.scale_rows.dtype != torch.float8_e8m0fnu:
+    if out.scale_rows is not None and out.scale_rows.dtype != torch.float8_e8m0fnu:
         raise ValueError(
             f"out.scale_rows must be float8_e8m0fnu, got {out.scale_rows.dtype}"
         )
@@ -1699,7 +1701,7 @@ def _check_mxfp8_rows_storage(
             )
         _check_dense_gemm_mnl_view("out.values", out.values)
     sf_k = k // MXFP8_SCALE_VEC_SIZE
-    if out.scale_rows.shape != (num_groups, m, sf_k):
+    if out.scale_rows is not None and out.scale_rows.shape != (num_groups, m, sf_k):
         raise ValueError(
             f"out.scale_rows must have shape {(num_groups, m, sf_k)}, "
             f"got {tuple(out.scale_rows.shape)}"
@@ -2471,12 +2473,14 @@ def _check_wo_projection_weights(weights: WOProjectionMXFP8Weights) -> None:
         m=weights.rank,
         k=weights.group_width,
         num_groups=weights.groups,
+        require_scale_rows=False,
     )
     _check_mxfp8_rows_storage(
         weights.wo_b,
         m=weights.hidden,
         k=weights.rank * weights.groups,
         num_groups=1,
+        require_scale_rows=False,
     )
 
 

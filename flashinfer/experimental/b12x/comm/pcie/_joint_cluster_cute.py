@@ -331,9 +331,7 @@ def get_joint_cluster_launcher(
         1,
         1,
         current_cuda_stream(),
-        compile_spec=KernelCompileSpec.from_key(
-            "comm.pcie.joint_cluster", 5, key[:-1]
-        ),
+        compile_spec=KernelCompileSpec.from_key("comm.pcie.joint_cluster", 5, key[:-1]),
     )
 
     def run(

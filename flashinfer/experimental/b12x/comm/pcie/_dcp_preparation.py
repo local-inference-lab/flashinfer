@@ -134,6 +134,8 @@ def query_from_runtime(runtime, *, surface, call) -> PcieQuery:
             natural_log=bool(call.get("is_lse_base_on_e", True)),
         )
     elif surface.endswith("all_gather_heads"):
+        from ._gather_preparation import GATHER_MODES
+
         value = _call_value(call, "local_input")
         out = call.get("out")
         overlaps = (
@@ -141,17 +143,29 @@ def query_from_runtime(runtime, *, surface, call) -> PcieQuery:
             and value.data_ptr() < out.data_ptr() + out.nbytes
             and out.data_ptr() < value.data_ptr() + value.nbytes
         )
+        gather_transport = call.get("gather_transport", "barrier")
+        has_gate = bool(call.get("has_gate", call.get("gate") is not None))
+        if has_gate and gather_transport not in GATHER_MODES:
+            raise ValueError(
+                "gated all_gather_heads requires a selected gather_transport"
+            )
         metadata.update(
             dtype=str(value.dtype),
             shape=tuple(value.shape),
             stride=tuple(value.stride()),
-            gather_transport="barrier",
+            gather_transport=gather_transport,
             disjoint_output=not overlaps,
             word_aligned=value.data_ptr() % 4 == 0
             and (out is None or out.data_ptr() % 4 == 0),
             pack_aligned=value.data_ptr() % 16 == 0
             and (out is None or out.data_ptr() % 16 == 0),
         )
+        if has_gate:
+            metadata["has_gate"] = True
+        if "submode" in call:
+            metadata["submode"] = call["submode"]
+        if "active_blocks" in call:
+            metadata["active_blocks"] = int(call["active_blocks"])
     elif surface.endswith("all_gather_pair"):
         from .pcie_dcp_a2a import _pair_outputs_disjoint
 

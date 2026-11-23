@@ -102,6 +102,8 @@ def _run_inv_rope_out(
     positions: torch.Tensor,
     cos_sin_cache: torch.Tensor,
     weights: list[torch.Tensor],
+    scale_rows_a: torch.Tensor | None,
+    scale_rows_b: torch.Tensor | None,
     tiled_a: torch.Tensor | None,
     tiled_b: torch.Tensor | None,
     out: torch.Tensor,
@@ -110,24 +112,34 @@ def _run_inv_rope_out(
 ) -> None:
     require_disjoint(
         out,
-        (o, positions, cos_sin_cache, scratch, *weights, tiled_a, tiled_b),
+        (
+            o,
+            positions,
+            cos_sin_cache,
+            scratch,
+            *weights,
+            scale_rows_a,
+            scale_rows_b,
+            tiled_a,
+            tiled_b,
+        ),
         owner="WO inverse-RoPE output",
     )
     plan = plan_from_handle(handle)
     state = require_prepared(plan, "gemm.wo_projection", o.device)
     q = plan.query
 
-    def matrix(parts, tiled):
+    def matrix(parts, scale_rows, tiled):
         return MXFP8Rows(
             parts[0],
+            None if scale_rows is None else scale_rows.view(torch.float8_e8m0fnu),
             parts[1].view(torch.float8_e8m0fnu),
-            parts[2].view(torch.float8_e8m0fnu),
             tiled,
         )
 
     packed = Weights(
-        matrix(weights[:3], tiled_a),
-        matrix(weights[3:], tiled_b),
+        matrix(weights[:2], scale_rows_a, tiled_a),
+        matrix(weights[2:], scale_rows_b, tiled_b),
         q.groups,
         q.group_width,
         q.rank,
@@ -151,7 +163,17 @@ def _run_inv_rope_out(
 
 @_run_inv_rope_out.register_fake
 def _run_inv_rope_out_fake(
-    o, positions, cos_sin_cache, weights, tiled_a, tiled_b, out, scratch, handle
+    o,
+    positions,
+    cos_sin_cache,
+    weights,
+    scale_rows_a,
+    scale_rows_b,
+    tiled_a,
+    tiled_b,
+    out,
+    scratch,
+    handle,
 ) -> None:
     pass
 
@@ -165,15 +187,26 @@ def run_inv_rope_out(
         for packed in (weights.wo_a, weights.wo_b)
         for tensor in (
             packed.values,
-            packed.scale_rows.view(torch.uint8),
             packed.scale_mma.view(torch.uint8),
         )
     ]
+    scale_rows_a = (
+        None
+        if weights.wo_a.scale_rows is None
+        else weights.wo_a.scale_rows.view(torch.uint8)
+    )
+    scale_rows_b = (
+        None
+        if weights.wo_b.scale_rows is None
+        else weights.wo_b.scale_rows.view(torch.uint8)
+    )
     _run_inv_rope_out(
         o,
         positions,
         cos_sin_cache,
         operands,
+        scale_rows_a,
+        scale_rows_b,
         weights.wo_a.values_tiled,
         weights.wo_b.values_tiled,
         out,

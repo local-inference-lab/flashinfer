@@ -60,9 +60,7 @@ __all__ = [
 
 
 class _JointLaunch(_PackedMath):
-    def __init__(
-        self, family, world_size, rank, threads, max_blocks, has_addend=False
-    ):
+    def __init__(self, family, world_size, rank, threads, max_blocks, has_addend=False):
         super().__init__("bfloat16")
         self._family = family
         self._world_size = world_size

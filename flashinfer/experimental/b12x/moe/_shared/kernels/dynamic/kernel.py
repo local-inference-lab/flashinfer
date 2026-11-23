@@ -2249,11 +2249,13 @@ class MoEDynamicKernelBackend:
         # and not byte-addressable).
         b_w13_u32 = cute.recast_tensor(b_w13, cutlass.Uint32)
         b_down_u32 = cute.recast_tensor(b_down, cutlass.Uint32)
-        frontend_clusters = (
-            max_active_clusters - Int32(8)
-            if cutlass.const_expr(self.external_materialized_fc1)
-            else max_active_clusters
-        )
+        frontend_clusters = max_active_clusters
+        if cutlass.const_expr(self.external_materialized_fc1):
+            # Reserve 8 SMs for concurrent streams (e.g., prefill DMA wait_flag)
+            # so a full-device resident-grid frontend cannot deadlock them, while
+            # preserving a positive grid for small explicit cluster caps (<= 8).
+            if max_active_clusters > Int32(8):
+                frontend_clusters = max_active_clusters - Int32(8)
         grid = (*self.cluster_shape_mn, frontend_clusters)
         self.kernel(
             a_input,

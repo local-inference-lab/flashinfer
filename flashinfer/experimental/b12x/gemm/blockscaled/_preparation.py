@@ -205,7 +205,11 @@ def compile_packed(
                     query.out_features, slices, ordinal
                 )
             if mxfp8_a16_dequant(query, config):
-                from ._dequant import DEQUANT_BLOCK_K, DEQUANT_BLOCK_R, _dequantize_mxfp8
+                from ._dequant import (
+                    DEQUANT_BLOCK_K,
+                    DEQUANT_BLOCK_R,
+                    _dequantize_mxfp8,
+                )
 
                 k = query.padded_in_features
                 programs["dequant"] = _dequantize_mxfp8.warmup(
@@ -465,7 +469,9 @@ class _PackedExecutionState:
         source_align_ok = bool(source.data_ptr() % 16 == 0) and source_layout_ok
         if is_tc_gemv:
             if not source_layout_ok or (source_align_ok != q.source_aligned and m):
-                raise ValueError("packed TC-GEMV source layout differs from preparation")
+                raise ValueError(
+                    "packed TC-GEMV source layout differs from preparation"
+                )
         elif source.is_contiguous() != q.source_contiguous or (
             bool(source.data_ptr() % 16 == 0) != q.source_aligned and m
         ):
@@ -619,7 +625,15 @@ class _PackedExecutionState:
                         triton.cdiv(k, DEQUANT_BLOCK_K),
                         1,
                     )
-                ](values, scale_bytes, weight, q.out_features, k, DEQUANT_BLOCK_R, DEQUANT_BLOCK_K)
+                ](
+                    values,
+                    scale_bytes,
+                    weight,
+                    q.out_features,
+                    k,
+                    DEQUANT_BLOCK_R,
+                    DEQUANT_BLOCK_K,
+                )
                 torch.mm(
                     source.view(m, q.in_features),
                     weight.t(),
@@ -627,11 +641,7 @@ class _PackedExecutionState:
                 )
                 return out
             if config.mode == "a16" and config.a16_backend == "tc_gemv":
-                src_2d = (
-                    source
-                    if source.ndim == 2
-                    else source.view(m, q.in_features)
-                )
+                src_2d = source if source.ndim == 2 else source.view(m, q.in_features)
                 self.programs["gemm"](
                     src_2d,
                     values,

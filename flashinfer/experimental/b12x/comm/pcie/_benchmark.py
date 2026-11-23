@@ -235,6 +235,11 @@ class _ReductionInputs:
             self.source = torch.empty(shape, dtype=dtype, device=device)
             self.out = self.source if inplace else torch.empty_like(self.source)
         self.owner_call = None
+        self.zero_addend = (
+            torch.zeros_like(self.source)
+            if call.get("has_addend", False) and not self.owner and not self.fused
+            else None
+        )
         if self.owner:
             from ._owner_preparation import prepared_call
 
@@ -299,7 +304,10 @@ class _ReductionInputs:
                 block_limit=call["block_limit"],
             )
         if not self.fused:
-            state.run_plain(self.source, self.out)
+            if self.zero_addend is None:
+                state.run_plain(self.source, self.out)
+            else:
+                state.run_plain(self.source, self.out, self.zero_addend)
             return self.out
         state.run_fused(
             self.source,

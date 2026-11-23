@@ -406,10 +406,26 @@ class PCIeDmaAllReduce:
         plan: Plan,
         out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Ring all-gather local shards [shape] -> [world_size, *shape] via CE."""
+        """Experimental pure Copy-Engine ring all-gather `[shape] -> [world_size, *shape]`.
+
+        Experimental API: opt in by preparing a DMA plan for this channel via
+        ``b12x.comm.pcie.plan(query, runtime=channel)`` and passing the
+        materialized ``plan`` here.
+
+        Limitations:
+            - Supported dtypes: ``torch.bfloat16``, ``torch.float16``, ``torch.float32``.
+            - ``inp`` (and ``out`` when provided) must be contiguous on this
+              channel's CUDA device, with ``inp.numel()`` nonzero and divisible by 8.
+            - ``inp.nbytes`` must not exceed ``self.shard_capacity``.
+            - ``out`` must have shape ``(world_size, *inp.shape)`` and storage
+              strictly disjoint from ``inp`` (in-place / aliased outputs are rejected).
+            - Channel submissions must be serialized across invocations and graphs.
+        """
 
         state = require_prepared(plan, "comm.pcie", self.device)
-        if not hasattr(state, "require_runtime") or not hasattr(state, "run_all_gather"):
+        if not hasattr(state, "require_runtime") or not hasattr(
+            state, "run_all_gather"
+        ):
             raise TypeError("plan does not contain a prepared DMA channel")
         state.require_runtime(self)
         if out is None:
@@ -757,6 +773,14 @@ class PCIeDmaAllReduce:
         ):
             raise ValueError(
                 f"DMA all_gather output must be contiguous {expected_shape} {inp.dtype}"
+            )
+        in_bytes = inp.numel() * inp.element_size()
+        if (
+            inp.data_ptr() < out.data_ptr() + out.nbytes
+            and out.data_ptr() < inp.data_ptr() + in_bytes
+        ):
+            raise ValueError(
+                "DMA all_gather requires disjoint input and output storage"
             )
         kernels = self._kernels
         world = self.world_size

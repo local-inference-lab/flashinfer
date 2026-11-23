@@ -692,7 +692,9 @@ class PCIeAllReduce:
             )
         if self.algorithm == "hierarchical":
             if addend is not None:
-                raise ValueError("hierarchical all-reduce does not support fused addend")
+                raise ValueError(
+                    "hierarchical all-reduce does not support fused addend"
+                )
             if peer_input_ptrs is not None:
                 raise ValueError(
                     "peer_input_ptrs are unavailable for hierarchical all-reduce"

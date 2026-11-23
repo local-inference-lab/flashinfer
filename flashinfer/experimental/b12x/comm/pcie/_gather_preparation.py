@@ -40,18 +40,13 @@ def selected_gather_profile(transport, blocks, mode, active):
     ):
         raise ValueError("phased gather requires one complete eight-CTA cluster")
     if transport == "selected_recursive_pix_last":
-        if not (
-            (blocks == 8 and active == 8)
-            or (blocks == 16 and active in (8, 16))
-        ):
+        if not ((blocks == 8 and active == 8) or (blocks == 16 and active in (8, 16))):
             raise ValueError(
                 "pix-last recursive gather requires 8/8 or 16/(8|16) physical/active CTAs"
             )
     elif transport == "selected_ring":
         if not ((blocks == 8 and active == 8) or (blocks == 16 and active == 16)):
-            raise ValueError(
-                "ring gather requires 8/8 or 16/16 physical/active CTAs"
-            )
+            raise ValueError("ring gather requires 8/8 or 16/16 physical/active CTAs")
     elif transport == "selected_switch_push":
         if not ((blocks == 8 and active == 8) or (blocks == 16 and active in (8, 16))):
             raise ValueError(
@@ -62,9 +57,7 @@ def selected_gather_profile(transport, blocks, mode, active):
         "selected_recursive_ready",
         "selected_recursive_outer_first",
     ) and (blocks != 8 or active != 8):
-        raise ValueError(
-            "recursive gathers require eight active and physical CTAs"
-        )
+        raise ValueError("recursive gathers require eight active and physical CTAs")
     return (int(mode == "word_exchange") << 16) | active
 
 
@@ -200,6 +193,12 @@ class SelectedGatherState:
             raise ValueError("selected gather plan belongs to a different channel")
 
     def run_selected(self, source, output, gate=None):
+        """Launch a prepared selected gather.
+
+        When ``has_gate`` is enabled, ``gate[0]`` is a collective decision that
+        must have the same zero/nonzero truth value on every participating rank
+        (CUDA-graph-captured skips avoid host sync or extra barriers).
+        """
         c, runtime = self.query.call, self.runtime
         if tuple(source.shape) != tuple(c["shape"]) or str(source.dtype) != c["dtype"]:
             raise ValueError(
@@ -218,6 +217,14 @@ class SelectedGatherState:
                 raise ValueError(
                     "gated selected gather requires a contiguous aligned int32 CUDA gate"
                 )
+            gate_bytes = gate.numel() * gate.element_size()
+            if (
+                gate.data_ptr() < output.data_ptr() + output.nbytes
+                and output.data_ptr() < gate.data_ptr() + gate_bytes
+            ):
+                raise ValueError(
+                    "gated selected gather requires gate storage disjoint from output"
+                )
             gate_address = gate.data_ptr()
         else:
             if gate is not None:
@@ -232,7 +239,7 @@ class SelectedGatherState:
             runtime._graph_base_slot = runtime._next_slot & 1
             runtime._device_slot_selection = True
         bank = runtime._graph_base_slot if barrier else 0
-        self.launcher(
+        args = (
             source.data_ptr(),
             output.data_ptr(),
             self.selector.data_ptr(),
@@ -242,8 +249,11 @@ class SelectedGatherState:
             runtime._slot_bytes if bank == 0 else -runtime._slot_bytes,
             runtime._exchange_offset,
             runtime._exchange_counter_offset,
-            gate_address=gate_address,
         )
+        if gate_address is not None:
+            self.launcher(*args, gate_address=gate_address)
+        else:
+            self.launcher(*args)
         return output
 
     def run(self, *, local_input, out, gate=None):

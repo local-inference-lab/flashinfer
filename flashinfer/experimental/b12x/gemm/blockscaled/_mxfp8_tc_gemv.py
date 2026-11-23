@@ -221,7 +221,10 @@ def _atomic_add_gpu_u32(addr: Int64, val: Uint32, *, loc=None, ip=None) -> Uint3
     return Uint32(
         llvm.inline_asm(
             T.i32(),
-            [Int64(addr).ir_value(loc=loc, ip=ip), Uint32(val).ir_value(loc=loc, ip=ip)],
+            [
+                Int64(addr).ir_value(loc=loc, ip=ip),
+                Uint32(val).ir_value(loc=loc, ip=ip),
+            ],
             "atom.acq_rel.gpu.global.add.u32 $0, [$1], $2;",
             "=r,l,r",
             has_side_effects=True,
@@ -249,20 +252,14 @@ def _st_global_release_u32(addr: Int64, val: Uint32, *, loc=None, ip=None) -> No
 
 
 @cute.jit
-def _f8_128x4_offset(
-    row: Int32, g: Int32, k_blocks4: cutlass.Constexpr[int]
-) -> Int64:
+def _f8_128x4_offset(row: Int32, g: Int32, k_blocks4: cutlass.Constexpr[int]) -> Int64:
     tile_r = row >> Int32(7)
     tile_k = g >> Int32(2)
     r_in = row & Int32(127)
     return (
-        (
-            (Int64(tile_r) * Int64(k_blocks4) + Int64(tile_k)) * Int64(32)
-            + Int64(r_in & Int32(31))
-        )
-        * Int64(16)
-        + Int64((r_in >> Int32(5)) * Int32(4) + (g & Int32(3)))
-    )
+        (Int64(tile_r) * Int64(k_blocks4) + Int64(tile_k)) * Int64(32)
+        + Int64(r_in & Int32(31))
+    ) * Int64(16) + Int64((r_in >> Int32(5)) * Int32(4) + (g & Int32(3)))
 
 
 class MXFP8MultiRowTCGemvKernel:
@@ -287,7 +284,9 @@ class MXFP8MultiRowTCGemvKernel:
         self.split_k = int(split_k)
         self.n_per_cta = int(n_per_cta)
         if self.n_per_cta not in (16, 32):
-            raise ValueError(f"MXFP8 TC-GEMV requires n_per_cta in (16, 32), got {self.n_per_cta}")
+            raise ValueError(
+                f"MXFP8 TC-GEMV requires n_per_cta in (16, 32), got {self.n_per_cta}"
+            )
         self.rope_head_dim = int(rope_head_dim)
         self.rope_dim = int(rope_dim)
         if self.rope_head_dim != 0:
@@ -300,6 +299,10 @@ class MXFP8MultiRowTCGemvKernel:
                     f"MXFP8 TC-GEMV fused RoPE requires power-of-two head_dim >= 128 and rope_dim == 64, "
                     f"got head_dim={self.rope_head_dim}, rope_dim={self.rope_dim}"
                 )
+            if self.n <= 0 or self.n % 2 != 0:
+                raise ValueError(
+                    f"MXFP8 TC-GEMV fused RoPE requires positive even n so rotary pairs are complete, got n={self.n}"
+                )
         self.nope_dim = self.rope_head_dim - self.rope_dim
         self.n_tiles = self.n_per_cta // 16
         self.k_blocks4 = (self.k // 32 + 3) // 4
@@ -308,7 +311,9 @@ class MXFP8MultiRowTCGemvKernel:
                 f"MXFP8 TC-GEMV requires padded_k={self.k} divisible by 64*split_k"
             )
         if self.in_features % 16 != 0 or self.in_features > self.k:
-            raise ValueError("MXFP8 TC-GEMV requires 16-aligned in_features <= padded_k")
+            raise ValueError(
+                "MXFP8 TC-GEMV requires 16-aligned in_features <= padded_k"
+            )
         self.chunks_per_split = (self.k // 64) // self.split_k
         self.warps = effective_mxfp8_tc_gemv_warps(self.k, self.split_k, warps)
         self.chunks_per_warp = self.chunks_per_split // self.warps
@@ -466,10 +471,14 @@ class MXFP8MultiRowTCGemvKernel:
                     w_base + Int64(row_b) * Int64(self.k) + w_off
                 )
                 sa = _ue8m0_to_bf16x2_sm120(
-                    _ld_global_nc_u8(s_base + _f8_128x4_offset(row_a, g, self.k_blocks4))
+                    _ld_global_nc_u8(
+                        s_base + _f8_128x4_offset(row_a, g, self.k_blocks4)
+                    )
                 )
                 sb = _ue8m0_to_bf16x2_sm120(
-                    _ld_global_nc_u8(s_base + _f8_128x4_offset(row_b, g, self.k_blocks4))
+                    _ld_global_nc_u8(
+                        s_base + _f8_128x4_offset(row_b, g, self.k_blocks4)
+                    )
                 )
                 for half in cutlass.range_constexpr(2):
                     wa0, wa1 = _e4m3x4_scaled_to_bf16x2x2_sm120(
@@ -492,19 +501,40 @@ class MXFP8MultiRowTCGemvKernel:
                         x1 = Uint32(0)
                         x2 = Uint32(0)
                         x3 = Uint32(0)
-                        if cutlass.const_expr(self.in_features == self.k) or k_col < Int32(
-                            self.in_features
-                        ):
+                        if cutlass.const_expr(
+                            self.in_features == self.k
+                        ) or k_col < Int32(self.in_features):
                             x0, x1, x2, x3 = ld_global_nc_v4_u32(px)
                         a0, a1, a2, a3 = bf16_mma_m16n8k16_f32(
-                            acc[0, mt, 0], acc[0, mt, 1], acc[0, mt, 2], acc[0, mt, 3],
-                            wa0, wb0, wa1, wb1, x0, x1,
+                            acc[0, mt, 0],
+                            acc[0, mt, 1],
+                            acc[0, mt, 2],
+                            acc[0, mt, 3],
+                            wa0,
+                            wb0,
+                            wa1,
+                            wb1,
+                            x0,
+                            x1,
                         )
                         a0, a1, a2, a3 = bf16_mma_m16n8k16_f32(
-                            a0, a1, a2, a3,
-                            wa2, wb2, wa3, wb3, x2, x3,
+                            a0,
+                            a1,
+                            a2,
+                            a3,
+                            wa2,
+                            wb2,
+                            wa3,
+                            wb3,
+                            x2,
+                            x3,
                         )
-                        acc[0, mt, 0], acc[0, mt, 1], acc[0, mt, 2], acc[0, mt, 3] = a0, a1, a2, a3
+                        acc[0, mt, 0], acc[0, mt, 1], acc[0, mt, 2], acc[0, mt, 3] = (
+                            a0,
+                            a1,
+                            a2,
+                            a3,
+                        )
         else:
             row_a0 = cutlass.min(first_n + group, Int32(self.n - 1))
             row_b0 = cutlass.min(first_n + group + 8, Int32(self.n - 1))
@@ -530,16 +560,24 @@ class MXFP8MultiRowTCGemvKernel:
                     w_base + Int64(row_b1) * Int64(self.k) + w_off
                 )
                 sa0 = _ue8m0_to_bf16x2_sm120(
-                    _ld_global_nc_u8(s_base + _f8_128x4_offset(row_a0, g, self.k_blocks4))
+                    _ld_global_nc_u8(
+                        s_base + _f8_128x4_offset(row_a0, g, self.k_blocks4)
+                    )
                 )
                 sb0 = _ue8m0_to_bf16x2_sm120(
-                    _ld_global_nc_u8(s_base + _f8_128x4_offset(row_b0, g, self.k_blocks4))
+                    _ld_global_nc_u8(
+                        s_base + _f8_128x4_offset(row_b0, g, self.k_blocks4)
+                    )
                 )
                 sa1 = _ue8m0_to_bf16x2_sm120(
-                    _ld_global_nc_u8(s_base + _f8_128x4_offset(row_a1, g, self.k_blocks4))
+                    _ld_global_nc_u8(
+                        s_base + _f8_128x4_offset(row_a1, g, self.k_blocks4)
+                    )
                 )
                 sb1 = _ue8m0_to_bf16x2_sm120(
-                    _ld_global_nc_u8(s_base + _f8_128x4_offset(row_b1, g, self.k_blocks4))
+                    _ld_global_nc_u8(
+                        s_base + _f8_128x4_offset(row_b1, g, self.k_blocks4)
+                    )
                 )
                 for half in cutlass.range_constexpr(2):
                     h_off = x_off + Int64(half * 16)
@@ -550,11 +588,16 @@ class MXFP8MultiRowTCGemvKernel:
                         x1 = Uint32(0)
                         x2 = Uint32(0)
                         x3 = Uint32(0)
-                        if cutlass.const_expr(self.in_features == self.k) or k_col < Int32(
-                            self.in_features
-                        ):
+                        if cutlass.const_expr(
+                            self.in_features == self.k
+                        ) or k_col < Int32(self.in_features):
                             x0, x1, x2, x3 = ld_global_nc_v4_u32(px)
-                        x_buf[mt, 0], x_buf[mt, 1], x_buf[mt, 2], x_buf[mt, 3] = x0, x1, x2, x3
+                        x_buf[mt, 0], x_buf[mt, 1], x_buf[mt, 2], x_buf[mt, 3] = (
+                            x0,
+                            x1,
+                            x2,
+                            x3,
+                        )
                     # N-tile 0
                     wa0, wa1 = _e4m3x4_scaled_to_bf16x2x2_sm120(
                         pa0 if cutlass.const_expr(half == 0) else pa2, sa0
@@ -570,14 +613,35 @@ class MXFP8MultiRowTCGemvKernel:
                     )
                     for mt in cutlass.range_constexpr(self.max_m_tiles):
                         a0, a1, a2, a3 = bf16_mma_m16n8k16_f32(
-                            acc[0, mt, 0], acc[0, mt, 1], acc[0, mt, 2], acc[0, mt, 3],
-                            wa0, wb0, wa1, wb1, x_buf[mt, 0], x_buf[mt, 1],
+                            acc[0, mt, 0],
+                            acc[0, mt, 1],
+                            acc[0, mt, 2],
+                            acc[0, mt, 3],
+                            wa0,
+                            wb0,
+                            wa1,
+                            wb1,
+                            x_buf[mt, 0],
+                            x_buf[mt, 1],
                         )
                         a0, a1, a2, a3 = bf16_mma_m16n8k16_f32(
-                            a0, a1, a2, a3,
-                            wa2, wb2, wa3, wb3, x_buf[mt, 2], x_buf[mt, 3],
+                            a0,
+                            a1,
+                            a2,
+                            a3,
+                            wa2,
+                            wb2,
+                            wa3,
+                            wb3,
+                            x_buf[mt, 2],
+                            x_buf[mt, 3],
                         )
-                        acc[0, mt, 0], acc[0, mt, 1], acc[0, mt, 2], acc[0, mt, 3] = a0, a1, a2, a3
+                        acc[0, mt, 0], acc[0, mt, 1], acc[0, mt, 2], acc[0, mt, 3] = (
+                            a0,
+                            a1,
+                            a2,
+                            a3,
+                        )
                     # N-tile 1
                     wc0, wc1 = _e4m3x4_scaled_to_bf16x2x2_sm120(
                         pc0 if cutlass.const_expr(half == 0) else pc2, sa1
@@ -593,18 +657,41 @@ class MXFP8MultiRowTCGemvKernel:
                     )
                     for mt in cutlass.range_constexpr(self.max_m_tiles):
                         a0, a1, a2, a3 = bf16_mma_m16n8k16_f32(
-                            acc[1, mt, 0], acc[1, mt, 1], acc[1, mt, 2], acc[1, mt, 3],
-                            wc0, wd0, wc1, wd1, x_buf[mt, 0], x_buf[mt, 1],
+                            acc[1, mt, 0],
+                            acc[1, mt, 1],
+                            acc[1, mt, 2],
+                            acc[1, mt, 3],
+                            wc0,
+                            wd0,
+                            wc1,
+                            wd1,
+                            x_buf[mt, 0],
+                            x_buf[mt, 1],
                         )
                         a0, a1, a2, a3 = bf16_mma_m16n8k16_f32(
-                            a0, a1, a2, a3,
-                            wc2, wd2, wc3, wd3, x_buf[mt, 2], x_buf[mt, 3],
+                            a0,
+                            a1,
+                            a2,
+                            a3,
+                            wc2,
+                            wd2,
+                            wc3,
+                            wd3,
+                            x_buf[mt, 2],
+                            x_buf[mt, 3],
                         )
-                        acc[1, mt, 0], acc[1, mt, 1], acc[1, mt, 2], acc[1, mt, 3] = a0, a1, a2, a3
+                        acc[1, mt, 0], acc[1, mt, 1], acc[1, mt, 2], acc[1, mt, 3] = (
+                            a0,
+                            a1,
+                            a2,
+                            a3,
+                        )
 
         storage = cutlass.utils.SmemAllocator().allocate(self._shared_storage_cls())
         partials = storage.partials.get_tensor(
-            cute.make_layout((self.warps * _LANES * 4 * self.max_m_tiles * self.n_tiles,))
+            cute.make_layout(
+                (self.warps * _LANES * 4 * self.max_m_tiles * self.n_tiles,)
+            )
         )
         if cutlass.const_expr(self.warps > 1):
             for nt in cutlass.range_constexpr(self.n_tiles):
@@ -637,7 +724,11 @@ class MXFP8MultiRowTCGemvKernel:
                                     total = (
                                         total
                                         + partials[
-                                            ((slot_idx * self.warps + w_i) * _LANES + lane) * 4
+                                            (
+                                                (slot_idx * self.warps + w_i) * _LANES
+                                                + lane
+                                            )
+                                            * 4
                                             + e
                                         ]
                                     )
@@ -647,7 +738,9 @@ class MXFP8MultiRowTCGemvKernel:
                                 total, feature, row, rows, is_odd, in_rope, cos_sin
                             )
                             if feature < self.n and row < rows:
-                                out[Int64(row) * Int64(self.n) + Int64(feature)] = bf_val
+                                out[Int64(row) * Int64(self.n) + Int64(feature)] = (
+                                    bf_val
+                                )
         else:
             tile_elems = self.n_tiles * self.max_m_tiles * 128
             scratch_base = Int64(scratch.toint())
@@ -656,18 +749,38 @@ class MXFP8MultiRowTCGemvKernel:
                 for mt in cutlass.range_constexpr(self.max_m_tiles):
                     slot_idx = nt * self.max_m_tiles + mt
                     if warp == Int32(slot_idx % self.warps):
-                        t0 = acc[nt, mt, 0] if cutlass.const_expr(self.warps == 1) else Float32(0.0)
-                        t1 = acc[nt, mt, 1] if cutlass.const_expr(self.warps == 1) else Float32(0.0)
-                        t2 = acc[nt, mt, 2] if cutlass.const_expr(self.warps == 1) else Float32(0.0)
-                        t3 = acc[nt, mt, 3] if cutlass.const_expr(self.warps == 1) else Float32(0.0)
+                        t0 = (
+                            acc[nt, mt, 0]
+                            if cutlass.const_expr(self.warps == 1)
+                            else Float32(0.0)
+                        )
+                        t1 = (
+                            acc[nt, mt, 1]
+                            if cutlass.const_expr(self.warps == 1)
+                            else Float32(0.0)
+                        )
+                        t2 = (
+                            acc[nt, mt, 2]
+                            if cutlass.const_expr(self.warps == 1)
+                            else Float32(0.0)
+                        )
+                        t3 = (
+                            acc[nt, mt, 3]
+                            if cutlass.const_expr(self.warps == 1)
+                            else Float32(0.0)
+                        )
                         if cutlass.const_expr(self.warps > 1):
                             for w_i in cutlass.range_constexpr(self.warps):
-                                pbase = ((slot_idx * self.warps + w_i) * _LANES + lane) * 4
+                                pbase = (
+                                    (slot_idx * self.warps + w_i) * _LANES + lane
+                                ) * 4
                                 t0 = t0 + partials[pbase + 0]
                                 t1 = t1 + partials[pbase + 1]
                                 t2 = t2 + partials[pbase + 2]
                                 t3 = t3 + partials[pbase + 3]
-                        vaddr = scratch_base + (sbase + Int64((slot_idx * _LANES + lane) * 4)) * Int64(4)
+                        vaddr = scratch_base + (
+                            sbase + Int64((slot_idx * _LANES + lane) * 4)
+                        ) * Int64(4)
                         _st_global_wb_v4_f32(vaddr, t0, t1, t2, t3)
             cute.arch.sync_threads()
             last_flag = storage.last.get_tensor(cute.make_layout((1,)))
@@ -695,10 +808,9 @@ class MXFP8MultiRowTCGemvKernel:
                             s3 = Float32(0.0)
                             lane_off = Int64((slot_idx * _LANES + lane) * 4)
                             for sp in cutlass.range_constexpr(self.split_k):
-                                raddr = (
-                                    scratch_base
-                                    + (tbase + Int64(sp) * tile_elems + lane_off) * Int64(4)
-                                )
+                                raddr = scratch_base + (
+                                    tbase + Int64(sp) * tile_elems + lane_off
+                                ) * Int64(4)
                                 v0, v1, v2, v3 = _ld_global_cg_v4_f32(raddr)
                                 s0 = s0 + v0
                                 s1 = s1 + v1
@@ -789,22 +901,45 @@ def compile_mxfp8_tc_gemv(
 
     def run(source, values, scale_bytes, output, scratch, flags, stream):
         sc_ptr = (
-            make_ptr(Float32, scratch.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
+            make_ptr(
+                Float32, scratch.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
+            )
             if scratch is not None
-            else make_ptr(Float32, output.data_ptr(), cute.AddressSpace.gmem, assumed_align=4)
+            else make_ptr(
+                Float32, output.data_ptr(), cute.AddressSpace.gmem, assumed_align=4
+            )
         )
         fl_ptr = (
             make_ptr(Uint32, flags.data_ptr(), cute.AddressSpace.gmem, assumed_align=4)
             if flags is not None
-            else make_ptr(Uint32, output.data_ptr(), cute.AddressSpace.gmem, assumed_align=4)
+            else make_ptr(
+                Uint32, output.data_ptr(), cute.AddressSpace.gmem, assumed_align=4
+            )
         )
         run_compiled(
             raw,
             (
-                make_ptr(BFloat16, source.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
-                make_ptr(Uint8, values.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
-                make_ptr(Uint8, scale_bytes.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
-                make_ptr(BFloat16, output.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+                make_ptr(
+                    BFloat16,
+                    source.data_ptr(),
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                ),
+                make_ptr(
+                    Uint8, values.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
+                ),
+                make_ptr(
+                    Uint8,
+                    scale_bytes.data_ptr(),
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                ),
+                make_ptr(
+                    BFloat16,
+                    output.data_ptr(),
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                ),
                 sc_ptr,
                 fl_ptr,
                 Int32(source.shape[0]),
@@ -878,24 +1013,54 @@ def compile_mxfp8_tc_gemv_rope(
         )
 
     def run(source, values, scale_bytes, output, cos_sin, scratch, flags, stream):
+        if split_k > 1 and (scratch is None or flags is None):
+            raise ValueError("split_k > 1 requires scratch and flags buffers")
         sc_ptr = (
-            make_ptr(Float32, scratch.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
+            make_ptr(
+                Float32, scratch.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
+            )
             if scratch is not None
-            else make_ptr(Float32, output.data_ptr(), cute.AddressSpace.gmem, assumed_align=4)
+            else make_ptr(
+                Float32, output.data_ptr(), cute.AddressSpace.gmem, assumed_align=4
+            )
         )
         fl_ptr = (
             make_ptr(Uint32, flags.data_ptr(), cute.AddressSpace.gmem, assumed_align=4)
             if flags is not None
-            else make_ptr(Uint32, output.data_ptr(), cute.AddressSpace.gmem, assumed_align=4)
+            else make_ptr(
+                Uint32, output.data_ptr(), cute.AddressSpace.gmem, assumed_align=4
+            )
         )
         run_compiled(
             raw,
             (
-                make_ptr(BFloat16, source.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
-                make_ptr(Uint8, values.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
-                make_ptr(Uint8, scale_bytes.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
-                make_ptr(BFloat16, output.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
-                make_ptr(Float32, cos_sin.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+                make_ptr(
+                    BFloat16,
+                    source.data_ptr(),
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                ),
+                make_ptr(
+                    Uint8, values.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
+                ),
+                make_ptr(
+                    Uint8,
+                    scale_bytes.data_ptr(),
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                ),
+                make_ptr(
+                    BFloat16,
+                    output.data_ptr(),
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                ),
+                make_ptr(
+                    Float32,
+                    cos_sin.data_ptr(),
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                ),
                 sc_ptr,
                 fl_ptr,
                 Int32(source.shape[0]),

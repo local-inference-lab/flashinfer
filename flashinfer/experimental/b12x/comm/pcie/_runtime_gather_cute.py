@@ -104,15 +104,36 @@ class SelectedGather(_AllGatherHeadsLaunch):
         stream: cuda.CUstream,
     ):
         self.selected(
-            source, output, selector, gate, stages, signals, rows, stride, offset, counter
+            source,
+            output,
+            selector,
+            gate,
+            stages,
+            signals,
+            rows,
+            stride,
+            offset,
+            counter,
         ).launch(grid=(self.blocks, 1, 1), block=(self._threads, 1, 1), stream=stream)
 
     @cute.kernel
     def selected(
-        self, source, output, selector, gate, stages, signals, rows, stride, offset, counter
+        self,
+        source,
+        output,
+        selector,
+        gate,
+        stages,
+        signals,
+        rows,
+        stride,
+        offset,
+        counter,
     ):
         run_gather = cutlass.Boolean(True)
         if cutlass.const_expr(self.has_gate):
+            # Collective contract: every rank must supply an identical zero vs
+            # nonzero gate value so CUDA-graph-captured skips stay barrier-free.
             run_gather = Uint32(cute.arch.load(gate, Uint32)) != Uint32(0)
         if run_gather:
             block, _, _ = cute.arch.block_idx()
@@ -359,7 +380,11 @@ def compile_selected_gather(
             pointer(Uint32, output),
             pointer(Uint32, selector, 4),
             *(
-                (pointer(Uint32, selector if gate_address is None else gate_address, 4),)
+                (
+                    pointer(
+                        Uint32, selector if gate_address is None else gate_address, 4
+                    ),
+                )
                 if uses_gate_arg
                 else ()
             ),

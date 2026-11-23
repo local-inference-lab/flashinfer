@@ -479,7 +479,9 @@ def _validate_config(query, config, device):
                 query.num_tokens, query.out_features, config.split_k, config.tile_n
             )
             if query.workspace_nbytes < needed:
-                raise ValueError("caller workspace is too small for MXFP8 TC-GEMV split-K")
+                raise ValueError(
+                    "caller workspace is too small for MXFP8 TC-GEMV split-K"
+                )
         return
     if config.dense_config is not None:
         if config.mode != "quantized" or query.recipe not in (
@@ -644,9 +646,7 @@ def _tuning_parameters(query, device):
             return True
         if parameters["a16_backend"] == "tc_gemv":
             if not (
-                tc_gemv
-                and parameters["tile_m"] == 16
-                and parameters["tile_k"] == 64
+                tc_gemv and parameters["tile_m"] == 16 and parameters["tile_k"] == 64
             ):
                 return False
             if parameters["tile_n"] == 16:
@@ -661,7 +661,11 @@ def _tuning_parameters(query, device):
             if chunks_per_split <= 4:
                 return parameters["mma_warps"] in (2, 4)
             return parameters["mma_warps"] in (4, 8)
-        if parameters["tile_n"] == 16 or parameters["mma_warps"] == 8 or parameters["split_k"] == 7:
+        if (
+            parameters["tile_n"] == 16
+            or parameters["mma_warps"] == 8
+            or parameters["split_k"] == 7
+        ):
             return False
         if parameters["tile_n"] == 32 and not (
             query.recipe == "mxfp8"
@@ -730,10 +734,7 @@ def _tuning_parameters(query, device):
             not tc_gemv
             or query.num_tokens > 28
             or query.activation_mode == "quantized"
-            or (
-                parameters["mode"] == "a16"
-                and parameters["a16_backend"] == "tc_gemv"
-            )
+            or (parameters["mode"] == "a16" and parameters["a16_backend"] == "tc_gemv")
         )
 
     a16_backends = ("auto",)
@@ -752,9 +753,7 @@ def _tuning_parameters(query, device):
             else ("a16", "quantized")
             if query.activation_mode == "auto"
             else (query.activation_mode,),
-            "mma_warps": (
-                (2, 4, 8) if tc_gemv else (2, 4)
-            )
+            "mma_warps": ((2, 4, 8) if tc_gemv else (2, 4))
             if query.recipe == "mxfp8"
             else (None,),
             "dense_config": dense_configs,
@@ -853,7 +852,9 @@ TUNING = TuningContract(
         ),
         Knob(name="tile_k", values=(64, 128, 256), when=FrozenMapping({"mode": "a16"})),
         Knob(
-            name="split_k", values=(1, 2, 4, 7, 8, 16), when=FrozenMapping({"mode": "a16"})
+            name="split_k",
+            values=(1, 2, 4, 7, 8, 16),
+            when=FrozenMapping({"mode": "a16"}),
         ),
         Knob(
             name="mma_warps",
