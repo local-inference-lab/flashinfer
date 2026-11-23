@@ -445,6 +445,8 @@ def launch_w4a8_compact_micro(
     _prepared_quantize=None,
     max_active_clusters: int | None = None,
     fc1_tile_n: int = 128,
+    prequant_a_values: torch.Tensor | None = None,
+    prequant_a_scales: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run compact W4A8 projections and ordered route reduction into output."""
     if max_active_clusters is not None and max_active_clusters <= 0:
@@ -480,16 +482,39 @@ def launch_w4a8_compact_micro(
         offset, size = layout[name]
         return storage.narrow(0, offset, size)
 
-    values = region("a_values").view(cap, k)
-    scale_rows = region("a_scales").view(cap, k // 32)
-    scale_mma = region("a_mma_scales")
     intermediate = region("intermediate")
     projections = region("projections")
-    if not fuse_input_quantization:
-        if _prepared_quantize is None:
-            quantize_mxfp8_rows_cute(a, values, scale_rows, scale_mma, expected_m=cap)
-        else:
-            _prepared_quantize(a, values, scale_rows, scale_mma)
+    if (
+        not fuse_input_quantization
+        and prequant_a_values is not None
+        and prequant_a_scales is not None
+    ):
+        if (
+            prequant_a_values.dtype != torch.uint8
+            or prequant_a_scales.dtype != torch.uint8
+            or not prequant_a_values.is_contiguous()
+            or not prequant_a_scales.is_contiguous()
+            or prequant_a_values.device != a.device
+            or prequant_a_scales.device != a.device
+            or prequant_a_values.numel() < cap * k
+            or prequant_a_scales.numel() < cap * (k // 32)
+        ):
+            raise ValueError(
+                "prequantized MXFP8 buffers must be contiguous uint8 covering [max_tokens, K] and [max_tokens, K//32]"
+            )
+        values = prequant_a_values
+        scale_rows = prequant_a_scales
+    else:
+        values = region("a_values").view(cap, k)
+        scale_rows = region("a_scales").view(cap, k // 32)
+        scale_mma = region("a_mma_scales")
+        if not fuse_input_quantization:
+            if _prepared_quantize is None:
+                quantize_mxfp8_rows_cute(
+                    a, values, scale_rows, scale_mma, expected_m=cap
+                )
+            else:
+                _prepared_quantize(a, values, scale_rows, scale_mma)
 
     compiled = _prepared_kernel or _compiled_direct_w4a8_compact(
         int(a.device.index or 0),

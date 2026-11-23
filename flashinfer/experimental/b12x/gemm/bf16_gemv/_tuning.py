@@ -326,11 +326,11 @@ TUNING = TuningContract(
         Knob(name="block_threads", values=(128, 256), binding=ParameterBinding.COMPILE),
         Knob(
             name="split_k",
-            values=(1, 2, 3, 4, 6, 7, 8, 12, 14, 16, 28, 56),
+            values=(1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 28, 56),
             binding=ParameterBinding.COMPILE,
         ),
     ),
-    candidate_contract_version=17,
+    candidate_contract_version=18,
     parameters=_parameters,
     materialize=lambda query, device, choice: GemvConfig(**dict(choice)),
 )

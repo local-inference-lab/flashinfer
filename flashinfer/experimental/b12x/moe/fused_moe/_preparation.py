@@ -1319,6 +1319,8 @@ class _FusedMoeState:
         experts = kwargs.pop("experts", self.experts)
         scale_buffers = kwargs.pop("_scale_buffers", ())
         weight_views_cache = kwargs.pop("_weight_views_cache", None)
+        prequant_a_values = kwargs.pop("prequant_a_values", None)
+        prequant_a_scales = kwargs.pop("prequant_a_scales", None)
         if experts is not self.experts:
             raise ValueError("prepared experts differ from the plan declaration")
         kwargs["a4_prefill"] = self._precision_choice(kwargs.get("a4_prefill"))
@@ -1353,6 +1355,8 @@ class _FusedMoeState:
             compact_launches=self.compact_launches,
             output_layout=self.scratch.caps.output_layout,
             weight_views_cache=weight_views_cache,
+            prequant_a_values=prequant_a_values,
+            prequant_a_scales=prequant_a_scales,
         )
         if (
             self.experts.plan.activation.a4_prefill is not None

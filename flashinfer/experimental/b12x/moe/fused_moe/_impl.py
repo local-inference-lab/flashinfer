@@ -1287,6 +1287,8 @@ class TPMoEFP4Binding:
     rotation_a_gate: torch.Tensor | None = None
     rotation_a_up: torch.Tensor | None = None
     kernel_workspace: torch.Tensor | None = None
+    prequant_a_values: torch.Tensor | None = None
+    prequant_a_scales: torch.Tensor | None = None
     # Preserve the route geometry selected by the caller-owned scratch plan.
     # Re-running the live-batch heuristic here can select a smaller block than
     # the arena was sized for (for example, planned 64 versus live 48).
@@ -14213,6 +14215,8 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             fast_math=fast_math,
             csf_inline_scales=inline_scales is not None,
             fuse_input_quantization=plan.decode_config.compact_fuse_input_quantization,
+            prequant_a_values=binding.prequant_a_values,
+            prequant_a_scales=binding.prequant_a_scales,
         )
         return scatter_output
 

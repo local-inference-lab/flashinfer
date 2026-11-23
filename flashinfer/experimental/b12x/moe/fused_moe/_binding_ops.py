@@ -326,6 +326,91 @@ def _fake(
     pass
 
 
+def supports_prequant_mxfp8(plan, tokens: int) -> bool:
+    """Return True if the prepared MoE plan accepts pre-quantized MXFP8 activations."""
+    prepared = getattr(plan, "_prepared", None)
+    state = getattr(prepared, "state", None)
+    if state is None:
+        return False
+    variant = state.for_tokens(int(tokens)) if hasattr(state, "for_tokens") else state
+    return bool(
+        getattr(variant, "compact_launches", None) is not None
+        and not getattr(variant.config, "compact_fuse_input_quantization", False)
+        and int(variant.scratch.caps.max_tokens) == int(tokens)
+    )
+
+
+@torch.library.custom_op(
+    "b12x::prepared_moe_prequant_out",
+    mutates_args=("output", "scratch", "activation_amax", "scale_storage"),
+)
+def prepared_moe_prequant_out(
+    a: torch.Tensor,
+    prequant_a_values: torch.Tensor,
+    prequant_a_scales: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    output: torch.Tensor,
+    scratch: torch.Tensor,
+    scale_inputs: list[torch.Tensor],
+    scale_storage: list[torch.Tensor],
+    plan_handle: int,
+    input_scales_static: bool,
+    fast_math: bool | None,
+    activation_amax: torch.Tensor | None,
+    layer_idx: int | None,
+    route_expert_map: torch.Tensor | None,
+    output_expert_map: torch.Tensor | None,
+    scales_expanded: bool,
+    a4_prefill: bool | None,
+) -> None:
+    state = require_prepared(plan_from_handle(plan_handle), "moe.decode", a.device)
+    binding = state.bind(
+        a=a,
+        prequant_a_values=prequant_a_values,
+        prequant_a_scales=prequant_a_scales,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        output=output,
+        scratch=scratch,
+        input_scales_static=input_scales_static,
+        fast_math=fast_math,
+        activation_amax=activation_amax,
+        layer_idx=layer_idx,
+        route_expert_map=route_expert_map,
+        output_expert_map=output_expert_map,
+        scales_expanded=scales_expanded,
+        a4_prefill=a4_prefill,
+        _scale_buffers=scale_storage or scale_inputs,
+        _weight_views_cache={},
+    )
+    state.run(_bind_scale_buffers(binding, scale_storage or scale_inputs))
+
+
+@prepared_moe_prequant_out.register_fake
+def _fake_prequant(
+    a,
+    prequant_a_values,
+    prequant_a_scales,
+    topk_weights,
+    topk_ids,
+    output,
+    scratch,
+    scale_inputs,
+    scale_storage,
+    plan_handle,
+    input_scales_static,
+    fast_math,
+    activation_amax,
+    layer_idx,
+    route_expert_map,
+    output_expert_map,
+    scales_expanded,
+    a4_prefill,
+) -> None:
+    pass
+
+
 @torch.library.custom_op(
     "b12x::prepared_routed_moe_out",
     mutates_args=(

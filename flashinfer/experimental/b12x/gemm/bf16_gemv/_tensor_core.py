@@ -32,7 +32,7 @@ from b12x._lib.utils.pointers import make_ptr
 TC_MAX_ROWS = 32
 TC_MAX_WARPS = 8
 TC_K_MULTIPLE = 32
-TC_SPLIT_K_VALUES = (1, 2, 3, 4, 6, 7, 8, 12, 14, 16, 28, 56)
+TC_SPLIT_K_VALUES = (1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 28, 56)
 _LANES = 32
 
 _TC_SPLITK_BUFFERS: dict[tuple[int, int, int, int, int], tuple[torch.Tensor, torch.Tensor]] = {}
