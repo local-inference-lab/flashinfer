@@ -101,11 +101,19 @@ def _validate_query(query: PcieQuery, device) -> None:
             push = query.call.get("local_push", False)
             scattered = query.call.get("cross_island_rsag", False)
             dma = query.call.get("cross_island_dma", False)
-            if any(type(value) is not bool for value in (push, scattered, dma)):
+            cross_push = query.call.get("cross_island_push", False)
+            if any(
+                type(value) is not bool
+                for value in (push, scattered, dma, cross_push)
+            ):
                 raise TypeError("island protocol choices must be booleans")
             if dma and not (push and scattered):
                 raise ValueError(
                     "cross-island DMA requires local push and scatter/gather"
+                )
+            if cross_push and (not push or dma):
+                raise ValueError(
+                    "cross-island push requires local push without cross-island DMA"
                 )
         blocks, active = query.call["blocks"], query.call["active_blocks"]
         if (
@@ -237,6 +245,6 @@ def _validate_query(query: PcieQuery, device) -> None:
         )
 
 
-TUNING = replace(TUNING, query_schema_version=43, validate_query=_validate_query)
+TUNING = replace(TUNING, query_schema_version=44, validate_query=_validate_query)
 
 __all__ = ["PcieQuery", "PcieConfig", "SURFACES", "TUNING"]

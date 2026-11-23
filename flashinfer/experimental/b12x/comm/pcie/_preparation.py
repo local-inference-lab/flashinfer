@@ -145,13 +145,22 @@ def plan(
             query.call.get("local_push", False),
             query.call.get("cross_island_rsag", False),
             query.call.get("cross_island_dma", False),
+            query.call.get("cross_island_push", False),
         )
         default = next(
             name for name, value in ISLAND_VARIANTS.items() if value == flags
         )
         alternatives = {default: (query, runtime)}
         if not query.setup.get("threads_override", False):
-            for name, (push, scattered, dma) in ISLAND_VARIANTS.items():
+            elems = prod(query.call["inp"]["shape"])
+            qcap = int(query.setup["quarter_capacity"])
+            for name, (push, scattered, dma, cross_push) in ISLAND_VARIANTS.items():
+                if name == "island_allpush_full" and (
+                    elems % 32 != 0 or elems > qcap * 2
+                ):
+                    continue
+                if name == "island_allpush_rsag" and elems % 128 != 0:
+                    continue
                 alternatives[name] = (
                     replace(
                         query,
@@ -161,6 +170,7 @@ def plan(
                                 "local_push": push,
                                 "cross_island_rsag": scattered,
                                 "cross_island_dma": dma,
+                                "cross_island_push": cross_push,
                             }
                         ),
                     ),

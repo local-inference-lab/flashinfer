@@ -327,120 +327,86 @@ class RecursiveGather(SelectedGather):
                 )
                 bank = Int64(generation % Uint32(2)) * stride
                 local = self._staging_words(stages[self._rank] + bank)
-                lane = Int32(tid) % Int32(32)
-                first = Int32(block) * Int32(self._warps_per_block) + Int32(tid) // Int32(
-                    32
-                )
-                step = active * Int32(self._warps_per_block)
                 packs = Int32(self.row_words // 4)
-                row_tiles = (packs + Int32(31)) // Int32(32)
-                tiles = rows * row_tiles
-                # 2-phase Pair-2 (r^4 cross-root) x Switch-4 (r^1,r^2,r^3 intra-switch) gather:
-                # 2 barriers instead of 3, zero intermediate output round-trip, overlapped local write.
+                total = rows * packs
+                total64 = Int64(total)
+                first = Int32(block) * Int32(self._threads) + Int32(tid)
+                step = active * Int32(self._threads)
+                # Overlapped 2-barrier Pair-2 (r^4 cross-switch) x Switch-4 (r^1,r^2,r^3
+                # 54.8 GB/s physical switch) with flat per-sender staging & single source read.
                 partner = self._rank ^ 4
-                remote_p = self._staging_words(stages[partner] + bank)
-                dst_slot_p = self._rank if self._rank < partner else self._rank - 1
-                tile = first
-                while tile < tiles:
-                    row = tile // row_tiles
-                    pack = (tile - row * row_tiles) * Int32(32) + lane
-                    if pack < packs:
-                        src_pack = Int64(row) * Int64(packs) + Int64(pack)
-                        dst_pack = (
-                            Int64(row) * Int64(7) + Int64(dst_slot_p)
-                        ) * Int64(packs) + Int64(pack)
-                        words = ld_global_v4_u32(
-                            (source + src_pack * Int64(4)).toint()
-                        )
-                        st_global_v4_u32(
-                            (remote_p + dst_pack * Int64(4)).toint(), *words
-                        )
-                    tile += step
-                g0 = self._signal_arrive(signals, partner, block, tid)
+                sw0, sw1, sw2 = self._rank ^ 1, self._rank ^ 2, self._rank ^ 3
+                rem_p4 = self._staging_words(stages[partner] + bank)
+                rem_sw0 = self._staging_words(stages[sw0] + bank)
+                rem_sw1 = self._staging_words(stages[sw1] + bank)
+                rem_sw2 = self._staging_words(stages[sw2] + bank)
+                s_p4 = self._rank if self._rank < partner else self._rank - 1
+                s_sw0 = self._rank if self._rank < sw0 else self._rank - 1
+                s_sw1 = self._rank if self._rank < sw1 else self._rank - 1
+                s_sw2 = self._rank if self._rank < sw2 else self._rank - 1
+                p4_base = rem_p4 + Int64(s_p4) * total64 * Int64(4)
+                sw0_base = rem_sw0 + Int64(s_sw0) * total64 * Int64(4)
+                sw1_base = rem_sw1 + Int64(s_sw1) * total64 * Int64(4)
+                sw2_base = rem_sw2 + Int64(s_sw2) * total64 * Int64(4)
+                idx = first
+                while idx < total:
+                    row = idx // packs
+                    pack = idx - row * packs
+                    off = Int64(idx) * Int64(4)
+                    words = ld_global_v4_u32((source + off).toint())
+                    out_p = (
+                        Int64(row) * Int64(8) + Int64(self._rank)
+                    ) * Int64(packs) + Int64(pack)
+                    st_global_v4_u32((output + out_p * Int64(4)).toint(), *words)
+                    st_global_v4_u32((p4_base + off).toint(), *words)
+                    st_global_v4_u32((sw0_base + off).toint(), *words)
+                    st_global_v4_u32((sw1_base + off).toint(), *words)
+                    st_global_v4_u32((sw2_base + off).toint(), *words)
+                    idx += step
+                self._pair_barrier(signals, partner, block, tid)
 
-                tile = first
-                while tile < tiles:
-                    row = tile // row_tiles
-                    pack = (tile - row * row_tiles) * Int32(32) + lane
-                    if pack < packs:
-                        src_pack = Int64(row) * Int64(packs) + Int64(pack)
-                        out_pack = (
-                            Int64(row) * Int64(8) + Int64(self._rank)
-                        ) * Int64(packs) + Int64(pack)
-                        _copy_16b(
-                            source + src_pack * Int64(4),
-                            output + out_pack * Int64(4),
-                        )
-                    tile += step
-                self._signal_wait(signals, partner, block, tid, g0)
-
-                sw_peers = (self._rank ^ 1, self._rank ^ 2, self._rank ^ 3)
-                orig_partner_slot = partner if partner < self._rank else partner - 1
-                tile = first
-                while tile < tiles:
-                    row = tile // row_tiles
-                    pack = (tile - row * row_tiles) * Int32(32) + lane
-                    if pack < packs:
-                        src_pack = Int64(row) * Int64(packs) + Int64(pack)
-                        inc_partner = (
-                            Int64(row) * Int64(7) + Int64(orig_partner_slot)
-                        ) * Int64(packs) + Int64(pack)
-                        w_own = ld_global_v4_u32(
-                            (source + src_pack * Int64(4)).toint()
-                        )
-                        w_rem = ld_global_cg_v4_u32(
-                            (local + inc_partner * Int64(4)).toint()
-                        )
-                        for pi in cutlass.range_constexpr(3):
-                            peer = sw_peers[pi]
-                            rem_stg = self._staging_words(stages[peer] + bank)
-                            s_own = self._rank if self._rank < peer else self._rank - 1
-                            s_rem = partner if partner < peer else partner - 1
-                            dp_own = (
-                                Int64(row) * Int64(7) + Int64(s_own)
-                            ) * Int64(packs) + Int64(pack)
-                            dp_rem = (
-                                Int64(row) * Int64(7) + Int64(s_rem)
-                            ) * Int64(packs) + Int64(pack)
-                            st_global_v4_u32(
-                                (rem_stg + dp_own * Int64(4)).toint(), *w_own
-                            )
-                            st_global_v4_u32(
-                                (rem_stg + dp_rem * Int64(4)).toint(), *w_rem
-                            )
-                        out_p = (
-                            Int64(row) * Int64(8) + Int64(partner)
-                        ) * Int64(packs) + Int64(pack)
-                        st_global_v4_u32(
-                            (output + out_p * Int64(4)).toint(), *w_rem
-                        )
-                    tile += step
+                orig_p4 = partner if partner < self._rank else partner - 1
+                in_p4 = local + Int64(orig_p4) * total64 * Int64(4)
+                ps_sw0 = partner if partner < sw0 else partner - 1
+                ps_sw1 = partner if partner < sw1 else partner - 1
+                ps_sw2 = partner if partner < sw2 else partner - 1
+                p4_sw0 = rem_sw0 + Int64(ps_sw0) * total64 * Int64(4)
+                p4_sw1 = rem_sw1 + Int64(ps_sw1) * total64 * Int64(4)
+                p4_sw2 = rem_sw2 + Int64(ps_sw2) * total64 * Int64(4)
+                idx = first
+                while idx < total:
+                    row = idx // packs
+                    pack = idx - row * packs
+                    off = Int64(idx) * Int64(4)
+                    w_rem = ld_global_cg_v4_u32((in_p4 + off).toint())
+                    out_p = (
+                        Int64(row) * Int64(8) + Int64(partner)
+                    ) * Int64(packs) + Int64(pack)
+                    st_global_v4_u32((output + out_p * Int64(4)).toint(), *w_rem)
+                    st_global_v4_u32((p4_sw0 + off).toint(), *w_rem)
+                    st_global_v4_u32((p4_sw1 + off).toint(), *w_rem)
+                    st_global_v4_u32((p4_sw2 + off).toint(), *w_rem)
+                    idx += step
                 self._switch4_barrier(signals, block, tid)
 
                 others = tuple(
                     r for r in range(8) if r != self._rank and r != partner
                 )
-                tile = first
-                while tile < tiles:
-                    row = tile // row_tiles
-                    pack = (tile - row * row_tiles) * Int32(32) + lane
-                    if pack < packs:
-                        for oi in cutlass.range_constexpr(6):
-                            src_r = others[oi]
-                            slot_r = src_r if src_r < self._rank else src_r - 1
-                            inc_p = (
-                                Int64(row) * Int64(7) + Int64(slot_r)
-                            ) * Int64(packs) + Int64(pack)
-                            out_p = (
-                                Int64(row) * Int64(8) + Int64(src_r)
-                            ) * Int64(packs) + Int64(pack)
-                            words = ld_global_cg_v4_u32(
-                                (local + inc_p * Int64(4)).toint()
-                            )
-                            st_global_v4_u32(
-                                (output + out_p * Int64(4)).toint(), *words
-                            )
-                    tile += step
+                for oi in cutlass.range_constexpr(6):
+                    src_r = others[oi]
+                    slot_r = src_r if src_r < self._rank else src_r - 1
+                    in_base = local + Int64(slot_r) * total64 * Int64(4)
+                    idx = first
+                    while idx < total:
+                        row = idx // packs
+                        pack = idx - row * packs
+                        off = Int64(idx) * Int64(4)
+                        words = ld_global_cg_v4_u32((in_base + off).toint())
+                        out_p = (
+                            Int64(row) * Int64(8) + Int64(src_r)
+                        ) * Int64(packs) + Int64(pack)
+                        st_global_v4_u32((output + out_p * Int64(4)).toint(), *words)
+                        idx += step
                 if Int32(tid) == Int32(0):
                     _a2a_graph_epoch_arrive(
                         (signals[self._rank] + Int64(_GRAPH_EPOCH_INDEX)).toint(),

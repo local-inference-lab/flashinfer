@@ -128,7 +128,7 @@ def compile_selected_gather(world, rank, row_words, threads, blocks, chunks, tra
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "comm.pcie.selected_gather",
-            21,
+            22,
             (world, rank, row_words, threads, blocks, chunks, transport),
         ),
     )

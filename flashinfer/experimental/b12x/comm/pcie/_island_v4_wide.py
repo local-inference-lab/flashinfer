@@ -44,6 +44,7 @@ from ._island_rs_cute import (
     _fence_sc_sys,
     _flag_address,
     _fma_rn_f32,
+    _island_v4_allpush_to_final,
     _ld_cg_v4_u32,
     _ld_nc_v4_u32,
     _load_acquire_gpu_u32,
@@ -203,73 +204,26 @@ class _IslandV4ResNorm7168WideLaunch:
             final_off += qcap * Int64(16)
 
         if bidx < Int32(self._ab):
-            gen = Uint32(sh_gen[1])
-            q_v4 = Int64(self._rows * 224)
-            qbytes = Int64(self._rows * 3584)
-            stride = Int64(self._ab * 512)
-            start = Int64(bidx) * Int64(512) + Int64(tidx)
-            in_addr = Int64(inp.toint())
-            for d in cutlass.range_constexpr(1, 4):
-                dl = self._lane ^ d
-                peer = self._island * 4 + dl
-                dst = Int64(slabs[peer].toint()) + stage_off + Int64(self._lane) * qbytes
-                src = in_addr + Int64(dl) * qbytes
-                idx = start
-                while idx < q_v4:
-                    w = ld_global_v4_u32(src + idx * Int64(16))
-                    st_global_v4_u32(dst + idx * Int64(16), w[0], w[1], w[2], w[3])
-                    idx += stride
-            self._sync3(slabs, self_base, _RS_ARRIVED, False, bidx, tidx, gen)
-
-            mine_in = in_addr + Int64(self._lane) * qbytes
-            self_st = self_base + stage_off
-            self_pt = self_base + part_off
-            idx = start
-            while idx < q_v4:
-                totals = (Float32(0.0),) * 8
-                for p in cutlass.range_constexpr(4):
-                    if cutlass.const_expr(p == self._lane):
-                        w = ld_global_v4_u32(mine_in + idx * Int64(16))
-                    else:
-                        w = _ld_cg_v4_u32(self_st + Int64(p) * qbytes + idx * Int64(16))
-                    totals = _accumulate_payload_words(totals, w, 4)
-                pk = _pack_payload_words(totals, 4)
-                st_global_v4_u32(self_pt + idx * Int64(16), pk[0], pk[1], pk[2], pk[3])
-                idx += stride
-            self._sync3(slabs, self_base, _XS_ARRIVED, True, bidx, tidx, gen * Uint32(2))
-
-            idx = start
-            while idx < q_v4:
-                loaded = [None, None, None, None]
-                for d in cutlass.range_constexpr(4):
-                    isl = self._island ^ d
-                    if cutlass.const_expr(isl == self._island):
-                        loaded[isl] = ld_global_v4_u32(self_pt + idx * Int64(16))
-                    else:
-                        loaded[isl] = _ld_nc_v4_u32(
-                            Int64(slabs[isl * 4 + self._lane].toint())
-                            + part_off
-                            + idx * Int64(16)
-                        )
-                totals = (Float32(0.0),) * 8
-                for isl in cutlass.range_constexpr(4):
-                    totals = _accumulate_payload_words(totals, loaded[isl], 4)
-                pk = _pack_payload_words(totals, 4)
-                st_global_v4_u32(
-                    self_base + final_off + Int64(self._lane) * qbytes + idx * Int64(16),
-                    pk[0], pk[1], pk[2], pk[3],
-                )
-                for d in cutlass.range_constexpr(1, 4):
-                    peer = self._island * 4 + (self._lane ^ d)
-                    st_global_v4_u32(
-                        Int64(slabs[peer].toint())
-                        + final_off
-                        + Int64(self._lane) * qbytes
-                        + idx * Int64(16),
-                        pk[0], pk[1], pk[2], pk[3],
-                    )
-                idx += stride
-            self._sync3(slabs, self_base, _AG_ARRIVED, False, bidx, tidx, gen)
+            _island_v4_allpush_to_final(
+                slabs,
+                self_base,
+                inp,
+                inp,
+                stage_off,
+                part_off,
+                final_off,
+                qcap,
+                bidx,
+                tidx,
+                Uint32(sh_gen[1]),
+                self._island,
+                self._lane,
+                self._rows,
+                7168,
+                self._ab,
+                False,
+                False,
+            )
 
         if bidx < Int32(max(self._ab, self._rows)):
             if tidx == Int32(0):
@@ -498,73 +452,26 @@ class _IslandV4Norm3584WideLaunch:
             final_off += qcap * Int64(16)
 
         if bidx < Int32(self._ab):
-            gen = Uint32(sh_gen[1])
-            q_v4 = Int64(self._rows * 112)
-            qbytes = Int64(self._rows * 1792)
-            stride = Int64(self._ab * 512)
-            start = Int64(bidx) * Int64(512) + Int64(tidx)
-            in_addr = Int64(inp.toint())
-            for d in cutlass.range_constexpr(1, 4):
-                dl = self._lane ^ d
-                peer = self._island * 4 + dl
-                dst = Int64(slabs[peer].toint()) + stage_off + Int64(self._lane) * qbytes
-                src = in_addr + Int64(dl) * qbytes
-                idx = start
-                while idx < q_v4:
-                    w = ld_global_v4_u32(src + idx * Int64(16))
-                    st_global_v4_u32(dst + idx * Int64(16), w[0], w[1], w[2], w[3])
-                    idx += stride
-            self._sync3(slabs, self_base, _RS_ARRIVED, False, bidx, tidx, gen)
-
-            mine_in = in_addr + Int64(self._lane) * qbytes
-            self_st = self_base + stage_off
-            self_pt = self_base + part_off
-            idx = start
-            while idx < q_v4:
-                totals = (Float32(0.0),) * 8
-                for p in cutlass.range_constexpr(4):
-                    if cutlass.const_expr(p == self._lane):
-                        w = ld_global_v4_u32(mine_in + idx * Int64(16))
-                    else:
-                        w = _ld_cg_v4_u32(self_st + Int64(p) * qbytes + idx * Int64(16))
-                    totals = _accumulate_payload_words(totals, w, 4)
-                pk = _pack_payload_words(totals, 4)
-                st_global_v4_u32(self_pt + idx * Int64(16), pk[0], pk[1], pk[2], pk[3])
-                idx += stride
-            self._sync3(slabs, self_base, _XS_ARRIVED, True, bidx, tidx, gen * Uint32(2))
-
-            idx = start
-            while idx < q_v4:
-                loaded = [None, None, None, None]
-                for d in cutlass.range_constexpr(4):
-                    isl = self._island ^ d
-                    if cutlass.const_expr(isl == self._island):
-                        loaded[isl] = ld_global_v4_u32(self_pt + idx * Int64(16))
-                    else:
-                        loaded[isl] = _ld_nc_v4_u32(
-                            Int64(slabs[isl * 4 + self._lane].toint())
-                            + part_off
-                            + idx * Int64(16)
-                        )
-                totals = (Float32(0.0),) * 8
-                for isl in cutlass.range_constexpr(4):
-                    totals = _accumulate_payload_words(totals, loaded[isl], 4)
-                pk = _pack_payload_words(totals, 4)
-                st_global_v4_u32(
-                    self_base + final_off + Int64(self._lane) * qbytes + idx * Int64(16),
-                    pk[0], pk[1], pk[2], pk[3],
-                )
-                for d in cutlass.range_constexpr(1, 4):
-                    peer = self._island * 4 + (self._lane ^ d)
-                    st_global_v4_u32(
-                        Int64(slabs[peer].toint())
-                        + final_off
-                        + Int64(self._lane) * qbytes
-                        + idx * Int64(16),
-                        pk[0], pk[1], pk[2], pk[3],
-                    )
-                idx += stride
-            self._sync3(slabs, self_base, _AG_ARRIVED, False, bidx, tidx, gen)
+            _island_v4_allpush_to_final(
+                slabs,
+                self_base,
+                inp,
+                inp,
+                stage_off,
+                part_off,
+                final_off,
+                qcap,
+                bidx,
+                tidx,
+                Uint32(sh_gen[1]),
+                self._island,
+                self._lane,
+                self._rows,
+                3584,
+                self._ab,
+                False,
+                False,
+            )
 
         if bidx < Int32(max(self._ab, self._rows)):
             if tidx == Int32(0):
@@ -748,99 +655,26 @@ class _IslandV4Mix7168WideLaunch:
             final_off += qcap * Int64(16)
 
         if bidx < Int32(self._ab):
-            gen = Uint32(sh_gen[1])
-            q_v4 = Int64(self._rows * 224)
-            qbytes = Int64(self._rows * 3584)
-            stride = Int64(self._ab * 512)
-            start = Int64(bidx) * Int64(512) + Int64(tidx)
-            in_addr = Int64(inp.toint())
-            add_addr = Int64(addend.toint())
-            for d in cutlass.range_constexpr(1, 4):
-                dl = self._lane ^ d
-                peer = self._island * 4 + dl
-                dst = Int64(slabs[peer].toint()) + stage_off + Int64(self._lane) * qbytes
-                src = in_addr + Int64(dl) * qbytes
-                asrc = add_addr + Int64(dl) * qbytes
-                idx = start
-                while idx < q_v4:
-                    w = ld_global_v4_u32(src + idx * Int64(16))
-                    if cutlass.const_expr(self._has_addend):
-                        aw = ld_global_v4_u32(asrc + idx * Int64(16))
-                        pk = []
-                        for j in cutlass.range_constexpr(4):
-                            sl, sh = unpack_bf16x2(w[j])
-                            al, ah = unpack_bf16x2(aw[j])
-                            pk.append(
-                                pack_f32x2_to_bf16x2(_add_rn_f32(sl, al), _add_rn_f32(sh, ah))
-                            )
-                        st_global_v4_u32(dst + idx * Int64(16), pk[0], pk[1], pk[2], pk[3])
-                    else:
-                        st_global_v4_u32(dst + idx * Int64(16), w[0], w[1], w[2], w[3])
-                    idx += stride
-            self._sync3(slabs, self_base, _RS_ARRIVED, False, bidx, tidx, gen)
-
-            mine_in = in_addr + Int64(self._lane) * qbytes
-            mine_add = add_addr + Int64(self._lane) * qbytes
-            self_st = self_base + stage_off
-            self_pt = self_base + part_off
-            idx = start
-            while idx < q_v4:
-                totals = (Float32(0.0),) * 8
-                for p in cutlass.range_constexpr(4):
-                    if cutlass.const_expr(p == self._lane):
-                        w = ld_global_v4_u32(mine_in + idx * Int64(16))
-                        if cutlass.const_expr(self._has_addend):
-                            aw = ld_global_v4_u32(mine_add + idx * Int64(16))
-                            pk = []
-                            for j in cutlass.range_constexpr(4):
-                                sl, sh = unpack_bf16x2(w[j])
-                                al, ah = unpack_bf16x2(aw[j])
-                                pk.append(
-                                    pack_f32x2_to_bf16x2(
-                                        _add_rn_f32(sl, al), _add_rn_f32(sh, ah)
-                                    )
-                                )
-                            w = (pk[0], pk[1], pk[2], pk[3])
-                    else:
-                        w = _ld_cg_v4_u32(self_st + Int64(p) * qbytes + idx * Int64(16))
-                    totals = _accumulate_payload_words(totals, w, 4)
-                pk = _pack_payload_words(totals, 4)
-                st_global_v4_u32(self_pt + idx * Int64(16), pk[0], pk[1], pk[2], pk[3])
-                idx += stride
-            self._sync3(slabs, self_base, _XS_ARRIVED, True, bidx, tidx, gen * Uint32(2))
-
-            idx = start
-            while idx < q_v4:
-                loaded = [None, None, None, None]
-                for d in cutlass.range_constexpr(4):
-                    isl = self._island ^ d
-                    if cutlass.const_expr(isl == self._island):
-                        loaded[isl] = ld_global_v4_u32(self_pt + idx * Int64(16))
-                    else:
-                        loaded[isl] = _ld_nc_v4_u32(
-                            Int64(slabs[isl * 4 + self._lane].toint())
-                            + part_off
-                            + idx * Int64(16)
-                        )
-                totals = (Float32(0.0),) * 8
-                for isl in cutlass.range_constexpr(4):
-                    totals = _accumulate_payload_words(totals, loaded[isl], 4)
-                pk = _pack_payload_words(totals, 4)
-                st_global_v4_u32(
-                    self_base + final_off + Int64(self._lane) * qbytes + idx * Int64(16),
-                    pk[0], pk[1], pk[2], pk[3],
-                )
-                for d in cutlass.range_constexpr(1, 4):
-                    peer = self._island * 4 + (self._lane ^ d)
-                    st_global_v4_u32(
-                        Int64(slabs[peer].toint())
-                        + final_off
-                        + Int64(self._lane) * qbytes
-                        + idx * Int64(16),
-                        pk[0], pk[1], pk[2], pk[3],
-                    )
-                idx += stride
-            self._sync3(slabs, self_base, _AG_ARRIVED, False, bidx, tidx, gen)
+            _island_v4_allpush_to_final(
+                slabs,
+                self_base,
+                inp,
+                addend,
+                stage_off,
+                part_off,
+                final_off,
+                qcap,
+                bidx,
+                tidx,
+                Uint32(sh_gen[1]),
+                self._island,
+                self._lane,
+                self._rows,
+                7168,
+                self._ab,
+                self._has_addend,
+                False,
+            )
 
         if bidx < Int32(max(self._ab, self._rows)):
             if tidx == Int32(0):
@@ -1165,10 +999,11 @@ def get_island_resnorm7168_wide_launcher(
     device_index: int,
     *,
     blocks: int = MAX_BLOCKS,
-    active_blocks: int = 8,
+    active_blocks: int | None = None,
 ) -> Callable[..., None]:
     del device_index
-    ab = max(1, min(int(active_blocks), int(blocks)))
+    req_ab = (16 if int(rows) >= 60 else 8) if active_blocks is None else int(active_blocks)
+    ab = max(1, min(req_ab, int(blocks)))
     launch = _IslandV4ResNorm7168WideLaunch(rank, rows, ab)
     slab_ph = make_ptr(cutlass.Uint8, 256, cute.AddressSpace.gmem, assumed_align=256)
     bf_ph = make_ptr(cutlass.BFloat16, 16, cute.AddressSpace.gmem, assumed_align=16)
@@ -1182,7 +1017,7 @@ def get_island_resnorm7168_wide_launcher(
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "comm.pcie.island_v4_resnorm7168_wide.bf16",
-            1,
+            2,
             (int(rank), int(rows), int(ab)),
             labels=("rank", "rows", "active_blocks"),
         ),
@@ -1216,10 +1051,11 @@ def get_island_norm3584_wide_launcher(
     device_index: int,
     *,
     blocks: int = MAX_BLOCKS,
-    active_blocks: int = 8,
+    active_blocks: int | None = None,
 ) -> Callable[..., None]:
     del device_index
-    ab = max(1, min(int(active_blocks), int(blocks)))
+    req_ab = (16 if int(rows) >= 60 else 8) if active_blocks is None else int(active_blocks)
+    ab = max(1, min(req_ab, int(blocks)))
     launch = _IslandV4Norm3584WideLaunch(rank, rows, ab)
     slab_ph = make_ptr(cutlass.Uint8, 256, cute.AddressSpace.gmem, assumed_align=256)
     bf_ph = make_ptr(cutlass.BFloat16, 16, cute.AddressSpace.gmem, assumed_align=16)
@@ -1234,7 +1070,7 @@ def get_island_norm3584_wide_launcher(
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "comm.pcie.island_v4_norm3584_wide.bf16",
-            1,
+            2,
             (int(rank), int(rows), int(ab)),
             labels=("rank", "rows", "active_blocks"),
         ),
@@ -1270,10 +1106,11 @@ def get_island_mix7168_wide_launcher(
     device_index: int,
     *,
     blocks: int = MAX_BLOCKS,
-    active_blocks: int = 8,
+    active_blocks: int | None = None,
 ) -> Callable[..., None]:
     del device_index
-    ab = max(1, min(int(active_blocks), int(blocks)))
+    req_ab = (16 if int(rows) >= 60 else 8) if active_blocks is None else int(active_blocks)
+    ab = max(1, min(req_ab, int(blocks)))
     launch = _IslandV4Mix7168WideLaunch(
         rank, rows, ab, sources, write, mode, aux, has_addend
     )
@@ -1290,7 +1127,7 @@ def get_island_mix7168_wide_launcher(
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "comm.pcie.island_v4_mix7168_wide.bf16",
-            1,
+            2,
             (int(rank), int(rows), int(ab), int(sources), int(write), int(mode), bool(aux), bool(has_addend)),
             labels=("rank", "rows", "active_blocks", "sources", "write", "mode", "aux", "has_addend"),
         ),

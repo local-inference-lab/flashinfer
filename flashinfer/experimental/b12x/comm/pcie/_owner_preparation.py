@@ -203,6 +203,7 @@ def query_from_runtime(
             "inplace": out is not None and out.data_ptr() == inp.data_ptr(),
             "cross_island_rsag": False,
             "local_push": False,
+            "cross_island_push": False,
             "inp": _tensor_call(inp),
             "output": None if out is None else _tensor_call(out),
         }
@@ -348,6 +349,7 @@ def compile_owner_surface(query_payload, ordinal):
                 wait_nanosleep_cycles=call["wait_nanosleep_cycles"],
                 cross_island_rsag=call.get("cross_island_rsag", False),
                 local_push=call.get("local_push", False),
+                cross_island_push=call.get("cross_island_push", False),
             )
         if query.surface == "PCIeIslandRSAllReduce.reduce_scatter":
             from ._island_copy import get_reduce_scatter_programs

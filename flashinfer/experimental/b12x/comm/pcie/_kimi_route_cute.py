@@ -157,6 +157,38 @@ class GatherRouterTopK(_DCPA2ABase):
         cute.arch.sync_threads()
 
     @cute.jit
+    def _group3_barrier(self, signals, peers, bidx, tid) -> None:
+        """3-peer barrier (cross-switch or intra-switch) with single-leader fence."""
+        cute.arch.sync_threads()
+        if Int32(tid) == Int32(0):
+            _fence_sc_sys()
+            self_sig = signals[self._rank]
+            base_cnt = self_sig + Int64(bidx) * Int64(_MAX_RANKS)
+            g = [Uint32(0), Uint32(0), Uint32(0)]
+            ci = [Int64(0), Int64(0), Int64(0)]
+            for idx in cutlass.range_constexpr(3):
+                p = peers[idx]
+                gv = Uint32(cute.arch.load(base_cnt + Int64(p), Uint32)) + Uint32(1)
+                cute.arch.store(base_cnt + Int64(p), gv)
+                sl = Int64(gv % Uint32(2))
+                c = Int64(_MAX_BLOCKS * _MAX_RANKS) + (
+                    (sl * Int64(_MAX_BLOCKS) + Int64(bidx))
+                    * Int64(_MAX_RANKS * _FLAG_STRIDE)
+                )
+                _store_relaxed_sys_u32(
+                    signals[p] + c + Int64(self._rank * _FLAG_STRIDE), gv
+                )
+                g[idx] = gv
+                ci[idx] = c
+            for idx in cutlass.range_constexpr(3):
+                p = peers[idx]
+                addr = Int64((self_sig + ci[idx] + Int64(p * _FLAG_STRIDE)).toint())
+                obs = _load_acquire_sys_u32(addr)
+                while obs != g[idx]:
+                    obs = _load_acquire_sys_u32(addr)
+        cute.arch.sync_threads()
+
+    @cute.jit
     def __call__(
         self,
         first: cute.Pointer,
@@ -232,13 +264,13 @@ class GatherRouterTopK(_DCPA2ABase):
         )
         warp_keys = storage.warp_keys.get_tensor(cute.make_layout((128,), stride=(1,)))
 
-        # 3-phase CrossRoot-first (r^8 [1 shard] -> r^4 [2 shards]) x Switch-4
-        # (r^1,r^2,r^3 [4 shards each over 49.6 GB/s intra-switch]): 4x less
-        # cross-root PCIe traffic, 3 barriers, single-leader fences, SMEM logits.
-        p8 = self._rank ^ 8
-        rem8 = self._staging_words(staging[p8] + slot_offset) + row_stage_words
+        # 2-phase Cross3-first (r^4,r^8,r^12: ONLY 3 shards cross uplink, overlapped
+        # with own-shard intra-switch push) -> Switch-4 forward (3 cross shards over
+        # 54.8 GB/s physical switch): 2 barriers, 0 PCIe reads, 0-bit exact.
+        xs_peers = (self._rank ^ 4, self._rank ^ 8, self._rank ^ 12)
+        sw_peers = (self._rank ^ 1, self._rank ^ 2, self._rank ^ 3)
+
         if warp == Int32(0):
-            dst_base = rem8 + Int64(self._rank * 42 * 4)
             out_row = Int64(row) * Int64(16) + Int64(self._rank)
             if wlane < first_packs:
                 vals = ld_global_v4_u32(
@@ -247,7 +279,6 @@ class GatherRouterTopK(_DCPA2ABase):
                 st_global_v4_u32(
                     (out_first + (out_row * first_packs + wlane) * 4).toint(), *vals
                 )
-                st_global_v4_u32((dst_base + Int64(wlane) * 4).toint(), *vals)
             if wlane < second_packs:
                 vals = ld_global_v4_u32(
                     (second + Int64(row * second_packs + wlane) * 4).toint()
@@ -255,101 +286,77 @@ class GatherRouterTopK(_DCPA2ABase):
                 st_global_v4_u32(
                     (out_second + (out_row * second_packs + wlane) * 4).toint(), *vals
                 )
-                st_global_v4_u32(
-                    (dst_base + Int64(first_packs + wlane) * 4).toint(), *vals
-                )
                 base = Int32(self._rank * 56) + Int32(wlane * 4)
                 logits_smem[base + 0] = _u32_to_f32(vals[0])
                 logits_smem[base + 1] = _u32_to_f32(vals[1])
                 logits_smem[base + 2] = _u32_to_f32(vals[2])
                 logits_smem[base + 3] = _u32_to_f32(vals[3])
-        self._pair_barrier(signals, p8, row, tid)
+        for pi in cutlass.range_constexpr(3):
+            if warp == Int32(pi + 1):
+                peer = xs_peers[pi]
+                dst_base = (
+                    self._staging_words(staging[peer] + slot_offset)
+                    + row_stage_words
+                    + Int64(self._rank * 42 * 4)
+                )
+                if wlane < first_packs:
+                    _copy_16b(
+                        first + Int64(row * first_packs + wlane) * 4,
+                        dst_base + Int64(wlane) * 4,
+                    )
+                if wlane < second_packs:
+                    _copy_16b(
+                        second + Int64(row * second_packs + wlane) * 4,
+                        dst_base + Int64(first_packs + wlane) * 4,
+                    )
+            if warp == Int32(pi + 4):
+                peer = sw_peers[pi]
+                dst_base = (
+                    self._staging_words(staging[peer] + slot_offset)
+                    + row_stage_words
+                    + Int64(self._rank * 42 * 4)
+                )
+                if wlane < first_packs:
+                    _copy_16b(
+                        first + Int64(row * first_packs + wlane) * 4,
+                        dst_base + Int64(wlane) * 4,
+                    )
+                if wlane < second_packs:
+                    _copy_16b(
+                        second + Int64(row * second_packs + wlane) * 4,
+                        dst_base + Int64(first_packs + wlane) * 4,
+                    )
+        self._group3_barrier(signals, xs_peers, row, tid)
 
-        p4 = self._rank ^ 4
-        p12 = self._rank ^ 12
-        rem4 = self._staging_words(staging[p4] + slot_offset) + row_stage_words
-        if warp == Int32(0):
-            dst_base = rem4 + Int64(self._rank * 42 * 4)
-            if wlane < first_packs:
-                _copy_16b(
-                    first + Int64(row * first_packs + wlane) * 4,
-                    dst_base + Int64(wlane) * 4,
-                )
-            if wlane < second_packs:
-                _copy_16b(
-                    second + Int64(row * second_packs + wlane) * 4,
-                    dst_base + Int64(first_packs + wlane) * 4,
-                )
-        elif warp == Int32(1):
-            src_base = self_stage + Int64(p8 * 42 * 4)
-            dst_base = rem4 + Int64(p8 * 42 * 4)
-            out_row = Int64(row) * Int64(16) + Int64(p8)
-            if wlane < first_packs:
-                vals = ld_global_cg_v4_u32((src_base + Int64(wlane) * 4).toint())
-                st_global_v4_u32((dst_base + Int64(wlane) * 4).toint(), *vals)
-                st_global_v4_u32(
-                    (out_first + (out_row * first_packs + wlane) * 4).toint(), *vals
-                )
-            if wlane < second_packs:
-                vals = ld_global_cg_v4_u32(
-                    (src_base + Int64(first_packs + wlane) * 4).toint()
-                )
-                st_global_v4_u32(
-                    (dst_base + Int64(first_packs + wlane) * 4).toint(), *vals
-                )
-                st_global_v4_u32(
-                    (out_second + (out_row * second_packs + wlane) * 4).toint(), *vals
-                )
-                base = Int32(p8 * 56) + Int32(wlane * 4)
-                logits_smem[base + 0] = _u32_to_f32(vals[0])
-                logits_smem[base + 1] = _u32_to_f32(vals[1])
-                logits_smem[base + 2] = _u32_to_f32(vals[2])
-                logits_smem[base + 3] = _u32_to_f32(vals[3])
-        self._pair_barrier(signals, p4, row, tid)
-
-        sw_peers = (self._rank ^ 1, self._rank ^ 2, self._rank ^ 3)
-        owned = (self._rank, p4, p8, p12)
+        # Phase 2: Forward 3 cross-switch shards to 3 intra-switch peers (warps 0..8)
+        # while warps 9..11 unpack those 3 shards in parallel.
         for pi in cutlass.range_constexpr(3):
             peer = sw_peers[pi]
             rem_sw = (
                 self._staging_words(staging[peer] + slot_offset) + row_stage_words
             )
-            for si in cutlass.range_constexpr(4):
-                w_id = pi * 4 + si
-                if warp == Int32(w_id):
-                    sr = owned[si]
+            for si in cutlass.range_constexpr(3):
+                if warp == Int32(pi * 3 + si):
+                    sr = xs_peers[si]
+                    src_base = self_stage + Int64(sr * 42 * 4)
                     dst_base = rem_sw + Int64(sr * 42 * 4)
-                    if cutlass.const_expr(sr == self._rank):
-                        if wlane < first_packs:
-                            _copy_16b(
-                                first + Int64(row * first_packs + wlane) * 4,
-                                dst_base + Int64(wlane) * 4,
-                            )
-                        if wlane < second_packs:
-                            _copy_16b(
-                                second + Int64(row * second_packs + wlane) * 4,
-                                dst_base + Int64(first_packs + wlane) * 4,
-                            )
-                    else:
-                        src_base = self_stage + Int64(sr * 42 * 4)
-                        if wlane < first_packs:
-                            vals = ld_global_cg_v4_u32(
-                                (src_base + Int64(wlane) * 4).toint()
-                            )
-                            st_global_v4_u32(
-                                (dst_base + Int64(wlane) * 4).toint(), *vals
-                            )
-                        if wlane < second_packs:
-                            vals = ld_global_cg_v4_u32(
-                                (src_base + Int64(first_packs + wlane) * 4).toint()
-                            )
-                            st_global_v4_u32(
-                                (dst_base + Int64(first_packs + wlane) * 4).toint(),
-                                *vals,
-                            )
-        # Warps 12 & 13 unpack p4 & p12 overlapped with the intra-switch push.
-        for xi, peer in ((0, p4), (1, p12)):
-            if warp == Int32(12 + xi):
+                    if wlane < first_packs:
+                        vals = ld_global_cg_v4_u32(
+                            (src_base + Int64(wlane) * 4).toint()
+                        )
+                        st_global_v4_u32(
+                            (dst_base + Int64(wlane) * 4).toint(), *vals
+                        )
+                    if wlane < second_packs:
+                        vals = ld_global_cg_v4_u32(
+                            (src_base + Int64(first_packs + wlane) * 4).toint()
+                        )
+                        st_global_v4_u32(
+                            (dst_base + Int64(first_packs + wlane) * 4).toint(), *vals
+                        )
+        for si in cutlass.range_constexpr(3):
+            if warp == Int32(9 + si):
+                peer = xs_peers[si]
                 src_base = self_stage + Int64(peer * 42 * 4)
                 out_row = Int64(row) * Int64(16) + Int64(peer)
                 if wlane < first_packs:
@@ -371,10 +378,12 @@ class GatherRouterTopK(_DCPA2ABase):
                     logits_smem[base + 1] = _u32_to_f32(vals[1])
                     logits_smem[base + 2] = _u32_to_f32(vals[2])
                     logits_smem[base + 3] = _u32_to_f32(vals[3])
-        self._sw4_barrier(signals, row, tid)
+        self._group3_barrier(signals, sw_peers, row, tid)
 
         # Unpack remaining 12 received shards from local L2-coherent staging.
-        rem_peers = tuple(p for p in range(16) if p not in (self._rank, p4, p8, p12))
+        rem_peers = tuple(
+            p for p in range(16) if p not in (self._rank, xs_peers[0], xs_peers[1], xs_peers[2])
+        )
         for idx in cutlass.range_constexpr(12):
             if warp == Int32(idx):
                 peer = rem_peers[idx]
@@ -526,7 +535,7 @@ def compile_row_route(rank, device_slot_selection, rows=4):
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "comm.pcie.row_gather_kimi_topk",
-            9,
+            10,
             (rank, device_slot_selection, rows),
             labels=("rank", "device_slot_selection", "rows"),
         ),

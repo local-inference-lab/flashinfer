@@ -89,10 +89,9 @@ def _pick_blocks(elements: int) -> int:
     return 16
 
 
-# Auto dispatch keeps a single 7,168-element row on the shorter hierarchical
-# protocol and routes larger vectors through equal-quarter ownership when each
-# rank-owned quarter is aligned to a complete 32-word transfer group.
-CROSSOVER_ELEMENTS = 7_168
+# Route every aligned multiple of 128 BF16 elements (including 1x3584 and 1x7168)
+# through equal-quarter ownership so PCIe RO=1 all-push and fused V4 kernels apply.
+CROSSOVER_ELEMENTS = 0
 PREFERRED_ALIGNMENT_ELEMENTS = 128
 
 
