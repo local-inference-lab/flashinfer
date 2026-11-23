@@ -66,16 +66,23 @@ def _route_topk_values(
     eligible = expert_offsets < num_experts
     remaining = tl.where(eligible, selection_scores, neg_inf)
 
+    # Pack (order-preserving uint32(score), expert_id) into a single uint64 so
+    # each top-k step performs one reduction and breaks ties by larger expert ID.
+    clean = remaining + 0.0
+    bits = clean.to(tl.uint32, bitcast=True)
+    key_u32 = tl.where((bits & 0x80000000) != 0, ~bits, bits | 0x80000000)
+    packed = tl.where(
+        eligible,
+        (key_u32.to(tl.uint64) << 16) | expert_offsets.to(tl.uint64),
+        tl.full((BLOCK_E,), 0, dtype=tl.uint64),
+    )
+
     topk_ids = tl.zeros((TOPK_BLOCK,), dtype=tl.int32)
     for slot in range(TOP_K):
-        best_logits = tl.max(remaining, axis=0)
-        best_ids = tl.max(
-            tl.where(eligible & (remaining == best_logits), expert_offsets_i32, -1),
-            axis=0,
-        )
+        best_packed = tl.max(packed, axis=0)
+        best_ids = (best_packed & 0xFFFF).to(tl.int32)
         topk_ids = tl.where(topk_offsets == slot, best_ids, topk_ids)
-        eligible = eligible & (expert_offsets != best_ids)
-        remaining = tl.where(eligible, remaining, neg_inf)
+        packed = tl.where(expert_offsets_i32 == best_ids, 0, packed)
 
     topk_logits = tl.gather(logits, topk_ids, axis=0)
     if SCORE_FUNC == "sqrtsoftplus" or SCORE_FUNC == "sigmoid":
@@ -300,7 +307,7 @@ def route_topk(
         HAS_CORRECTION_BIAS=correction_bias is not None,
         HAS_IMAGE_BIAS=image_correction_bias is not None and image_mask is not None,
         HAS_VALID_TOKENS=num_valid_tokens is not None,
-        num_warps=4 if block_e <= 256 else 8,
+        num_warps=4 if block_e <= 512 else 8,
     )
 
 

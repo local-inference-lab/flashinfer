@@ -50,6 +50,33 @@ class WoProjectionQuery:
 class WoProjectionConfig:
     backend: str = "mxfp8"
     decode_tile_n: int = 0
+    wo_a_split_k: int = 1
+    wo_a_warps: int = 4
+    wo_b_warps: int = 4
+
+
+def _a16_tc_gemv_eligible(query, device):
+    return (
+        device is not None
+        and device.compute_capability in ((12, 0), (12, 1))
+        and query.dtype == "bfloat16"
+        and not query.wo_a_tiled
+        and not query.wo_b_tiled
+        and not query.sfb_k_replicated
+        and 1 <= query.max_tokens <= 32
+        and query.group_width % 64 == 0
+        and (query.groups * query.rank) % 64 == 0
+        and query.rank % 16 == 0
+        and query.hidden % 8 == 0
+        and (
+            query.operation == "plain"
+            or (
+                query.nope_dim % 16 == 0
+                and query.rope_dim % 16 == 0
+                and query.cos_sin_dtype == "float32"
+            )
+        )
+    )
 
 
 def _decode_domain(query):
@@ -119,8 +146,33 @@ def _validate_query(query, device):
 
 
 def _validate(query, config, device):
-    if not isinstance(config, WoProjectionConfig) or config.backend != "mxfp8":
-        raise ValueError("WO projection requires an MXFP8 configuration")
+    if not isinstance(config, WoProjectionConfig) or config.backend not in (
+        "mxfp8",
+        "a16_tc_gemv",
+    ):
+        raise ValueError("WO projection requires an MXFP8 or A16 TC-GEMV configuration")
+    if config.backend == "a16_tc_gemv":
+        if not _a16_tc_gemv_eligible(query, device):
+            raise ValueError("WO A16 TC-GEMV backend is ineligible for this query")
+        if (
+            type(config.decode_tile_n) is not int
+            or config.decode_tile_n not in (16, 32)
+            or type(config.wo_a_split_k) is not int
+            or config.wo_a_split_k not in (1, 2)
+            or (query.group_width // 64) % config.wo_a_split_k != 0
+            or type(config.wo_a_warps) is not int
+            or config.wo_a_warps not in (4, 8)
+            or type(config.wo_b_warps) is not int
+            or config.wo_b_warps not in (4, 8)
+        ):
+            raise ValueError("invalid WO A16 TC-GEMV configuration")
+        return
+    if (
+        config.wo_a_split_k != 1
+        or config.wo_a_warps != 4
+        or config.wo_b_warps != 4
+    ):
+        raise ValueError("WO A16 TC-GEMV knobs require backend='a16_tc_gemv'")
     if type(config.decode_tile_n) is not int or config.decode_tile_n not in (
         0,
         64,
@@ -135,6 +187,21 @@ def _validate(query, config, device):
 
 
 def _default(query, device):
+    if (
+        _a16_tc_gemv_eligible(query, device)
+        and not query.dynamic_tokens
+        and query.operation == "inv_rope"
+        and query.cos_sin_dtype == "float32"
+    ):
+        wo_b_tn = 32 if query.max_tokens >= 25 else 16
+        warps = 8 if query.max_tokens <= 8 else 4
+        return WoProjectionConfig(
+            backend="a16_tc_gemv",
+            decode_tile_n=wo_b_tn,
+            wo_a_split_k=1,
+            wo_a_warps=warps,
+            wo_b_warps=warps,
+        )
     if not _decode_tuning_geometry(query):
         return WoProjectionConfig()
     override = query.codegen.get("wo_b_fused_tile", "")
@@ -148,10 +215,59 @@ def _default(query, device):
 
 def _parameters(query, device):
     override = query.codegen.get("wo_b_fused_tile", "")
-    tiles = (0, int(override.split("x")[1])) if override else (0, 64, 128)
+    mxfp8_tiles = (0, int(override.split("x")[1])) if override else (0, 64, 128)
+    mxfp8_tiles = mxfp8_tiles if _decode_domain(query) else (0,)
+    a16_ok = _a16_tc_gemv_eligible(query, device)
+    a16_tiles = (16, 32) if query.max_tokens >= 17 else (16,)
+    a16_splits = (
+        (1, 2)
+        if (
+            a16_ok
+            and (query.group_width // 64) % 2 == 0
+            and query.groups * ((query.rank + 15) // 16) <= 192
+        )
+        else (1,)
+    )
+    backends = ("mxfp8", "a16_tc_gemv") if a16_ok else ("mxfp8",)
+    all_tiles = tuple(dict.fromkeys((*mxfp8_tiles, *(a16_tiles if a16_ok else ()))))
+
+    def eligible(choice):
+        if choice["backend"] == "mxfp8":
+            return (
+                choice["decode_tile_n"] in mxfp8_tiles
+                and choice["wo_a_split_k"] == 1
+                and choice["wo_a_warps"] == 4
+                and choice["wo_b_warps"] == 4
+            )
+        return (
+            a16_ok
+            and choice["decode_tile_n"] in a16_tiles
+            and choice["wo_a_split_k"] in a16_splits
+            and choice["wo_a_warps"] in (4, 8)
+            and choice["wo_b_warps"] in (4, 8)
+        )
+
+    def prefer_a16(choice):
+        # Single-launch grouped A16 TC-GEMV streams WO-A and WO-B once from DRAM
+        # without activation quantization, consistently beating MXFP8 DenseGemm
+        # in cold DRAM for M <= 32 even when hot-L2 single-layer tuning prefers MXFP8.
+        return (
+            not a16_ok
+            or query.dynamic_tokens
+            or choice["backend"] == "a16_tc_gemv"
+        )
+
     return ParameterSpace.create(
         TUNING.knobs,
-        values={"decode_tile_n": tiles if _decode_domain(query) else (0,)},
+        values={
+            "backend": backends,
+            "decode_tile_n": all_tiles,
+            "wo_a_split_k": a16_splits if a16_ok else (1,),
+            "wo_a_warps": (4, 8) if a16_ok else (4,),
+            "wo_b_warps": (4, 8) if a16_ok else (4,),
+        },
+        predicates=(eligible,),
+        efficiency_predicates=(prefer_a16,),
         autotune_effort=query.autotune_effort,
     )
 
@@ -159,7 +275,7 @@ def _parameters(query, device):
 TUNING = TuningContract(
     component_id="gemm.wo_projection",
     query_schema_version=23,
-    config_schema_version=22,
+    config_schema_version=23,
     query_fields=frozenset(WoProjectionQuery.__dataclass_fields__),
     config_fields=frozenset(WoProjectionConfig.__dataclass_fields__),
     encode_query=lambda query: {
@@ -171,10 +287,13 @@ TUNING = TuningContract(
     validate_config=_validate,
     default_config=_default,
     knobs=(
-        Knob(name="backend", values=("mxfp8",), binding=ParameterBinding.COMPILE),
+        Knob(name="backend", values=("mxfp8", "a16_tc_gemv"), binding=ParameterBinding.COMPILE),
         Knob(name="decode_tile_n", values=None, binding=ParameterBinding.COMPILE),
+        Knob(name="wo_a_split_k", values=(1, 2), binding=ParameterBinding.COMPILE),
+        Knob(name="wo_a_warps", values=(4, 8), binding=ParameterBinding.COMPILE),
+        Knob(name="wo_b_warps", values=(4, 8), binding=ParameterBinding.COMPILE),
     ),
-    candidate_contract_version=6,
+    candidate_contract_version=7,
     parameters=_parameters,
     materialize=lambda query, device, choice: WoProjectionConfig(**dict(choice)),
 )

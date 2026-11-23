@@ -1950,7 +1950,7 @@ def compile_route_topk(query_payload, ordinal):
             HAS_CORRECTION_BIAS=query.has_correction_bias,
             HAS_IMAGE_BIAS=query.has_image_correction_bias,
             HAS_VALID_TOKENS=query.has_valid_tokens,
-            num_warps=4 if block_e <= 256 else 8,
+            num_warps=4 if block_e <= 512 else 8,
             grid=(query.num_tokens,),
         )
 

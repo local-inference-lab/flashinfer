@@ -2249,7 +2249,12 @@ class MoEDynamicKernelBackend:
         # and not byte-addressable).
         b_w13_u32 = cute.recast_tensor(b_w13, cutlass.Uint32)
         b_down_u32 = cute.recast_tensor(b_down, cutlass.Uint32)
-        grid = (*self.cluster_shape_mn, max_active_clusters)
+        frontend_clusters = (
+            max_active_clusters - Int32(8)
+            if cutlass.const_expr(self.external_materialized_fc1)
+            else max_active_clusters
+        )
+        grid = (*self.cluster_shape_mn, frontend_clusters)
         self.kernel(
             a_input,
             topk_ids,

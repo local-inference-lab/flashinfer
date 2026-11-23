@@ -41,13 +41,22 @@ class _JointClusterLaunch(_JointLaunch):
         local_signal: cute.Pointer,
         selector: cute.Pointer,
         payload: cute.Pointer,
+        addend: cute.Pointer,
         output: cute.Pointer,
         size: Int64,
         capacity: Int64,
         stream: cuda.CUstream,
     ):
         self.kernel(
-            peers, signals, local_signal, selector, payload, output, size, capacity
+            peers,
+            signals,
+            local_signal,
+            selector,
+            payload,
+            addend,
+            output,
+            size,
+            capacity,
         ).launch(grid=(64, 1, 1), block=(512, 1, 1), cluster=(8, 1, 1), stream=stream)
 
     @cute.jit
@@ -62,6 +71,7 @@ class _JointClusterLaunch(_JointLaunch):
         self,
         peers: cute.Pointer,
         payload: Int64,
+        addend: Int64,
         output: Int64,
         size: Int64,
         capacity: Int64,
@@ -82,7 +92,7 @@ class _JointClusterLaunch(_JointLaunch):
                     end = size
             index = begin + flat
             while index < end:
-                words = ld_global_v4_u32(payload + index * Int64(16))
+                words = self._load_pack(payload, addend, index * Int64(16), False)
                 dest = Int64(peers[target]) + (
                     capacity + Int64(self._rank) * capacity + index
                 ) * Int64(16)
@@ -166,6 +176,7 @@ class _JointClusterLaunch(_JointLaunch):
         local_signal: cute.Pointer,
         selector: cute.Pointer,
         payload: cute.Pointer,
+        addend: cute.Pointer,
         output: cute.Pointer,
         size: Int64,
         capacity: Int64,
@@ -197,11 +208,16 @@ class _JointClusterLaunch(_JointLaunch):
                 )
             flat = Int64(bid) * Int64(self._threads) + Int64(tid)
             stride = Int64(active) * Int64(self._threads)
-            src, dst = Int64(payload.toint()), Int64(output.toint())
+            src, add, dst = (
+                Int64(payload.toint()),
+                Int64(addend.toint()),
+                Int64(output.toint()),
+            )
             if mode == Uint32(6):
                 self._ready_phased(
                     slot_peers,
                     src,
+                    add,
                     dst,
                     size,
                     capacity,
@@ -210,15 +226,18 @@ class _JointClusterLaunch(_JointLaunch):
                     Uint32(1),
                 )
             elif mode == Uint32(4):
-                self._pull(slot_peers, signals, src, dst, size, flat, stride)
+                self._pull(slot_peers, signals, src, add, dst, size, flat, stride)
             elif mode == Uint32(1):
-                self._ready(slot_peers, src, dst, size, capacity, flat, stride, mode)
+                self._ready(
+                    slot_peers, src, add, dst, size, capacity, flat, stride, mode
+                )
             else:
                 if cutlass.const_expr(self._family == "latency"):
                     if mode == Uint32(5):
                         self._ready_phased(
                             slot_peers,
                             src,
+                            add,
                             dst,
                             size,
                             capacity,
@@ -228,7 +247,15 @@ class _JointClusterLaunch(_JointLaunch):
                         )
                     else:
                         self._ready(
-                            slot_peers, src, dst, size, capacity, flat, stride, mode
+                            slot_peers,
+                            src,
+                            add,
+                            dst,
+                            size,
+                            capacity,
+                            flat,
+                            stride,
+                            mode,
                         )
                 else:
                     if mode == Uint32(2):
@@ -236,6 +263,7 @@ class _JointClusterLaunch(_JointLaunch):
                             slot_peers,
                             signals,
                             src,
+                            add,
                             dst,
                             size,
                             capacity,
@@ -248,6 +276,7 @@ class _JointClusterLaunch(_JointLaunch):
                             slot_peers,
                             signals,
                             src,
+                            add,
                             dst,
                             size,
                             capacity,
@@ -259,7 +288,14 @@ class _JointClusterLaunch(_JointLaunch):
 
 @program_cache
 def get_joint_cluster_launcher(
-    family, world_size, rank, threads, max_blocks, cluster_size, device_index
+    family,
+    world_size,
+    rank,
+    threads,
+    max_blocks,
+    cluster_size,
+    device_index,
+    has_addend=False,
 ):
     validate_cluster_geometry(max_blocks, threads, cluster_size)
     if cluster_size != 8 or family not in ("latency", "bandwidth"):
@@ -268,8 +304,20 @@ def get_joint_cluster_launcher(
         )
     if world_size not in (2, 3, 4, 6, 8, 10) or not 0 <= rank < world_size:
         raise ValueError("unsupported joint collective rank group")
-    key = (family, world_size, rank, threads, max_blocks, cluster_size, device_index)
-    launch = _JointClusterLaunch(family, world_size, rank, threads, max_blocks)
+    has_addend = bool(has_addend)
+    key = (
+        family,
+        world_size,
+        rank,
+        threads,
+        max_blocks,
+        cluster_size,
+        has_addend,
+        device_index,
+    )
+    launch = _JointClusterLaunch(
+        family, world_size, rank, threads, max_blocks, has_addend=has_addend
+    )
     raise_if_kernel_resolution_frozen("cute.compile", target=launch, cache_key=key)
     raw = b12x_compile(
         launch,
@@ -279,10 +327,13 @@ def get_joint_cluster_launcher(
         _dummy(Uint32, 4),
         _dummy(Uint32, 16),
         _dummy(Uint32, 16),
+        _dummy(Uint32, 16),
         1,
         1,
         current_cuda_stream(),
-        compile_spec=KernelCompileSpec.from_key("comm.pcie.joint_cluster", 2, key[:-1]),
+        compile_spec=KernelCompileSpec.from_key(
+            "comm.pcie.joint_cluster", 5, key[:-1]
+        ),
     )
 
     def run(
@@ -294,9 +345,11 @@ def get_joint_cluster_launcher(
         output_address,
         size_packs,
         capacity_packs,
+        addend_address=None,
     ):
         if not 0 < size_packs <= capacity_packs:
             raise ValueError("joint payload must fit its prepared capacity")
+        add_addr = input_address if addend_address is None else addend_address
         raw(
             make_ptr(
                 cutlass.Uint64,
@@ -315,6 +368,7 @@ def get_joint_cluster_launcher(
             ),
             make_ptr(Uint32, selector_address, cute.AddressSpace.gmem, assumed_align=4),
             make_ptr(Uint32, input_address, cute.AddressSpace.gmem, assumed_align=16),
+            make_ptr(Uint32, add_addr, cute.AddressSpace.gmem, assumed_align=16),
             make_ptr(Uint32, output_address, cute.AddressSpace.gmem, assumed_align=16),
             int(size_packs),
             int(capacity_packs),

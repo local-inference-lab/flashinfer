@@ -490,6 +490,7 @@ class PCIeAllReduce:
         override: PcieConfig | CollectiveConfig | None = None,
         joint_only: bool = False,
         joint_cluster_size: int = 1,
+        joint_has_addend: bool = False,
         **call,
     ) -> Plan:
         """Select an existing native channel once, then declare its plan.
@@ -590,9 +591,20 @@ class PCIeAllReduce:
                         )
                     if default not in alternatives:
                         default = next(iter(alternatives))
-                    if joint_cluster_size != 1:
+                    if joint_cluster_size != 1 or joint_has_addend:
                         from dataclasses import replace
 
+                        extra_call = {}
+                        if joint_cluster_size != 1:
+                            extra_call.update(
+                                {
+                                    "joint_cluster_size": joint_cluster_size,
+                                    "threads": 512,
+                                    "blocks": 64,
+                                }
+                            )
+                        if joint_has_addend:
+                            extra_call["has_addend"] = True
                         alternatives = {
                             name: (
                                 replace(
@@ -600,9 +612,7 @@ class PCIeAllReduce:
                                     call=FrozenMapping(
                                         {
                                             **native.call,
-                                            "joint_cluster_size": joint_cluster_size,
-                                            "threads": 512,
-                                            "blocks": 64,
+                                            **extra_call,
                                         }
                                     ),
                                 ),
@@ -650,6 +660,7 @@ class PCIeAllReduce:
         *,
         plan: Plan,
         out: Optional[torch.Tensor] = None,
+        addend: Optional[torch.Tensor] = None,
         peer_input_ptrs: Optional[Sequence[int]] = None,
         blocks: Optional[int] = None,
         stream: object = None,
@@ -657,6 +668,8 @@ class PCIeAllReduce:
     ) -> torch.Tensor:
         state = require_prepared(plan, "comm.pcie", inp.device)
         if self._bf16_twoshot is not None and state.runtime is self._bf16_twoshot:
+            if addend is not None:
+                raise ValueError("two-shot all-reduce does not support fused addend")
             if peer_input_ptrs is not None or blocks is not None:
                 raise ValueError(
                     "two-shot all-reduce uses its prepared staging and launch geometry"
@@ -678,6 +691,8 @@ class PCIeAllReduce:
                 block_limit=state.query.call["block_limit"],
             )
         if self.algorithm == "hierarchical":
+            if addend is not None:
+                raise ValueError("hierarchical all-reduce does not support fused addend")
             if peer_input_ptrs is not None:
                 raise ValueError(
                     "peer_input_ptrs are unavailable for hierarchical all-reduce"
@@ -699,6 +714,7 @@ class PCIeAllReduce:
             inp,
             plan=plan,
             out=out,
+            addend=addend,
             peer_input_ptrs=peer_input_ptrs,
             stream=stream,
             channel_id=channel_id,

@@ -157,6 +157,9 @@ class _DmaExecutionState:
     def run(self, inp, *, out=None):
         return self.runtime._run_prepared(inp, out=out, state=self)
 
+    def run_all_gather(self, inp, *, out=None):
+        return self.runtime._run_prepared_all_gather(inp, out=out, state=self)
+
     def prime(self, inp, *, out) -> None:
         """Prime the actual caller-owned collective transport after loading code."""
         if self.runtime._fp8 and (

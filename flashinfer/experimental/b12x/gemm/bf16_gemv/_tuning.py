@@ -259,6 +259,19 @@ def _parameters(query, device):
             and choice["split_k"] == 1
         )
 
+    n_blocks = (query.out_features + 15) // 16
+    weight_bytes = query.in_features * query.out_features * 2
+    min_dram_ctas = (
+        96
+        if (
+            device is not None
+            and device.sm_count >= 128
+            and weight_bytes >= (1 << 20)
+            and any(n_blocks * sk >= 96 for sk in tc_splits)
+        )
+        else 0
+    )
+
     return ParameterSpace.create(
         TUNING.knobs,
         values={"backend": tuple(backends), "split_k": split_values},
@@ -269,6 +282,9 @@ def _parameters(query, device):
         # TC-GEMV is eligible, hot-L2 benchmarking over-favors cuBLASLt
         # two-kernel split-K which is slower in cold DRAM across 93 layers.
         # At M >= 17 cuBLASLt TMA beats TC-GEMV even in cold DRAM.
+        # Similarly, on >=128-SM GPUs, DRAM-bound weights (>=1 MiB) need at
+        # least 96 CTAs to hide GDDR7 latency; hot-L2 tuning otherwise picks
+        # under-occupied split_k (e.g. 48 CTAs for router N=384).
         efficiency_predicates=(
             lambda choice: (
                 (choice["backend"] != "mma" or _mma_preferred(query))
@@ -278,6 +294,11 @@ def _parameters(query, device):
                     and _tc_eligible(query)
                     and query.max_rows <= 16
                     and query.out_features <= 4096
+                )
+                and not (
+                    choice["backend"] == "tc"
+                    and min_dram_ctas > 0
+                    and n_blocks * choice["split_k"] < min_dram_ctas
                 )
             ),
         ),
@@ -309,7 +330,7 @@ TUNING = TuningContract(
             binding=ParameterBinding.COMPILE,
         ),
     ),
-    candidate_contract_version=16,
+    candidate_contract_version=17,
     parameters=_parameters,
     materialize=lambda query, device, choice: GemvConfig(**dict(choice)),
 )

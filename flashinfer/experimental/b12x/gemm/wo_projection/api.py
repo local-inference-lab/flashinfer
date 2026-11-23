@@ -94,6 +94,95 @@ def run_out(source, weights: Weights, *, out, scratch, plan: Plan):
     return out
 
 
+@torch.library.custom_op(
+    "b12x::wo_projection_inv_rope_out", mutates_args=("out", "scratch")
+)
+def _run_inv_rope_out(
+    o: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    weights: list[torch.Tensor],
+    tiled_a: torch.Tensor | None,
+    tiled_b: torch.Tensor | None,
+    out: torch.Tensor,
+    scratch: torch.Tensor,
+    handle: int,
+) -> None:
+    require_disjoint(
+        out,
+        (o, positions, cos_sin_cache, scratch, *weights, tiled_a, tiled_b),
+        owner="WO inverse-RoPE output",
+    )
+    plan = plan_from_handle(handle)
+    state = require_prepared(plan, "gemm.wo_projection", o.device)
+    q = plan.query
+
+    def matrix(parts, tiled):
+        return MXFP8Rows(
+            parts[0],
+            parts[1].view(torch.float8_e8m0fnu),
+            parts[2].view(torch.float8_e8m0fnu),
+            tiled,
+        )
+
+    packed = Weights(
+        matrix(weights[:3], tiled_a),
+        matrix(weights[3:], tiled_b),
+        q.groups,
+        q.group_width,
+        q.rank,
+        q.hidden,
+        q.sfb_k_replicated,
+    )
+    binding = state.bind_inv_rope(
+        o=o,
+        positions=positions,
+        cos_sin_cache=cos_sin_cache,
+        weights=packed,
+        heads_per_group=q.heads_per_group,
+        nope_dim=q.nope_dim,
+        rope_dim=q.rope_dim,
+        out=out,
+        scratch=scratch,
+        return_3d=q.return_3d,
+    )
+    state.run_inv_rope(binding)
+
+
+@_run_inv_rope_out.register_fake
+def _run_inv_rope_out_fake(
+    o, positions, cos_sin_cache, weights, tiled_a, tiled_b, out, scratch, handle
+) -> None:
+    pass
+
+
+def run_inv_rope_out(
+    o, positions, cos_sin_cache, weights: Weights, *, out, scratch, plan: Plan
+):
+    """Write a prepared inverse-RoPE projection into output with caller-owned scratch."""
+    operands = [
+        tensor
+        for packed in (weights.wo_a, weights.wo_b)
+        for tensor in (
+            packed.values,
+            packed.scale_rows.view(torch.uint8),
+            packed.scale_mma.view(torch.uint8),
+        )
+    ]
+    _run_inv_rope_out(
+        o,
+        positions,
+        cos_sin_cache,
+        operands,
+        weights.wo_a.values_tiled,
+        weights.wo_b.values_tiled,
+        out,
+        scratch,
+        plan.handle,
+    )
+    return out
+
+
 def bind(plan: Plan, **kwargs) -> Binding:
     """Bind caller-owned WO tensors and scratch to a ready plan."""
     source = kwargs.get("source_tgd")
@@ -184,6 +273,7 @@ __all__ = [
     "run",
     "run_out",
     "run_inv_rope",
+    "run_inv_rope_out",
     "pack_weights",
     "quantize_input",
     "quantize_input_inv_rope",

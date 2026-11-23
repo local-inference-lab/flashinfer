@@ -150,6 +150,55 @@ class _PackedMath:
             )
 
     @cute.jit
+    def _receive_bf16_remote_sum(
+        self,
+        local_base: Int64,
+        shard_packs: Int64,
+        index: Int64,
+        self_words,
+        accumulator: cute.Tensor,
+    ) -> None:
+        incoming = cute.make_rmem_tensor((self._world_size, 4), Uint32)
+        waiting = cutlass.Boolean(True)
+        while waiting:
+            waiting = cutlass.Boolean(False)
+            for peer_index in cutlass.range_constexpr(1, self._world_size):
+                peer = (self._rank + peer_index) % self._world_size
+                address = local_base + (Int64(peer) * shard_packs + index) * Int64(16)
+                words = ld_relaxed_sys_global_v4_u32(address)
+                for word in cutlass.range_constexpr(4):
+                    incoming[peer, word] = words[word]
+                    waiting = (
+                        waiting
+                        | ((words[word] & Uint32(0xFFFF)) == Uint32(0))
+                        | ((words[word] & Uint32(0xFFFF0000)) == Uint32(0))
+                    )
+        self._accumulate_words(
+            accumulator,
+            self_words[0],
+            self_words[1],
+            self_words[2],
+            self_words[3],
+            True,
+        )
+        for peer_index in cutlass.range_constexpr(1, self._world_size):
+            peer = (self._rank + peer_index) % self._world_size
+            self._accumulate_words(
+                accumulator,
+                incoming[peer, 0],
+                incoming[peer, 1],
+                incoming[peer, 2],
+                incoming[peer, 3],
+                False,
+            )
+        for peer_index in cutlass.range_constexpr(1, self._world_size):
+            peer = (self._rank + peer_index) % self._world_size
+            address = local_base + (Int64(peer) * shard_packs + index) * Int64(16)
+            st_relaxed_sys_global_v4_u32(
+                address, Uint32(0), Uint32(0), Uint32(0), Uint32(0)
+            )
+
+    @cute.jit
     def _accumulate_words(
         self,
         accumulator: cute.Tensor,

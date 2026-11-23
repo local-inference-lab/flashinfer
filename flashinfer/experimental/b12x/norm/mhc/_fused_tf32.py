@@ -20,7 +20,9 @@ from b12x._lib.intrinsics.memory import (
     cp_async4_shared_global,
     cp_async_u32_shared_global,
     get_ptr_as_int64,
+    ld_global_v4_u32,
     shared_ptr_to_u32,
+    st_global_v4_u32,
     u32_as_f32,
 )
 from b12x._lib.intrinsics.mma import tf32_mma_m16n8k8_f32
@@ -339,6 +341,9 @@ class _FusedFinalize:
         self.norm_eps, self.sinkhorn_iters = norm_eps, sinkhorn_iters
         self.fuse_norm = fuse_norm
         self.splits = hidden // 32
+        # Parallelize the K-split reduction across warps (hidden % 512 == 0 => splits % 16 == 0).
+        self.num_warps = 16 if (self.splits % 16 == 0) else 8
+        self.splits_per_warp = self.splits // self.num_warps
 
     @cute.jit
     def __call__(
@@ -356,7 +361,7 @@ class _FusedFinalize:
     ):
         self.kernel(partials, scale, bias, norm, y, pre, post, comb).launch(
             grid=(tokens, 1, 1),
-            block=(160 if self.fuse_norm else 32, 1, 1),
+            block=(self.num_warps * 32, 1, 1),
             stream=stream,
             use_pdl=_MHC_PDL,
         )
@@ -378,11 +383,29 @@ class _FusedFinalize:
         row, _, _ = cute.arch.block_idx()
         tid, _, _ = cute.arch.thread_idx()
         lane = tid % 32
-        if tid < 32:
+        warp = tid // 32
+
+        smem = utils.SmemAllocator()
+        warp_partials = smem.allocate_tensor(
+            Float32, cute.make_layout((self.num_warps, 32), stride=(32, 1)), 16
+        )
+
+        # Phase 1: all warps cooperatively reduce splits in parallel (10 splits/warp for H=5120).
+        cols = 26 if const_expr(self.fuse_norm) else 25
+        if lane < cols:
+            acc = Float32(0)
+            split_base = warp * self.splits_per_warp
+            for s in cutlass.range_constexpr(self.splits_per_warp):
+                acc += Float32(partials[row, split_base + s, lane])
+            warp_partials[warp, lane] = acc
+        cute.arch.sync_threads()
+
+        # Phase 2: warp 0 finishes Sinkhorn + pre/post/comb while warps 1..15 normalize y (128-bit v4).
+        if warp == 0:
             value = Float32(0)
             if lane < 25:
-                for split in cutlass.range_constexpr(self.splits):
-                    value += Float32(partials[row, split, lane])
+                for w in cutlass.range_constexpr(self.num_warps):
+                    value += warp_partials[w, lane]
             square = Float32(cute.arch.shuffle_sync(value, Int32(0)))
             inv = cute.math.rsqrt(
                 square / Float32(4 * self.hidden) + Float32(self.rms_eps), fastmath=True
@@ -424,61 +447,61 @@ class _FusedFinalize:
             if lane < 16:
                 comb[row, lane // 4, lane % 4] = cvalue
         elif const_expr(self.fuse_norm):
-            square = Float32(0)
-            for group in cutlass.range_constexpr((self.splits + 31) // 32):
-                split = lane + group * 32
-                if split < self.splits:
-                    square += Float32(partials[row, split, 25])
-            square = _warp_allreduce_sum(square)
+            sq = warp_partials[lane, 25] if lane < self.num_warps else Float32(0)
+            square = _warp_allreduce_sum(sq)
             inv = cute.math.rsqrt(
-                square / Float32(self.hidden) + Float32(self.norm_eps), fastmath=True
+                square / Float32(self.hidden) + Float32(self.norm_eps),
+                fastmath=True,
             )
-            values = cute.make_rmem_tensor(cute.make_layout((4,)), Float32)
-            weights = cute.make_rmem_tensor(cute.make_layout((4,)), Float32)
-            next_values = cute.make_rmem_tensor(cute.make_layout((4,)), Float32)
-            next_weights = cute.make_rmem_tensor(cute.make_layout((4,)), Float32)
-            pairs = cute.recast_tensor(y, Uint32)
-            if const_expr(norm.element_type == cutlass.BFloat16):
-                norm_pairs = cute.recast_tensor(norm, Uint32)
-            for j in cutlass.range_constexpr(2):
-                h = tid - 32 + j * 128
-                packed = pairs[row, h]
-                values[j * 2] = u32_as_f32(packed << Uint32(16))
-                values[j * 2 + 1] = u32_as_f32(packed & Uint32(0xFFFF0000))
-                if const_expr(norm.element_type == cutlass.BFloat16):
-                    packed_weight = norm_pairs[h]
-                    weights[j * 2] = u32_as_f32(packed_weight << Uint32(16))
-                    weights[j * 2 + 1] = u32_as_f32(packed_weight & Uint32(0xFFFF0000))
-                else:
-                    weights[j * 2], weights[j * 2 + 1] = norm[h * 2], norm[h * 2 + 1]
-            for chunk in range(self.hidden // 512):
-                if chunk + 1 < self.hidden // 512:
-                    for j in cutlass.range_constexpr(2):
-                        h = (chunk + 1) * 256 + tid - 32 + j * 128
-                        packed = pairs[row, h]
-                        next_values[j * 2] = u32_as_f32(packed << Uint32(16))
-                        next_values[j * 2 + 1] = u32_as_f32(packed & Uint32(0xFFFF0000))
-                        if const_expr(norm.element_type == cutlass.BFloat16):
-                            packed_weight = norm_pairs[h]
-                            next_weights[j * 2] = u32_as_f32(
-                                packed_weight << Uint32(16)
+            ntid = tid - 32
+            nthreads = (self.num_warps - 1) * 32
+            total_packs = self.hidden // 8
+            pack_iters = (total_packs + nthreads - 1) // nthreads
+            y_row_base = (
+                get_ptr_as_int64(y, Int64(0)) + Int64(row) * Int64(self.hidden * 2)
+            )
+            norm_base = get_ptr_as_int64(norm, Int64(0))
+            for chunk in cutlass.range_constexpr(pack_iters):
+                pack = chunk * nthreads + ntid
+                if pack < total_packs:
+                    byte_off = Int64(pack) * Int64(16)
+                    yaddr = y_row_base + byte_off
+                    yw = ld_global_v4_u32(yaddr)
+                    outw = cute.make_rmem_tensor((4,), Uint32)
+                    if const_expr(norm.element_type == cutlass.BFloat16):
+                        ww = ld_global_v4_u32(norm_base + byte_off)
+                        for wd in cutlass.range_constexpr(4):
+                            v0 = u32_as_f32(yw[wd] << Uint32(16))
+                            v1 = u32_as_f32(yw[wd] & Uint32(0xFFFF0000))
+                            w0 = u32_as_f32(ww[wd] << Uint32(16))
+                            w1 = u32_as_f32(ww[wd] & Uint32(0xFFFF0000))
+                            outw[wd] = _pack_bf16_pair(
+                                v0 * inv * w0,
+                                v1 * inv * w1,
                             )
-                            next_weights[j * 2 + 1] = u32_as_f32(
-                                packed_weight & Uint32(0xFFFF0000)
+                    else:
+                        wlo = ld_global_v4_u32(norm_base + Int64(pack) * Int64(32))
+                        whi = ld_global_v4_u32(
+                            norm_base + Int64(pack) * Int64(32) + Int64(16)
+                        )
+                        ws = (
+                            u32_as_f32(wlo[0]),
+                            u32_as_f32(wlo[1]),
+                            u32_as_f32(wlo[2]),
+                            u32_as_f32(wlo[3]),
+                            u32_as_f32(whi[0]),
+                            u32_as_f32(whi[1]),
+                            u32_as_f32(whi[2]),
+                            u32_as_f32(whi[3]),
+                        )
+                        for wd in cutlass.range_constexpr(4):
+                            v0 = u32_as_f32(yw[wd] << Uint32(16))
+                            v1 = u32_as_f32(yw[wd] & Uint32(0xFFFF0000))
+                            outw[wd] = _pack_bf16_pair(
+                                v0 * inv * ws[wd * 2],
+                                v1 * inv * ws[wd * 2 + 1],
                             )
-                        else:
-                            next_weights[j * 2], next_weights[j * 2 + 1] = (
-                                norm[h * 2],
-                                norm[h * 2 + 1],
-                            )
-                for j in cutlass.range_constexpr(2):
-                    h = chunk * 256 + tid - 32 + j * 128
-                    pairs[row, h] = _pack_bf16_pair(
-                        values[j * 2] * inv * weights[j * 2],
-                        values[j * 2 + 1] * inv * weights[j * 2 + 1],
-                    )
-                for j in cutlass.range_constexpr(4):
-                    values[j], weights[j] = next_values[j], next_weights[j]
+                    st_global_v4_u32(yaddr, outw[0], outw[1], outw[2], outw[3])
         if const_expr(_MHC_PDL):
             cute.arch.sync_threads()
             cute.arch.griddepcontrol_launch_dependents()
@@ -530,7 +553,7 @@ def _launch(kernel, family, operands, *, _prepared, constants):
     ) + tuple(constants)
     return _compile_mhc_entry(
         kernel,
-        compile_spec=KernelCompileSpec.from_key(family, 4, key),
+        compile_spec=KernelCompileSpec.from_key(family, 7, key),
         compile_args=args,
         runtime_args=args,
     )

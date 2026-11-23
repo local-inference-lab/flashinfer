@@ -95,10 +95,12 @@ from b12x._lib.intrinsics.conversion import (
 from b12x._lib.intrinsics.math import div_rn_f32, fabs_f32, fmax_f32, rcp_approx_ftz
 from b12x._lib.intrinsics.memory import (
     get_ptr_as_int64,
+    ld_global_nc_v4_u32,
     st_global_f32,
     st_global_u32,
     st_global_u64,
     st_global_u8,
+    st_global_v4_u32,
 )
 from b12x._lib.intrinsics.quantization import (
     max_abs_16,
@@ -703,7 +705,9 @@ class SnapshotAndCacheDsv41SwaKernel(ConcatAndCacheGlmNextMlaKernel):
     def __init__(self, block_size: int, snapshot_tokens: int):
         super().__init__(block_size, dsv41=True)
         self.snapshot_tokens = snapshot_tokens
-        self.copy_tiles = snapshot_tokens * 528 // 1024
+        total_bytes = snapshot_tokens * 528
+        self.wide_copy = (total_bytes % 2048) == 0
+        self.copy_tiles = total_bytes // (2048 if self.wide_copy else 1024)
 
     @cute.jit
     def __call__(
@@ -763,13 +767,23 @@ class SnapshotAndCacheDsv41SwaKernel(ConcatAndCacheGlmNextMlaKernel):
             tile = task % Int32(self.copy_tiles)
             state = Int64(history_rows[request])
             if (state >= Int64(0)) & (state < history_capacity):
-                offset = Int64(tile) * Int64(1024) + Int64(tid) * Int64(8)
-                source = get_ptr_as_int64(history, 0) + state * history_stride + offset
-                destination = (
-                    get_ptr_as_int64(cache, 0) + Int64(request) * cache_stride + offset
-                )
-                st_global_u32(destination, _ld_global_u32(source))
-                st_global_u32(destination + Int64(4), _ld_global_u32(source + Int64(4)))
+                if cutlass.const_expr(self.wide_copy):
+                    offset = Int64(tile) * Int64(2048) + Int64(tid) * Int64(16)
+                    source = get_ptr_as_int64(history, 0) + state * history_stride + offset
+                    destination = (
+                        get_ptr_as_int64(cache, 0) + Int64(request) * cache_stride + offset
+                    )
+                    v0, v1, v2, v3 = ld_global_nc_v4_u32(source)
+                    st_global_v4_u32(destination, v0, v1, v2, v3)
+                else:
+                    if Int32(tid) < Int32(64):
+                        offset = Int64(tile) * Int64(1024) + Int64(tid) * Int64(16)
+                        source = get_ptr_as_int64(history, 0) + state * history_stride + offset
+                        destination = (
+                            get_ptr_as_int64(cache, 0) + Int64(request) * cache_stride + offset
+                        )
+                        v0, v1, v2, v3 = ld_global_nc_v4_u32(source)
+                        st_global_v4_u32(destination, v0, v1, v2, v3)
         else:
             self._write_record(
                 kv_c,
@@ -1653,7 +1667,7 @@ def _snapshot_cache_writer_launch(
     )
     spec = KernelCompileSpec.from_facts(
         "attention.compressed_sparse_mla.snapshot_cache",
-        1,
+        2,
         tensor_compile_fact("kv", kv, dynamic_dims=(0,), dynamic_strides=(0,)),
         tensor_compile_fact("cache", cache, dynamic_dims=(0, 1), dynamic_strides=(0,)),
         tensor_compile_fact("slots", slots, dynamic_dims=(0,)),

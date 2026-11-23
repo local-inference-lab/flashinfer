@@ -1076,6 +1076,7 @@ class PCIeDCPA2A:
         plan: Plan,
         threads: int | None = None,
         block_limit: int | None = None,
+        gate: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Gather rank-local heads into a rank-major head dimension."""
         with _device_guard(self.device):
@@ -1085,6 +1086,7 @@ class PCIeDCPA2A:
                 state=self._prepared_state(plan),
                 threads=threads,
                 block_limit=block_limit,
+                gate=gate,
             )
 
     def _all_gather_heads_on_device(
@@ -1095,6 +1097,7 @@ class PCIeDCPA2A:
         state,
         threads: int,
         block_limit: int,
+        gate: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         self._check_stream()
         if self._closed:
@@ -1148,7 +1151,9 @@ class PCIeDCPA2A:
         if isinstance(state, SelectedGatherState):
             if block_limit != state.query.call["block_limit"]:
                 raise ValueError("DCP grid differs from the prepared gather")
-            return state.run_selected(local_input, out)
+            return state.run_selected(local_input, out, gate=gate)
+        if gate is not None:
+            raise ValueError("gate is only supported for selected gather plans")
         if state.query.call.get("gather_transport") == "word_exchange":
             if str(local_input.dtype) != state.query.call["dtype"]:
                 raise ValueError(
@@ -2247,6 +2252,7 @@ class PCIeDCPA2APool:
         plan: Plan,
         threads=None,
         block_limit=None,
+        gate=None,
         stream=None,
         channel_id=None,
     ):
@@ -2261,9 +2267,15 @@ class PCIeDCPA2APool:
                         plan=plan,
                         threads=threads,
                         block_limit=block_limit,
+                        gate=gate,
                     )
             return channel.all_gather_heads(
-                local_input, out, plan=plan, threads=threads, block_limit=block_limit
+                local_input,
+                out,
+                plan=plan,
+                threads=threads,
+                block_limit=block_limit,
+                gate=gate,
             )
 
     def all_gather_pair(

@@ -31,6 +31,7 @@ META = OpMeta(
         "run",
         "run_out",
         "run_inv_rope",
+        "run_inv_rope_out",
         "pack_weights",
         "quantize_input",
         "quantize_input_inv_rope",
@@ -74,6 +75,7 @@ if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
         run,
         run_out,
         run_inv_rope,
+        run_inv_rope_out,
     )
 
 install_lazy_api(globals(), META)

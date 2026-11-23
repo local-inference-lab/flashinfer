@@ -3370,6 +3370,7 @@ class PCIeOneshotAllReduce:
         *,
         plan: Plan,
         out: Optional[torch.Tensor] = None,
+        addend: Optional[torch.Tensor] = None,
         peer_input_ptrs: Optional[Sequence[int]] = None,
     ) -> torch.Tensor:
         with _device_guard(self.device):
@@ -3377,6 +3378,7 @@ class PCIeOneshotAllReduce:
                 inp,
                 plan=plan,
                 out=out,
+                addend=addend,
                 peer_input_ptrs=peer_input_ptrs,
             )
 
@@ -3386,6 +3388,7 @@ class PCIeOneshotAllReduce:
         *,
         plan: Plan,
         out: Optional[torch.Tensor] = None,
+        addend: Optional[torch.Tensor] = None,
         peer_input_ptrs: Optional[Sequence[int]] = None,
     ) -> torch.Tensor:
         if self._closed:
@@ -3407,7 +3410,10 @@ class PCIeOneshotAllReduce:
         _validate_plain_io(inp, out)
         state = require_prepared(plan, "comm.pcie", self.device)
         state.require_runtime(self)
-        state.run_plain(inp, out)
+        if addend is not None:
+            state.run_plain(inp, out, addend=addend)
+        else:
+            state.run_plain(inp, out)
         return out
 
     def all_reduce_fused_add_rms_norm(
@@ -4258,6 +4264,7 @@ class PCIeOneshotAllReducePool:
         *,
         plan: Plan,
         out: Optional[torch.Tensor] = None,
+        addend: Optional[torch.Tensor] = None,
         peer_input_ptrs: Optional[Sequence[int]] = None,
         stream: object = None,
         channel_id: Optional[str] = None,
@@ -4267,6 +4274,7 @@ class PCIeOneshotAllReducePool:
                 inp,
                 plan=plan,
                 out=out,
+                addend=addend,
                 peer_input_ptrs=peer_input_ptrs,
                 stream=stream,
                 channel_id=channel_id,
@@ -4278,6 +4286,7 @@ class PCIeOneshotAllReducePool:
         *,
         plan: Plan,
         out: Optional[torch.Tensor] = None,
+        addend: Optional[torch.Tensor] = None,
         peer_input_ptrs: Optional[Sequence[int]] = None,
         stream: object = None,
         channel_id: Optional[str] = None,
@@ -4288,10 +4297,18 @@ class PCIeOneshotAllReducePool:
         if stream is not None and self.device.type == "cuda":
             with torch.cuda.stream(stream):
                 return channel.all_reduce(
-                    inp, plan=plan, out=out, peer_input_ptrs=peer_input_ptrs
+                    inp,
+                    plan=plan,
+                    out=out,
+                    addend=addend,
+                    peer_input_ptrs=peer_input_ptrs,
                 )
         return channel.all_reduce(
-            inp, plan=plan, out=out, peer_input_ptrs=peer_input_ptrs
+            inp,
+            plan=plan,
+            out=out,
+            addend=addend,
+            peer_input_ptrs=peer_input_ptrs,
         )
 
     def all_reduce_fused_add_rms_norm(

@@ -25,6 +25,7 @@ from b12x._lib.utils.device import current_cuda_stream
 from b12x._lib.utils.pointers import make_ptr
 from ._oneshot_cute import _PackedMath, _dummy
 from ._cute_intrinsics import (
+    add_bf16x2,
     graph_epoch_arrive_serialized,
     ld_relaxed_gpu_u32,
     ld_relaxed_sys_global_v4_u32,
@@ -59,13 +60,41 @@ __all__ = [
 
 
 class _JointLaunch(_PackedMath):
-    def __init__(self, family, world_size, rank, threads, max_blocks):
+    def __init__(
+        self, family, world_size, rank, threads, max_blocks, has_addend=False
+    ):
         super().__init__("bfloat16")
         self._family = family
         self._world_size = world_size
         self._rank = rank
         self._threads = threads
         self._max_blocks = max_blocks
+        self._has_addend = bool(has_addend)
+
+    @cute.jit
+    def _load_pack(
+        self,
+        payload: Int64,
+        addend: Int64,
+        offset: Int64,
+        nc: cutlass.Constexpr[bool],
+    ):
+        if cutlass.const_expr(nc):
+            words = ld_global_nc_v4_u32(payload + offset)
+        else:
+            words = ld_global_v4_u32(payload + offset)
+        if cutlass.const_expr(self._has_addend):
+            if cutlass.const_expr(nc):
+                extra = ld_global_nc_v4_u32(addend + offset)
+            else:
+                extra = ld_global_v4_u32(addend + offset)
+            return (
+                add_bf16x2(words[0], extra[0]),
+                add_bf16x2(words[1], extra[1]),
+                add_bf16x2(words[2], extra[2]),
+                add_bf16x2(words[3], extra[3]),
+            )
+        return words
 
     @cute.jit
     def __call__(
@@ -75,13 +104,22 @@ class _JointLaunch(_PackedMath):
         local_signal: cute.Pointer,
         selector: cute.Pointer,
         payload: cute.Pointer,
+        addend: cute.Pointer,
         output: cute.Pointer,
         size: Int64,
         capacity: Int64,
         stream: cuda.CUstream,
     ):
         self.kernel(
-            peers, signals, local_signal, selector, payload, output, size, capacity
+            peers,
+            signals,
+            local_signal,
+            selector,
+            payload,
+            addend,
+            output,
+            size,
+            capacity,
         ).launch(
             grid=(self._max_blocks, 1, 1),
             block=(self._threads, 1, 1),
@@ -133,6 +171,7 @@ class _JointLaunch(_PackedMath):
         self,
         peers: cute.Pointer,
         payload: Int64,
+        addend: Int64,
         output: Int64,
         size: Int64,
         capacity: Int64,
@@ -141,30 +180,24 @@ class _JointLaunch(_PackedMath):
         mode: Uint32,
     ):
         local = Int64(peers[self._rank]) + capacity * Int64(16)
-        index = flat
-        while index < size:
-            words = ld_global_v4_u32(payload + index * Int64(16))
-            if mode == Uint32(0):
-                for target in cutlass.range_constexpr(self._world_size):
+        if mode == Uint32(0):
+            # Rotated multi-peer publish without self-staging avoids 3-to-1 RX incast
+            # and cuts 25% of sys-coherent staging traffic on TP4.
+            index = flat
+            while index < size:
+                words = self._load_pack(payload, addend, index * Int64(16), False)
+                for peer_index in cutlass.range_constexpr(1, self._world_size):
+                    target = (self._rank + peer_index) % self._world_size
                     dest = Int64(peers[target]) + (
                         capacity + Int64(self._rank) * capacity + index
                     ) * Int64(16)
                     self._publish_bf16_words(dest, words)
-            else:
-                owner = self._owner(index, size)
-                dest = Int64(peers[owner]) + (
-                    capacity + Int64(self._rank) * capacity + index
-                ) * Int64(16)
-                self._publish_bf16_words(dest, words)
-            index += stride
-        index = flat
-        while index < size:
-            owner = Int32(self._rank)
-            if mode == Uint32(1):
-                owner = self._owner(index, size)
-            if owner == Int32(self._rank):
+                index += stride
+            index = flat
+            while index < size:
+                self_words = self._load_pack(payload, addend, index * Int64(16), False)
                 acc = cute.make_rmem_tensor((8,), Float32)
-                self._receive_bf16_sum(local, capacity, index, acc)
+                self._receive_bf16_remote_sum(local, capacity, index, self_words, acc)
                 result = cute.make_rmem_tensor((4,), Uint32)
                 for word in cutlass.range_constexpr(4):
                     result[word] = pack_f32x2_to_bf16x2(
@@ -177,20 +210,64 @@ class _JointLaunch(_PackedMath):
                     result[2],
                     result[3],
                 )
-                if mode == Uint32(1):
-                    for target in cutlass.range_constexpr(self._world_size):
-                        if cutlass.const_expr(target != self._rank):
-                            dest = Int64(peers[target]) + (
-                                capacity + Int64(self._rank) * capacity + index
-                            ) * Int64(16)
-                            self._publish_bf16_words(dest, result)
-            index += stride
-        if mode == Uint32(1):
+                index += stride
+        else:
+            # Full-parallel rotated reduce-scatter + all-gather without self-staging:
+            # rotating `slot = (index + rank * part) % size` keeps every CTA active in
+            # parallel across all 3 remote shards while avoiding 3-to-1 PCIe RX incast.
+            part = size // Int64(self._world_size)
+            rot = Int64(self._rank) * part
+            index = flat
+            while index < size:
+                slot = index + rot
+                if slot >= size:
+                    slot -= size
+                owner = self._owner(slot, size)
+                if owner != Int32(self._rank):
+                    words = self._load_pack(payload, addend, slot * Int64(16), False)
+                    dest = Int64(peers[owner]) + (
+                        capacity + Int64(self._rank) * capacity + slot
+                    ) * Int64(16)
+                    self._publish_bf16_words(dest, words)
+                index += stride
             index = flat
             while index < size:
                 owner = self._owner(index, size)
+                if owner == Int32(self._rank):
+                    self_words = self._load_pack(
+                        payload, addend, index * Int64(16), False
+                    )
+                    acc = cute.make_rmem_tensor((8,), Float32)
+                    self._receive_bf16_remote_sum(
+                        local, capacity, index, self_words, acc
+                    )
+                    result = cute.make_rmem_tensor((4,), Uint32)
+                    for word in cutlass.range_constexpr(4):
+                        result[word] = pack_f32x2_to_bf16x2(
+                            acc[word * 2], acc[word * 2 + 1]
+                        )
+                    st_global_v4_u32(
+                        output + index * Int64(16),
+                        result[0],
+                        result[1],
+                        result[2],
+                        result[3],
+                    )
+                    for peer_index in cutlass.range_constexpr(1, self._world_size):
+                        target = (self._rank + peer_index) % self._world_size
+                        dest = Int64(peers[target]) + (
+                            capacity + Int64(self._rank) * capacity + index
+                        ) * Int64(16)
+                        self._publish_bf16_words(dest, result)
+                index += stride
+            index = flat
+            while index < size:
+                slot = index + rot
+                if slot >= size:
+                    slot -= size
+                owner = self._owner(slot, size)
                 if owner != Int32(self._rank):
-                    address = local + (Int64(owner) * capacity + index) * Int64(16)
+                    address = local + (Int64(owner) * capacity + slot) * Int64(16)
                     gathered = cute.make_rmem_tensor((4,), Uint32)
                     waiting = cutlass.Boolean(True)
                     while waiting:
@@ -204,7 +281,7 @@ class _JointLaunch(_PackedMath):
                                 | ((words[word] & Uint32(0xFFFF0000)) == Uint32(0))
                             )
                     st_global_v4_u32(
-                        output + index * Int64(16),
+                        output + slot * Int64(16),
                         gathered[0],
                         gathered[1],
                         gathered[2],
@@ -221,6 +298,7 @@ class _JointLaunch(_PackedMath):
         peers: cute.Pointer,
         signals: cute.Pointer,
         payload: Int64,
+        addend: Int64,
         output: Int64,
         size: Int64,
         flat: Int64,
@@ -228,9 +306,13 @@ class _JointLaunch(_PackedMath):
     ):
         index = flat
         while index < size:
-            self._copy_pack(
-                payload + index * Int64(16),
+            words = self._load_pack(payload, addend, index * Int64(16), False)
+            st_global_v4_u32(
                 Int64(peers[self._rank]) + index * Int64(16),
+                words[0],
+                words[1],
+                words[2],
+                words[3],
             )
             index += stride
         self._barrier(signals)
@@ -251,6 +333,7 @@ class _JointLaunch(_PackedMath):
         peers: cute.Pointer,
         signals: cute.Pointer,
         payload: Int64,
+        addend: Int64,
         output: Int64,
         size: Int64,
         capacity: Int64,
@@ -270,7 +353,7 @@ class _JointLaunch(_PackedMath):
                 target = (self._rank + peer_index) % self._world_size
                 pack = Int64(target) * shard + index
                 if pack < size:
-                    words = ld_global_nc_v4_u32(payload + pack * Int64(16))
+                    words = self._load_pack(payload, addend, pack * Int64(16), True)
                     if cutlass.const_expr(push):
                         dest = Int64(peers[target]) + (
                             slab_offset + Int64(self._rank) * cap_shard + index
@@ -293,7 +376,7 @@ class _JointLaunch(_PackedMath):
                 acc = cute.make_rmem_tensor((8,), Float32)
                 for lane in cutlass.range_constexpr(8):
                     acc[lane] = Float32(0.0)
-                words = ld_global_nc_v4_u32(payload + pack * Int64(16))
+                words = self._load_pack(payload, addend, pack * Int64(16), True)
                 self._accumulate_words(
                     acc, words[0], words[1], words[2], words[3], False
                 )
@@ -374,6 +457,7 @@ class _JointLaunch(_PackedMath):
         local_signal: cute.Pointer,
         selector: cute.Pointer,
         payload: cute.Pointer,
+        addend: cute.Pointer,
         output: cute.Pointer,
         size: Int64,
         capacity: Int64,
@@ -397,15 +481,18 @@ class _JointLaunch(_PackedMath):
             flat = Int64(bid) * Int64(self._threads) + Int64(tid)
             stride = Int64(active) * Int64(self._threads)
             src = Int64(payload.toint())
+            add = Int64(addend.toint())
             dst = Int64(output.toint())
             if mode == Uint32(4):
-                self._pull(slot_peers, signals, src, dst, size, flat, stride)
+                self._pull(slot_peers, signals, src, add, dst, size, flat, stride)
             elif mode == Uint32(1):
-                self._ready(slot_peers, src, dst, size, capacity, flat, stride, mode)
+                self._ready(
+                    slot_peers, src, add, dst, size, capacity, flat, stride, mode
+                )
             else:
                 if cutlass.const_expr(self._family == "latency"):
                     self._ready(
-                        slot_peers, src, dst, size, capacity, flat, stride, mode
+                        slot_peers, src, add, dst, size, capacity, flat, stride, mode
                     )
                 else:
                     if mode == Uint32(2):
@@ -413,6 +500,7 @@ class _JointLaunch(_PackedMath):
                             slot_peers,
                             signals,
                             src,
+                            add,
                             dst,
                             size,
                             capacity,
@@ -425,6 +513,7 @@ class _JointLaunch(_PackedMath):
                             slot_peers,
                             signals,
                             src,
+                            add,
                             dst,
                             size,
                             capacity,
@@ -435,13 +524,23 @@ class _JointLaunch(_PackedMath):
 
 
 def is_joint_launcher_prepared(
-    family, world_size, rank, threads, max_blocks, device_index
+    family, world_size, rank, threads, max_blocks, device_index, has_addend=False
 ):
-    return (family, world_size, rank, threads, max_blocks, device_index) in _PREPARED
+    return (
+        family,
+        world_size,
+        rank,
+        threads,
+        max_blocks,
+        bool(has_addend),
+        device_index,
+    ) in _PREPARED
 
 
 @program_cache
-def get_joint_launcher(family, world_size, rank, threads, max_blocks, device_index):
+def get_joint_launcher(
+    family, world_size, rank, threads, max_blocks, device_index, has_addend=False
+):
     if family not in ("latency", "bandwidth"):
         raise ValueError("joint family must be latency or bandwidth")
     if world_size not in (2, 3, 4, 6, 8, 10) or not 0 <= rank < world_size:
@@ -454,8 +553,11 @@ def get_joint_launcher(family, world_size, rank, threads, max_blocks, device_ind
         512,
     ):
         raise ValueError("invalid joint launch geometry")
-    key = (family, world_size, rank, threads, max_blocks, device_index)
-    launch = _JointLaunch(family, world_size, rank, threads, max_blocks)
+    has_addend = bool(has_addend)
+    key = (family, world_size, rank, threads, max_blocks, has_addend, device_index)
+    launch = _JointLaunch(
+        family, world_size, rank, threads, max_blocks, has_addend=has_addend
+    )
     raise_if_kernel_resolution_frozen("cute.compile", target=launch, cache_key=key)
     raw = b12x_compile(
         launch,
@@ -465,10 +567,11 @@ def get_joint_launcher(family, world_size, rank, threads, max_blocks, device_ind
         _dummy(Uint32, 4),
         _dummy(Uint32, 16),
         _dummy(Uint32, 16),
+        _dummy(Uint32, 16),
         1,
         1,
         current_cuda_stream(),
-        compile_spec=KernelCompileSpec.from_key("comm.pcie.joint", 5, key[:-1]),
+        compile_spec=KernelCompileSpec.from_key("comm.pcie.joint", 8, key[:-1]),
     )
 
     def run(
@@ -480,9 +583,11 @@ def get_joint_launcher(family, world_size, rank, threads, max_blocks, device_ind
         output_address,
         size_packs,
         capacity_packs,
+        addend_address=None,
     ):
         if not 0 < size_packs <= capacity_packs:
             raise ValueError("joint payload must fit its prepared capacity")
+        add_addr = input_address if addend_address is None else addend_address
         raw(
             make_ptr(
                 cutlass.Uint64,
@@ -501,6 +606,7 @@ def get_joint_launcher(family, world_size, rank, threads, max_blocks, device_ind
             ),
             make_ptr(Uint32, selector_address, cute.AddressSpace.gmem, assumed_align=4),
             make_ptr(Uint32, input_address, cute.AddressSpace.gmem, assumed_align=16),
+            make_ptr(Uint32, add_addr, cute.AddressSpace.gmem, assumed_align=16),
             make_ptr(Uint32, output_address, cute.AddressSpace.gmem, assumed_align=16),
             int(size_packs),
             int(capacity_packs),

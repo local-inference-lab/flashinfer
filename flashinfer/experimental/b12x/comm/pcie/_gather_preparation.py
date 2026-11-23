@@ -92,6 +92,17 @@ def validate_query(query):
             "selected gather shape exceeds or differs from its channel geometry"
         )
     transport = call["gather_transport"]
+    has_gate = call.get("has_gate", False)
+    if type(has_gate) is not bool:
+        raise ValueError("selected gather has_gate must be a bool")
+    if has_gate and transport not in (
+        "joint",
+        "selected_barrier",
+        "selected_word_exchange",
+    ):
+        raise ValueError(
+            "gated selected gather requires joint, barrier, or word_exchange transport"
+        )
     selected_gather_profile(
         transport, call["block_limit"], call["submode"], call["active_blocks"]
     )
@@ -188,12 +199,32 @@ class SelectedGatherState:
         if runtime is not self.runtime:
             raise ValueError("selected gather plan belongs to a different channel")
 
-    def run_selected(self, source, output):
+    def run_selected(self, source, output, gate=None):
         c, runtime = self.query.call, self.runtime
         if tuple(source.shape) != tuple(c["shape"]) or str(source.dtype) != c["dtype"]:
             raise ValueError(
                 "selected gather input differs from the prepared shape or dtype"
             )
+        has_gate = bool(c.get("has_gate", False))
+        if has_gate:
+            if (
+                gate is None
+                or gate.device != runtime.device
+                or gate.dtype not in (torch.int32, torch.uint32)
+                or gate.numel() < 1
+                or not gate.is_contiguous()
+                or gate.data_ptr() % 4
+            ):
+                raise ValueError(
+                    "gated selected gather requires a contiguous aligned int32 CUDA gate"
+                )
+            gate_address = gate.data_ptr()
+        else:
+            if gate is not None:
+                raise ValueError(
+                    "ungated selected gather does not accept a gate tensor"
+                )
+            gate_address = None
         barrier = "barrier" in GATHER_MODES[c["gather_transport"]]
         if barrier and not runtime._device_slot_selection:
             # Selected barrier kernels retire device epochs even in eager warmup.
@@ -211,16 +242,18 @@ class SelectedGatherState:
             runtime._slot_bytes if bank == 0 else -runtime._slot_bytes,
             runtime._exchange_offset,
             runtime._exchange_counter_offset,
+            gate_address=gate_address,
         )
         return output
 
-    def run(self, *, local_input, out):
+    def run(self, *, local_input, out, gate=None):
         return self.runtime._all_gather_heads_on_device(
             local_input,
             out,
             state=self,
             threads=self.query.call["threads"],
             block_limit=self.query.call["block_limit"],
+            gate=gate,
         )
 
 
@@ -248,6 +281,7 @@ def plan(query, *, runtime, invocation, override):
             raise ValueError(f"selected gather {field} differs from its runtime owner")
     c = query.call
     element = 1 if c["dtype"] == "torch.float8_e4m3fn" else 2
+    has_gate = bool(c.get("has_gate", False))
     args = (
         query.world_size,
         query.rank,
@@ -256,6 +290,7 @@ def plan(query, *, runtime, invocation, override):
         c["block_limit"],
         query.setup["exchange_chunks"],
         c["gather_transport"].removeprefix("selected_"),
+        has_gate,
     )
 
     def materialize(selection, device):
@@ -358,6 +393,8 @@ def startup_spec(plan, profiles):
         state.runtime._exchange_chunks,
         pairs,
     )
+    if c.get("has_gate", False):
+        key += (("has_gate", True),)
     return JointStartupSpec(key, pairs, state.selector, state, False, state.query.rank)
 
 

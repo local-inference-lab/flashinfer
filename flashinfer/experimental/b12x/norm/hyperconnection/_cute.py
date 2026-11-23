@@ -65,12 +65,31 @@ def _float_bits(value: Float32, *, loc=None, ip=None) -> Uint32:
 
 
 class _GroupedRmsNorm:
+    _PACK_ELEMENTS = 8
+
     def __init__(
         self, streams: int, hidden_size: int, zero_centered: bool = True
     ) -> None:
         self.streams = int(streams)
         self.hidden_size = int(hidden_size)
-        self.items = (self.hidden_size + _THREADS - 1) // _THREADS
+        self.vectorized = (self.hidden_size % self._PACK_ELEMENTS) == 0
+        self.packs = self.hidden_size // self._PACK_ELEMENTS
+        if self.vectorized:
+            self.threads = (
+                64
+                if self.packs <= 64
+                else 128
+                if self.packs <= 160
+                else _THREADS
+            )
+            self.warps = self.threads // 32
+            self.pack_items = (self.packs + self.threads - 1) // self.threads
+            self.items = (self.hidden_size + self.threads - 1) // self.threads
+        else:
+            self.threads = _THREADS
+            self.warps = _WARPS
+            self.pack_items = 0
+            self.items = (self.hidden_size + _THREADS - 1) // _THREADS
         self.zero_centered = bool(zero_centered)
 
     @cute.jit
@@ -86,7 +105,7 @@ class _GroupedRmsNorm:
     ) -> None:
         self.kernel(state, weight, output, eps, state_row_stride).launch(
             grid=(rows, 1, 1),
-            block=(_THREADS, 1, 1),
+            block=(self.threads, 1, 1),
             stream=stream,
         )
 
@@ -107,36 +126,120 @@ class _GroupedRmsNorm:
         weight_base = Int64(Int32(row) % Int32(self.streams)) * Int64(self.hidden_size)
         source_base = (row_i // Int64(self.streams)) * state_row_stride + weight_base
 
-        values = cute.make_rmem_tensor((self.items,), Float32)
-        square_sum = Float32(0.0)
-        for item in cutlass.range_constexpr(self.items):
-            column = thread_i + Int32(item * _THREADS)
-            value = Float32(0.0)
-            if column < Int32(self.hidden_size):
-                value = Float32(state[source_base + column.to(Int64)])
-            values[item] = value
-            square_sum += value * value
-
         allocator = cutlass.utils.SmemAllocator()
         reduction = allocator.allocate_tensor(
             element_type=Float32,
-            layout=cute.make_layout((1, _WARPS)),
+            layout=cute.make_layout((1, self.warps)),
             byte_alignment=16,
         )
-        total = _block_sum(square_sum, reduction)
-        scale = cute.math.rsqrt(
-            total / Float32(self.hidden_size) + eps,
-            fastmath=True,
-        )
-        for item in cutlass.range_constexpr(self.items):
-            column = thread_i + Int32(item * _THREADS)
-            if column < Int32(self.hidden_size):
-                learned = Float32(weight[weight_base + column.to(Int64)])
-                output[base + column.to(Int64)] = BFloat16(
-                    values[item]
-                    * scale
-                    * (Float32(1.0 if self.zero_centered else 0.0) + learned)
+
+        if cutlass.const_expr(self.vectorized):
+            state_addr = Int64(state.toint())
+            weight_addr = Int64(weight.toint())
+            output_addr = Int64(output.toint())
+            aligned = (
+                ((state_addr | weight_addr | output_addr) & Int64(15)) == Int64(0)
+            ) and ((state_row_stride & Int64(7)) == Int64(0))
+            if aligned:
+                src_row_bytes = state_addr + source_base * Int64(2)
+                wt_row_bytes = weight_addr + weight_base * Int64(2)
+                out_row_bytes = output_addr + base * Int64(2)
+                v_vals = cute.make_rmem_tensor(
+                    (self.pack_items, self._PACK_ELEMENTS), Float32
                 )
+                square_sum = Float32(0.0)
+                for item in cutlass.range_constexpr(self.pack_items):
+                    pack = thread_i + Int32(item * self.threads)
+                    if pack < Int32(self.packs):
+                        words = ld_global_v4_u32(
+                            src_row_bytes + pack.to(Int64) * Int64(16)
+                        )
+                        for word in cutlass.range_constexpr(4):
+                            lo, hi = bfloat2_to_float2_scaled(
+                                words[word], Float32(1.0)
+                            )
+                            v_vals[item, word * 2] = lo
+                            v_vals[item, word * 2 + 1] = hi
+                            square_sum += lo * lo + hi * hi
+                total = _block_sum(square_sum, reduction)
+                scale = cute.math.rsqrt(
+                    total / Float32(self.hidden_size) + eps,
+                    fastmath=True,
+                )
+                for item in cutlass.range_constexpr(self.pack_items):
+                    pack = thread_i + Int32(item * self.threads)
+                    if pack < Int32(self.packs):
+                        byte_off = pack.to(Int64) * Int64(16)
+                        w_words = ld_global_v4_u32(wt_row_bytes + byte_off)
+                        out_words = cute.make_rmem_tensor((4,), Uint32)
+                        for word in cutlass.range_constexpr(4):
+                            w_lo, w_hi = bfloat2_to_float2_scaled(
+                                w_words[word], Float32(1.0)
+                            )
+                            if cutlass.const_expr(self.zero_centered):
+                                w_lo += Float32(1.0)
+                                w_hi += Float32(1.0)
+                            out_words[word] = pack_f32x2_to_bfloat2(
+                                v_vals[item, word * 2] * scale * w_lo,
+                                v_vals[item, word * 2 + 1] * scale * w_hi,
+                            )
+                        st_global_v4_u32(
+                            out_row_bytes + byte_off,
+                            out_words[0],
+                            out_words[1],
+                            out_words[2],
+                            out_words[3],
+                        )
+            else:
+                values = cute.make_rmem_tensor((self.items,), Float32)
+                square_sum = Float32(0.0)
+                for item in cutlass.range_constexpr(self.items):
+                    column = thread_i + Int32(item * self.threads)
+                    value = Float32(0.0)
+                    if column < Int32(self.hidden_size):
+                        value = Float32(state[source_base + column.to(Int64)])
+                    values[item] = value
+                    square_sum += value * value
+
+                total = _block_sum(square_sum, reduction)
+                scale = cute.math.rsqrt(
+                    total / Float32(self.hidden_size) + eps,
+                    fastmath=True,
+                )
+                for item in cutlass.range_constexpr(self.items):
+                    column = thread_i + Int32(item * self.threads)
+                    if column < Int32(self.hidden_size):
+                        learned = Float32(weight[weight_base + column.to(Int64)])
+                        output[base + column.to(Int64)] = BFloat16(
+                            values[item]
+                            * scale
+                            * (Float32(1.0 if self.zero_centered else 0.0) + learned)
+                        )
+        else:
+            values = cute.make_rmem_tensor((self.items,), Float32)
+            square_sum = Float32(0.0)
+            for item in cutlass.range_constexpr(self.items):
+                column = thread_i + Int32(item * self.threads)
+                value = Float32(0.0)
+                if column < Int32(self.hidden_size):
+                    value = Float32(state[source_base + column.to(Int64)])
+                values[item] = value
+                square_sum += value * value
+
+            total = _block_sum(square_sum, reduction)
+            scale = cute.math.rsqrt(
+                total / Float32(self.hidden_size) + eps,
+                fastmath=True,
+            )
+            for item in cutlass.range_constexpr(self.items):
+                column = thread_i + Int32(item * self.threads)
+                if column < Int32(self.hidden_size):
+                    learned = Float32(weight[weight_base + column.to(Int64)])
+                    output[base + column.to(Int64)] = BFloat16(
+                        values[item]
+                        * scale
+                        * (Float32(1.0 if self.zero_centered else 0.0) + learned)
+                    )
 
 
 class _EngramMix:
@@ -837,7 +940,7 @@ def _compile(
                 *args,
                 compile_spec=KernelCompileSpec.from_key(
                     "norm.hyperconnection.cute",
-                    9,
+                    10,
                     key,
                 ),
             )

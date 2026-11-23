@@ -148,6 +148,7 @@ def compile_packed(
                         query.num_tokens,
                         config.split_k,
                         config.mma_warps or 8,
+                        config.tile_n or 16,
                     ),
                     **activation_program,
                 }
@@ -329,7 +330,10 @@ def _projection_workspace_bytes(query, config, device):
             from ._mxfp8_tc_gemv import mxfp8_tc_gemv_workspace_bytes
 
             return mxfp8_tc_gemv_workspace_bytes(
-                query.num_tokens, query.out_features, config.split_k
+                query.num_tokens,
+                query.out_features,
+                config.split_k,
+                config.tile_n or 16,
             )
         slices = effective_a16_config(query, config)[2]
         partials = (
@@ -824,12 +828,16 @@ def _plan_bf16(query: BlockscaledQuery, *, invocation=FrozenMapping(), override=
         ):
             from ._mxfp8_tc_gemv import _FLAGS_CACHE, mxfp8_tc_gemv_flags_bytes
 
-            fbytes = mxfp8_tc_gemv_flags_bytes(query.out_features, config.split_k)
+            n_per_cta = config.tile_n or 16
+            fbytes = mxfp8_tc_gemv_flags_bytes(
+                query.out_features, config.split_k, n_per_cta
+            )
             fkey = (
                 device.ordinal,
                 query.out_features,
                 query.padded_in_features,
                 config.split_k,
+                n_per_cta,
             )
             persistent.append(
                 PersistentMemory(
@@ -944,6 +952,7 @@ def _plan_bf16(query: BlockscaledQuery, *, invocation=FrozenMapping(), override=
                 query.out_features,
                 query.padded_in_features,
                 config.split_k,
+                config.tile_n or 16,
             )
         return _PackedExecutionState(
             query,
