@@ -425,6 +425,7 @@ def _uniform_prepared(
     tile_config: tuple[int, int, int, int] = (64, 256, 64, 256),
     dummy_scale: torch.Tensor | None = None,
     workspace: torch.Tensor | None = None,
+    allocate=None,
 ) -> PreparedW4A16MoeWeights:
     unique = sorted(set(bits.reshape(-1).tolist()))
     if len(unique) != 1:
@@ -432,6 +433,21 @@ def _uniform_prepared(
     bit = int(unique[0])
     from b12x.moe._shared.kernels.w4a16.prepare import prepare_trellis256_moe_weights
 
+    if allocate is not None:
+        shared_suh = up_suh.data_ptr() == gate_suh.data_ptr()
+        gate_suh = allocate(
+            gate_suh.shape, dtype=gate_suh.dtype, device=gate_suh.device
+        ).copy_(gate_suh)
+        up_suh = (
+            gate_suh
+            if shared_suh
+            else allocate(
+                up_suh.shape, dtype=up_suh.dtype, device=up_suh.device
+            ).copy_(up_suh)
+        )
+        down_svh = allocate(
+            down_svh.shape, dtype=down_svh.dtype, device=down_svh.device
+        ).copy_(down_svh)
     w13, down = assemble_uniform_slots(
         weights.codes,
         num_experts=num_experts,
@@ -439,7 +455,13 @@ def _uniform_prepared(
         bits=bit,
         device=gate_suh.device,
         staging=staging,
+        allocate=allocate,
     )
+    inter_flat = intermediate.reshape(num_experts, -1)
+    if config.transform.expert.kind == "none" and allocate is not None:
+        inter_flat = allocate(
+            inter_flat.shape, dtype=inter_flat.dtype, device=inter_flat.device
+        ).copy_(inter_flat)
     prepared = prepare_trellis256_moe_weights(
         w13=w13,
         w2=down,
@@ -455,11 +477,12 @@ def _uniform_prepared(
         codebook=config.codebook.value,
         gate_suh=gate_suh,
         up_suh=up_suh,
-        intermediate_rotations=intermediate.reshape(num_experts, -1),
+        intermediate_rotations=inter_flat,
         down_svh=down_svh,
         tile_config=tile_config,
         dummy_scale=dummy_scale,
         workspace=workspace,
+        allocate=allocate,
     )
     if config.transform.expert.kind == "none":
         if weights.expert_sign_patterns is not None:
@@ -486,6 +509,86 @@ def _uniform_prepared(
             "all-zero expert_sign_patterns"
         )
     assert prepared.trellis is not None
+    resolved_extent = extent or TrellisExtent(
+        global_intermediate_size=intermediate_size,
+        first_slot=0,
+        slot_count=intermediate_size // 32,
+    )
+    from b12x.moe._shared.kernels.exl3_roofline_launch import exl3_roofline_enabled
+    from .trellis_layout import intermediate_hadamard_sign_table
+
+    if (
+        exl3_roofline_enabled()
+        and gate_suh.device.type == "cuda"
+        and torch.cuda.get_device_capability(gate_suh.device)[0] == 12
+        and config.codebook is TrellisCodebook.LUT_E4M3
+        and bit == 2
+        and activation == "situ"
+        and hidden_size % 512 == 0
+        and intermediate_size % 128 == 0
+    ):
+        patterns_cpu = sign_patterns.detach().cpu()
+        if bool(torch.any(patterns_cpu > 7)):
+            raise ValueError("expert_sign_patterns values must be in 0..7")
+        gu_abs = intermediate[:, :2, :].abs()
+        gu_const = bool(torch.equal(gu_abs, gu_abs[:, :, :1].expand_as(gu_abs)))
+        if gu_const:
+            # Bit-exact compact layout: [E, I + I//8 + 8] fp16
+            #   [0 .. I-1]          : exact FP16 down rotations
+            #   [I .. I + I//8 - 1] : packed uint16 sign bits for gate (I//16) + up (I//16)
+            #   [I + I//8 + 0..1]   : exact FP16 positive magnitudes for gate, up
+            packed_cols = intermediate_size + intermediate_size // 8 + 8
+            alloc = torch.empty if allocate is None else allocate
+            rot_scales = alloc(
+                (num_experts, packed_cols),
+                dtype=torch.float16,
+                device=gate_suh.device,
+            )
+            rot_scales[:, :intermediate_size].copy_(intermediate[:, 2, :])
+            bit_shifts = torch.arange(16, dtype=torch.int32, device=gate_suh.device)
+            neg = (
+                (intermediate[:, :2, :].view(torch.uint16).to(torch.int32) >> 15) & 1
+            ).view(num_experts, 2 * (intermediate_size // 16), 16)
+            sign_words = (neg << bit_shifts).sum(dim=-1, dtype=torch.int32).to(torch.uint16)
+            rot_scales[:, intermediate_size : intermediate_size + intermediate_size // 8].view(
+                torch.uint16
+            ).copy_(sign_words)
+            rot_scales[:, intermediate_size + intermediate_size // 8].copy_(
+                intermediate[:, 0, 0].abs()
+            )
+            rot_scales[:, intermediate_size + intermediate_size // 8 + 1].copy_(
+                intermediate[:, 1, 0].abs()
+            )
+            rot_scales[:, intermediate_size + intermediate_size // 8 + 2 :].zero_()
+        else:
+            rot_scales = intermediate.reshape(num_experts, -1)
+            if allocate is not None:
+                rot_scales = allocate(
+                    rot_scales.shape, dtype=rot_scales.dtype, device=rot_scales.device
+                ).copy_(rot_scales)
+            else:
+                rot_scales = rot_scales.contiguous()
+        if allocate is not None:
+            patterns_store = allocate(
+                sign_patterns.shape, dtype=torch.uint8, device=gate_suh.device
+            ).copy_(sign_patterns)
+        else:
+            patterns_store = sign_patterns.contiguous()
+        sign_table = intermediate_hadamard_sign_table(
+            extent=resolved_extent,
+            device=gate_suh.device,
+            allocate=allocate,
+        )
+        return replace(
+            prepared,
+            trellis=replace(
+                prepared.trellis,
+                intermediate_hadamard=True,
+                intermediate_rotations=rot_scales,
+                intermediate_sign_table=sign_table,
+                intermediate_sign_patterns=patterns_store,
+            ),
+        )
     return replace(
         prepared,
         trellis=replace(
@@ -494,12 +597,8 @@ def _uniform_prepared(
             intermediate_rotations=append_intermediate_signs(
                 intermediate.reshape(num_experts, -1),
                 sign_patterns,
-                extent=extent
-                or TrellisExtent(
-                    global_intermediate_size=intermediate_size,
-                    first_slot=0,
-                    slot_count=intermediate_size // 32,
-                ),
+                extent=resolved_extent,
+                allocate=allocate,
             ),
         ),
     )
@@ -700,6 +799,7 @@ def prepare_trellis_weights(
     tile_config: tuple[int, int, int, int] | None = None,
     dummy_scale: torch.Tensor | None = None,
     workspace: torch.Tensor | None = None,
+    allocate=None,
 ) -> PreparedW4A16MoeWeights | PreparedProjectionTrellisWeights:
     """Prepare one rank-local canonical Trellis MoE layer."""
 
@@ -828,6 +928,7 @@ def prepare_trellis_weights(
             tile_config=tile_config or (64, 256, 64, 256),
             dummy_scale=dummy_scale,
             workspace=workspace,
+            allocate=allocate,
         )
     return _projection_prepared(
         config,

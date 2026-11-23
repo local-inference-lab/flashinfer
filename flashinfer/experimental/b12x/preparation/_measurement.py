@@ -354,6 +354,12 @@ def _l2_flush_fn(device: object, *, enabled: bool):
 
     properties = torch.cuda.get_device_properties(device)
     flush_bytes = max(2 * int(properties.L2_cache_size), 64 << 20)
+    try:
+        free_bytes, _ = torch.cuda.mem_get_info(device)
+    except Exception:
+        free_bytes = None
+    if free_bytes is not None and free_bytes < flush_bytes + (64 << 20):
+        flush_bytes = max(32 << 20, min(flush_bytes, int(free_bytes) - (64 << 20)))
     buffer = torch.ones(
         (flush_bytes + 3) // 4,
         dtype=torch.float32,

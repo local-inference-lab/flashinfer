@@ -53,6 +53,7 @@ def assemble_uniform_slots(
     bits: int,
     device: torch.device | str,
     staging: TrellisStaging = TrellisStaging(),
+    allocate=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Assemble FC1/FC2 int16 carriers without decoding or rounding weights.
 
@@ -79,12 +80,13 @@ def assemble_uniform_slots(
     if codes.shape[1] != payload or codes.stride(1) != 1:
         raise ValueError(f"codes must have {payload} contiguous bytes per logical row")
     batch_size = staging.batch_size(slots=slots, hidden_size=hidden_size, bits=bits)
-    w13 = torch.empty(
+    alloc = torch.empty if allocate is None else allocate
+    w13 = alloc(
         (2, num_experts, hidden_tiles, 2 * slots, 16 * bits),
         dtype=torch.int16,
         device=device,
     )
-    w2 = torch.empty(
+    w2 = alloc(
         (num_experts, 2 * slots, hidden_tiles, 16 * bits),
         dtype=torch.int16,
         device=device,
@@ -137,6 +139,7 @@ def append_intermediate_signs(
     sign_patterns: torch.Tensor,
     *,
     extent: TrellisExtent,
+    allocate=None,
 ) -> torch.Tensor:
     """Append [pre 2I | post I] signs sliced in checkpoint-global coordinates."""
 
@@ -165,4 +168,58 @@ def append_intermediate_signs(
         signs.index_copy_(
             0, rows, torch.cat((pre, post)).half().expand(rows.numel(), -1)
         )
-    return torch.cat((values, signs.to(device=values.device)), dim=1).contiguous()
+    if allocate is None:
+        return torch.cat((values, signs.to(device=values.device)), dim=1).contiguous()
+    out = allocate((values.shape[0], 6 * local), dtype=torch.float16, device=values.device)
+    out[:, : 3 * local].copy_(values)
+    out[:, 3 * local :].copy_(signs)
+    return out
+
+
+_INTERMEDIATE_SIGN_TABLE_CACHE: dict[
+    tuple[str, int | None, int, int, int, int], torch.Tensor
+] = {}
+
+
+def intermediate_hadamard_sign_table(
+    *,
+    extent: TrellisExtent,
+    device: torch.device | str,
+    allocate=None,
+) -> torch.Tensor:
+    """Return the shared fp16 [8, 3*I_local] table of [pre 2I | post I] signs."""
+
+    resolved = torch.device(device)
+    index = resolved.index
+    if resolved.type == "cuda" and index is None:
+        index = torch.cuda.current_device()
+    local = extent.intermediate_size
+    begin = 32 * extent.first_slot
+    key = (
+        resolved.type,
+        index,
+        extent.global_intermediate_size,
+        begin,
+        local,
+    )
+    if allocate is None:
+        cached = _INTERMEDIATE_SIGN_TABLE_CACHE.get(key)
+        if cached is not None:
+            return cached
+    table_cpu = torch.empty((8, 3 * local), dtype=torch.float16)
+    for pattern in range(8):
+        pre = intermediate_hadamard_signs(
+            2 * extent.global_intermediate_size, sign_pattern=pattern, axis=1
+        )[2 * begin : 2 * (begin + local)]
+        post = intermediate_hadamard_signs(
+            extent.global_intermediate_size, sign_pattern=pattern, axis=2
+        )[begin : begin + local]
+        table_cpu[pattern].copy_(torch.cat((pre, post)).half())
+    if allocate is None:
+        table = table_cpu.to(device=resolved).contiguous()
+        _INTERMEDIATE_SIGN_TABLE_CACHE[key] = table
+    else:
+        table = allocate(table_cpu.shape, dtype=torch.float16, device=resolved).copy_(
+            table_cpu
+        )
+    return table

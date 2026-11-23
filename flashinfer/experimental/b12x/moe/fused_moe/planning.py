@@ -533,6 +533,7 @@ def _prepare_weights(
             device=device,
             staging=staging,
             rotation_dtype=plan.activation.rotation_dtype,
+            allocate=allocate,
         )
     else:
         if not isinstance(weights, PackedWeights):

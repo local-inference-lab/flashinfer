@@ -140,6 +140,10 @@ def _control_snapshot(a4_prefill: bool | None = None) -> FrozenMapping:
         _FP32_TOPK_WEIGHTS,
         _w4a16_small_m_occupancy,
     )
+    from b12x.moe._shared.kernels.exl3_roofline_launch import (
+        exl3_roofline_enabled,
+        exl3_roofline_prefill_mode,
+    )
     from b12x.moe._shared.kernels.w4a16.prefill_a4 import (
         a4_prefill_enabled,
         a4_prefill_terms,
@@ -149,8 +153,11 @@ def _control_snapshot(a4_prefill: bool | None = None) -> FrozenMapping:
     tile = _impl._dynamic_tile_mn_override()
     raw_materialized = _impl.os.environ.get(_impl._DYNAMIC_NVFP4_MATERIALIZED_ENV)
     a4_enabled = a4_prefill_enabled() if a4_prefill is None else a4_prefill
+    roofline_on = exl3_roofline_enabled()
     return FrozenMapping(
         {
+            "exl3_roofline": roofline_on,
+            "exl3_prefill_mode": exl3_roofline_prefill_mode() if roofline_on else "w2a16",
             "trellis_decode_table": trellis_decode_table(),
             "w4a16_small_m_occupancy": _w4a16_small_m_occupancy(),
             "w4a16_fp32_topk_weights": _FP32_TOPK_WEIGHTS,
@@ -392,6 +399,8 @@ def _lower_caps(
         w4a16_skip_empty_m_blocks=bool(
             query.controls.get("w4a16_skip_empty_m_blocks", True)
         ),
+        exl3_roofline=bool(query.controls.get("exl3_roofline", True)),
+        exl3_prefill_mode=str(query.controls.get("exl3_prefill_mode", "w2a16")),
         swiglu_beta=_decode_scalar(query.swiglu_beta),
         prequantized_input=query.prequantized_input,
         reserve_sms=query.reserve_sms,
@@ -1012,6 +1021,8 @@ def _program_carriers(
     launches = [item[-1] for item in scratch._prewarmed_fused_launches]
     launches.extend(item[-1] for item in scratch._prewarmed_topk_sum_launches)
     launches.extend(item[-1] for item in scratch._mixed_trellis_launches)
+    if scratch._exl3_roofline_launches is not None:
+        launches.extend(scratch._exl3_roofline_launches.carriers())
     if scratch._prewarmed_route_pack_launches is not None:
         launches.extend(scratch._prewarmed_route_pack_launches.carriers())
     plan = scratch.launch_plan
@@ -1171,6 +1182,7 @@ class _FusedMoePrograms:
     fused_launches: tuple
     topk_sum_launches: tuple
     mixed_trellis_launches: tuple
+    exl3_roofline_launches: object | None
     route_pack_launches: object | None
     w4a16: _W4A16PrimaryLaunches | None
     compact: object | None
@@ -1244,6 +1256,7 @@ def compile_fused_moe(
             scratch._prewarmed_fused_launches,
             scratch._prewarmed_topk_sum_launches,
             scratch._mixed_trellis_launches,
+            scratch._exl3_roofline_launches,
             scratch._prewarmed_route_pack_launches,
             w4a16,
             compact,
@@ -1765,6 +1778,7 @@ def plan(
                 _prewarmed_fused_launches=programs.fused_launches,
                 _prewarmed_topk_sum_launches=programs.topk_sum_launches,
                 _mixed_trellis_launches=programs.mixed_trellis_launches,
+                _exl3_roofline_launches=programs.exl3_roofline_launches,
                 _prewarmed_route_pack_launches=programs.route_pack_launches,
             )
             launchers = list(programs.launchers)

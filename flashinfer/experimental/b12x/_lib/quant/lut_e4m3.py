@@ -171,16 +171,33 @@ def lut_e4m3_value_table_resident(device: torch.device | str) -> torch.Tensor | 
     return _LUT_E4M3_VALUE_TABLE_DEVICE.get((resolved.type, index))
 
 
-@functools.cache
+_LUT_E4M3_DIRECT_TABLE_DEVICE: dict[tuple[str, int | None], torch.Tensor] = {}
+
+
 def _lut_e4m3_direct_table_device(
     device_type: str,
     device_index: int | None,
+    *,
+    allocate=None,
 ) -> torch.Tensor:
-    device = torch.device(device_type, device_index)
-    return lut_e4m3_direct_table_cpu().to(device=device).contiguous()
+    key = (device_type, device_index)
+    cached = _LUT_E4M3_DIRECT_TABLE_DEVICE.get(key)
+    if cached is None:
+        device = torch.device(device_type, device_index)
+        cpu = lut_e4m3_direct_table_cpu()
+        if allocate is None:
+            cached = cpu.to(device=device).contiguous()
+        else:
+            cached = allocate(cpu.shape, dtype=cpu.dtype, device=device).copy_(cpu)
+        _LUT_E4M3_DIRECT_TABLE_DEVICE[key] = cached
+    return cached
 
 
-def lut_e4m3_direct_table(device: torch.device | str) -> torch.Tensor:
+def lut_e4m3_direct_table(
+    device: torch.device | str,
+    *,
+    allocate=None,
+) -> torch.Tensor:
     """Return the process-lifetime rate-indexed 192 KiB direct table.
 
     Rows are the 2-, 3- and 4-bit slices in rate order: byte(window, bits) =
@@ -193,7 +210,16 @@ def lut_e4m3_direct_table(device: torch.device | str) -> torch.Tensor:
     index = resolved.index
     if resolved.type == "cuda" and index is None:
         index = torch.cuda.current_device()
-    return _lut_e4m3_direct_table_device(resolved.type, index)
+    return _lut_e4m3_direct_table_device(resolved.type, index, allocate=allocate)
+
+
+def lut_e4m3_direct_table_resident(device: torch.device | str) -> torch.Tensor | None:
+    """Return the resident 192 KiB direct table without materializing a missing entry."""
+    resolved = torch.device(device)
+    index = resolved.index
+    if resolved.type == "cuda" and index is None:
+        index = torch.cuda.current_device()
+    return _LUT_E4M3_DIRECT_TABLE_DEVICE.get((resolved.type, index))
 
 
 def _lut_e4m3_permutation(codewords: torch.Tensor, bits: int) -> torch.Tensor:
@@ -237,6 +263,7 @@ __all__ = [
     "lut_e4m3_decode_ranks_torch",
     "lut_e4m3_direct_table",
     "lut_e4m3_direct_table_cpu",
+    "lut_e4m3_direct_table_resident",
     "lut_e4m3_value_table",
     "lut_e4m3_value_table_cpu",
     "lut_e4m3_value_table_resident",

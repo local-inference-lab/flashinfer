@@ -147,6 +147,8 @@ class TrellisWeightState:
     gate_suh: torch.Tensor | None = None
     up_suh: torch.Tensor | None = None
     intermediate_rotations: torch.Tensor | None = None
+    intermediate_sign_table: torch.Tensor | None = None
+    intermediate_sign_patterns: torch.Tensor | None = None
     down_svh: torch.Tensor | None = None
     intermediate_hadamard: bool = False
     tile_config: tuple[int, int, int, int] | None = None
@@ -219,6 +221,14 @@ class PreparedW4A16MoeWeights:
     @property
     def intermediate_rotations(self) -> torch.Tensor | None:
         return None if self.trellis is None else self.trellis.intermediate_rotations
+
+    @property
+    def intermediate_sign_table(self) -> torch.Tensor | None:
+        return None if self.trellis is None else self.trellis.intermediate_sign_table
+
+    @property
+    def intermediate_sign_patterns(self) -> torch.Tensor | None:
+        return None if self.trellis is None else self.trellis.intermediate_sign_patterns
 
     @property
     def down_svh(self) -> torch.Tensor | None:
@@ -1522,6 +1532,7 @@ def prepare_trellis256_moe_weights(
     down_svh: torch.Tensor | None = None,
     tile_config: tuple[int, int, int, int] | None = None,
     workspace: torch.Tensor | None = None,
+    allocate=None,
 ) -> PreparedW4A16MoeWeights:
     """Wrap or synthesize native ``trellis_t256`` tiles for any codebook.
 
@@ -1849,8 +1860,9 @@ def prepare_trellis256_moe_weights(
             )
 
     validate_codebook_bits(normalized_codebook, resolved_trellis_bits)
+    alloc = torch.empty if allocate is None else allocate
     if dummy_scale is None:
-        dummy_scale = torch.zeros(4, dtype=torch.uint8, device=resolved_device)
+        dummy_scale = alloc((4,), dtype=torch.uint8, device=resolved_device).zero_()
     else:
         if dummy_scale.device != resolved_device:
             raise ValueError(
@@ -1866,14 +1878,14 @@ def prepare_trellis256_moe_weights(
                 "trellis_t256 dummy_scale must be a contiguous four-byte "
                 f"tensor with shape (4,), got {tuple(dummy_scale.shape)}"
             )
-        if int(dummy_scale.data_ptr()) % 16 != 0:
-            raise ValueError(
-                "trellis_t256 dummy_scale must be at least 16-byte aligned"
-            )
+    if int(dummy_scale.data_ptr()) % 16 != 0:
+        raise ValueError(
+            "trellis_t256 dummy_scale must be at least 16-byte aligned"
+        )
 
-    global_scale = torch.ones(
+    global_scale = alloc(
         (num_experts,), dtype=torch.float32, device=resolved_device
-    )
+    ).fill_(1)
     if workspace is None:
         workspace = _make_workspace(resolved_device, max_blocks_per_sm=4)
     elif workspace.device != resolved_device or workspace.dtype != torch.int32:

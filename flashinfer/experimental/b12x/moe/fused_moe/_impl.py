@@ -767,6 +767,8 @@ class _TPCoreWorkspacePlan:
     dynamic_route_mode: str | None = None
     full_rotation: bool = False
     projection_mixed_trellis: bool = False
+    exl3_roofline: bool = False
+    exl3_prefill_mode: str = "w2a16"
     trellis_bits: int = 3
     trellis_tile_config: tuple[int, int, int, int] | None = None
     trellis_pair_kinds: frozenset[str] | None = None
@@ -855,6 +857,8 @@ class TPMoEScratchCaps:
     w4a16_a4_prefill_warps: int = 8
     prequantized_input: bool = False
     reserve_sms: int = 0
+    exl3_roofline: bool | None = None
+    exl3_prefill_mode: str | None = None
     frozen: bool = True
 
     def __post_init__(self) -> None:
@@ -930,6 +934,29 @@ class TPMoEScratchCaps:
             object.__setattr__(
                 self, "w4a16_prefill_fused_sum", prefill_fused_sum_enabled()
             )
+        if self.exl3_roofline is None:
+            from b12x.moe._shared.kernels.exl3_roofline_launch import (
+                exl3_roofline_enabled,
+            )
+
+            object.__setattr__(self, "exl3_roofline", exl3_roofline_enabled())
+        else:
+            object.__setattr__(self, "exl3_roofline", bool(self.exl3_roofline))
+        if self.exl3_prefill_mode is None:
+            from b12x.moe._shared.kernels.exl3_roofline_launch import (
+                exl3_roofline_prefill_mode,
+            )
+
+            object.__setattr__(
+                self, "exl3_prefill_mode", exl3_roofline_prefill_mode()
+            )
+        else:
+            mode = str(self.exl3_prefill_mode).strip().lower()
+            if mode not in ("w2a16", "mxfp8"):
+                raise ValueError(
+                    f"exl3_prefill_mode must be 'w2a16' or 'mxfp8', got {mode!r}"
+                )
+            object.__setattr__(self, "exl3_prefill_mode", mode)
         object.__setattr__(self, "frozen", bool(self.frozen))
 
     @property
@@ -993,6 +1020,7 @@ class TPMoEScratchPlan:
     _mixed_trellis_launches: tuple[tuple[torch.dtype, bool, bool, object], ...] = field(
         default=(), repr=False
     )
+    _exl3_roofline_launches: object | None = field(default=None, repr=False)
     _prewarmed_route_pack_launches: object | None = field(default=None, repr=False)
 
     @property
@@ -1106,6 +1134,22 @@ class TPMoEScratchPlan:
         )
         if self._core_workspace_plan.projection_mixed_trellis:
             return _bind_projection_mixed_trellis_from_views(
+                scratch_plan=self,
+                tensors=tensors,
+                a=a,
+                experts=experts,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                output=output,
+                input_scales_static=input_scales_static,
+                fast_math=fast_math,
+                activation_amax=activation_amax,
+                layer_idx=layer_idx,
+                route_expert_map=route_expert_map,
+                output_expert_map=output_expert_map,
+            )
+        if self._core_workspace_plan.exl3_roofline:
+            return _bind_exl3_roofline_from_views(
                 scratch_plan=self,
                 tensors=tensors,
                 a=a,
@@ -1344,6 +1388,8 @@ class TPMoEFP4Binding:
     csf_route_pack: bool = False
     mixed_trellis_binding: object | None = None
     mixed_trellis_buffers: object | None = None
+    exl3_roofline_launches: object | None = None
+    exl3_roofline_buffers: object | None = None
     compiler_scratch: torch.Tensor | None = None
     compiler_a4_prefill: bool | None = None
 
@@ -3465,6 +3511,9 @@ def _plan_core_workspace(
     trellis_codebook: str | None = None,
     intermediate_hadamard: bool = False,
     projection_mixed_trellis: bool = False,
+    exl3_roofline: bool | None = None,
+    exl3_prefill_mode: str | None = None,
+    w4a16_fast_math: bool = True,
     apply_router_weight_on_input: bool = False,
     collect_activation_amax: bool = False,
     deterministic_output: bool = False,
@@ -3480,6 +3529,7 @@ def _plan_core_workspace(
     source_format = _normalize_fp4_source_format(source_format)
     quant_mode = _normalize_quant_mode_for_source(quant_mode, source_format)
     activation = normalize_moe_activation(activation)
+    raw_deterministic_output = bool(deterministic_output)
     deterministic_output = bool(deterministic_output and implementation == "dynamic")
     swiglu_limit, swiglu_alpha, swiglu_beta = _normalize_swiglu_params(
         activation,
@@ -3683,6 +3733,108 @@ def _plan_core_workspace(
                 route_block_size_m=block_size_m,
                 tensor_specs=tensor_specs,
             )
+        if full_rotation and not projection_mixed_trellis:
+            from b12x.moe._shared.kernels.exl3_roofline_launch import (
+                exl3_roofline_eligible,
+                exl3_roofline_prefill_mode,
+                exl3_roofline_scratch_geometry,
+            )
+
+            if exl3_roofline_eligible(
+                enabled=exl3_roofline,
+                trellis_codebook=trellis_codebook,
+                trellis_bits=trellis_bits,
+                intermediate_hadamard=intermediate_hadamard,
+                activation=activation,
+                swiglu_limit=swiglu_limit,
+                swiglu_clamp_after_silu=swiglu_clamp_after_silu,
+                dtype=dtype,
+                hidden_size=k,
+                intermediate_size=n,
+                weight_E=weight_E,
+                route_E=route_E,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+                collect_activation_amax=collect_activation_amax,
+                raw_routes=raw_routes,
+                fast_math=w4a16_fast_math,
+                deterministic_output=raw_deterministic_output,
+                device=device,
+            ):
+                resolved_prefill_mode = (
+                    exl3_roofline_prefill_mode()
+                    if exl3_prefill_mode is None
+                    else exl3_prefill_mode
+                )
+                routed_capacity = max(int(routed_rows), 1)
+                topk = max(int(num_topk), 1)
+                token_capacity = (routed_capacity + topk - 1) // topk
+                max_slots, max_blks, _, inter_words = exl3_roofline_scratch_geometry(
+                    capacity_tokens=token_capacity,
+                    top_k=topk,
+                    hidden_size=int(k),
+                    intermediate_size=int(n),
+                    num_experts=route_E,
+                    prefill_mode=resolved_prefill_mode,
+                )
+                tensor_specs = (
+                    _TensorAllocSpec(
+                        "x_rot_f16", (token_capacity, int(k)), torch.float16
+                    ),
+                    _TensorAllocSpec(
+                        "a_scales", (token_capacity, int(k) // 32), torch.uint8
+                    ),
+                    _TensorAllocSpec(
+                        "intermediate_u32", (inter_words,), torch.uint32
+                    ),
+                    _TensorAllocSpec(
+                        "fc1_accum_f32", (max(topk * 2 * int(n), int(k)),), torch.float32
+                    ),
+                    _TensorAllocSpec(
+                        "y_rot_bf16", (token_capacity, int(k)), torch.bfloat16
+                    ),
+                    _TensorAllocSpec(
+                        "packed_route_indices", (max_slots,), torch.int32
+                    ),
+                    _TensorAllocSpec("block_expert_ids", (max_blks,), torch.int32),
+                    _TensorAllocSpec("packed_route_count", (1,), torch.int32),
+                    _TensorAllocSpec("expert_offsets", (route_E + 1,), torch.int32),
+                    _TensorAllocSpec("expert_counts", (route_E,), torch.int32),
+                    _TensorAllocSpec(
+                        "full_rotation_output",
+                        (token_capacity, int(k)),
+                        torch.float32,
+                    ),
+                )
+                return _TPCoreWorkspacePlan(
+                    implementation="exl3_roofline",
+                    quant_mode=quant_mode,
+                    activation=activation,
+                    swiglu_limit=swiglu_limit,
+                    swiglu_clamp_after_silu=swiglu_clamp_after_silu,
+                    swiglu_alpha=swiglu_alpha,
+                    swiglu_beta=swiglu_beta,
+                    state_E=state_E,
+                    weight_E=weight_E,
+                    route_E=route_E,
+                    routed_rows=routed_capacity,
+                    max_rows=max(max_rows, routed_capacity),
+                    k=k,
+                    n=n,
+                    num_topk=num_topk,
+                    device=device,
+                    dtype=dtype,
+                    deterministic_output=False,
+                    full_rotation=True,
+                    projection_mixed_trellis=False,
+                    exl3_roofline=True,
+                    exl3_prefill_mode=resolved_prefill_mode,
+                    trellis_bits=int(trellis_bits),
+                    trellis_tile_config=trellis_tile_config,
+                    trellis_codebook=trellis_codebook,
+                    intermediate_hadamard=True,
+                    route_block_size_m=64 if token_capacity > 32 else 8,
+                    tensor_specs=tensor_specs,
+                )
         routed_capacity = max(int(routed_rows), 1)
         fc1_cols = _activation_w1_rows(activation, int(n))
         route_slots_capacity = 1
@@ -7351,6 +7503,7 @@ def prepare_b12x_trellis_v2_weights(
     device: torch.device | str | None = None,
     staging: object | None = None,
     rotation_dtype: torch.dtype | None = None,
+    allocate=None,
 ) -> B12XFP4ExpertWeights:
     """Prepare canonical v2 trellis tensors into the normal expert owner."""
 
@@ -7379,13 +7532,15 @@ def prepare_b12x_trellis_v2_weights(
         device=device,
         staging=staging,
         tile_config=plan.trellis_tile_config,
+        allocate=allocate,
     )
     representation = _PreparedWeightRepresentation(
         quant_mode="w4a16",
         layout=PreparedWeightLayout.TRELLIS_NATIVE,
         value=value,
     )
-    unit_input = torch.ones((), dtype=torch.float32, device=value.w13.device)
+    alloc = torch.empty if allocate is None else allocate
+    unit_input = alloc((), dtype=torch.float32, device=value.w13.device).fill_(1)
     return B12XFP4ExpertWeights(
         plan=plan,
         a1_gscale=unit_input,
@@ -8453,6 +8608,9 @@ def plan_tp_moe_arena_layout(
     raw_routes: bool = False,
     w4a16_block_size_m: int | None = None,
     w4a16_prefill_fused_sum: bool | None = None,
+    w4a16_fast_math: bool = True,
+    exl3_roofline: bool | None = None,
+    exl3_prefill_mode: str | None = None,
     decode_config: MoeDecodeConfig,
 ) -> TPMoEArenaLayout:
     """Compute the byte layout needed by one lane-owned MoE pool."""
@@ -8561,6 +8719,9 @@ def plan_tp_moe_arena_layout(
             ),
             intermediate_hadamard=weight_plan.intermediate_hadamard,
             projection_mixed_trellis=_uses_projection_mixed_trellis(weight_plan),
+            exl3_roofline=exl3_roofline,
+            exl3_prefill_mode=exl3_prefill_mode,
+            w4a16_fast_math=w4a16_fast_math,
             apply_router_weight_on_input=apply_router_weight_on_input,
             collect_activation_amax=collect_activation_amax,
             deterministic_output=plan.deterministic_output,
@@ -8603,7 +8764,11 @@ def _plan_full_rotation_w4a16_launches(
     The immutable scratch plan owns compiled programs independently of module
     cache eviction. Runtime binding performs no kernel resolution or allocation.
     """
-    if not core_plan.full_rotation or core_plan.projection_mixed_trellis:
+    if (
+        not core_plan.full_rotation
+        or core_plan.projection_mixed_trellis
+        or core_plan.exl3_roofline
+    ):
         return (), ()
     if caps.quant_mode != "w4a16":
         raise RuntimeError("full-rotation TP MoE requires W4A16 execution")
@@ -9091,6 +9256,209 @@ def _bind_projection_mixed_trellis_from_views(
     )
 
 
+def _plan_exl3_roofline_launches(
+    *,
+    caps: TPMoEScratchCaps,
+    core_plan: _TPCoreWorkspacePlan,
+    capacity_tokens: int,
+):
+    """Precompile every CuTeDSL and Triton kernel for the EXL3 2-bit roofline engine."""
+    if not core_plan.exl3_roofline or core_plan.device.type != "cuda":
+        return None
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA must be available before planning EXL3 roofline MoE")
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("EXL3 roofline launch planning cannot run during capture")
+
+    from b12x.moe._shared.kernels.exl3_roofline_launch import (
+        compile_exl3_roofline_launches,
+    )
+
+    return compile_exl3_roofline_launches(
+        capacity_tokens=max(int(capacity_tokens), 1),
+        hidden_size=core_plan.k,
+        intermediate_size=core_plan.n,
+        num_experts=core_plan.weight_E,
+        top_k=core_plan.num_topk,
+        trellis_bits=core_plan.trellis_bits,
+        prefill_mode=core_plan.exl3_prefill_mode,
+        device=core_plan.device,
+    )
+
+
+def _bind_exl3_roofline_from_views(
+    *,
+    scratch_plan: TPMoEScratchPlan,
+    tensors: Mapping[str, torch.Tensor],
+    a: torch.Tensor,
+    experts: B12XFP4ExpertWeights,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    output: torch.Tensor | None,
+    input_scales_static: bool,
+    fast_math: bool | None,
+    activation_amax: torch.Tensor | None,
+    layer_idx: int | None,
+    route_expert_map: torch.Tensor | None,
+    output_expert_map: torch.Tensor | None,
+) -> TPMoEFP4Binding:
+    """Bind canonical EXL3 2-bit weights to caller-owned roofline scratch views."""
+    from b12x.moe._shared.kernels.exl3_roofline_launch import (
+        Exl3RooflineBuffers,
+        Exl3RooflineLaunches,
+        lut_e4m3_direct_table,
+    )
+
+    core_plan = scratch_plan._core_workspace_plan
+    if not core_plan.exl3_roofline:
+        raise TypeError("scratch plan is not EXL3 roofline")
+    if output_expert_map is not None:
+        raise NotImplementedError(
+            "EXL3 roofline does not support external output_expert_map"
+        )
+    if activation_amax is not None:
+        raise NotImplementedError("EXL3 roofline does not collect activation amax")
+    effective_fast_math = (
+        scratch_plan.caps.w4a16_fast_math if fast_math is None else bool(fast_math)
+    )
+    if not effective_fast_math:
+        raise NotImplementedError("EXL3 roofline requires fast_math=True")
+    if a.ndim != 2 or tuple(a.shape[1:]) != (core_plan.k,):
+        raise ValueError(
+            f"input must have shape [M,{core_plan.k}], got {tuple(a.shape)}"
+        )
+    m = int(a.shape[0])
+    capacity_tokens = core_plan.routed_rows // core_plan.num_topk
+    if m <= 0 or m > capacity_tokens:
+        raise ValueError(f"input rows must be in [1,{capacity_tokens}], got {m}")
+    expected_routes = (m, core_plan.num_topk)
+    if tuple(topk_weights.shape) != expected_routes:
+        raise ValueError(
+            f"topk_weights must have shape {expected_routes}, "
+            f"got {tuple(topk_weights.shape)}"
+        )
+    if tuple(topk_ids.shape) != expected_routes:
+        raise ValueError(
+            f"topk_ids must have shape {expected_routes}, got {tuple(topk_ids.shape)}"
+        )
+    for name, tensor, dtype in (
+        ("input", a, core_plan.dtype),
+        ("topk_weights", topk_weights, torch.float32),
+    ):
+        if tensor.dtype != dtype:
+            raise TypeError(f"{name} must be {dtype}, got {tensor.dtype}")
+        if tensor.device != a.device or not tensor.is_contiguous():
+            raise ValueError(f"{name} must be contiguous on {a.device}")
+    if topk_ids.dtype not in (torch.int32, torch.int64):
+        raise TypeError("topk_ids must be torch.int32 or torch.int64")
+    if topk_ids.device != a.device or not topk_ids.is_contiguous():
+        raise ValueError(f"topk_ids must be contiguous on {a.device}")
+    if int(a.data_ptr()) % 16:
+        raise ValueError("input must have at least 16-byte alignment")
+
+    prepared = experts.representation_for("w4a16")
+    if prepared.trellis is None or not prepared.trellis.intermediate_hadamard:
+        raise TypeError("EXL3 roofline requires prepared intermediate-Hadamard Trellis weights")
+    if prepared.w13.device != a.device:
+        raise ValueError(f"prepared weights must be on {a.device}, got {prepared.w13.device}")
+    if (
+        prepared.gate_suh is None
+        or prepared.up_suh is None
+        or prepared.down_svh is None
+        or prepared.intermediate_rotations is None
+        or prepared.intermediate_sign_table is None
+        or prepared.intermediate_sign_patterns is None
+    ):
+        raise ValueError("EXL3 roofline requires full-rotation Trellis scale and compact sign tables")
+    if route_expert_map is not None:
+        raise ValueError("EXL3 roofline does not support route_expert_map")
+    if (
+        prepared.gate_suh.numel() != core_plan.k
+        or prepared.up_suh.data_ptr() != prepared.gate_suh.data_ptr()
+        or prepared.down_svh.numel() != core_plan.k
+    ):
+        raise ValueError(
+            "EXL3 roofline requires shared broadcast gate/up suh and down svh vectors"
+        )
+
+    launches = scratch_plan._exl3_roofline_launches
+    if not isinstance(launches, Exl3RooflineLaunches):
+        raise RuntimeError("EXL3 roofline launches were not compiled")
+
+    if output is None:
+        output_tensor = tensors["full_rotation_output"][:m]
+    else:
+        if (
+            output.device != a.device
+            or output.ndim != 2
+            or output.dtype not in (torch.bfloat16, torch.float32)
+            or tuple(output.shape) not in {(m, core_plan.k), (capacity_tokens, core_plan.k)}
+            or not output.is_contiguous()
+            or int(output.data_ptr()) % 16
+        ):
+            raise ValueError(
+                "EXL3 roofline output must be contiguous, 16-byte-aligned "
+                f"bf16/fp32[{m},{core_plan.k}] on {a.device}"
+            )
+        output_tensor = output[:m]
+
+    rot_flat = prepared.intermediate_rotations.reshape(-1)
+    packed_rot = 1 if rot_flat.numel() != core_plan.weight_E * 3 * core_plan.n else 0
+    buffers = Exl3RooflineBuffers(
+        x_rot_f16=tensors["x_rot_f16"],
+        a_scales=tensors["a_scales"],
+        intermediate_u32=tensors["intermediate_u32"],
+        fc1_accum_f32=tensors["fc1_accum_f32"],
+        y_rot_bf16=tensors["y_rot_bf16"],
+        packed_route_indices=tensors["packed_route_indices"],
+        block_expert_ids=tensors["block_expert_ids"],
+        packed_route_count=tensors["packed_route_count"],
+        expert_offsets=tensors["expert_offsets"],
+        expert_counts=tensors["expert_counts"],
+        direct_lut=(
+            launches.direct_lut
+            if launches.direct_lut is not None
+            else lut_e4m3_direct_table(a.device)
+        ),
+        w13_u32=prepared.w13.view(torch.uint32).reshape(-1),
+        w2_u32=prepared.w2.view(torch.uint32).reshape(-1),
+        rot_f16=rot_flat,
+        rot_u16=rot_flat.view(torch.uint16),
+        packed_rot=packed_rot,
+        sign_patterns=prepared.intermediate_sign_patterns.reshape(-1),
+        sign_table=prepared.intermediate_sign_table.reshape(-1),
+        gate_suh=prepared.gate_suh.reshape(-1),
+        down_svh=prepared.down_svh.reshape(-1),
+    )
+    return TPMoEFP4Binding(
+        a=a,
+        experts=experts,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        implementation="exl3_roofline",
+        state_E=core_plan.state_E,
+        weight_E=core_plan.weight_E,
+        max_rows=core_plan.max_rows,
+        k=core_plan.k,
+        n=core_plan.n,
+        num_topk=core_plan.num_topk,
+        device=core_plan.device,
+        dtype=core_plan.dtype,
+        execution_plan=scratch_plan.launch_plan,
+        output=output_tensor,
+        input_scales_static=bool(input_scales_static),
+        fast_math=True,
+        quant_mode="w4a16",
+        decode_config=scratch_plan.caps.decode_config,
+        routed_rows_capacity=core_plan.routed_rows,
+        layer_idx=layer_idx,
+        route_block_size_m=core_plan.route_block_size_m,
+        route_expert_map=route_expert_map,
+        exl3_roofline_launches=launches,
+        exl3_roofline_buffers=buffers,
+    )
+
+
 def _resolve_trellis_route_block_size(caps: TPMoEScratchCaps) -> int | None:
     """Resolve the one route geometry shared by trellis sizing and binding."""
     if caps.w4a16_block_size_m is not None:
@@ -9186,6 +9554,9 @@ def _plan_tp_moe_arena_layout_from_caps(
         raw_routes=caps.output_layout == "routes",
         w4a16_block_size_m=_resolve_trellis_route_block_size(caps),
         w4a16_prefill_fused_sum=caps.w4a16_prefill_fused_sum,
+        w4a16_fast_math=caps.w4a16_fast_math,
+        exl3_roofline=caps.exl3_roofline,
+        exl3_prefill_mode=caps.exl3_prefill_mode,
         decode_config=caps.decode_config,
     )
 
@@ -9255,6 +9626,9 @@ def plan_tp_moe_scratch(
         ),
         intermediate_hadamard=caps.weight_plan.intermediate_hadamard,
         projection_mixed_trellis=_uses_projection_mixed_trellis(caps.weight_plan),
+        exl3_roofline=caps.exl3_roofline,
+        exl3_prefill_mode=caps.exl3_prefill_mode,
+        w4a16_fast_math=caps.w4a16_fast_math,
         apply_router_weight_on_input=caps.apply_router_weight_on_input,
         collect_activation_amax=caps.collect_activation_amax,
         deterministic_output=launch_plan.deterministic_output,
@@ -9275,15 +9649,22 @@ def plan_tp_moe_scratch(
             core_plan=core_workspace_plan,
             capacity_tokens=capacity_tokens,
         )
+        exl3_roofline_launches = _plan_exl3_roofline_launches(
+            caps=caps,
+            core_plan=core_workspace_plan,
+            capacity_tokens=capacity_tokens,
+        )
     else:
         fused_launches = ()
         topk_sum_launches = ()
         mixed_trellis_launches = ()
+        exl3_roofline_launches = None
     route_pack_launches = None
     if (
         prewarm_launches
         and core_workspace_plan.full_rotation
         and not core_workspace_plan.projection_mixed_trellis
+        and not core_workspace_plan.exl3_roofline
         and core_workspace_plan.device.type == "cuda"
     ):
         from b12x.moe._shared.kernels.w4a16.route_pack import (
@@ -9318,6 +9699,7 @@ def plan_tp_moe_scratch(
         _prewarmed_fused_launches=fused_launches,
         _prewarmed_topk_sum_launches=topk_sum_launches,
         _mixed_trellis_launches=mixed_trellis_launches,
+        _exl3_roofline_launches=exl3_roofline_launches,
         _prewarmed_route_pack_launches=route_pack_launches,
     )
 
@@ -9883,6 +10265,9 @@ def materialize_tp_moe_arena_workspaces(
             ),
             intermediate_hadamard=weight_plan.intermediate_hadamard,
             projection_mixed_trellis=_uses_projection_mixed_trellis(weight_plan),
+            exl3_roofline=False,
+            exl3_prefill_mode=caps.exl3_prefill_mode,
+            w4a16_fast_math=caps.w4a16_fast_math,
             apply_router_weight_on_input=apply_router_weight_on_input,
             collect_activation_amax=collect_activation_amax,
             deterministic_output=plan.deterministic_output,
@@ -13701,6 +14086,28 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             mixed_buffers,
         )
         return _finalize_trellis_output(binding, result)
+    if binding.implementation == "exl3_roofline":
+        from b12x.moe._shared.kernels.exl3_roofline_launch import (
+            Exl3RooflineBuffers,
+            Exl3RooflineLaunches,
+            run_exl3_roofline_moe,
+        )
+
+        exl3_launches = binding.exl3_roofline_launches
+        exl3_buffers = binding.exl3_roofline_buffers
+        if not isinstance(exl3_launches, Exl3RooflineLaunches):
+            raise TypeError("EXL3 roofline binding is missing compiled launches")
+        if not isinstance(exl3_buffers, Exl3RooflineBuffers):
+            raise TypeError("EXL3 roofline binding is missing scratch buffers")
+        return run_exl3_roofline_moe(
+            a=binding.a,
+            topk_weights=binding.topk_weights,
+            topk_ids=binding.topk_ids,
+            output=_require_binding_field(binding, "output"),
+            launches=exl3_launches,
+            buffers=exl3_buffers,
+            route_expert_map=binding.route_expert_map,
+        )
     plan = binding.execution_plan
     if plan is None:
         raise RuntimeError(
