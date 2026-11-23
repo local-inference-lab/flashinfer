@@ -204,9 +204,11 @@ def _eager_storage_shards(
     return base_shards + tagged_incoming + plain_payload_incoming
 
 
-def _payload_ready_supported(*, device, exchange_group, world_size):
+def _payload_ready_capability(
+    *, device, exchange_group, world_size
+) -> tuple[bool, int]:
     if world_size not in SUPPORTED_WORLD_SIZES:
-        return False
+        return False, ONESHOT_REQUIRED_SMS
     capability = _run_collective_preallocation_setup(
         owner="PCIe sentinel capability",
         exchange_group=exchange_group,
@@ -216,10 +218,20 @@ def _payload_ready_supported(*, device, exchange_group, world_size):
         ),
     )
     capabilities = _broadcast_gather_object(capability, exchange_group)
-    return all(
+    supported = all(
         int(major) >= 8 and int(sms) >= ONESHOT_REQUIRED_SMS
         for major, _minor, sms in capabilities
     )
+    if not supported:
+        return False, ONESHOT_REQUIRED_SMS
+    max_blocks = min(64, min(int(sms) for _major, _minor, sms in capabilities))
+    return True, max(ONESHOT_REQUIRED_SMS, max_blocks)
+
+
+def _payload_ready_supported(*, device, exchange_group, world_size):
+    return _payload_ready_capability(
+        device=device, exchange_group=exchange_group, world_size=world_size
+    )[0]
 
 
 def _transport_policy_contract() -> tuple[bool, bool, bool, bool, bool]:
@@ -300,6 +312,39 @@ def _validate_plain_io(inp: torch.Tensor, out: torch.Tensor) -> None:
     if source != output and source < output + nbytes and output < source + nbytes:
         raise ValueError(
             "plain oneshot input and output must be exact aliases or disjoint"
+        )
+
+
+def _validate_plain_addend(
+    inp: torch.Tensor, out: torch.Tensor, addend: torch.Tensor
+) -> None:
+    if addend.device != inp.device:
+        raise ValueError("addend tensor must be on the same device as the input")
+    if addend.shape != inp.shape or addend.dtype != inp.dtype:
+        raise ValueError("addend tensor must match input shape and dtype")
+    if addend.data_ptr() % 16 or not _is_weak_contiguous(addend):
+        raise ValueError(
+            "plain oneshot addend must be 16-byte aligned and weak-contiguous"
+        )
+    if inp.numel() == 0:
+        return
+    if any(
+        size > 1 and addend_stride != source_stride
+        for size, source_stride, addend_stride in zip(
+            inp.shape, inp.stride(), addend.stride(), strict=True
+        )
+    ):
+        raise ValueError("plain oneshot addend must match input physical traversal")
+    addend_ptr = addend.data_ptr()
+    output_ptr = out.data_ptr()
+    nbytes = inp.numel() * inp.element_size()
+    if (
+        addend_ptr != output_ptr
+        and addend_ptr < output_ptr + nbytes
+        and output_ptr < addend_ptr + nbytes
+    ):
+        raise ValueError(
+            "plain oneshot addend and output must be exact aliases or disjoint"
         )
 
 
@@ -2379,10 +2424,12 @@ class PCIeOneshotAllReduce:
                 exchange_group=self.exchange_group,
             )
 
-            self._sentinel_supported = _payload_ready_supported(
-                device=self.device,
-                exchange_group=self.exchange_group,
-                world_size=self.world_size,
+            self._sentinel_supported, self._payload_ready_max_blocks = (
+                _payload_ready_capability(
+                    device=self.device,
+                    exchange_group=self.exchange_group,
+                    world_size=self.world_size,
+                )
             )
 
             def prepare() -> tuple[Optional[CudaRTLibrary], object]:
@@ -2454,8 +2501,10 @@ class PCIeOneshotAllReduce:
         ext_module,
         stream_affine: bool,
         sentinel_supported: bool = False,
+        payload_ready_max_blocks: int = ONESHOT_REQUIRED_SMS,
     ) -> None:
         self._sentinel_supported = bool(sentinel_supported)
+        self._payload_ready_max_blocks = int(payload_ready_max_blocks)
         self.rank = int(rank)
         self.world_size = int(world_size)
         self.device = device
@@ -2663,7 +2712,7 @@ class PCIeOneshotAllReduce:
             exchange_group=exchange_group,
         )
 
-        sentinel_supported = _payload_ready_supported(
+        sentinel_supported, payload_ready_max_blocks = _payload_ready_capability(
             device=device_obj, exchange_group=exchange_group, world_size=world_size
         )
 
@@ -2720,6 +2769,7 @@ class PCIeOneshotAllReduce:
             ext_module=ext,
             stream_affine=stream_affine,
             sentinel_supported=sentinel_supported,
+            payload_ready_max_blocks=payload_ready_max_blocks,
         )
 
         def abort_native_runtime() -> None:
@@ -3253,16 +3303,32 @@ class PCIeOneshotAllReduce:
             raise RuntimeError("oneshot slot variant was not prepared") from exc
 
     def _run_prepared_plain(
-        self, inp: torch.Tensor, out: torch.Tensor, query, launchers
+        self,
+        inp: torch.Tensor,
+        out: torch.Tensor,
+        query,
+        launchers,
+        *,
+        addend: Optional[torch.Tensor] = None,
     ) -> None:
         launcher, state = self._prepared_launcher(launchers, inp)
         call = query.call
+        has_addend = bool(call.get("has_addend", False))
+        if has_addend:
+            if addend is None:
+                raise ValueError(
+                    "fused addend all-reduce plan requires an addend tensor"
+                )
+            _validate_plain_addend(inp, out, addend)
+        elif addend is not None:
+            raise ValueError("plain all-reduce plan does not accept an addend tensor")
         plan = state.plain_graph_plans.get(self._ext._plain_graph_plan_key(inp))
         if plan is None:
             raise RuntimeError(
                 "oneshot graph resources were not bound during preparation"
             )
         table_address, _ = self._ext._select_table(state, inp.data_ptr())
+        kwargs = {"addend_address": addend.data_ptr()} if has_addend else {}
         with torch.cuda.device(inp.device):
             launcher(
                 table_address,
@@ -3278,6 +3344,7 @@ class PCIeOneshotAllReduce:
                 int(state.eager_buffer_bytes or 0) // 16,
                 *plan.remote_push_slot_ptrs,
                 call["blocks"] if state.device_slot_selection else call["eager_blocks"],
+                **kwargs,
             )
 
     def _run_prepared_fused(
@@ -3851,10 +3918,12 @@ class PCIeOneshotAllReducePool:
                 exchange_group=self.exchange_group,
             )
 
-            self._sentinel_supported = _payload_ready_supported(
-                device=self.device,
-                exchange_group=self.exchange_group,
-                world_size=self.world_size,
+            self._sentinel_supported, self._payload_ready_max_blocks = (
+                _payload_ready_capability(
+                    device=self.device,
+                    exchange_group=self.exchange_group,
+                    world_size=self.world_size,
+                )
             )
             self._eager_storage_shards = _eager_storage_shards(
                 self.world_size,
@@ -3995,6 +4064,9 @@ class PCIeOneshotAllReducePool:
             ext_module=self._ext,
             stream_affine=not self.single_channel,
             sentinel_supported=self._sentinel_supported,
+            payload_ready_max_blocks=getattr(
+                self, "_payload_ready_max_blocks", ONESHOT_REQUIRED_SMS
+            ),
         )
 
         def abort_native_runtime() -> None:

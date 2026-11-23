@@ -312,6 +312,7 @@ def query_from_metadata(
     zero_centered: bool = False,
     reduction_dtype: torch.dtype | None = None,
     input_addend: bool = False,
+    has_addend: bool = False,
     group_size: int = 0,
     group_id_limit: int = 0,
     group_ids_dtype: str = "int32",
@@ -344,7 +345,14 @@ def query_from_metadata(
     stage_input = native.eager_tables is not None
     variants = ((False, 0), (True, 0), (True, 1)) if stage_input else ((False, 0),)
     if surface in _PLAIN_SURFACES:
+        if has_addend:
+            if not stage_input or dtype != torch.bfloat16:
+                raise ValueError(
+                    "fused input addend requires staged BF16 plain oneshot storage"
+                )
         launcher = _plain_launcher_metadata(backend, native, tensor)
+        if has_addend:
+            launcher["has_addend"] = True
         registered = not launcher["stage_input"]
     else:
         if (input_addend or group_size) and not stage_input:
@@ -425,6 +433,9 @@ def query_from_metadata(
         "registered": registered,
         "variants": variants,
     }
+    payload_ready_max_blocks = int(getattr(runtime, "_payload_ready_max_blocks", 36))
+    if payload_ready_max_blocks > 36:
+        setup["payload_ready_max_blocks"] = payload_ready_max_blocks
     return PcieQuery(
         surface=surface,
         world_size=int(runtime.world_size),
@@ -471,7 +482,14 @@ def query_from_runtime(runtime, *, surface, call) -> PcieQuery:
     stage_input = native.eager_tables is not None
     variants = ((False, 0), (True, 0), (True, 1)) if stage_input else ((False, 0),)
     if surface in _PLAIN_SURFACES:
+        has_addend = bool(values.get("has_addend", False))
+        if has_addend and (not stage_input or inp.dtype != torch.bfloat16):
+            raise ValueError(
+                "fused input addend requires staged BF16 plain oneshot storage"
+            )
         launcher = _plain_launcher_metadata(backend, native, inp)
+        if has_addend:
+            launcher["has_addend"] = True
     else:
         input_addend = _check_input_addend(inp, values.get("input_addend"))
         if (input_addend or group_size) and not stage_input:
@@ -542,6 +560,9 @@ def query_from_runtime(runtime, *, surface, call) -> PcieQuery:
         "registered": not stage_input,
         "variants": variants,
     }
+    payload_ready_max_blocks = int(getattr(runtime, "_payload_ready_max_blocks", 36))
+    if payload_ready_max_blocks > 36:
+        setup["payload_ready_max_blocks"] = payload_ready_max_blocks
     return PcieQuery(
         surface=surface,
         world_size=int(runtime.world_size),
@@ -581,6 +602,7 @@ def compile_oneshot_surface(query_payload, ordinal):
                     call["transport"] if variant[0] else call["eager_transport"],
                     call["threads"] if variant[0] else call["eager_threads"],
                     call["device_index"],
+                    has_addend=bool(call.get("has_addend", False)),
                 )
                 for variant in variants
             }
@@ -676,9 +698,13 @@ class _OneshotExecutionState:
                 return
             raise RuntimeError("oneshot plan was not bound during preparation")
 
-    def run_plain(self, inp, out):
+    def run_plain(self, inp, out, addend=None):
         _validate_plain_io(inp, out)
         self._require_bound_input(inp)
+        if addend is not None:
+            return self.runtime._run_prepared_plain(
+                inp, out, self.query, self.launchers, addend=addend
+            )
         return self.runtime._run_prepared_plain(inp, out, self.query, self.launchers)
 
     def run_fused(

@@ -247,6 +247,35 @@ def test_plain_buckets_follow_bytes_and_preserve_collective_semantics():
     assert twoshot("push").grid == twoshot("pull").grid
     assert twoshot("push").identity != twoshot("pull").identity
 
+    plain_addend = SimpleNamespace(
+        operation="all_reduce",
+        world_size=4,
+        inplace=False,
+        alternatives={
+            "remote_push_rsag": dict(
+                surface="OneshotAllReduce.all_reduce",
+                topology="pcie_ipc",
+                call=dict(dtype="bfloat16", stage_input=True, has_addend=True),
+                setup=dict(shape=(32, 5120), payload_ready_max_blocks=64),
+            )
+        },
+    )
+    plain_no_addend = SimpleNamespace(
+        operation="all_reduce",
+        world_size=4,
+        inplace=False,
+        alternatives={
+            "remote_push_rsag": dict(
+                surface="OneshotAllReduce.all_reduce",
+                topology="pcie_ipc",
+                call=dict(dtype="bfloat16", stage_input=True),
+                setup=dict(shape=(32, 5120), payload_ready_max_blocks=64),
+            )
+        },
+    )
+    assert _bucket(plain_addend).grid == _bucket(plain_no_addend).grid
+    assert _bucket(plain_addend).identity != _bucket(plain_no_addend).identity
+
 
 @pytest.mark.parametrize("pairwise", (False, True), ids=("oneshot", "twoshot_pairwise"))
 def test_tp4_allreduce_reuses_complete_interval_winner(tmp_path, host_races, pairwise):

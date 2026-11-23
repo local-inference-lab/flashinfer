@@ -490,7 +490,7 @@ class PCIeAllReduce:
         override: PcieConfig | CollectiveConfig | None = None,
         joint_only: bool = False,
         joint_cluster_size: int = 1,
-        joint_has_addend: bool = False,
+        has_addend: bool = False,
         **call,
     ) -> Plan:
         """Select an existing native channel once, then declare its plan.
@@ -509,6 +509,10 @@ class PCIeAllReduce:
             raise ValueError(
                 "clustered joint planning requires joint_only=True and plain all_reduce"
             )
+        if has_addend and (joint_only or operation != "all_reduce"):
+            raise ValueError(
+                "fused input addend requires static plain all_reduce planning"
+            )
 
         if operation not in (
             "all_reduce",
@@ -523,10 +527,11 @@ class PCIeAllReduce:
             )
 
             target = self._runtime._prepared_channel_for_stream(stream, channel_id)
+            addend_call = {"has_addend": True} if has_addend else {}
             query = query_from_runtime(
                 target,
                 surface=f"OneshotAllReduce.{operation}",
-                call={"inp": inp, **call},
+                call={"inp": inp, **addend_call, **call},
             )
             if query.call["stage_input"]:
                 alternatives = oneshot_alternatives(query, target)
@@ -550,7 +555,7 @@ class PCIeAllReduce:
                     native = query_from_runtime(
                         twoshot,
                         surface="PCIeTwoShotBF16.all_reduce",
-                        call={"inp": inp, **call},
+                        call={"inp": inp, **addend_call, **call},
                     )
                     alternatives["twoshot"] = (native, twoshot)
                     if (
@@ -591,20 +596,9 @@ class PCIeAllReduce:
                         )
                     if default not in alternatives:
                         default = next(iter(alternatives))
-                    if joint_cluster_size != 1 or joint_has_addend:
+                    if joint_cluster_size != 1:
                         from dataclasses import replace
 
-                        extra_call = {}
-                        if joint_cluster_size != 1:
-                            extra_call.update(
-                                {
-                                    "joint_cluster_size": joint_cluster_size,
-                                    "threads": 512,
-                                    "blocks": 64,
-                                }
-                            )
-                        if joint_has_addend:
-                            extra_call["has_addend"] = True
                         alternatives = {
                             name: (
                                 replace(
@@ -612,7 +606,9 @@ class PCIeAllReduce:
                                     call=FrozenMapping(
                                         {
                                             **native.call,
-                                            **extra_call,
+                                            "joint_cluster_size": joint_cluster_size,
+                                            "threads": 512,
+                                            "blocks": 64,
                                         }
                                     ),
                                 ),
@@ -630,6 +626,10 @@ class PCIeAllReduce:
         if joint_only:
             raise ValueError(
                 "joint-only planning requires a staged all-peer BF16 collective"
+            )
+        if has_addend:
+            raise ValueError(
+                "fused input addend requires a single-channel staged BF16 all-reduce"
             )
         if operation == "all_reduce" and self._use_bf16_twoshot(inp, call.get("out")):
             query = query_from_runtime(
@@ -668,12 +668,11 @@ class PCIeAllReduce:
     ) -> torch.Tensor:
         state = require_prepared(plan, "comm.pcie", inp.device)
         if self._bf16_twoshot is not None and state.runtime is self._bf16_twoshot:
-            if addend is not None:
-                raise ValueError("two-shot all-reduce does not support fused addend")
             if peer_input_ptrs is not None or blocks is not None:
                 raise ValueError(
                     "two-shot all-reduce uses its prepared staging and launch geometry"
                 )
+            addend_kwargs = {"addend": addend} if addend is not None else {}
             if stream is not None:
                 with torch.cuda.stream(stream):
                     return self._bf16_twoshot.all_reduce(
@@ -682,6 +681,7 @@ class PCIeAllReduce:
                         out=out,
                         threads=state.query.call["threads"],
                         block_limit=state.query.call["block_limit"],
+                        **addend_kwargs,
                     )
             return self._bf16_twoshot.all_reduce(
                 inp,
@@ -689,6 +689,7 @@ class PCIeAllReduce:
                 out=out,
                 threads=state.query.call["threads"],
                 block_limit=state.query.call["block_limit"],
+                **addend_kwargs,
             )
         if self.algorithm == "hierarchical":
             if addend is not None:

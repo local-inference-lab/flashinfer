@@ -40,13 +40,18 @@ def selected_gather_profile(transport, blocks, mode, active):
     ):
         raise ValueError("phased gather requires one complete eight-CTA cluster")
     if transport == "selected_recursive_pix_last":
-        if not ((blocks == 8 and active == 8) or (blocks == 16 and active in (8, 16))):
+        if not (
+            (blocks == 8 and active == 8)
+            or (blocks == 16 and active in (8, 16))
+        ):
             raise ValueError(
                 "pix-last recursive gather requires 8/8 or 16/(8|16) physical/active CTAs"
             )
     elif transport == "selected_ring":
         if not ((blocks == 8 and active == 8) or (blocks == 16 and active == 16)):
-            raise ValueError("ring gather requires 8/8 or 16/16 physical/active CTAs")
+            raise ValueError(
+                "ring gather requires 8/8 or 16/16 physical/active CTAs"
+            )
     elif transport == "selected_switch_push":
         if not ((blocks == 8 and active == 8) or (blocks == 16 and active in (8, 16))):
             raise ValueError(
@@ -57,7 +62,9 @@ def selected_gather_profile(transport, blocks, mode, active):
         "selected_recursive_ready",
         "selected_recursive_outer_first",
     ) and (blocks != 8 or active != 8):
-        raise ValueError("recursive gathers require eight active and physical CTAs")
+        raise ValueError(
+            "recursive gathers require eight active and physical CTAs"
+        )
     return (int(mode == "word_exchange") << 16) | active
 
 
@@ -85,17 +92,6 @@ def validate_query(query):
             "selected gather shape exceeds or differs from its channel geometry"
         )
     transport = call["gather_transport"]
-    has_gate = call.get("has_gate", False)
-    if type(has_gate) is not bool:
-        raise ValueError("selected gather has_gate must be a bool")
-    if has_gate and transport not in (
-        "joint",
-        "selected_barrier",
-        "selected_word_exchange",
-    ):
-        raise ValueError(
-            "gated selected gather requires joint, barrier, or word_exchange transport"
-        )
     selected_gather_profile(
         transport, call["block_limit"], call["submode"], call["active_blocks"]
     )
@@ -192,46 +188,12 @@ class SelectedGatherState:
         if runtime is not self.runtime:
             raise ValueError("selected gather plan belongs to a different channel")
 
-    def run_selected(self, source, output, gate=None):
-        """Launch a prepared selected gather.
-
-        When ``has_gate`` is enabled, ``gate[0]`` is a collective decision that
-        must have the same zero/nonzero truth value on every participating rank
-        (CUDA-graph-captured skips avoid host sync or extra barriers).
-        """
+    def run_selected(self, source, output):
         c, runtime = self.query.call, self.runtime
         if tuple(source.shape) != tuple(c["shape"]) or str(source.dtype) != c["dtype"]:
             raise ValueError(
                 "selected gather input differs from the prepared shape or dtype"
             )
-        has_gate = bool(c.get("has_gate", False))
-        if has_gate:
-            if (
-                gate is None
-                or gate.device != runtime.device
-                or gate.dtype not in (torch.int32, torch.uint32)
-                or gate.numel() < 1
-                or not gate.is_contiguous()
-                or gate.data_ptr() % 4
-            ):
-                raise ValueError(
-                    "gated selected gather requires a contiguous aligned int32 CUDA gate"
-                )
-            gate_bytes = gate.numel() * gate.element_size()
-            if (
-                gate.data_ptr() < output.data_ptr() + output.nbytes
-                and output.data_ptr() < gate.data_ptr() + gate_bytes
-            ):
-                raise ValueError(
-                    "gated selected gather requires gate storage disjoint from output"
-                )
-            gate_address = gate.data_ptr()
-        else:
-            if gate is not None:
-                raise ValueError(
-                    "ungated selected gather does not accept a gate tensor"
-                )
-            gate_address = None
         barrier = "barrier" in GATHER_MODES[c["gather_transport"]]
         if barrier and not runtime._device_slot_selection:
             # Selected barrier kernels retire device epochs even in eager warmup.
@@ -239,7 +201,7 @@ class SelectedGatherState:
             runtime._graph_base_slot = runtime._next_slot & 1
             runtime._device_slot_selection = True
         bank = runtime._graph_base_slot if barrier else 0
-        args = (
+        self.launcher(
             source.data_ptr(),
             output.data_ptr(),
             self.selector.data_ptr(),
@@ -250,20 +212,15 @@ class SelectedGatherState:
             runtime._exchange_offset,
             runtime._exchange_counter_offset,
         )
-        if gate_address is not None:
-            self.launcher(*args, gate_address=gate_address)
-        else:
-            self.launcher(*args)
         return output
 
-    def run(self, *, local_input, out, gate=None):
+    def run(self, *, local_input, out):
         return self.runtime._all_gather_heads_on_device(
             local_input,
             out,
             state=self,
             threads=self.query.call["threads"],
             block_limit=self.query.call["block_limit"],
-            gate=gate,
         )
 
 
@@ -291,7 +248,6 @@ def plan(query, *, runtime, invocation, override):
             raise ValueError(f"selected gather {field} differs from its runtime owner")
     c = query.call
     element = 1 if c["dtype"] == "torch.float8_e4m3fn" else 2
-    has_gate = bool(c.get("has_gate", False))
     args = (
         query.world_size,
         query.rank,
@@ -300,7 +256,6 @@ def plan(query, *, runtime, invocation, override):
         c["block_limit"],
         query.setup["exchange_chunks"],
         c["gather_transport"].removeprefix("selected_"),
-        has_gate,
     )
 
     def materialize(selection, device):
@@ -403,8 +358,6 @@ def startup_spec(plan, profiles):
         state.runtime._exchange_chunks,
         pairs,
     )
-    if c.get("has_gate", False):
-        key += (("has_gate", True),)
     return JointStartupSpec(key, pairs, state.selector, state, False, state.query.rank)
 
 

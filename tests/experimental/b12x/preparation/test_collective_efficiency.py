@@ -118,3 +118,25 @@ def test_small_and_decode_payloads_keep_the_complete_search(packs):
 def test_nonexpanded_plain_surfaces_are_unaffected(changes):
     value = query(1 << 26, **changes)
     assert candidates(value, "default") == candidates(value, "audit")
+
+
+def test_payload_ready_max_blocks_expands_only_payload_ready_protocols():
+    from b12x.comm.pcie.pcie_oneshot import _MAX_BLOCKS
+
+    base = query(20480, world=4)
+    expanded = replace(
+        base,
+        alternatives=FrozenMapping(
+            {
+                name: {**payload, "setup": {"payload_ready_max_blocks": 64}}
+                for name, payload in base.alternatives.items()
+            }
+        ),
+    )
+    configs = candidates(expanded, "default")
+    for name in ("remote_push_full", "remote_push_rsag"):
+        blocks = {c.blocks for c in configs if c.implementation == name}
+        assert 64 in blocks and max(blocks) == 64
+    for name in ("pull", "remote_push_ll", "remote_push_simple"):
+        blocks = {c.blocks for c in configs if c.implementation == name}
+        assert max(blocks) == _MAX_BLOCKS

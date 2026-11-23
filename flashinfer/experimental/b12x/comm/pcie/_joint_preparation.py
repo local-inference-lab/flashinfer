@@ -108,29 +108,20 @@ def _workspace(runtime):
 
 
 @program_cache(scope="preparation")
-def compile_joint(family, world, rank, threads, max_blocks, ordinal, has_addend=False):
+def compile_joint(family, world, rank, threads, max_blocks, ordinal):
     from ._joint_cute import get_joint_launcher
 
-    return get_joint_launcher(
-        family, world, rank, threads, max_blocks, ordinal, has_addend=has_addend
-    )
+    return get_joint_launcher(family, world, rank, threads, max_blocks, ordinal)
 
 
 @program_cache(scope="preparation")
 def compile_joint_cluster(
-    family, world, rank, threads, max_blocks, cluster_size, ordinal, has_addend=False
+    family, world, rank, threads, max_blocks, cluster_size, ordinal
 ):
     from ._joint_cluster_cute import get_joint_cluster_launcher
 
     return get_joint_cluster_launcher(
-        family,
-        world,
-        rank,
-        threads,
-        max_blocks,
-        cluster_size,
-        ordinal,
-        has_addend=has_addend,
+        family, world, rank, threads, max_blocks, cluster_size, ordinal
     )
 
 
@@ -203,7 +194,7 @@ class _JointExecutionState(_OneshotExecutionState):
         self.selector.fill_(selected)
         torch.cuda.synchronize(self.runtime.device)
 
-    def run_plain(self, inp, out, addend=None):
+    def run_plain(self, inp, out):
         if self.runtime._closed:
             raise RuntimeError("runtime is closed")
         if not self._bound:
@@ -211,20 +202,6 @@ class _JointExecutionState(_OneshotExecutionState):
         self.runtime._check_stream()
         self._check_input(inp)
         _validate_plain_io(inp, out)
-        has_addend = bool(self.query.call.get("has_addend", False))
-        if has_addend:
-            if addend is None:
-                raise ValueError(
-                    "fused-addend joint all-reduce requires an addend tensor"
-                )
-            _validate_plain_io(addend, out)
-            add_ptr = addend.data_ptr()
-        else:
-            if addend is not None:
-                raise ValueError(
-                    "plain joint all-reduce does not accept an addend tensor"
-                )
-            add_ptr = inp.data_ptr()
         work = self.workspace
         with torch.cuda.device(self.runtime.device):
             self.launcher(
@@ -236,14 +213,12 @@ class _JointExecutionState(_OneshotExecutionState):
                 out.data_ptr(),
                 self.query.call["size_packs"],
                 work.capacity_packs,
-                addend_address=add_ptr,
             )
 
 
 def plan(query, *, runtime, override=None):
     call = query.call
     cluster_size = call.get("joint_cluster_size", 1)
-    has_addend = bool(call.get("has_addend", False))
     from ._joint_profile import validate_cluster_geometry
 
     validate_cluster_geometry(call["blocks"], call["threads"], cluster_size)
@@ -269,9 +244,7 @@ def plan(query, *, runtime, override=None):
 
     def materialize(selection, device):
         if cluster_size == 1:
-            launcher = load_programs(
-                compile_joint(*args, device.ordinal, has_addend=has_addend)
-            )
+            launcher = load_programs(compile_joint(*args, device.ordinal))
         else:
             from ._joint_cluster_cute import validate_cluster_residency
 
@@ -279,9 +252,7 @@ def plan(query, *, runtime, override=None):
                 call["blocks"], call["threads"], cluster_size, device.identity
             )
             launcher = load_programs(
-                compile_joint_cluster(
-                    *args, cluster_size, device.ordinal, has_addend=has_addend
-                )
+                compile_joint_cluster(*args, cluster_size, device.ordinal)
             )
             validate_cluster_residency(
                 launcher, call["blocks"], call["threads"], cluster_size
@@ -300,7 +271,6 @@ def plan(query, *, runtime, override=None):
                 *args,
                 *((cluster_size,) if cluster_size != 1 else ()),
                 CompileJob.DEVICE_ORDINAL,
-                has_addend,
             ),
         ),
         _memory_requirements=lambda config, device: MemoryRequirements(

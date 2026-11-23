@@ -213,7 +213,11 @@ def _parameters(query, device):
     override = query.codegen.get("wo_b_fused_tile", "")
     mxfp8_tiles = (0, int(override.split("x")[1])) if override else (0, 64, 128)
     mxfp8_tiles = mxfp8_tiles if _decode_domain(query) else (0,)
-    a16_ok = _a16_tc_gemv_eligible(query, device)
+    a16_ok = (
+        _a16_tc_gemv_eligible(query, device)
+        and query.operation == "inv_rope"
+        and query.cos_sin_dtype == "float32"
+    )
     a16_tiles = (16, 32) if query.max_tokens >= 17 else (16,)
     a16_splits = (
         (1, 2)

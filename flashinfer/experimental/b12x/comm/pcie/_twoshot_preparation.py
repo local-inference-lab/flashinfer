@@ -191,31 +191,37 @@ def query_from_runtime(runtime, *, surface: str, call) -> PcieQuery:
         if output.device != runtime.device:
             raise ValueError("two-shot output device differs from runtime")
     _validate_geometry(runtime, operation, payload, scale, output)
-    call_metadata = FrozenMapping(
-        {
-            "operation": operation,
-            "dtype": dtype,
-            "scale_dtype": scale_dtype,
-            "rows": int(rows),
-            "row_elems": int(runtime.row_elems),
-            "shape": tuple(payload.shape),
-            "stride": tuple(payload.stride()),
-            "alignment": _alignment(payload),
-            "scale_shape": scale_shape,
-            "scale_stride": scale_stride,
-            "scale_alignment": scale_alignment,
-            "output_shape": None if output is None else tuple(output.shape),
-            "output_stride": None if output is None else tuple(output.stride()),
-            "output_dtype": None
-            if output is None
-            else str(output.dtype).removeprefix("torch."),
-            "output_alignment": None if output is None else _alignment(output),
-            "transport": transport,
-            "threads": threads,
-            "block_limit": block_limit,
-            "device_slot_variants": ((False, 0), (True, 0), (True, 1)),
-        }
-    )
+    has_addend = bool(values.get("has_addend", False))
+    if has_addend and surface != "PCIeTwoShotBF16.all_reduce":
+        raise ValueError(
+            "two-shot fused addend is only supported on PCIeTwoShotBF16.all_reduce"
+        )
+    call_dict = {
+        "operation": operation,
+        "dtype": dtype,
+        "scale_dtype": scale_dtype,
+        "rows": int(rows),
+        "row_elems": int(runtime.row_elems),
+        "shape": tuple(payload.shape),
+        "stride": tuple(payload.stride()),
+        "alignment": _alignment(payload),
+        "scale_shape": scale_shape,
+        "scale_stride": scale_stride,
+        "scale_alignment": scale_alignment,
+        "output_shape": None if output is None else tuple(output.shape),
+        "output_stride": None if output is None else tuple(output.stride()),
+        "output_dtype": None
+        if output is None
+        else str(output.dtype).removeprefix("torch."),
+        "output_alignment": None if output is None else _alignment(output),
+        "transport": transport,
+        "threads": threads,
+        "block_limit": block_limit,
+        "device_slot_variants": ((False, 0), (True, 0), (True, 1)),
+    }
+    if has_addend:
+        call_dict["has_addend"] = True
+    call_metadata = FrozenMapping(call_dict)
     # _OwnedSharedBuffer stores only pointers.  The pointer delta is exactly
     # the aligned signal prefix, followed by both fixed protocol slots.
     setup = FrozenMapping(
@@ -370,6 +376,7 @@ def compile_twoshot_surface(query_payload, ordinal: int):
             get_twoshot_bf16_launcher,
         )
 
+        has_addend = bool(call.get("has_addend", False))
         if call["transport"] == "pull":
             # One launch stages locally, then reads peer slabs for the reduction
             # and for the reduced shards.
@@ -383,6 +390,7 @@ def compile_twoshot_surface(query_payload, ordinal: int):
                         int(call["threads"]),
                         int(call["row_elems"]),
                         int(ordinal),
+                        has_addend=has_addend,
                     )
                 )
                 for device_slot, bias in call["device_slot_variants"]
@@ -406,6 +414,7 @@ def compile_twoshot_surface(query_payload, ordinal: int):
                 int(call["row_elems"]),
                 int(ordinal),
                 bool(call.get("payload_schedule") == "pairwise"),
+                has_addend=has_addend and operation == "reduce_scatter",
             )
             for operation in operations
             for device_slot, bias in call["device_slot_variants"]
@@ -439,13 +448,20 @@ class _TwoShotExecutionState:
                 "two-shot prepared plan misses requested slot launcher"
             ) from exc
 
-    def run(self, payload, scale, out, *, threads: int, block_limit: int):
+    def run(self, payload, scale, out, *, threads: int, block_limit: int, addend=None):
         self.require_runtime(self.runtime)
         call = self.query.call
+        has_addend = bool(call.get("has_addend", False))
+        if has_addend and addend is None:
+            raise ValueError("fused addend two-shot plan requires an addend tensor")
+        if not has_addend and addend is not None:
+            raise ValueError("two-shot plan does not accept an addend tensor")
         bindings = [
             ("payload", payload, call["dtype"]),
             ("output", out, call["output_dtype"] or "bfloat16"),
         ]
+        if has_addend:
+            bindings.append(("addend", addend, call["dtype"]))
         if call["scale_shape"] is not None:
             bindings.append(("scale", scale, call["scale_dtype"]))
         for name, tensor, dtype in bindings:
@@ -461,6 +477,16 @@ class _TwoShotExecutionState:
             call["alignment"],
         ):
             raise ValueError("two-shot payload metadata differs from preparation")
+        if has_addend and (
+            tuple(addend.shape),
+            tuple(addend.stride()),
+            _alignment(addend),
+        ) != (
+            tuple(call["shape"]),
+            tuple(call["stride"]),
+            call["alignment"],
+        ):
+            raise ValueError("two-shot addend metadata differs from preparation")
         if call["scale_shape"] is not None and (
             scale is None
             or (tuple(scale.shape), tuple(scale.stride()), _alignment(scale))
@@ -501,6 +527,9 @@ class _TwoShotExecutionState:
                     payload,
                     source_name="input" if operation == "all_reduce" else "payload",
                 )
+            if has_addend and out.data_ptr() != addend.data_ptr():
+                _require_disjoint(out, addend, source_name="addend")
+        addend_kwargs = {"addend": addend} if has_addend else {}
         return self.runtime._launch_prepared(
             payload,
             scale,
@@ -508,10 +537,13 @@ class _TwoShotExecutionState:
             state=self,
             threads=threads,
             block_limit=block_limit,
+            **addend_kwargs,
         )
 
 
-def prepared_call(state: object, *, payload, out, scale=None) -> PreparedCall:
+def prepared_call(
+    state: object, *, payload, out, scale=None, addend=None
+) -> PreparedCall:
     """Prime the actual collective against caller-owned source/output buffers."""
     if not isinstance(state, _TwoShotExecutionState):
         raise TypeError("two-shot prepared call requires materialized state")
@@ -526,6 +558,7 @@ def prepared_call(state: object, *, payload, out, scale=None) -> PreparedCall:
         if scale is not None:
             raise TypeError("BF16 two-shot priming does not accept scale")
         run_scale = None
+    addend_kwargs = {"addend": addend} if addend is not None else {}
     return PreparedCall(
         run=lambda: state.run(
             payload,
@@ -533,6 +566,7 @@ def prepared_call(state: object, *, payload, out, scale=None) -> PreparedCall:
             out,
             threads=state.query.call["threads"],
             block_limit=state.query.call["block_limit"],
+            **addend_kwargs,
         ),
         output=out,
         capture_safe=False,

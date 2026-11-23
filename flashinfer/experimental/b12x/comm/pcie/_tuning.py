@@ -175,6 +175,13 @@ def _validate_query(query: PcieQuery, device) -> None:
         transport = query.call.get("gather_transport", "barrier")
         from ._gather_preparation import GATHER_MODES, validate_query as validate_gather
 
+        has_gate = query.call.get("has_gate", False)
+        if type(has_gate) is not bool:
+            raise ValueError("all_gather_heads has_gate must be a bool")
+        if has_gate and transport not in ("barrier", "word_exchange"):
+            raise ValueError(
+                "gated all_gather_heads requires barrier or word_exchange transport"
+            )
         if transport in GATHER_MODES:
             validate_gather(query)
         elif transport not in ("barrier", "word_exchange"):

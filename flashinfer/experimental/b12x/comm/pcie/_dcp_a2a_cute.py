@@ -162,7 +162,8 @@ def _subset_pair_barrier(
             cute.arch.store(self_ptr, value)
             slot = Int64(value % Uint32(2))
             common_index = Int64(max_blocks * _MAX_RANKS) + (
-                (slot * Int64(max_blocks) + Int64(bidx)) * Int64(_MAX_RANKS * _FLAG_STRIDE)
+                (slot * Int64(max_blocks) + Int64(bidx))
+                * Int64(_MAX_RANKS * _FLAG_STRIDE)
             )
             peer_index = common_index + Int64(rank * _FLAG_STRIDE)
             _store_relaxed_sys_u32(signals[peer] + peer_index, value)
@@ -172,7 +173,8 @@ def _subset_pair_barrier(
             value = Uint32(cute.arch.load(self_signal + self_index, Uint32))
             slot = Int64(value % Uint32(2))
             common_index = Int64(max_blocks * _MAX_RANKS) + (
-                (slot * Int64(max_blocks) + Int64(bidx)) * Int64(_MAX_RANKS * _FLAG_STRIDE)
+                (slot * Int64(max_blocks) + Int64(bidx))
+                * Int64(_MAX_RANKS * _FLAG_STRIDE)
             )
             mine_index = common_index + Int64(peer * _FLAG_STRIDE)
             observed = _load_acquire_sys_u32(self_signal + mine_index)
@@ -501,8 +503,12 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
         if pairwise and world_size != 4:
             raise ValueError("pairwise payloads require world size four")
         self._pairwise = bool(pairwise)
-        self._hier_dcp8 = bool(hier_dcp8 and self._world_size == 8 and not self._pairwise)
-        self._fast_dcp4 = bool(hier_dcp8 and self._world_size == 4 and not self._pairwise)
+        self._hier_dcp8 = bool(
+            hier_dcp8 and self._world_size == 8 and not self._pairwise
+        )
+        self._fast_dcp4 = bool(
+            hier_dcp8 and self._world_size == 4 and not self._pairwise
+        )
 
     @cute.jit
     def __call__(
@@ -703,14 +709,10 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
             nw = weights[i] * inv_w
             if nw != Float32(0.0):
                 if cutlass.const_expr(i == 0):
-                    baddr = (
-                        Int64(local_output.toint())
-                        + (
-                            Int64(batch_index) * input_stride_batch
-                            + Int64(head) * input_stride_head
-                        )
-                        * Int64(16)
-                    )
+                    baddr = Int64(local_output.toint()) + (
+                        Int64(batch_index) * input_stride_batch
+                        + Int64(head) * input_stride_head
+                    ) * Int64(16)
                     w0 = ld_global_v4_u32(baddr + Int64(lane) * Int64(16))
                     w1 = ld_global_v4_u32(baddr + Int64(lane + Int32(32)) * Int64(16))
                 else:
@@ -723,7 +725,9 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
                         self_stg.toint(), inc_r * Int64(packs_per_head) * Int64(16)
                     )
                     w0 = ld_global_cg_v4_u32(baddr + Int64(lane) * Int64(16))
-                    w1 = ld_global_cg_v4_u32(baddr + Int64(lane + Int32(32)) * Int64(16))
+                    w1 = ld_global_cg_v4_u32(
+                        baddr + Int64(lane + Int32(32)) * Int64(16)
+                    )
                 for pair in cutlass.range_constexpr(4):
                     lo0, hi0 = self._unpack_pair(w0[pair])
                     accum0[pair * 2] = _fma_rn_f32(nw, lo0, accum0[pair * 2])
@@ -800,11 +804,14 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
                         )
                     if lane == Int32(0):
                         cute.arch.store(
-                            dst_lse + inc_row, cute.arch.load(local_lse + src_row, Float32)
+                            dst_lse + inc_row,
+                            cute.arch.load(local_lse + src_row, Float32),
                         )
                 row += warp_stride
 
-        _subset_pair_barrier(signals, signals[self._rank], self._rank, sw_peers, _MAX_BLOCKS)
+        _subset_pair_barrier(
+            signals, signals[self._rank], self._rank, sw_peers, _MAX_BLOCKS
+        )
 
         # Phase 2: Combine 4 intra-switch partials for `partner` (= rank^4) from local memory
         # and push the single combined partial directly to staging[partner] slot 6 (1-to-1 pair).
@@ -864,7 +871,9 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
 
         # Post arrival to partner, then overlap our first row's local 4-rank combine while
         # partner's cross-switch push crosses PCIe!
-        tag = _pair_signal_arrive(signals, signals[self._rank], self._rank, partner, _MAX_BLOCKS)
+        tag = _pair_signal_arrive(
+            signals, signals[self._rank], self._rank, partner, _MAX_BLOCKS
+        )
         own_lse = Float32(float("-inf"))
         if warp_first < rows:
             bi0 = warp_first // heads_per_rank
@@ -957,7 +966,9 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
                     self_stg.toint(), slot6_row * Int64(packs_per_head) * Int64(16)
                 )
                 w0 = ld_global_cg_v4_u32(base6_addr + Int64(lane) * Int64(16))
-                w1 = ld_global_cg_v4_u32(base6_addr + Int64(lane + Int32(32)) * Int64(16))
+                w1 = ld_global_cg_v4_u32(
+                    base6_addr + Int64(lane + Int32(32)) * Int64(16)
+                )
                 for pair in cutlass.range_constexpr(4):
                     lo0, hi0 = self._unpack_pair(w0[pair])
                     out0[pair * 2] = _fma_rn_f32(nw_r, lo0, out0[pair * 2])
@@ -1049,7 +1060,9 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
                     )
                 row += warp_stride
 
-        _subset_pair_barrier(signals, signals[self._rank], self._rank, sw_peers, _MAX_BLOCKS)
+        _subset_pair_barrier(
+            signals, signals[self._rank], self._rank, sw_peers, _MAX_BLOCKS
+        )
 
         self_stg = staging[self._rank] + slot_offset
         accum0 = cute.make_rmem_tensor((8,), Float32)
@@ -1570,11 +1583,23 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
 
 
 class _AllGatherHeadsLaunch(_DCPA2ABase):
+    def __init__(
+        self,
+        world_size: int,
+        rank: int,
+        threads: int,
+        device_slot_selection: bool,
+        has_gate: bool = False,
+    ) -> None:
+        super().__init__(world_size, rank, threads, device_slot_selection)
+        self._has_gate = bool(has_gate)
+
     @cute.jit
     def __call__(
         self,
         local_input: cute.Pointer,
         output: cute.Pointer,
+        gate: cute.Pointer,
         staging0: cute.Pointer,
         staging1: cute.Pointer,
         staging2: cute.Pointer,
@@ -1617,6 +1642,7 @@ class _AllGatherHeadsLaunch(_DCPA2ABase):
         self.kernel(
             local_input,
             output,
+            gate,
             staging0,
             staging1,
             staging2,
@@ -1665,6 +1691,7 @@ class _AllGatherHeadsLaunch(_DCPA2ABase):
         self,
         local_input: cute.Pointer,
         output: cute.Pointer,
+        gate: cute.Pointer,
         staging0: cute.Pointer,
         staging1: cute.Pointer,
         staging2: cute.Pointer,
@@ -1738,18 +1765,24 @@ class _AllGatherHeadsLaunch(_DCPA2ABase):
             signal14,
             signal15,
         )
-        gdim, _, _ = cute.arch.grid_dim()
-        self.gather(
-            local_input,
-            output,
-            staging,
-            signals,
-            batch,
-            local_heads,
-            packs_per_head,
-            slot_delta_256b,
-            Int32(gdim),
-        )
+        run_gather = cutlass.Boolean(True)
+        if cutlass.const_expr(self._has_gate):
+            # Collective contract: every rank supplies the same zero/nonzero gate
+            # so CUDA-graph-captured skips stay barrier-free.
+            run_gather = Uint32(cute.arch.load(gate, Uint32)) != Uint32(0)
+        if run_gather:
+            gdim, _, _ = cute.arch.grid_dim()
+            self.gather(
+                local_input,
+                output,
+                staging,
+                signals,
+                batch,
+                local_heads,
+                packs_per_head,
+                slot_delta_256b,
+                Int32(gdim),
+            )
 
     @cute.jit
     def gather(
@@ -2953,6 +2986,7 @@ def _gather_launcher_key(
     rank: int,
     threads: int,
     device_slot_selection: bool,
+    has_gate: bool = False,
 ) -> tuple[object, ...]:
     """Return the cache key for an all-gather-heads launcher."""
     return (
@@ -2960,6 +2994,7 @@ def _gather_launcher_key(
         int(rank),
         int(threads),
         bool(device_slot_selection),
+        bool(has_gate),
     )
 
 
@@ -2968,6 +3003,7 @@ def is_all_gather_heads_prepared(
     rank: int,
     threads: int,
     device_slot_selection: bool,
+    has_gate: bool = False,
 ) -> bool:
     return (
         _gather_launcher_key(
@@ -2975,6 +3011,7 @@ def is_all_gather_heads_prepared(
             rank,
             threads,
             device_slot_selection,
+            has_gate=has_gate,
         )
         in _PREPARED_GATHER_LAUNCHERS
     )
@@ -2986,25 +3023,30 @@ def _get_compiled_all_gather_heads(
     rank: int,
     threads: int,
     device_slot_selection: bool,
+    has_gate: bool = False,
 ) -> Callable:
     """Compile and retain one all-gather-heads launcher specialization."""
+    has_gate = bool(has_gate)
     launch = _AllGatherHeadsLaunch(
         world_size,
         rank,
         threads,
         device_slot_selection,
+        has_gate=has_gate,
     )
     key = (
         int(world_size),
         int(rank),
         int(threads),
         bool(device_slot_selection),
+        has_gate,
     )
     raise_if_kernel_resolution_frozen("cute.compile", target=launch, cache_key=key)
     p_u32 = _u32_ptr(16, align=4)
     p_u8 = _u8_ptr(16)
     raw = b12x_compile(
         launch,
+        p_u32,
         p_u32,
         p_u32,
         *(p_u8 for _ in range(_MAX_RANKS)),
@@ -3017,13 +3059,14 @@ def _get_compiled_all_gather_heads(
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "comm.pcie.dcp_a2a.all_gather_heads",
-            14,
+            15,
             key,
             labels=(
                 "world_size",
                 "rank",
                 "threads",
                 "device_slot_selection",
+                "has_gate",
             ),
         ),
     )
@@ -3039,8 +3082,15 @@ def _get_compiled_all_gather_heads(
         element_size: int,
         slot_delta_256b: int,
         blocks: int,
+        gate_ptr: int | None = None,
     ) -> None:
         """Launch the compiled all-gather-heads kernel with runtime arguments."""
+        if has_gate and gate_ptr is None:
+            raise ValueError("gated all_gather_heads requires a device gate pointer")
+        if not has_gate and gate_ptr is not None:
+            raise ValueError("ungated all_gather_heads does not accept a gate pointer")
+        if gate_ptr is not None and gate_ptr % 4:
+            raise ValueError("all_gather_heads gate pointer must be 4-byte aligned")
         row_bytes = int(head_dim) * int(element_size)
         if row_bytes % 16:
             raise ValueError("DCP gather rows must be a multiple of 16 bytes")
@@ -3050,6 +3100,7 @@ def _get_compiled_all_gather_heads(
         raw(
             _u32_ptr(local_input_ptr),
             _u32_ptr(output_ptr),
+            _u32_ptr(local_input_ptr if gate_ptr is None else gate_ptr, align=4),
             *(_u8_ptr(ptr) for ptr in stages),
             *(_u32_ptr(ptr, align=4) for ptr in signals),
             int(batch),
@@ -3357,14 +3408,17 @@ def all_gather_heads(
     slot_delta_bytes: int,
     blocks: int,
     launcher: Callable | None = None,
+    gate_ptr: int | None = None,
 ) -> None:
     slot_delta_256b = _slot_delta_256b(slot_delta_bytes)
+    has_gate = gate_ptr is not None
     if launcher is None:
         launcher = _get_compiled_all_gather_heads(
             world_size,
             rank,
             threads,
             device_slot_selection,
+            has_gate=has_gate,
         )
         if not device_slot_selection:
             _get_compiled_all_gather_heads(
@@ -3372,7 +3426,9 @@ def all_gather_heads(
                 rank,
                 threads,
                 True,
+                has_gate=has_gate,
             )
+    gate_kwargs = {"gate_ptr": gate_ptr} if gate_ptr is not None else {}
     launcher(
         local_input_ptr,
         output_ptr,
@@ -3384,6 +3440,7 @@ def all_gather_heads(
         element_size,
         slot_delta_256b,
         blocks,
+        **gate_kwargs,
     )
 
 

@@ -143,9 +143,7 @@ def _configs(query, device=None):
             )
             phys_blocks = 16 if (is_dcp8_pix or is_tp16_ring16) else 8
             active_choices = (
-                (8, 16)
-                if is_dcp8_pix
-                else ((16,) if is_tp16_ring16 else (8,))
+                (8, 16) if is_dcp8_pix else ((16,) if is_tp16_ring16 else (8,))
             )
             for active in active_choices:
                 for count in counts:
@@ -212,17 +210,20 @@ def _configs(query, device=None):
         ):
             from .pcie_oneshot import _MAX_BLOCKS
 
+            max_blocks = _MAX_BLOCKS
+            if name in ("remote_push_full", "remote_push_rsag"):
+                max_blocks = max(
+                    _MAX_BLOCKS,
+                    int(payload["setup"].get("payload_ready_max_blocks", _MAX_BLOCKS)),
+                )
+            base_grids = (1, 2, 4, 8, 16, 32, _MAX_BLOCKS)
+            if max_blocks > _MAX_BLOCKS:
+                base_grids = (*base_grids, max_blocks)
             units = int(call["size_packs"]) * (2 if name == "tp2_remote_push" else 1)
             for count_threads in (32, 64, 128, 256, 512):
                 grids = (
-                    1,
-                    2,
-                    4,
-                    8,
-                    16,
-                    32,
-                    _MAX_BLOCKS,
-                    min(_MAX_BLOCKS, max(1, -(-units // count_threads))),
+                    *base_grids,
+                    min(max_blocks, max(1, -(-units // count_threads))),
                 )
                 for count_blocks in dict.fromkeys(grids):
                     yield CollectiveConfig(
@@ -307,8 +308,18 @@ def _efficient_plain_grid(query, value):
         return True
     from .pcie_oneshot import _MAX_BLOCKS
 
+    max_blocks = _MAX_BLOCKS
+    if name in ("remote_push_full", "remote_push_rsag"):
+        max_blocks = max(
+            _MAX_BLOCKS,
+            int(
+                query.alternatives[name]["setup"].get(
+                    "payload_ready_max_blocks", _MAX_BLOCKS
+                )
+            ),
+        )
     # Retain maximum grids at every thread count even for arbitrarily large payloads.
-    if value["blocks"] == _MAX_BLOCKS:
+    if value["blocks"] == max_blocks:
         return True
     units = int(call["size_packs"]) * (2 if name == "tp2_remote_push" else 1)
     # Only exclude extreme serialization; idle blocks can affect synchronization latency.
@@ -440,7 +451,8 @@ def _validate_query(query, device):
                 query.world_size not in (8, 16)
                 and not (
                     query.world_size == 4
-                    and name in ("dcp_ring", "dcp_switch_push", "dcp_recursive_pix_last")
+                    and name
+                    in ("dcp_ring", "dcp_switch_push", "dcp_recursive_pix_last")
                 )
             )
             or (name == "dcp_recursive_outer_first" and query.world_size != 16)
@@ -603,6 +615,12 @@ def _bucket(query):
         )
         if "joint_cluster_size" in call:
             alternatives[name]["joint_cluster_size"] = call["joint_cluster_size"]
+        if call.get("has_addend", False):
+            alternatives[name]["has_addend"] = True
+        if setup.get("payload_ready_max_blocks", 36) > 36:
+            alternatives[name]["payload_ready_max_blocks"] = int(
+                setup["payload_ready_max_blocks"]
+            )
     if len(sizes) != 1:
         raise ValueError("collective alternatives disagree on payload size")
     size = sizes.pop()
@@ -623,7 +641,7 @@ def _bucket(query):
 TUNING = TuningContract(
     component_id="comm.pcie",
     query_schema_version=8,
-    candidate_contract_version=13,
+    candidate_contract_version=14,
     config_schema_version=2,
     query_fields=frozenset(
         ("operation", "world_size", "rank", "alternatives", "default", "inplace")

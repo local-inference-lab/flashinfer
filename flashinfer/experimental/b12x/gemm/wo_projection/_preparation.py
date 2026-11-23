@@ -759,9 +759,12 @@ class _PreparedWO:
             stream_int = cuda_stream_to_int(stream)
             flags = binding.tmp_q if self.a16_split_k > 1 else None
             if flags is not None:
-                with torch.cuda.stream(
-                    torch.cuda.ExternalStream(stream_int, device=flags.device)
-                ):
+                if stream_int is not None:
+                    with torch.cuda.stream(
+                        torch.cuda.ExternalStream(stream_int, device=flags.device)
+                    ):
+                        flags.zero_()
+                else:
                     flags.zero_()
             self.a16_wo_a(
                 binding.source_tgd,
@@ -844,9 +847,12 @@ class _PreparedWO:
             stream_int = cuda_stream_to_int(stream)
             flags = binding.tmp_q if self.a16_split_k > 1 else None
             if flags is not None:
-                with torch.cuda.stream(
-                    torch.cuda.ExternalStream(stream_int, device=flags.device)
-                ):
+                if stream_int is not None:
+                    with torch.cuda.stream(
+                        torch.cuda.ExternalStream(stream_int, device=flags.device)
+                    ):
+                        flags.zero_()
+                else:
                     flags.zero_()
             self.a16_wo_a(
                 binding.o,

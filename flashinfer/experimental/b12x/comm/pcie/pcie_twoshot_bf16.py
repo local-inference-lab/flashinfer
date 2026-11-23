@@ -370,9 +370,20 @@ class PCIeTwoShotBF16:
         finally:
             self._capture_context_depth = 0
 
-    def _launch_prepared(self, payload, scale, out, *, state, threads, block_limit):
+    def _launch_prepared(
+        self, payload, scale, out, *, state, threads, block_limit, addend=None
+    ):
         del scale
         operation = state.query.call["operation"]
+        has_addend = bool(state.query.call.get("has_addend", False))
+        if has_addend:
+            if addend is None:
+                raise ValueError("fused addend two-shot plan requires an addend tensor")
+            self._check_tensor(addend, shape=tuple(payload.shape), name="addend")
+            if out.data_ptr() != addend.data_ptr():
+                _require_disjoint(out, addend, source_name="addend")
+        elif addend is not None:
+            raise ValueError("two-shot plan does not accept an addend tensor")
         payload_packs = payload.numel() // _PACK_ELEMS
         if operation == "all_gather":
             shard_packs = payload_packs
@@ -399,18 +410,24 @@ class PCIeTwoShotBF16:
         # Each native launch consumes one slot and one graph epoch.
         pull = operation == "all_reduce" and state.query.call["transport"] == "pull"
         if pull:
-            steps = (("all_reduce", payload, out),)
+            steps = (("all_reduce", payload, out, has_addend),)
         elif operation == "all_reduce":
             shard = self._push_shard[: shard_packs * _PACK_ELEMS]
-            steps = (("reduce_scatter", payload, shard), ("all_gather", shard, out))
+            steps = (
+                ("reduce_scatter", payload, shard, has_addend),
+                ("all_gather", shard, out, False),
+            )
         else:
-            steps = ((operation, payload, out),)
-        for name, source, destination in steps:
+            steps = ((operation, payload, out, has_addend),)
+        for name, source, destination, step_has_addend in steps:
             if self._device_slot_selection:
                 slot = 0
             else:
                 slot = self._slot % 2
                 self._slot += 1
+            addend_kwargs = (
+                {"addend_address": addend.data_ptr()} if step_has_addend else {}
+            )
             state.launcher(self._device_slot_selection, self._device_slot_bias, name)(
                 source.data_ptr(),
                 self._staging_ptrs[slot],
@@ -424,6 +441,7 @@ class PCIeTwoShotBF16:
                 shard_packs,
                 total_packs,
                 blocks,
+                **addend_kwargs,
             )
 
     # ---- public collectives ---------------------------------------------
@@ -518,6 +536,7 @@ class PCIeTwoShotBF16:
         out: Optional[torch.Tensor] = None,
         *,
         plan: Plan,
+        addend: Optional[torch.Tensor] = None,
         threads: int = 512,
         block_limit: int = 64,
     ) -> torch.Tensor:
@@ -549,6 +568,7 @@ class PCIeTwoShotBF16:
                 state=state,
                 threads=threads,
                 block_limit=block_limit,
+                addend=addend,
             )
         return out
 

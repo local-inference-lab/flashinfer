@@ -215,3 +215,50 @@ def test_unset_effort_defaults_and_invalid_effort_is_rejected(monkeypatch):
                 hidden=5120,
             )
         )
+
+
+@pytest.mark.parametrize("method", ["run", "run_inv_rope"])
+def test_a16_split_k_flags_zeroed_on_current_stream_when_stream_none(
+    monkeypatch, method
+):
+    import torch
+
+    from b12x.gemm.wo_projection._preparation import _PreparedWO
+
+    def fail_external_stream(*_args, **_kwargs):
+        raise AssertionError("ExternalStream must not be constructed when stream=None")
+
+    monkeypatch.setattr(torch.cuda, "ExternalStream", fail_external_stream)
+
+    calls = []
+    flags = torch.full((4,), 0xFFFFFFFF, dtype=torch.uint32)
+    binding = SimpleNamespace(
+        source_tgd=torch.empty((2, 1, 16), dtype=torch.bfloat16),
+        o=torch.empty((2, 1, 16), dtype=torch.bfloat16),
+        positions=torch.zeros((2,), dtype=torch.int64),
+        cos_sin_cache=torch.zeros((4, 16), dtype=torch.float32),
+        weights=SimpleNamespace(
+            wo_a=SimpleNamespace(values=object(), scale_mma=object()),
+            wo_b=SimpleNamespace(values=object(), scale_mma=object()),
+        ),
+        tmp=torch.empty((2, 16), dtype=torch.bfloat16),
+        x_q=object(),
+        tmp_q=flags,
+        output=torch.empty((2, 16, 1), dtype=torch.bfloat16),
+        return_3d=False,
+    )
+    state = _PreparedWO(
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        a16_wo_a=lambda *args: calls.append(("a", flags.clone(), args[-1])),
+        a16_wo_b=lambda *args: calls.append(("b", args[-1])),
+        a16_split_k=2,
+    )
+    getattr(state, method)(binding)
+    assert calls[0][0] == "a" and calls[0][2] is None
+    assert torch.equal(calls[0][1], torch.zeros_like(flags))
+    assert calls[1] == ("b", None)

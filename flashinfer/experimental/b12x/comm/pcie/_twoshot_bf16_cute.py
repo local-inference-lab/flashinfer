@@ -38,6 +38,7 @@ from b12x._lib.utils.pointers import make_ptr
 
 from ._dcp_cute_common import _threadfence_sys
 from ._cute_intrinsics import (
+    add_bf16x2,
     graph_epoch_arrive_serialized,
     ld_relaxed_gpu_u32,
     pack_f32x2_to_bf16x2,
@@ -92,11 +93,16 @@ class _TwoShotBf16Launch:
         threads: int,
         row_elems: int,
         pairwise: bool = False,
+        has_addend: bool = False,
     ) -> None:
         if operation not in ("reduce_scatter", "all_gather"):
             raise ValueError(f"invalid two-shot operation {operation!r}")
         if pairwise and world_size != 4:
             raise ValueError("pairwise payloads require world size four")
+        if has_addend and operation != "reduce_scatter":
+            raise ValueError(
+                "two-shot fused addend is only supported on reduce_scatter"
+            )
         self._pairwise = bool(pairwise)
         self._operation = operation
         self._world_size = int(world_size)
@@ -105,11 +111,31 @@ class _TwoShotBf16Launch:
         self._slot_bias = int(slot_bias) & 1
         self._threads = int(threads)
         self._row_elems = int(row_elems)
+        self._has_addend = bool(has_addend)
+
+    @cute.jit
+    def _load_payload_pack(
+        self,
+        payload_address: Int64,
+        addend_address: Int64,
+        offset: Int64,
+    ):
+        words = ld_global_nc_v4_u32(payload_address + offset)
+        if cutlass.const_expr(self._has_addend):
+            extra = ld_global_nc_v4_u32(addend_address + offset)
+            return (
+                add_bf16x2(words[0], extra[0]),
+                add_bf16x2(words[1], extra[1]),
+                add_bf16x2(words[2], extra[2]),
+                add_bf16x2(words[3], extra[3]),
+            )
+        return words
 
     @cute.jit
     def __call__(
         self,
         payload: cute.Pointer,
+        addend: cute.Pointer,
         staging0: cute.Pointer,
         staging1: cute.Pointer,
         staging2: cute.Pointer,
@@ -153,6 +179,7 @@ class _TwoShotBf16Launch:
     ) -> None:
         self.kernel(
             payload,
+            addend,
             staging0,
             staging1,
             staging2,
@@ -311,6 +338,7 @@ class _TwoShotBf16Launch:
     def kernel(
         self,
         payload: cute.Pointer,
+        addend: cute.Pointer,
         staging0: cute.Pointer,
         staging1: cute.Pointer,
         staging2: cute.Pointer,
@@ -401,6 +429,7 @@ class _TwoShotBf16Launch:
             end = shard_packs
 
         payload_address = Int64(payload.toint())
+        addend_address = Int64(addend.toint())
         staging_slot_offset = Int64(0)
         if cutlass.const_expr(self._device_slot_selection):
             if cutlass.const_expr(self._operation == "all_gather"):
@@ -444,8 +473,10 @@ class _TwoShotBf16Launch:
                 if cutlass.const_expr(self._operation == "all_gather"):
                     valid_pack = Int64(local_rank) * shard_packs + index
                 if valid_pack < total_packs:
-                    words = ld_global_nc_v4_u32(
-                        payload_address + (source_pack + index) * Int64(16)
+                    words = self._load_payload_pack(
+                        payload_address,
+                        addend_address,
+                        (source_pack + index) * Int64(16),
                     )
                     _st_generic_v4_u32(
                         destination_payload + index * Int64(16),
@@ -478,10 +509,12 @@ class _TwoShotBf16Launch:
 
                 local_pack = Int64(local_rank) * shard_packs + index
                 if local_pack < total_packs:
-                    self._load_accumulate_pack_global_nc(
-                        accumulator,
-                        payload_address + local_pack * Int64(16),
+                    local_words = self._load_payload_pack(
+                        payload_address,
+                        addend_address,
+                        local_pack * Int64(16),
                     )
+                    self._accumulate_words(accumulator, local_words)
 
                     for peer_index in cutlass.range(
                         Int32(1),
@@ -577,8 +610,10 @@ def get_twoshot_bf16_launcher(
     row_elems: int,
     device_index: int,
     pairwise: bool = False,
+    has_addend: bool = False,
 ) -> Callable[..., None]:
     """Compile and return one static world/operation/thread specialization."""
+    has_addend = bool(has_addend)
     process_key = _bf16_process_key(
         operation,
         world_size,
@@ -589,7 +624,7 @@ def get_twoshot_bf16_launcher(
         row_elems,
         device_index,
     )
-    del device_index  # part of the process-local cache key
+    del device_index, process_key  # part of the process-local cache key
     if world_size not in _SUPPORTED_WORLD_SIZES:
         raise ValueError(
             f"BF16 two-shot launchers support world sizes {_SUPPORTED_WORLD_SIZES}, "
@@ -611,6 +646,7 @@ def get_twoshot_bf16_launcher(
         threads,
         row_elems,
         pairwise,
+        has_addend=has_addend,
     )
     cache_key = (
         "bf16",
@@ -622,12 +658,14 @@ def get_twoshot_bf16_launcher(
         int(threads),
         int(row_elems),
         bool(pairwise),
+        has_addend,
     )
     raise_if_kernel_resolution_frozen(
         "cute.compile", target=launch, cache_key=cache_key
     )
     raw = b12x_compile(
         launch,
+        make_ptr(cutlass.Uint32, 16, cute.AddressSpace.gmem, assumed_align=16),
         make_ptr(cutlass.Uint32, 16, cute.AddressSpace.gmem, assumed_align=16),
         *(
             make_ptr(
@@ -657,7 +695,7 @@ def get_twoshot_bf16_launcher(
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             f"comm.pcie.twoshot_bf16.{operation}",
-            2,
+            3,
             cache_key,
         ),
     )
@@ -673,13 +711,27 @@ def get_twoshot_bf16_launcher(
         shard_packs: int,
         total_packs: int,
         grid_x: int,
+        *,
+        addend_address: int = 0,
     ) -> None:
+        if has_addend and addend_address == 0:
+            raise ValueError(
+                "fused addend two-shot launcher requires an addend address"
+            )
+        if not has_addend and addend_address != 0:
+            raise ValueError("two-shot launcher does not accept an addend address")
         if len(staging_addresses) != 16 or len(signal_addresses) != 16:
             raise ValueError("two-shot scalar pointer ABI requires sixteen peers")
         raw_args = (
             make_ptr(
                 cutlass.Uint32,
                 payload_address,
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            ),
+            make_ptr(
+                cutlass.Uint32,
+                addend_address if has_addend else payload_address,
                 cute.AddressSpace.gmem,
                 assumed_align=16,
             ),
@@ -748,6 +800,7 @@ class _TwoShotPullAllReduceLaunch(_TwoShotBf16Launch):
         slot_bias: int,
         threads: int,
         row_elems: int,
+        has_addend: bool = False,
     ) -> None:
         super().__init__(
             "reduce_scatter",  # barrier addressing uses the dynamic-rank path
@@ -757,12 +810,14 @@ class _TwoShotPullAllReduceLaunch(_TwoShotBf16Launch):
             slot_bias,
             threads,
             row_elems,
+            has_addend=has_addend,
         )
 
     @cute.jit
     def __call__(
         self,
         payload: cute.Pointer,
+        addend: cute.Pointer,
         staging0: cute.Pointer,
         staging1: cute.Pointer,
         staging2: cute.Pointer,
@@ -806,6 +861,7 @@ class _TwoShotPullAllReduceLaunch(_TwoShotBf16Launch):
     ) -> None:
         self.kernel(
             payload,
+            addend,
             staging0,
             staging1,
             staging2,
@@ -866,6 +922,7 @@ class _TwoShotPullAllReduceLaunch(_TwoShotBf16Launch):
     def kernel(
         self,
         payload: cute.Pointer,
+        addend: cute.Pointer,
         staging0: cute.Pointer,
         staging1: cute.Pointer,
         staging2: cute.Pointer,
@@ -950,6 +1007,7 @@ class _TwoShotPullAllReduceLaunch(_TwoShotBf16Launch):
         flat = Int64(bidx) * threads + Int64(tidx)
 
         payload_address = Int64(payload.toint())
+        addend_address = Int64(addend.toint())
         output_address = Int64(output.toint())
         staging_slot_offset = Int64(0)
         self_signal = self._select_address(signals, local_rank)
@@ -979,7 +1037,9 @@ class _TwoShotPullAllReduceLaunch(_TwoShotBf16Launch):
                 shard_rank = (local_rank + Int32(peer_index)) % Int32(self._world_size)
                 pack = Int64(shard_rank) * shard_packs + index
                 if pack < total_packs:
-                    words = ld_global_nc_v4_u32(payload_address + pack * Int64(16))
+                    words = self._load_payload_pack(
+                        payload_address, addend_address, pack * Int64(16)
+                    )
                     st_global_v4_u32(
                         self_base + pack * Int64(16),
                         words[0],
@@ -1003,7 +1063,9 @@ class _TwoShotPullAllReduceLaunch(_TwoShotBf16Launch):
                 # loop is unrolled at compile time), then accumulate in fixed
                 # rank order: self, then (rank + i) % world for i = 1..world-1.
                 pack_offset = (shard_base + index) * Int64(16)
-                local_words = ld_global_nc_v4_u32(payload_address + pack_offset)
+                local_words = self._load_payload_pack(
+                    payload_address, addend_address, pack_offset
+                )
                 peer_words = []
                 for peer_index in cutlass.range_constexpr(1, self._world_size):
                     source_rank = (local_rank + Int32(peer_index)) % Int32(
@@ -1058,8 +1120,10 @@ def get_twoshot_bf16_allreduce_launcher(
     threads: int,
     row_elems: int,
     device_index: int,
+    has_addend: bool = False,
 ) -> Callable[..., None]:
     """Compile the single-launch pull-based bf16 all-reduce specialization."""
+    has_addend = bool(has_addend)
     process_key = _bf16_process_key(
         "all_reduce_pull",
         world_size,
@@ -1090,6 +1154,7 @@ def get_twoshot_bf16_allreduce_launcher(
         slot_bias,
         threads,
         row_elems,
+        has_addend=has_addend,
     )
     cache_key = (
         "bf16",
@@ -1100,12 +1165,14 @@ def get_twoshot_bf16_allreduce_launcher(
         slot_bias,
         int(threads),
         int(row_elems),
+        has_addend,
     )
     raise_if_kernel_resolution_frozen(
         "cute.compile", target=launch, cache_key=cache_key
     )
     raw = b12x_compile(
         launch,
+        make_ptr(cutlass.Uint32, 16, cute.AddressSpace.gmem, assumed_align=16),
         make_ptr(cutlass.Uint32, 16, cute.AddressSpace.gmem, assumed_align=16),
         *(
             make_ptr(
@@ -1135,7 +1202,7 @@ def get_twoshot_bf16_allreduce_launcher(
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "comm.pcie.twoshot_bf16.all_reduce_pull",
-            4,
+            5,
             cache_key,
         ),
     )
@@ -1151,13 +1218,27 @@ def get_twoshot_bf16_allreduce_launcher(
         shard_packs: int,
         total_packs: int,
         grid_x: int,
+        *,
+        addend_address: int = 0,
     ) -> None:
+        if has_addend and addend_address == 0:
+            raise ValueError(
+                "fused addend two-shot pull launcher requires an addend address"
+            )
+        if not has_addend and addend_address != 0:
+            raise ValueError("two-shot pull launcher does not accept an addend address")
         if len(staging_addresses) != 16 or len(signal_addresses) != 16:
             raise ValueError("two-shot scalar pointer ABI requires sixteen peers")
         raw_args = (
             make_ptr(
                 cutlass.Uint32,
                 payload_address,
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            ),
+            make_ptr(
+                cutlass.Uint32,
+                addend_address if has_addend else payload_address,
                 cute.AddressSpace.gmem,
                 assumed_align=16,
             ),

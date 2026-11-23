@@ -45,6 +45,7 @@ def _assert_output(actual, expected, *, rtol=0, atol=0):
 
 def _reduction_reference(query, shape, dtype, device, fused):
     call = query.call
+    has_addend = bool(call.get("has_addend", False)) and not fused
     semantics = (
         (
             tuple(query.setup["logical_shape"]),
@@ -63,6 +64,8 @@ def _reduction_reference(query, shape, dtype, device, fused):
             ),
         )
         if fused
+        else (("has_addend", True),)
+        if has_addend
         else ()
     )
     key = ("reduction", query.world_size, query.rank, shape, dtype, device, semantics)
@@ -87,6 +90,8 @@ def _reduction_reference(query, shape, dtype, device, fused):
                 values = values.to(dtype).float()
             if call["input_addend"]:
                 values = (values + 0.125).to(dtype).float()
+        elif has_addend:
+            values = (values + 0.125).to(dtype).float()
         expected = values.sum(dim=0)
         if not fused:
             expected_outputs.append(expected.to(device=device, dtype=dtype))
@@ -235,8 +240,8 @@ class _ReductionInputs:
             self.source = torch.empty(shape, dtype=dtype, device=device)
             self.out = self.source if inplace else torch.empty_like(self.source)
         self.owner_call = None
-        self.zero_addend = (
-            torch.zeros_like(self.source)
+        self.plain_addend = (
+            torch.full(shape, 0.125, dtype=dtype, device=device)
             if call.get("has_addend", False) and not self.owner and not self.fused
             else None
         )
@@ -296,18 +301,22 @@ class _ReductionInputs:
         if self.owner:
             return self.owner_call.run()
         if self.twoshot:
+            addend_kwargs = (
+                {"addend": self.plain_addend} if self.plain_addend is not None else {}
+            )
             return state.run(
                 self.source,
                 None,
                 self.out,
                 threads=call["threads"],
                 block_limit=call["block_limit"],
+                **addend_kwargs,
             )
         if not self.fused:
-            if self.zero_addend is None:
+            if self.plain_addend is None:
                 state.run_plain(self.source, self.out)
             else:
-                state.run_plain(self.source, self.out, self.zero_addend)
+                state.run_plain(self.source, self.out, self.plain_addend)
             return self.out
         state.run_fused(
             self.source,
@@ -395,6 +404,11 @@ class _DcpInputs:
             device=runtime.device,
         )
         self.lse = None
+        self.gate = (
+            torch.ones((1,), dtype=torch.int32, device=runtime.device)
+            if not self.lse_reduce and call.get("has_gate", False)
+            else None
+        )
         if self.lse_reduce:
             self.lse = torch.empty_strided(
                 tuple(call["lse_shape"]),
@@ -421,6 +435,8 @@ class _DcpInputs:
                 out=self.out,
                 is_lse_base_on_e=self.state.query.call["natural_log"],
             )
+        if self.gate is not None:
+            return self.state.run(local_input=self.source, out=self.out, gate=self.gate)
         return self.state.run(local_input=self.source, out=self.out)
 
     def validate(self):

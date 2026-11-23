@@ -126,7 +126,7 @@ def _publish_packet(address: Int64, value: Uint64, *, loc=None, ip=None):
 
 
 class WordExchange:
-    def __init__(self, rank, world, row_words, threads, chunks):
+    def __init__(self, rank, world, row_words, threads, chunks, has_gate=False):
         if (
             world not in (2, 4)
             or not 0 <= rank < world
@@ -139,12 +139,14 @@ class WordExchange:
             )
         self.rank, self.world, self.row_words = rank, world, row_words
         self.warps, self.chunks = threads // 32, chunks
+        self.has_gate = bool(has_gate)
 
     @cute.jit
     def __call__(
         self,
         source: cute.Pointer,
         output: cute.Pointer,
+        gate: cute.Pointer,
         p0: cute.Pointer,
         p1: cute.Pointer,
         p2: cute.Pointer,
@@ -157,27 +159,33 @@ class WordExchange:
         stream: cuda.CUstream,
     ):
         self.kernel(
-            source, output, p0, p1, p2, p3, stride, offset, counter_offset, rows
+            source, output, gate, p0, p1, p2, p3, stride, offset, counter_offset, rows
         ).launch(grid=(grid_blocks, 1, 1), block=(self.warps * 32, 1, 1), stream=stream)
 
     @cute.kernel
     def kernel(
-        self, source, output, p0, p1, p2, p3, stride, offset, counter_offset, rows
+        self, source, output, gate, p0, p1, p2, p3, stride, offset, counter_offset, rows
     ):
-        grid_blocks, _, _ = cute.arch.grid_dim()
-        self.exchange(
-            source,
-            output,
-            p0,
-            p1,
-            p2,
-            p3,
-            stride,
-            offset,
-            counter_offset,
-            rows,
-            Int32(grid_blocks),
-        )
+        run_gather = cutlass.Boolean(True)
+        if cutlass.const_expr(self.has_gate):
+            # Collective contract: every rank must supply the same zero/nonzero gate
+            # so CUDA-graph-captured skips remain barrier-free.
+            run_gather = Uint32(cute.arch.load(gate, Uint32)) != Uint32(0)
+        if run_gather:
+            grid_blocks, _, _ = cute.arch.grid_dim()
+            self.exchange(
+                source,
+                output,
+                p0,
+                p1,
+                p2,
+                p3,
+                stride,
+                offset,
+                counter_offset,
+                rows,
+                Int32(grid_blocks),
+            )
 
     @cute.jit
     def exchange(
@@ -313,16 +321,20 @@ class WordExchange:
 
 
 @program_cache
-def compile_word_exchange(rank, world, row_words, threads, blocks, chunks):
+def compile_word_exchange(
+    rank, world, row_words, threads, blocks, chunks, has_gate=False
+):
     if not 1 <= blocks <= MAX_CHUNKS:
         raise ValueError("word exchange grid limit must be between one and 64")
-    operation = WordExchange(rank, world, row_words, threads, chunks)
+    has_gate = bool(has_gate)
+    operation = WordExchange(rank, world, row_words, threads, chunks, has_gate=has_gate)
 
     def pointer(dtype, address=16, alignment=16):
         return make_ptr(dtype, address, cute.AddressSpace.gmem, assumed_align=alignment)
 
     executable = compile_kernel(
         operation,
+        pointer(Uint32, alignment=4),
         pointer(Uint32, alignment=4),
         pointer(Uint32, alignment=4),
         *(pointer(Uint8) for _ in range(4)),
@@ -333,11 +345,21 @@ def compile_word_exchange(rank, world, row_words, threads, blocks, chunks):
         Int32(1),
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
-            "comm.pcie.word_exchange", 1, (rank, world, row_words, threads, chunks)
+            "comm.pcie.word_exchange",
+            2,
+            (rank, world, row_words, threads, chunks, has_gate),
         ),
     )
 
-    def launch(source, output, data, stride, offset, counter_offset, rows):
+    def launch(
+        source, output, data, stride, offset, counter_offset, rows, gate_address=None
+    ):
+        if has_gate and gate_address is None:
+            raise ValueError("gated word exchange requires a device gate address")
+        if not has_gate and gate_address is not None:
+            raise ValueError("ungated word exchange does not accept a gate address")
+        if gate_address is not None and gate_address % 4:
+            raise ValueError("word exchange gate must be 4-byte aligned")
         if rows <= 0 or rows * row_words > chunks * CHUNK_WORDS:
             raise ValueError("word exchange exceeds its declared chunk capacity")
         if source % 4 or output % 4:
@@ -351,6 +373,7 @@ def compile_word_exchange(rank, world, row_words, threads, blocks, chunks):
         executable(
             pointer(Uint32, source, 4),
             pointer(Uint32, output, 4),
+            pointer(Uint32, source if gate_address is None else gate_address, 4),
             *(pointer(Uint8, value) for value in padded_data),
             Int64(stride),
             Int64(offset),

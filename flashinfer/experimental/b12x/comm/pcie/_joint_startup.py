@@ -203,8 +203,6 @@ def joint_startup_spec(plan, *, profiles=None):
     )
     if cluster_size != 1:
         key += (("cluster_size", cluster_size),)
-    if call.get("has_addend", False):
-        key += (("has_addend", True),)
     return JointStartupSpec(
         key, profiles, state.selector, state, inplace, state.query.rank
     )
@@ -303,16 +301,6 @@ class JointStartupTuner:
                 self.invalid = torch.zeros(
                     (1,), dtype=torch.int32, device=runtime.device
                 )
-                self.zero_addend = (
-                    torch.zeros_like(self.inputs.source)
-                    if (not self.gather and query.call.get("has_addend", False))
-                    else None
-                )
-                self.one_gate = (
-                    torch.ones((1,), dtype=torch.int32, device=runtime.device)
-                    if (self.gather and query.call.get("has_gate", False))
-                    else None
-                )
                 # The validator reads the int32 word; only its first byte is ever written.
                 self.invalid_any = self.invalid.view(torch.bool)[0]
                 self.eviction = self.eviction_sum = None
@@ -385,8 +373,6 @@ class JointStartupTuner:
             self.samples,
             self.profiles,
             self.invalid,
-            self.zero_addend,
-            self.one_gate,
             self.eviction,
             self.eviction_sum,
             self.launchers,
@@ -415,8 +401,6 @@ class JointStartupTuner:
             self.profiles,
             self.mismatch,
             self.invalid,
-            self.zero_addend,
-            self.one_gate,
             None if self.storage.external_eviction else self.storage._eviction,
             self.storage._eviction_sum,
         )
@@ -455,9 +439,7 @@ class JointStartupTuner:
 
     def _collective(self):
         if self.gather:
-            self.state.run_selected(
-                self.inputs.source, self.inputs.out, gate=self.one_gate
-            )
+            self.state.run_selected(self.inputs.source, self.inputs.out)
             return
         work = self.state.workspace
         self.state.launcher(
@@ -469,9 +451,6 @@ class JointStartupTuner:
             self.inputs.out.data_ptr(),
             self.state.query.call["size_packs"],
             work.capacity_packs,
-            addend_address=(
-                None if self.zero_addend is None else self.zero_addend.data_ptr()
-            ),
         )
 
     def run(self):

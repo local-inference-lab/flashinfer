@@ -50,12 +50,17 @@ def _selected_gather_query(query, transport, thread_counts):
 
     call, setup = query.call, query.setup
     if (
-        (
+        call.get("has_gate", False)
+        or (
             query.world_size not in (8, 16)
             and not (
                 query.world_size == 4
                 and transport
-                in ("selected_ring", "selected_switch_push", "selected_recursive_pix_last")
+                in (
+                    "selected_ring",
+                    "selected_switch_push",
+                    "selected_recursive_pix_last",
+                )
             )
         )
         or not query.surface.endswith(".all_gather_heads")
