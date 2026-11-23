@@ -299,6 +299,7 @@ def compile_dcp_surface(query_payload, ordinal):
                         call["route_transport"] == "row",
                         call["threads"],
                         rows=rows,
+                        world_size=query.world_size,
                     )
                     for slot in (False, True)
                 }

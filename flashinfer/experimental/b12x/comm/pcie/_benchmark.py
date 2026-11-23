@@ -467,6 +467,9 @@ def _route_benchmark_call(state):
     cases = []
     features = torch.arange(rows * 896, dtype=torch.long).reshape(rows, 896)
     latent_bytes = torch.arange(rows * 3584, dtype=torch.int32).reshape(rows, 3584)
+    world = state.query.world_size
+    down_cols = 3584 // world
+    router_cols = 896 // world
     for seed in (0, 1, 2):
         # These logits give exactly representable sigmoid scores on CPU and GPU.
         # Permute score groups across experts so a wrong rank order remains visible.
@@ -488,8 +491,8 @@ def _route_benchmark_call(state):
             tuple(
                 v.to(device)
                 for v in (
-                    latent[:, rank * 224 : (rank + 1) * 224].contiguous(),
-                    logits[:, rank * 56 : (rank + 1) * 56].contiguous(),
+                    latent[:, rank * down_cols : (rank + 1) * down_cols].contiguous(),
+                    logits[:, rank * router_cols : (rank + 1) * router_cols].contiguous(),
                     bias,
                     latent,
                     logits,

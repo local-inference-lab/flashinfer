@@ -81,18 +81,20 @@ def _is_supported_bhd_layout(tensor: torch.Tensor) -> bool:
 def _check_four_row_route(runtime, down, router, bias, latent, logits, weights, ids):
     """Check the seven live operands of the prepared multi-row expert route."""
     rows = int(down.shape[0]) if down is not None and down.ndim == 2 else 0
+    world = runtime.world_size
+    expected_qhd = (3584 * 2 + 896 * 4) // world if world in (8, 16) else -1
     if (
-        runtime.world_size != 16
+        world not in (8, 16)
         or not 2 <= rows <= 64
         or runtime.max_batch_size < rows
-        or runtime.query_head_dim != 672
+        or runtime.query_head_dim != expected_qhd
     ):
         raise ValueError(
-            "multi-row Kimi expert selection requires a sixteen-rank 672-byte channel (2..64 rows)"
+            "multi-row Kimi expert selection requires an 8- or 16-rank route channel (2..64 rows)"
         )
     expected = (
-        ("down", down, (rows, 224), torch.bfloat16),
-        ("router", router, (rows, 56), torch.float32),
+        ("down", down, (rows, 3584 // world), torch.bfloat16),
+        ("router", router, (rows, 896 // world), torch.float32),
         ("bias", bias, (896,), torch.float32),
         ("latent", latent, (rows, 3584), torch.bfloat16),
         ("logits", logits, (rows, 896), torch.float32),
@@ -1690,7 +1692,7 @@ class PCIeDCPA2A:
     ):
         self._check_stream()
         rows = int(router_logits.shape[0]) if router_logits.ndim == 2 else 0
-        if self._closed or rows <= 0 or rows > min(self.max_batch_size, 8):
+        if self._closed or rows <= 0 or rows > self.max_batch_size:
             raise ValueError("Kimi top-16 rows exceed prepared channel capacity")
         for value, shape, dtype, name in (
             (router_logits, (rows, 896), torch.float32, "router_logits"),

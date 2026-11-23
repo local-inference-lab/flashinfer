@@ -1577,9 +1577,37 @@ class RowReduction:
         )
 
 
+@dataclass(frozen=True)
+class TP8RoRowReduction:
+    """Borrow the existing PCIeOneshotAllReduce IPC slabs for fused TP8 RO epilogues (0 extra VRAM)."""
+
+    owner: object
+    width: int
+    rows: int
+    transport: str
+    plain_region_packs: int
+    plain_capacity_packs: int
+    ar_blocks: int
+    ar_threads: int
+    is_tp8_ro: bool = True
+
+    def resolve_slot(self):
+        state = self.owner._ext._state(self.owner._ptr)
+        capturing = torch.cuda.is_current_stream_capturing()
+        if state.device_slot_selection or capturing:
+            if not state.device_slot_selection:
+                state.slot_bias = state.eager_slot & 1
+                state.device_slot_selection = True
+            return True, int(state.slot_bias) & 1, 0, int(state.eager_tables[0]), int(state.signal_table_address)
+        slot = int(state.eager_slot) & 1
+        state.eager_slot ^= 1
+        return False, 0, slot, int(state.eager_tables[0]), int(state.signal_table_address)
+
+
 def prepared_rows(plan, *, rows, width, threads):
     """Return the native multi-row layout if the selected owner and explicit grid permit it."""
     from .pcie_island_rs import PCIeIslandRSAllReduce
+    from .pcie_oneshot import PCIeOneshotAllReduce
     from ._tuning import pairwise_device
 
     if plan.prepared is None or not 1 <= rows <= 64 or width not in (3584, 7168):
@@ -1588,6 +1616,43 @@ def prepared_rows(plan, *, rows, width, threads):
         return None
     state = plan.prepared.state
     owner = getattr(state, "runtime", None)
+    if isinstance(owner, PCIeOneshotAllReduce):
+        if owner.world_size != 8 or not 1 <= rows <= 32:
+            return None
+        transport = state.query.call.get("transport")
+        if transport not in ("remote_push_full", "remote_push_rsag"):
+            return None
+        setup = state.query.setup
+        if (
+            setup.get("dtype") != "bfloat16"
+            or tuple(setup.get("shape", ())) != (rows, width)
+            or tuple(setup.get("stride", ())) != (width, 1)
+        ):
+            return None
+        native = owner._ext._state(owner._ptr)
+        if native.eager_tables is None or not native.eager_buffer_bytes:
+            return None
+        plain_capacity_packs = int(native.eager_buffer_bytes) // 16
+        plain_region_packs = int(
+            state.query.call.get("payload_ready_region_packs", 0)
+            or native.plain_payload_ready_region_packs
+        )
+        if plain_region_packs == 0:
+            base_shards = 8 if native.sharded_eager_storage else 1
+            tagged = 2 * 7 if native.transport_policy[2] else 0
+            plain_region_packs = (base_shards + tagged) * plain_capacity_packs
+        ar_blocks = int(state.query.call["blocks"])
+        ar_threads = int(state.query.call["threads"])
+        return TP8RoRowReduction(
+            owner=owner,
+            width=width,
+            rows=rows,
+            transport=transport,
+            plain_region_packs=plain_region_packs,
+            plain_capacity_packs=plain_capacity_packs,
+            ar_blocks=ar_blocks,
+            ar_threads=ar_threads,
+        )
     if not isinstance(owner, PCIeIslandRSAllReduce):
         return None
     for operand in (state.query.call["inp"], state.query.call["output"]):

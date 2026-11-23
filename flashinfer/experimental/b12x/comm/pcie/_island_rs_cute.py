@@ -33,7 +33,7 @@ from b12x._lib.utils.device import (
     current_cuda_stream,
 )
 from b12x._lib.utils.pointers import make_ptr
-from ._joint_startup_cute import _globaltimer
+from ._cute_intrinsics import _globaltimer
 
 
 GROUP_TIMING_FIELDS = (

@@ -358,7 +358,7 @@ def _validate_query(query, device):
             raise ValueError("native alternatives must use the same rank group")
         if name in ("dcp_route_separate", "dcp_route_row") and (
             query.operation != "all_gather_pair_kimi_topk"
-            or query.world_size != 16
+            or query.world_size not in (8, 16)
             or native.call.get("route_transport")
             != {"dcp_route_separate": "separate", "dcp_route_row": "row"}[name]
         ):
