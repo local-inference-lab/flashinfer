@@ -482,7 +482,7 @@ def test_prepared_add_retains_fp32_before_cancellation() -> None:
             assert out[0, 0] == 0.5 and out[0, 1] == -0.5
 
 
-@pytest.mark.parametrize("hidden", (128, 512, 1280))
+@pytest.mark.parametrize("hidden", (128, 512, 1280, 2560))
 @pytest.mark.parametrize("weight_dtype", (torch.bfloat16, torch.float32))
 @pytest.mark.parametrize("streams,padding", ((1, 0), (1, 37), (4, 0), (4, 37)))
 def test_ordinary_rmsnorm_uses_affine_weight_without_offset(

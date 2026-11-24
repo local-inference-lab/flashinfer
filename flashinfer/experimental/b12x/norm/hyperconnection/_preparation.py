@@ -54,7 +54,9 @@ def _compile_hyperconnection(query_payload, config_payload, ordinal):
         weight_dtype = getattr(torch, query.weight_dtype)
         return native._compile(
             ("rmsnorm", streams, hidden, str(weight_dtype)),
-            native._GroupedRmsNorm(streams, hidden, False),
+            native._GroupedRmsNorm(
+                streams, hidden, False, fp32_weight=weight_dtype == torch.float32
+            ),
             3,
             device,
             has_eps=True,

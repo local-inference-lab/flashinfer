@@ -965,7 +965,7 @@ def _compile(
                 *args,
                 compile_spec=KernelCompileSpec.from_key(
                     "norm.hyperconnection.cute",
-                    10,
+                    11,
                     key,
                 ),
             )
