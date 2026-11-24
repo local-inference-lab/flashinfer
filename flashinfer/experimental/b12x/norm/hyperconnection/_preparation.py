@@ -164,12 +164,12 @@ def _compile_hyperconnection(query_payload, config_payload, ordinal):
                 torch.bfloat16,
             ),
         )
-    if role in ("swiglu", "relu2", "add", "sigmoid", "head_gate"):
+    if role in ("swiglu", "situ", "relu2", "add", "sigmoid", "head_gate"):
         dtypes = tuple(
             getattr(torch, name)
             for name in (query.left_dtype, query.right_dtype, query.output_dtype)
         )
-        width = hidden if role in ("swiglu", "head_gate") else 1
+        width = hidden if role in ("swiglu", "situ", "head_gate") else 1
         key = (
             role,
             *(str(dtype) for dtype in dtypes),

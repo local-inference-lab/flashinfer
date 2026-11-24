@@ -103,7 +103,7 @@ def _mg_head_partitions(heads: int, hpb: int = 16) -> tuple[tuple[int, int, int]
 
 
 _TOPK_CONTAINERS = (512, 1024, 2048)
-_TOPK_EXACT = frozenset({128, 512, 1024, 2048, 2051, 2112})
+_TOPK_EXACT = frozenset({128, 512, 1024, 2048, 2051, 2112, 2176})
 
 
 def _topk_container(model_type: int, topk: int) -> int:
@@ -425,7 +425,7 @@ def run_unified_prefill(
         and is_glm_model_type(model_type)
         and scale_format == ScaleFormat.ARBITRARY_FP32
     )
-    glm_topk_supported = topk in (512, 1024, 2048) or (
+    glm_topk_supported = topk in (512, 1024, 2048, 2176) or (
         model_type == ModelType.GLM_NEXT and topk in (2051, 2112)
     )
     if _mg_glm and glm_topk_supported:

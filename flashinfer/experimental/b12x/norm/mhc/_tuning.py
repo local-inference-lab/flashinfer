@@ -43,6 +43,7 @@ class MhcQuery:
     bf16x2_eligible: bool = True
     output_mode: str = "provided"
     rms_eps: float = 1.0e-6
+    rms_eps_outside_sqrt: bool = False
     hc_eps: float = 1.0e-6
     sinkhorn_iters: int = 20
     norm_eps: float = 0.0
@@ -403,6 +404,7 @@ def _validate_query(query, device):
             query.bf16x2_eligible,
             query.lagged_mix,
             query.expanded_residual,
+            query.rms_eps_outside_sqrt,
         )
     ):
         raise TypeError("operand-presence and layout flags must be boolean")
@@ -618,7 +620,7 @@ def _materialize_tuning(query, device, choice):
 
 TUNING = TuningContract(
     component_id="norm.mhc",
-    query_schema_version=22,
+    query_schema_version=23,
     config_schema_version=22,
     query_fields=frozenset(MhcQuery.__dataclass_fields__),
     config_fields=frozenset(MhcConfig.__dataclass_fields__),

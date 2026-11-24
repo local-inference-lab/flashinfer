@@ -157,6 +157,11 @@ def run_swiglu(gate_up, *, limit, out, plan: Plan, round_silu=False):
     return out
 
 
+def run_situ(gate_up, *, out, plan: Plan):
+    torch.ops.b12x.hyperconnection_situ(gate_up, out, plan.handle)
+    return out
+
+
 def run_relu2(source, *, out, plan: Plan):
     """Square positive BF16 values into disjoint caller-owned BF16 output."""
     torch.ops.b12x.hyperconnection_relu2(source, out, plan.handle)
@@ -194,6 +199,7 @@ __all__ = [
     "run_combine_norm",
     "run_engram_mix",
     "run_swiglu",
+    "run_situ",
     "run_relu2",
     "run_add",
     "run_sigmoid",

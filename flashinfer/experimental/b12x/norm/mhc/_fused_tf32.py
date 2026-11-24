@@ -336,10 +336,20 @@ class _FusedPartial:
 
 
 class _FusedFinalize:
-    def __init__(self, hidden, rms_eps, hc_eps, norm_eps, sinkhorn_iters, fuse_norm):
+    def __init__(
+        self,
+        hidden,
+        rms_eps,
+        hc_eps,
+        norm_eps,
+        sinkhorn_iters,
+        fuse_norm,
+        rms_eps_outside_sqrt=False,
+    ):
         self.hidden, self.rms_eps, self.hc_eps = hidden, rms_eps, hc_eps
         self.norm_eps, self.sinkhorn_iters = norm_eps, sinkhorn_iters
         self.fuse_norm = fuse_norm
+        self.rms_eps_outside_sqrt = bool(rms_eps_outside_sqrt)
         self.splits = hidden // 32
         # Parallelize the K-split reduction across warps (hidden % 512 == 0 => splits % 16 == 0).
         self.num_warps = 16 if (self.splits % 16 == 0) else 8
@@ -407,9 +417,16 @@ class _FusedFinalize:
                 for w in cutlass.range_constexpr(self.num_warps):
                     value += warp_partials[w, lane]
             square = Float32(cute.arch.shuffle_sync(value, Int32(0)))
-            inv = cute.math.rsqrt(
-                square / Float32(4 * self.hidden) + Float32(self.rms_eps), fastmath=True
-            )
+            if const_expr(self.rms_eps_outside_sqrt):
+                inv = Float32(1) / (
+                    cute.math.sqrt(square / Float32(4 * self.hidden), fastmath=True)
+                    + Float32(self.rms_eps)
+                )
+            else:
+                inv = cute.math.rsqrt(
+                    square / Float32(4 * self.hidden) + Float32(self.rms_eps),
+                    fastmath=True,
+                )
             prevalue = Float32(cute.arch.shuffle_sync(value, lane + 1))
             postvalue = Float32(cute.arch.shuffle_sync(value, lane + 5))
             cvalue = Float32(cute.arch.shuffle_sync(value, lane + 9))
@@ -526,8 +543,24 @@ def _partial(hidden, pre_only, tile_m, fuse_norm):
 
 
 @cache
-def _finalize(hidden, rms_eps, hc_eps, norm_eps, sinkhorn_iters, fuse_norm):
-    return _FusedFinalize(hidden, rms_eps, hc_eps, norm_eps, sinkhorn_iters, fuse_norm)
+def _finalize(
+    hidden,
+    rms_eps,
+    hc_eps,
+    norm_eps,
+    sinkhorn_iters,
+    fuse_norm,
+    rms_eps_outside_sqrt=False,
+):
+    return _FusedFinalize(
+        hidden,
+        rms_eps,
+        hc_eps,
+        norm_eps,
+        sinkhorn_iters,
+        fuse_norm,
+        rms_eps_outside_sqrt=rms_eps_outside_sqrt,
+    )
 
 
 def _compact_tensor(value):
@@ -630,6 +663,7 @@ def finalize(
     norm_eps,
     sinkhorn_iters,
     fuse_norm=True,
+    rms_eps_outside_sqrt=False,
     _prepared=None,
 ):
     operands = dict(
@@ -644,13 +678,20 @@ def finalize(
     )
     return _launch(
         _finalize(
-            residual.shape[-1], rms_eps, hc_eps, norm_eps, sinkhorn_iters, fuse_norm
+            residual.shape[-1],
+            rms_eps,
+            hc_eps,
+            norm_eps,
+            sinkhorn_iters,
+            fuse_norm,
+            rms_eps_outside_sqrt,
         ),
         "norm.mhc.fused_tf32_finalize",
         operands,
         _prepared=_prepared,
         constants=(
             ("rms_eps", rms_eps),
+            ("rms_eps_outside_sqrt", bool(rms_eps_outside_sqrt)),
             ("hc_eps", hc_eps),
             ("norm_eps", norm_eps),
             ("sinkhorn_iters", sinkhorn_iters),

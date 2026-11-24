@@ -188,8 +188,45 @@ def test_fused_indexer_route_keeps_generic_head_count_limit():
         topk=2048,
         num_rows=8,
         width=16384,
+        num_heads=128,
+    )
+
+
+@pytest.mark.parametrize("width", [8192, 16384, 32768, 131072])
+@pytest.mark.parametrize("rows", [1, 2, 4, 8, 16])
+def test_fused_indexer_route_covers_ernie55_decode_buckets(width, rows):
+    assert resolve_fused_indexer_path(
+        topk=2048,
+        num_rows=rows,
+        width=width,
         num_heads=64,
     )
+
+
+@pytest.mark.parametrize("rows", [32, 64])
+def test_fused_indexer_route_stops_after_ernie55_decode_buckets(rows):
+    assert not resolve_fused_indexer_path(
+        topk=2048,
+        num_rows=rows,
+        width=16384,
+        num_heads=64,
+    )
+
+
+def test_fused_indexer_direct_k_score_requires_batch_slack_256():
+    from b12x.attention.dsa_indexer.fused_indexer import (
+        DSAFusedIndexerKernel,
+        KV_LAYOUT_PAGED,
+    )
+
+    kernel = DSAFusedIndexerKernel(
+        topk=2048,
+        num_heads_static=64,
+        ctas_per_group=11,
+        kv_layout=KV_LAYOUT_PAGED,
+    )
+    assert kernel.carry_cap == 2048 + 128
+    assert not kernel.direct_k_score
 
 
 @pytest.mark.parametrize("rows", [1, 2, 4, 8, 16, 32, 64])

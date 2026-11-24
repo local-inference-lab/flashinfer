@@ -139,6 +139,7 @@ def _validate_query(query, device):
         "combine_norm",
         "engram_mix",
         "swiglu",
+        "situ",
         "relu2",
         "add",
         "sigmoid",

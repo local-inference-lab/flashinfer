@@ -120,6 +120,7 @@ class WOProjectionBinding:
     tmp: torch.Tensor
     tmp_q: MXFP8Rows
     output: torch.Tensor
+    gate: torch.Tensor | None = None
     return_3d: bool = False
     # DeepGEMM-style regime hint forwarded to the wo_b up-projection (N=hidden,
     # the n>1536 path). None keeps the M-independent default tile.
@@ -150,6 +151,7 @@ class WOProjectionInvRopeBinding:
     heads_per_group: int
     nope_dim: int = 448
     rope_dim: int = 64
+    gate: torch.Tensor | None = None
     return_3d: bool = False
     # DeepGEMM-style regime hint forwarded to the wo_b up-projection.
     expected_m: int | None = None
@@ -211,6 +213,7 @@ class _WOProjectionState:
         source_tgd: torch.Tensor,
         weights: WOProjectionMXFP8Weights,
         out: torch.Tensor | None = None,
+        gate: torch.Tensor | None = None,
         return_3d: bool = False,
         expected_m: int | None = None,
     ) -> WOProjectionBinding:
@@ -224,6 +227,7 @@ class _WOProjectionState:
             output=views.output,
             source_tgd=source_tgd,
             weights=weights,
+            gate=gate,
             return_3d=return_3d,
             expected_m=expected_m,
         )
@@ -238,6 +242,7 @@ class _WOProjectionState:
         weights: WOProjectionMXFP8Weights,
         heads_per_group: int,
         out: torch.Tensor | None = None,
+        gate: torch.Tensor | None = None,
         nope_dim: int = 448,
         rope_dim: int = 64,
         return_3d: bool = False,
@@ -262,6 +267,7 @@ class _WOProjectionState:
             cos_sin_cache=cos_sin_cache,
             weights=weights,
             heads_per_group=heads_per_group,
+            gate=gate,
             nope_dim=nope_dim,
             rope_dim=rope_dim,
             return_3d=return_3d,
@@ -699,6 +705,7 @@ def _quantize_attention_inv_rope_to_tdg_kernel(
 @triton.jit
 def _quantize_group_major_trg_to_tk_kernel(
     source,
+    gate,
     values,
     scale_rows,
     scale_mma,
@@ -708,6 +715,7 @@ def _quantize_group_major_trg_to_tk_kernel(
     source_stride_t,
     source_stride_r,
     source_stride_g,
+    gate_stride_t,
     scale_mma_s0,
     scale_mma_s1,
     scale_mma_s2,
@@ -715,6 +723,7 @@ def _quantize_group_major_trg_to_tk_kernel(
     scale_mma_s4,
     scale_mma_s5,
     CHUNKS_PER_PROGRAM: tl.constexpr,
+    HAS_GATE: tl.constexpr = False,
 ) -> None:
     token = tl.program_id(0)
     chunk_block = tl.program_id(1)
@@ -726,6 +735,10 @@ def _quantize_group_major_trg_to_tk_kernel(
     src = tl.load(
         source + token * source_stride_t + r * source_stride_r + g * source_stride_g,
     ).to(tl.float32)
+    if HAS_GATE:
+        g_val = tl.load(gate + token * gate_stride_t + cols).to(tl.float32)
+        s = tl.sigmoid(g_val).to(tl.bfloat16).to(tl.float32)
+        src = (src * s).to(tl.bfloat16).to(tl.float32)
     max_abs = tl.max(tl.abs(src), axis=1)
     safe = tl.where(max_abs > 0.0, max_abs / 448.0, 1.0)
     scale_exp = tl.minimum(tl.maximum(tl.ceil(tl.log2(safe)), -127.0), 127.0)
@@ -800,6 +813,7 @@ class _WOQuantizers:
     a_chunks: int
     b_chunks: int
     fast_b16_scale: bool
+    has_gate: bool = False
 
     def quantize_a(self, source_tgd: torch.Tensor, out: MXFP8Rows) -> None:
         chunks = self.a_chunks
@@ -884,12 +898,17 @@ class _WOQuantizers:
             1,
         )
 
-    def quantize_b(self, source_trg: torch.Tensor, out: MXFP8Rows) -> None:
+    def quantize_b(
+        self, source_trg: torch.Tensor, out: MXFP8Rows, gate: torch.Tensor | None = None
+    ) -> None:
         tokens, rank, groups = map(int, source_trg.shape)
         width = rank * groups
         chunks = self.b_chunks
+        gate_t = source_trg if gate is None else gate
+        gate_stride = 0 if gate is None else gate.stride(0)
         self.group_major[(tokens, width // 32 // chunks, 1)](
             source_trg,
+            gate_t,
             out.values,
             out.scale_rows.view(torch.uint8),
             out.scale_mma.view(torch.uint8),
@@ -899,6 +918,7 @@ class _WOQuantizers:
             source_trg.stride(0),
             source_trg.stride(1),
             source_trg.stride(2),
+            gate_stride,
             out.scale_mma.stride(0),
             out.scale_mma.stride(1),
             out.scale_mma.stride(2),
@@ -906,6 +926,7 @@ class _WOQuantizers:
             out.scale_mma.stride(4),
             out.scale_mma.stride(5),
             chunks,
+            self.has_gate,
         )
 
 
@@ -915,6 +936,7 @@ def compile_wo_quantizers(query_payload, ordinal: int) -> _WOQuantizers:
     query = dict(query_payload)
     operation = str(query["operation"])
     dynamic_tokens = query["dynamic_tokens"]
+    has_gate = bool(query.get("has_gate", False))
     key = (
         dynamic_tokens,
         operation,
@@ -930,6 +952,7 @@ def compile_wo_quantizers(query_payload, ordinal: int) -> _WOQuantizers:
         str(query["positions_dtype"]),
         str(query["cos_sin_dtype"]),
         int(dict(query["codegen"])["quant_chunks_per_program"]),
+        has_gate,
         int(ordinal),
     )
     with _WO_QUANTIZER_CACHE_LOCK:
@@ -1009,6 +1032,7 @@ def compile_wo_quantizers(query_payload, ordinal: int) -> _WOQuantizers:
         )
         group_major = group_major_kernel.warmup(
             torch.bfloat16,
+            torch.bfloat16,
             torch.float8_e4m3fn,
             torch.uint8,
             torch.uint8,
@@ -1018,8 +1042,10 @@ def compile_wo_quantizers(query_payload, ordinal: int) -> _WOQuantizers:
             int(query["rank"]),
             1,
             1 if groups == 1 else tokens * int(query["rank"]),
+            group_major_width if has_gate else 0,
             *group_major_strides,
             CHUNKS_PER_PROGRAM=b_chunks,
+            HAS_GATE=has_gate,
             num_warps=4,
             grid=(tokens, group_major_width // 32 // b_chunks, 1),
         )
@@ -1061,7 +1087,7 @@ def compile_wo_quantizers(query_payload, ordinal: int) -> _WOQuantizers:
                 grid=(tokens, groups, group_width // 32 // chunks),
             )
     launchers = _WOQuantizers(
-        key, grouped, inv_rope, group_major, chunks, b_chunks, fast_b16_scale
+        key, grouped, inv_rope, group_major, chunks, b_chunks, fast_b16_scale, has_gate
     )
     attach_programs(launchers, grouped, group_major, inv_rope)
     with _WO_QUANTIZER_CACHE_LOCK:
@@ -2133,6 +2159,7 @@ def _run_wo_b_quant_kernel(
         )
     ](
         source_trg,
+        source_trg,
         out_values,
         out_scale_rows.view(torch.uint8),
         out_scale_mma.view(torch.uint8),
@@ -2142,6 +2169,7 @@ def _run_wo_b_quant_kernel(
         source_trg.stride(0),
         source_trg.stride(1),
         source_trg.stride(2),
+        0,
         out_scale_mma.stride(0),
         out_scale_mma.stride(1),
         out_scale_mma.stride(2),
@@ -2149,6 +2177,7 @@ def _run_wo_b_quant_kernel(
         out_scale_mma.stride(4),
         out_scale_mma.stride(5),
         CHUNKS_PER_PROGRAM=chunks_per_program,
+        HAS_GATE=False,
         num_warps=4,
     )
 
@@ -2611,6 +2640,7 @@ def _build_wo_projection_binding_from_views(
     output: torch.Tensor,
     source_tgd: torch.Tensor,
     weights: WOProjectionMXFP8Weights,
+    gate: torch.Tensor | None = None,
     return_3d: bool = False,
     expected_m: int | None = None,
 ) -> WOProjectionBinding:
@@ -2630,6 +2660,7 @@ def _build_wo_projection_binding_from_views(
         tmp=tmp,
         tmp_q=tmp_q,
         output=output,
+        gate=gate,
         return_3d=bool(return_3d),
         expected_m=expected_m,
     )
@@ -2696,6 +2727,7 @@ def _build_wo_projection_inv_rope_binding_from_views(
     cos_sin_cache: torch.Tensor,
     weights: WOProjectionMXFP8Weights,
     heads_per_group: int,
+    gate: torch.Tensor | None = None,
     nope_dim: int = 448,
     rope_dim: int = 64,
     return_3d: bool = False,
@@ -2730,6 +2762,7 @@ def _build_wo_projection_inv_rope_binding_from_views(
         heads_per_group=int(heads_per_group),
         nope_dim=int(nope_dim),
         rope_dim=int(rope_dim),
+        gate=gate,
         return_3d=bool(return_3d),
         expected_m=expected_m,
     )

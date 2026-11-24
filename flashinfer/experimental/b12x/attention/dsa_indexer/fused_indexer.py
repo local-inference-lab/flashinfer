@@ -980,7 +980,7 @@ def resolve_fused_indexer_path(
             compute_capability in {(12, 0), (12, 1)}
             and int(num_rows) <= _C4_B12X_FUSED_MAX_ROWS
         )
-    if int(topk) == 2048 and num_heads is not None and int(num_heads) == 32:
+    if int(topk) == 2048 and num_heads is not None and int(num_heads) in {32, 64}:
         return int(num_rows) <= _GLM32_FUSED_MAX_ROWS
     return int(num_rows) <= FUSED_MAX_ROWS
 
@@ -999,7 +999,7 @@ def fused_indexer_scratch_max_rows(
         and compute_capability in {(12, 0), (12, 1)}
     ):
         return _C4_B12X_FUSED_MAX_ROWS
-    if int(topk) == 2048 and int(num_heads) == 32:
+    if int(topk) == 2048 and int(num_heads) in {32, 64}:
         return _GLM32_FUSED_MAX_ROWS
     return FUSED_MAX_ROWS
 
@@ -1203,6 +1203,9 @@ def _resolve_fused_batch_slack(
 
     if int(kv_layout) == KV_LAYOUT_PAGED and int(num_heads) == 64 and int(topk) == 512:
         return _DSV4_BATCH_SLACK
+    if int(num_heads) == 64 and int(topk) == 2048:
+        # 64-head Q staging adds 4KB over 32-head GLM; cap slack so SMEM stays <= 101376B on SM120.
+        return 128
     return _BATCH_SLACK
 
 
@@ -2910,23 +2913,6 @@ class DSAFusedIndexerKernel:
         )
         self.tokens_per_work = _PAGED_TOKENS_PER_GROUP * self.token_groups
         self.page_splits = _PAGE_SIZE // self.tokens_per_work
-        # Warp-owns-tokens direct-L2 score: no K staging, no page barriers.
-        # Gated to the 4-head-tile paged decode contract (DSV4 64-head) at
-        # rows >= 3 (ctas_per_group <= 16): those rows re-read an L2-resident
-        # K where 16B fragment loads are free. rows 1-2 stream mostly-cold K
-        # from DRAM, where the staged pipeline's contiguous 128B page loads
-        # win (measured +25% at rows=1, +3.5% at rows=2); they keep the
-        # historical path.
-        self.direct_k_score = (
-            _DIRECT_K_SCORE_ENABLED
-            and self.kv_layout == KV_LAYOUT_PAGED
-            and self.num_q_head_tiles == 4
-            and self.ctas_per_group <= 16
-        )
-        if self.mxfp4:
-            self.direct_k_score = True
-        self.score_warps = self.token_groups * self.num_q_head_tiles
-        self.score_threads = self.score_warps * _WARP_THREADS
         # Over-sized accumulator: scored tokens append until topk+slack, then
         # trim.  Keep the large measured slack specific to the paged DSV4
         # contract so top-k-2048 and contiguous contracts retain their existing
@@ -2938,6 +2924,26 @@ class DSAFusedIndexerKernel:
         )
         if self.mxfp4:
             batch_slack = 1536
+        # Warp-owns-tokens direct-L2 score: no K staging, no page barriers.
+        # Gated to the 4-head-tile paged decode contract (DSV4 64-head) at
+        # rows >= 3 (ctas_per_group <= 16): those rows re-read an L2-resident
+        # K where 16B fragment loads are free. rows 1-2 stream mostly-cold K
+        # from DRAM, where the staged pipeline's contiguous 128B page loads
+        # win (measured +25% at rows=1, +3.5% at rows=2); they keep the
+        # historical path. Each direct_k_score round appends up to 256 tokens
+        # into carry0, so it requires batch_slack >= 256 (excludes 64-head
+        # top-k-2048 where SMEM caps batch_slack at 128).
+        self.direct_k_score = (
+            _DIRECT_K_SCORE_ENABLED
+            and self.kv_layout == KV_LAYOUT_PAGED
+            and self.num_q_head_tiles == 4
+            and self.ctas_per_group <= 16
+            and batch_slack >= 256
+        )
+        if self.mxfp4:
+            self.direct_k_score = True
+        self.score_warps = self.token_groups * self.num_q_head_tiles
+        self.score_threads = self.score_warps * _WARP_THREADS
         self.carry_cap = int(self.topk) + int(batch_slack)
         self.mxfp4_carry_slots = (
             self.carry_cap + self.radix_threads - 1
