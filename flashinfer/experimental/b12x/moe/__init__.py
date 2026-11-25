@@ -6,6 +6,8 @@
   checkpoint encoding.
 - ``ep_moe``: expert-parallel MoE (replicated input -> local partial;
   cross-rank reduction is the caller's job, typically ``comm.pcie``).
+- ``situ_moe``: fused route-weighted SiTU MoE for Inkling 2 Mini (NVFP4 with
+  optional zero-scratch inline CSF scale decoding, and native MXFP8 MMA).
 """
 
 from __future__ import annotations
@@ -13,7 +15,7 @@ from __future__ import annotations
 import importlib
 from typing import Any
 
-_OP_MODULES = ("fused_moe", "ep_moe")
+_OP_MODULES = ("fused_moe", "ep_moe", "situ_moe")
 
 
 def __getattr__(name: str) -> Any:
