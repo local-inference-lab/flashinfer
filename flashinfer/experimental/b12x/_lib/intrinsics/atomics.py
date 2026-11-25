@@ -211,6 +211,42 @@ def red_add_global_bf16x2(addr: Int64, packed: Uint32, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def red_add_global_v4_bf16x2_packed(
+    addr: Int64,
+    p0: Uint32,
+    p1: Uint32,
+    p2: Uint32,
+    p3: Uint32,
+    *,
+    loc=None,
+    ip=None,
+):
+    """No-return 128-bit global atomic add of four packed bf16x2 registers (8 bf16).
+
+    The address must be 16-byte aligned. Used by the fused A4-prefill FC2
+    epilogue to scatter-add weighted per-route outputs directly into the
+    per-token output tensor.
+    """
+    llvm.inline_asm(
+        None,
+        [
+            Int64(addr).ir_value(loc=loc, ip=ip),
+            Uint32(p0).ir_value(loc=loc, ip=ip),
+            Uint32(p1).ir_value(loc=loc, ip=ip),
+            Uint32(p2).ir_value(loc=loc, ip=ip),
+            Uint32(p3).ir_value(loc=loc, ip=ip),
+        ],
+        "red.relaxed.gpu.global.add.noftz.v4.bf16x2 [$0], {$1, $2, $3, $4};",
+        "l,r,r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def red_max_global_f32_nonnegative(addr: Int64, val: Float32, *, loc=None, ip=None):
     """No-return global max reduction for a non-negative fp32 value.
 

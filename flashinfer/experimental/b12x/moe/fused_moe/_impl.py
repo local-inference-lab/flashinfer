@@ -1960,11 +1960,16 @@ def _select_dynamic_tile_mn(
     # boundary probes put M16->M32 between 14 and 15 routed rows/expert
     # (M16 wins at 14; M32 wins by 2.7-3.0% at 15), with later crossovers near
     # 48 and 96.  Integer products keep this deterministic at boundaries.
+    # On GB10 (SM121, 48 SMs), M128 halves block parallelism and regresses
+    # severely on high-expert-count prefill (e.g. Qwen3.8 E=512, I=640, T=8192:
+    # 28.49 ms/L at M128 vs 12.41 ms/L at M64), so cap gated NVFP4 at M64.
+    if compute_capability is None:
+        compute_capability = _current_compute_capability()
     if routed_rows < 15 * num_experts:
         tile_m = 16
     elif routed_rows < 48 * num_experts:
         tile_m = 32
-    elif routed_rows < 96 * num_experts:
+    elif routed_rows < 96 * num_experts or compute_capability == (12, 1):
         tile_m = 64
     else:
         tile_m = _LEVEL_TILE_M
