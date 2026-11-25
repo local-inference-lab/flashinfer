@@ -1471,8 +1471,79 @@ static int run_varlen_op(roce_ctx_t* c, uint32_t seq, uint32_t nbytes, uint32_t 
   return drain_all(c);
 }
 
+#ifdef __linux__
+// Restrict the proxy polling thread to high-capacity CPUs within its current
+// affinity mask on asymmetric Linux systems (such as ARM big.LITTLE). No-op
+// when sysfs cpu_capacity is absent, homogeneous, already restricted to one
+// tier, or would collapse below two CPUs.
+static void pin_high_capacity_cpus(void) {
+  cpu_set_t allowed;
+  CPU_ZERO(&allowed);
+  if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) {
+    return;
+  }
+  int cpus[CPU_SETSIZE];
+  uint32_t caps[CPU_SETSIZE];
+  int count = 0;
+  uint32_t min_cap = UINT32_MAX;
+  uint32_t max_cap = 0;
+  for (int cpu = 0; cpu < CPU_SETSIZE; cpu++) {
+    if (!CPU_ISSET(cpu, &allowed)) {
+      continue;
+    }
+    char path[128];
+    snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cpu_capacity", cpu);
+    FILE* f = fopen(path, "r");
+    if (f == NULL) {
+      return;
+    }
+    unsigned long val = 0;
+    int matched = fscanf(f, "%lu", &val);
+    fclose(f);
+    if (matched != 1 || val == 0 || val > UINT32_MAX) {
+      return;
+    }
+    cpus[count] = cpu;
+    caps[count] = (uint32_t)val;
+    if (caps[count] < min_cap) min_cap = caps[count];
+    if (caps[count] > max_cap) max_cap = caps[count];
+    count++;
+  }
+  if (count < 2 || min_cap == max_cap) {
+    return;
+  }
+  cpu_set_t next;
+  CPU_ZERO(&next);
+  int selected = 0;
+  for (int i = 0; i < count; i++) {
+    if ((uint64_t)caps[i] * 10 >= (uint64_t)max_cap * 9) {
+      CPU_SET(cpus[i], &next);
+      selected++;
+    }
+  }
+  if (selected < 2) {
+    CPU_ZERO(&next);
+    selected = 0;
+    uint64_t sum = (uint64_t)min_cap + (uint64_t)max_cap;
+    for (int i = 0; i < count; i++) {
+      if ((uint64_t)caps[i] * 2 > sum) {
+        CPU_SET(cpus[i], &next);
+        selected++;
+      }
+    }
+  }
+  if (selected >= 2 && selected < count) {
+    (void)sched_setaffinity(0, sizeof(next), &next);
+  }
+}
+#endif
+
 static void* proxy_main(void* arg) {
   roce_ctx_t* c = (roce_ctx_t*)arg;
+#ifdef __linux__
+  (void)pthread_setname_np(pthread_self(), "flare-roce");
+  pin_high_capacity_cpus();
+#endif
   volatile uint32_t* ctrl = (volatile uint32_t*)(c->region + c->ctrl_off);
   // Spin while ops are flowing.  After ROCE_IDLE_SPINS polls without a
   // doorbell, request a short nanosleep between polls (the OS decides the
