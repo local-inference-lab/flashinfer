@@ -385,3 +385,67 @@ def test_mxfp4_explicit_layout_preserves_source_and_rejects_a_partial_mma_tile()
             n=352,
             w4a16_layout=PreparedWeightLayout.MMA_PACKED,
         )
+
+
+def test_w4a16_reserve_sms_capacity_and_grid_sizing():
+    from types import SimpleNamespace
+
+    from b12x.moe._shared.kernels.w4a16.kernel.fused_launch import (
+        _w4a16_fused_persistent_grid_x,
+    )
+    from b12x.moe.fused_moe.execution import ExecutionCapacity
+
+    cap_default = ExecutionCapacity(max_tokens=2048, top_k=16)
+    cap_reserved = ExecutionCapacity(max_tokens=2048, top_k=16, reserve_sms=4)
+    assert cap_default.reserve_sms == 0
+    assert cap_reserved.reserve_sms == 4
+    with pytest.raises(ValueError, match="reserve_sms"):
+        ExecutionCapacity(max_tokens=2048, top_k=16, reserve_sms=-1)
+    with pytest.raises(ValueError, match="reserve_sms"):
+        ExecutionCapacity(max_tokens=2048, top_k=16, reserve_sms=True)
+
+    fused_full = SimpleNamespace(
+        blocks_per_sm=1,
+        weight_layout="packed",
+        moe_block_size=16,
+        fc1_tile_n=128,
+        fc2_tile_n=128,
+        hidden_size=3584,
+        schedule_whole_tiles=False,
+        reserve_sms=0,
+    )
+    fused_reserved = SimpleNamespace(**{**fused_full.__dict__, "reserve_sms": 4})
+    assert (
+        _w4a16_fused_persistent_grid_x(
+            fused=fused_full,
+            m=2048,
+            topk=16,
+            intermediate_size=192,
+            activation="silu",
+            direct_topk_routes=False,
+            sms=188,
+        )
+        == 188
+    )
+    assert (
+        _w4a16_fused_persistent_grid_x(
+            fused=fused_reserved,
+            m=2048,
+            topk=16,
+            intermediate_size=192,
+            activation="silu",
+            direct_topk_routes=False,
+            sms=188,
+        )
+        == 184
+    )
+    with pytest.raises(ValueError, match="reserve_sms"):
+        _w4a16_fused_persistent_grid_x(
+            fused=SimpleNamespace(**{**fused_full.__dict__, "reserve_sms": 188}),
+            m=2048,
+            topk=16,
+            intermediate_size=192,
+            activation="silu",
+            direct_topk_routes=False,
+            sms=188,
+        )

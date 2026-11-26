@@ -1060,7 +1060,7 @@ class PreparationJob:
         self._finalists = {}
         self._described_candidates = {}
         self._described_jobs = {}
-        self._discovery_locks = set()
+        self._discovery_locks = {}
         self._available_programs = set()
         self._pipeline = ()
         self._selections = {}
@@ -1388,20 +1388,25 @@ class PreparationJob:
                     self._timing.add(self._phase, time.perf_counter() - started)
                 send_value = None
                 if isinstance(signal, CollectiveTuningRequirement):
+                    self._release_discovery_locks()
                     self._blocked = signal
                     return self._progress(
                         False, False, (), False, ready_collective_tuning=signal
                     )
                 if isinstance(signal, TuningCacheRequirement):
+                    self._release_discovery_locks()
                     self._blocked = signal
                     return self._progress(False, False, (), False, ready_cache=signal)
                 if isinstance(signal, CollectiveRequirement):
+                    self._release_discovery_locks()
                     self._blocked = signal
                     return self._progress(False, False, (signal,), False)
                 if isinstance(signal, _TuningBatch):
+                    self._release_discovery_locks()
                     self._blocked = signal
                     return self._progress(False, False, (), False, signal.contributions)
                 if isinstance(signal, TuningRequirement):
+                    self._release_discovery_locks()
                     self._blocked = signal
                     return self._progress(False, False, (), False, (signal,))
                 if signal == "compile":
@@ -1437,7 +1442,7 @@ class PreparationJob:
         self._release_race_resources()
         closers = [self._steps.close, *reversed(self._temporaries)]
         self._temporaries.clear()
-        closers.extend(lock.release for lock in self._discovery_locks)
+        closers.extend(lock.release for lock in list(self._discovery_locks))
         self._discovery_locks.clear()
         if self.session._cache is not None:
             closers.append(self.session._cache.flush)
@@ -1996,12 +2001,12 @@ class PreparationJob:
                     except Timeout:
                         if not wait:
                             return
-                        yield from self._pump_pipeline(obligation)
+                        self._release_discovery_locks(exclude=state)
                         yield "compile"
                 record = state.cache.load_discovery(state.key)
                 if record is None:
                     state.lock = lock
-                    self._discovery_locks.add(lock)
+                    self._discovery_locks[lock] = state
                 else:
                     lock.release()
             if record is not None:
@@ -2026,8 +2031,15 @@ class PreparationJob:
     def _release_discovery_lock(self, state):
         lock, state.lock = state.lock, None
         if lock is not None:
-            self._discovery_locks.discard(lock)
+            self._discovery_locks.pop(lock, None)
             lock.release()
+
+    def _release_discovery_locks(self, *, exclude=None):
+        """Release uncommitted discovery locks before waiting on peers or another lock."""
+        for _, state in list(self._discovery_locks.items()):
+            if state is exclude:
+                continue
+            self._release_discovery_lock(state)
 
     def _finish_discovery(self, obligation, state, *, publish):
         if publish and state.cache is not None:

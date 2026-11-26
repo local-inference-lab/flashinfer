@@ -101,6 +101,7 @@ class W4A16FusedMoeCompileResult:
     broadcast_suh: bool = False
     small_m_direct_launches: tuple[_W4A16SmallMDirectLaunch, ...] = ()
     trellis_direct_lut: bool = False
+    reserve_sms: int = 0
 
 
 @dataclass(frozen=True)

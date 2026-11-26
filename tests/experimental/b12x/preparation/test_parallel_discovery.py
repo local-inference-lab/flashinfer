@@ -475,3 +475,73 @@ def test_worker_can_compile_after_discovery_without_deferred_cache_entries():
         assert not torch.cuda.is_initialized()
         """
     )
+
+
+def test_discovery_locks_release_before_cross_rank_block_and_lock_contention(
+    tmp_path, monkeypatch
+):
+    from b12x._lib.compile_pool import CompilationPlan
+    from b12x.preparation import CollectiveRequirement, DetectedDevice
+    from b12x.preparation import session as session_module
+    from .test_defaults import Query
+
+    class PendingDiscovery:
+        def describe(self, jobs):
+            return tuple(jobs)
+
+        def descriptions(self, jobs):
+            return None
+
+    monkeypatch.setattr(
+        session_module, "discovery_key", lambda rows, target: str(rows[0][2][0].args[0])
+    )
+    items = []
+    for index in range(2):
+        item = request(name=str(index), tuning=contract())
+        items.append(
+            replace(
+                item,
+                plan=replace(
+                    item.plan,
+                    query=Query(index + 1),
+                    _compile_jobs=lambda config, device, index=index: (
+                        CompileJob.create("test.factory:compile", index, config.width),
+                    ),
+                ),
+            )
+        )
+
+    with session(tmp_path, compile_workers=2) as engine:
+        job = engine.begin(items)
+        first, second = finish(job._configure(session_module._coalesce_requests(items)))
+        cache = engine._race_progress_cache()
+        engine.device = DetectedDevice(0, None)
+        monkeypatch.setattr(engine, "_compiler", lambda: PendingDiscovery())
+        try:
+            # 1. Contending on another rank's lock releases this job's prefetch locks.
+            finish(job._advance_discovery(first, wait=False))
+            assert len(job._discovery_locks) == 1
+            with cache.discovery_lock("1").acquire(timeout=0):
+                steps = job._describe_candidates(second)
+                assert next(steps) == "compile"
+                assert not job._discovery_locks
+                with cache.discovery_lock("0").acquire(timeout=0):
+                    pass
+                steps.close()
+
+            # 2. Blocking on a cross-rank requirement releases held prefetch locks.
+            finish(job._advance_discovery(first, wait=False))
+            assert len(job._discovery_locks) == 1
+
+            def blocked_steps():
+                yield CollectiveRequirement(key="sync", ranks=(0, 1))
+
+            job._steps = blocked_steps()
+            progress = job.advance()
+            assert progress.ready_collectives
+            assert not job._discovery_locks
+            with cache.discovery_lock("0").acquire(timeout=0):
+                pass
+            job.close()
+        finally:
+            engine.device = DetectedDevice(None, None)

@@ -265,6 +265,7 @@ def _query(
         a4_prefill=invocation.get("a4_prefill"),
         autotune_effort=capture_autotune_effort().value,
         prequantized_input=capacity.input_format == "mxfp8",
+        reserve_sms=capacity.reserve_sms,
     )
 
 
@@ -393,6 +394,7 @@ def _lower_caps(
         ),
         swiglu_beta=_decode_scalar(query.swiglu_beta),
         prequantized_input=query.prequantized_input,
+        reserve_sms=query.reserve_sms,
     )
 
 
@@ -679,6 +681,7 @@ def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
             fc1_pipeline_stages=caps.decode_config.w4a16_fc1_pipeline_stages,
             skip_empty_m_blocks=caps.w4a16_skip_empty_m_blocks,
             small_m_occupancy=caps.w4a16_small_m_occupancy,
+            reserve_sms=caps.reserve_sms,
         )
         packed = compile_w4a16_fused_moe(
             **compiler_args,

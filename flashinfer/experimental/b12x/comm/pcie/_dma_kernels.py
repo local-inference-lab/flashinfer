@@ -1434,7 +1434,7 @@ class DmaLaunchers:
 def compile_launchers(*, world_size: int, wire_mode: str) -> DmaLaunchers:
     """Resolve the primitive programs reachable by declaration metadata."""
 
-    if int(world_size) not in (2, 3, 4, 6, 8, 10):
+    if int(world_size) not in (2, 3, 4, 6, 8, 10, 16):
         raise ValueError(f"unsupported DMA world size {world_size}")
     mode = str(wire_mode)
     codec = "i8" if mode.startswith("i8") else "mx" if mode.startswith("mx") else "e4m3"
@@ -1505,6 +1505,7 @@ class DmaKernels:
         dtype_code: int,
         *,
         wait=None,
+        grid_cap: int | None = None,
     ) -> None:
         dtype_name = _DTYPES[int(dtype_code)]
         dtype = _dtype_type(dtype_name)
@@ -1512,13 +1513,16 @@ class DmaKernels:
         packs = int(elems) // elems_per_pack
         launchers = self._require_launchers()
         raw = (launchers.add if wait is None else launchers.wait_add)[int(dtype_code)]
+        grid = _grid_for_packs(packs)
+        if grid_cap is not None:
+            grid = max(1, min(grid, int(grid_cap)))
         raw(
             _ptr(dtype, dst_ptr, 16),
             _ptr(dtype, a_ptr, 16),
             _ptr(dtype, b_ptr, 16),
             () if wait is None else tuple(_ptr(Uint32, p, 4) for p in wait),
             packs,
-            _grid_for_packs(packs),
+            grid,
             current_cuda_stream(),
         )
 

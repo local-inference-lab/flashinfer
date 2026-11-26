@@ -150,3 +150,119 @@ def test_sm_query_failures_are_exchanged_before_geometry_or_ipc(
         )
     assert len(exchanged) == 1
     assert bool(exchanged[0]) is local_failure
+
+
+@pytest.mark.parametrize(
+    "operation,src_shape,dst_shape",
+    [
+        ("reduce_scatter", (1024, 7168), (64, 7168)),
+        ("all_gather", (64, 7168), (16, 64, 7168)),
+        ("row_to_col_all_to_all", (128, 3584), (2048, 224)),
+    ],
+)
+def test_island_row_shard_surfaces_preserve_grid_memory_key_and_disjoint_contract(
+    operation, src_shape, dst_shape
+):
+    from b12x.comm.pcie.pcie_allreduce import PCIeAllReduce
+
+    owner = object.__new__(pcie_island_rs.PCIeIslandRSAllReduce)
+    owner.rank, owner.world_size = 0, 16
+    owner.device, owner.blocks = torch.device("cpu"), 64
+    owner.blocks_override = False
+    owner.wait_nanosleep_cycles = 24
+    owner.threads, owner.threads_override = 512, False
+    owner.max_elements = 1024 * 7168
+    owner.quarter_capacity = (owner.max_elements // 2 + 3) // 4
+    owner.quarter_capacity = (owner.quarter_capacity + 7) // 8 * 8
+    owner.stage_offset = 256
+    owner.part_offset = 512
+    owner.final_offset = 768
+    owner.slab_bytes = 4096
+    owner._mapped_peers = (1, 2, 3, 4, 8, 12)
+    owner._closed = False
+
+    primary = SimpleNamespace(rank=0, world_size=16, device=torch.device("cpu"))
+    manager = PCIeAllReduce(
+        primary, "hierarchical", island_rs=owner, algorithm_override="island_rs"
+    )
+    src = torch.empty(src_shape, dtype=torch.bfloat16)
+    dst = torch.empty(dst_shape, dtype=torch.bfloat16)
+
+    assert getattr(manager, f"should_{operation}")(src)
+    op_plan = manager.plan(src, operation=operation, out=dst)
+    assert op_plan.query.surface == f"PCIeIslandRSAllReduce.{operation}"
+    assert op_plan.query.call["blocks"] == 64
+    assert op_plan.query.call["active_blocks"] == 16
+
+    # All island surfaces share one persistent slab key for the underlying runtime.
+    ar_query = _owner_preparation.query_from_runtime(
+        owner, surface="PCIeIslandRSAllReduce.all_reduce", call={"inp": src}
+    )
+    ar_plan = _owner_preparation.plan(ar_query, runtime=owner)
+    assert (
+        op_plan.memory_requirements().persistent[0].key
+        == ar_plan.memory_requirements().persistent[0].key
+    )
+
+    # Reject grid override mismatch and overlapping storage.
+    bad_query = replace(
+        op_plan.query, call=FrozenMapping(dict(op_plan.query.call, blocks=32))
+    )
+    with pytest.raises(ValueError, match="fixed physical grid"):
+        _owner_preparation.plan(bad_query, runtime=owner)
+    with pytest.raises(ValueError, match="disjoint"):
+        manager.plan(src, operation=operation, out=src)
+
+    # Hierarchical override disables island row-shard surfaces cleanly.
+    hier_only = PCIeAllReduce(
+        primary, "hierarchical", island_rs=owner, algorithm_override="hierarchical"
+    )
+    assert not getattr(hier_only, f"should_{operation}")(src)
+    with pytest.raises(ValueError, match="active TP16 PCIe island runtime"):
+        hier_only.plan(src, operation=operation, out=dst)
+
+
+@pytest.mark.parametrize(
+    "operation,src_shape,dst_shape",
+    [
+        ("reduce_scatter", (1024, 7168), (64, 7168)),
+        ("all_gather", (64, 7168), (16, 64, 7168)),
+    ],
+)
+def test_island_row_shard_ce_local_transport_contract(operation, src_shape, dst_shape):
+    from b12x.comm.pcie.pcie_allreduce import PCIeAllReduce
+
+    owner = object.__new__(pcie_island_rs.PCIeIslandRSAllReduce)
+    owner.rank, owner.world_size = 0, 16
+    owner.device, owner.blocks = torch.device("cpu"), 64
+    owner.blocks_override = False
+    owner.wait_nanosleep_cycles = 24
+    owner.threads, owner.threads_override = 512, False
+    owner.max_elements = 1024 * 7168
+    owner.quarter_capacity = (owner.max_elements // 2 + 3) // 4
+    owner.quarter_capacity = (owner.quarter_capacity + 7) // 8 * 8
+    owner.stage_offset = 256
+    owner.part_offset = 512
+    owner.final_offset = 768
+    owner.slab_bytes = 4096
+    owner._mapped_peers = (1, 2, 3, 4, 8, 12)
+    owner._closed = False
+
+    primary = SimpleNamespace(rank=0, world_size=16, device=torch.device("cpu"))
+    manager = PCIeAllReduce(
+        primary, "hierarchical", island_rs=owner, algorithm_override="island_rs"
+    )
+    src = torch.empty(src_shape, dtype=torch.bfloat16)
+    dst = torch.empty(dst_shape, dtype=torch.bfloat16)
+
+    sm_plan = manager.plan(src, operation=operation, out=dst)
+    ce_plan = manager.plan(src, operation=operation, out=dst, transport="ce_local")
+    assert "transport" not in sm_plan.query.call
+    assert ce_plan.query.call["transport"] == "ce_local"
+    assert sm_plan.query != ce_plan.query
+    assert (
+        sm_plan.memory_requirements().persistent[0].key
+        == ce_plan.memory_requirements().persistent[0].key
+    )
+    with pytest.raises(ValueError, match="transport"):
+        manager.plan(src, operation=operation, out=dst, transport="invalid")

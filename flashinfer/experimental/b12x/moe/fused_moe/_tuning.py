@@ -59,6 +59,7 @@ class MoeDecodeQuery:
     a4_prefill: bool | None = None
     autotune_effort: str = "default"
     prequantized_input: bool = False
+    reserve_sms: int = 0
 
     def to_dict(self) -> dict[str, object]:
         d = {
@@ -99,6 +100,8 @@ class MoeDecodeQuery:
         }
         if self.prequantized_input:
             d["prequantized_input"] = True
+        if self.reserve_sms:
+            d["reserve_sms"] = int(self.reserve_sms)
         return d
 
 
@@ -394,6 +397,12 @@ def _validate_query(query: MoeDecodeQuery, _device: DeviceIdentity | None) -> No
         raise TypeError("csf_inline_scales must be boolean")
     if not query.weight_layouts:
         raise ValueError("MoE query requires declared weight layouts")
+    if (
+        isinstance(query.reserve_sms, bool)
+        or not isinstance(query.reserve_sms, int)
+        or query.reserve_sms < 0
+    ):
+        raise ValueError("MoE reserve_sms must be a non-negative integer")
 
 
 def _nvfp4_query(query):

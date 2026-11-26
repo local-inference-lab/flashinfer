@@ -57,6 +57,13 @@ def _runtime_slab_bytes(runtime) -> int:
     raise ValueError("PCIe runtime does not expose its IPC slab capacity")
 
 
+_ISLAND_ROW_SHARD_SURFACES = (
+    "PCIeIslandRSAllReduce.reduce_scatter",
+    "PCIeIslandRSAllReduce.all_gather",
+    "PCIeIslandRSAllReduce.row_to_col_all_to_all",
+)
+
+
 def _surface_for_runtime(runtime) -> str:
     name = runtime.__class__.__name__
     return {
@@ -65,6 +72,15 @@ def _surface_for_runtime(runtime) -> str:
         "PCIeHierarchicalAllReduce": "PCIeHierarchicalAllReduce.all_reduce",
         "PCIeIslandRSAllReduce": "PCIeIslandRSAllReduce.all_reduce",
     }.get(name, "")
+
+
+def _surfaces_for_runtime(runtime) -> tuple[str, ...]:
+    primary = _surface_for_runtime(runtime)
+    if not primary:
+        return ()
+    if primary == "PCIeIslandRSAllReduce.all_reduce":
+        return (primary, *_ISLAND_ROW_SHARD_SURFACES)
+    return (primary,)
 
 
 def _alignment(tensor):
@@ -202,6 +218,57 @@ def query_from_runtime(
             "slab_bytes": _runtime_slab_bytes(runtime),
             "peer_ranks": tuple(runtime.mapped_peers),
         }
+    elif surface in _ISLAND_ROW_SHARD_SURFACES:
+        inp, out = raw["inp"], raw.get("out")
+        from .pcie_island_rs import _validate_disjoint_output
+
+        _validate_disjoint_output(inp, out)
+        blocks = int(runtime.blocks)
+        if raw.get("blocks") is not None and int(raw["blocks"]) != blocks:
+            raise ValueError(
+                "the island owner's physical grid cannot change between calls"
+            )
+        threads = (
+            int(raw["threads"])
+            if raw.get("threads") is not None
+            else (
+                int(runtime.threads)
+                if getattr(runtime, "threads_override", False)
+                else 1024
+            )
+        )
+        # Sixteen active CTAs saturate PCIe while preserving SM capacity for overlapped GEMMs.
+        active = raw.get("active_blocks")
+        if active is None:
+            active = min(blocks, 16)
+        transport = str(raw.get("transport", "sm_local"))
+        if transport not in ("sm_local", "ce_local"):
+            raise ValueError(f"unsupported island row-shard transport {transport!r}")
+        if (
+            transport == "ce_local"
+            and surface == "PCIeIslandRSAllReduce.row_to_col_all_to_all"
+        ):
+            raise ValueError(
+                "ce_local transport is not supported for row_to_col_all_to_all"
+            )
+        controls = {
+            "threads": threads,
+            "blocks": blocks,
+            "active_blocks": int(active),
+            "inp": _tensor_call(inp),
+            "output": None if out is None else _tensor_call(out),
+        }
+        if transport != "sm_local":
+            controls["transport"] = transport
+        setup = {
+            "max_elements": int(runtime.max_elements),
+            "quarter_capacity": int(runtime.quarter_capacity),
+            "stage_offset": int(runtime.stage_offset),
+            "part_offset": int(runtime.part_offset),
+            "final_offset": int(runtime.final_offset),
+            "slab_bytes": _runtime_slab_bytes(runtime),
+            "peer_ranks": tuple(runtime.mapped_peers),
+        }
     else:
         raise ValueError(f"unsupported PCIe owner surface {surface!r}")
     return PcieQuery(
@@ -282,6 +349,30 @@ def compile_owner_surface(query_payload, ordinal):
                 cross_island_rsag=call.get("cross_island_rsag", False),
                 local_push=call.get("local_push", False),
             )
+        if query.surface == "PCIeIslandRSAllReduce.reduce_scatter":
+            from ._island_copy import get_reduce_scatter_programs
+
+            return get_reduce_scatter_programs(
+                query.rank,
+                call["threads"],
+                ordinal,
+                transport=call.get("transport", "sm_local"),
+            )
+        if query.surface == "PCIeIslandRSAllReduce.all_gather":
+            from ._island_copy import get_all_gather_programs
+
+            return get_all_gather_programs(
+                query.rank,
+                call["threads"],
+                ordinal,
+                transport=call.get("transport", "sm_local"),
+            )
+        if query.surface == "PCIeIslandRSAllReduce.row_to_col_all_to_all":
+            from ._island_copy import get_row_to_col_all_to_all_programs
+
+            return get_row_to_col_all_to_all_programs(
+                query.rank, call["threads"], ordinal
+            )
     raise ValueError(f"unsupported PCIe owner surface {query.surface!r}")
 
 
@@ -324,12 +415,12 @@ def plan(
         raise TypeError("query must be PcieQuery")
     if invocation:
         raise ValueError("PCIe invocation semantics belong in PcieQuery")
-    if _surface_for_runtime(runtime) != query.surface:
+    if query.surface not in _surfaces_for_runtime(runtime):
         raise ValueError("query surface does not match the existing PCIe runtime owner")
     if (int(runtime.rank), int(runtime.world_size)) != (query.rank, query.world_size):
         raise ValueError("query does not match the existing PCIe runtime owner")
     if (
-        query.surface == "PCIeIslandRSAllReduce.all_reduce"
+        query.surface.startswith("PCIeIslandRSAllReduce.")
         and query.call["blocks"] != runtime.blocks
     ):
         raise ValueError("query differs from the island owner's fixed physical grid")
@@ -339,7 +430,7 @@ def plan(
         MemoryRequirements(
             persistent=(
                 PersistentMemory(
-                    ("comm.pcie", query.surface, id(runtime), "slab"),
+                    ("comm.pcie", _surface_for_runtime(runtime), id(runtime), "slab"),
                     slab,
                     slab,
                 ),
@@ -454,6 +545,88 @@ def prepared_call(state, **actual):
                 state.launcher(),
                 actual["inp"],
                 out,
+                query.call["blocks"],
+                actual.get("stream"),
+                active_blocks=query.call["active_blocks"],
+            ),
+            output=out,
+            capture_safe=True,
+        )
+    if query.surface == "PCIeIslandRSAllReduce.reduce_scatter":
+        from .pcie_island_rs import _validate_disjoint_output
+
+        inp = actual["inp"]
+        out = actual.get("out")
+        if out is None:
+            import torch
+
+            out = torch.empty(
+                (inp.shape[0] // runtime.world_size, *inp.shape[1:]),
+                dtype=inp.dtype,
+                device=inp.device,
+            )
+        _validate_disjoint_output(inp, out)
+        return PreparedCall(
+            run=lambda: runtime._run_prepared(
+                state.launcher(),
+                inp,
+                out,
+                query.call["blocks"],
+                actual.get("stream"),
+                active_blocks=query.call["active_blocks"],
+            ),
+            output=out,
+            capture_safe=True,
+        )
+    if query.surface == "PCIeIslandRSAllReduce.all_gather":
+        from .pcie_island_rs import _validate_disjoint_output
+
+        inp = actual["inp"]
+        out = actual.get("out")
+        if out is None:
+            import torch
+
+            out = torch.empty(
+                (runtime.world_size, *inp.shape),
+                dtype=inp.dtype,
+                device=inp.device,
+            )
+        _validate_disjoint_output(inp, out)
+        return PreparedCall(
+            run=lambda: runtime._run_prepared(
+                state.launcher(),
+                inp,
+                out,
+                query.call["blocks"],
+                actual.get("stream"),
+                active_blocks=query.call["active_blocks"],
+            ),
+            output=out,
+            capture_safe=True,
+        )
+    if query.surface == "PCIeIslandRSAllReduce.row_to_col_all_to_all":
+        from .pcie_island_rs import _validate_disjoint_output
+
+        inp = actual["inp"]
+        st, full_c = inp.shape
+        c = full_c // runtime.world_size
+        out = actual.get("out")
+        if out is None:
+            import torch
+
+            out = torch.empty(
+                (st * runtime.world_size, c),
+                dtype=inp.dtype,
+                device=inp.device,
+            )
+        _validate_disjoint_output(inp, out)
+        return PreparedCall(
+            run=lambda: runtime._run_prepared_a2a(
+                state.launcher(),
+                inp,
+                out,
+                st,
+                c,
                 query.call["blocks"],
                 actual.get("stream"),
                 active_blocks=query.call["active_blocks"],

@@ -49,6 +49,16 @@ def _validate_output_overlap(inp, out):
         )
 
 
+def _validate_disjoint_output(inp, out):
+    if (
+        out is not None
+        and inp.device == out.device
+        and inp.data_ptr() < out.data_ptr() + out.nbytes
+        and out.data_ptr() < inp.data_ptr() + inp.nbytes
+    ):
+        raise ValueError("island collective requires disjoint input and output storage")
+
+
 def _align_up(value: int, alignment: int = _ALIGNMENT) -> int:
     return (int(value) + alignment - 1) // alignment * alignment
 
@@ -227,6 +237,51 @@ class PCIeIslandRSAllReduce:
             and inp.data_ptr() % 4 == 0
         )
 
+    def should_reduce_scatter(self, inp: torch.Tensor) -> bool:
+        if not self.should_allreduce(inp) or inp.ndim < 1:
+            return False
+        if (
+            inp.shape[0] % self.world_size != 0
+            or inp.numel() % (self.world_size * 2) != 0
+        ):
+            return False
+        shard_pairs = inp.numel() // (2 * self.world_size)
+        return shard_pairs <= self.quarter_capacity // 4
+
+    def should_all_gather(self, inp: torch.Tensor) -> bool:
+        if (
+            self._closed
+            or inp.device != self.device
+            or inp.dtype != torch.bfloat16
+            or not inp.is_contiguous()
+            or inp.ndim < 1
+            or inp.numel() <= 0
+            or inp.numel() % 2 != 0
+            or inp.data_ptr() % 4 != 0
+        ):
+            return False
+        total_elems = inp.numel() * self.world_size
+        shard_pairs = inp.numel() // 2
+        return (
+            total_elems <= self.max_elements
+            and shard_pairs <= self.quarter_capacity // 4
+        )
+
+    def should_row_to_col_all_to_all(self, inp: torch.Tensor) -> bool:
+        if (
+            self._closed
+            or inp.device != self.device
+            or inp.dtype != torch.bfloat16
+            or not inp.is_contiguous()
+            or inp.ndim != 2
+            or inp.shape[0] <= 0
+            or inp.shape[1] <= 0
+            or inp.shape[1] % (self.world_size * 2) != 0
+            or inp.data_ptr() % 4 != 0
+        ):
+            return False
+        return inp.numel() * 2 <= 2 * self.quarter_capacity * 4
+
     def all_reduce(
         self,
         inp: torch.Tensor,
@@ -270,6 +325,162 @@ class PCIeIslandRSAllReduce:
         return self._run_prepared(
             state.launcher(), inp, out, selected, stream, active_blocks=participating
         )
+
+    def reduce_scatter(
+        self,
+        inp: torch.Tensor,
+        *,
+        plan: Plan,
+        out: Optional[torch.Tensor] = None,
+        stream: object = None,
+        channel_id: Optional[str] = None,
+    ) -> torch.Tensor:
+        del channel_id
+        state = require_prepared(plan, "comm.pcie", self.device)
+        state.require_runtime(self)
+        if state.query.surface != "PCIeIslandRSAllReduce.reduce_scatter":
+            raise ValueError("plan is not prepared for island reduce_scatter")
+        if not self.should_reduce_scatter(inp):
+            raise ValueError(
+                "input does not satisfy island reduce_scatter requirements "
+                f"(shape={tuple(inp.shape)}, dtype={inp.dtype})"
+            )
+        if tuple(inp.shape) != tuple(state.query.call["inp"]["shape"]):
+            raise ValueError("input shape differs from the prepared island plan")
+        expected_shape = (inp.shape[0] // self.world_size, *inp.shape[1:])
+        if out is None:
+            out = torch.empty(expected_shape, dtype=inp.dtype, device=inp.device)
+        if (
+            out.dtype != inp.dtype
+            or out.device != inp.device
+            or tuple(out.shape) != expected_shape
+            or not out.is_contiguous()
+            or out.data_ptr() % 4 != 0
+        ):
+            raise ValueError(
+                "reduce_scatter output must match shard shape and be 4-byte aligned"
+            )
+        _validate_disjoint_output(inp, out)
+        return self._run_prepared(
+            state.launcher(),
+            inp,
+            out,
+            int(state.query.call["blocks"]),
+            stream,
+            active_blocks=int(state.query.call["active_blocks"]),
+        )
+
+    def all_gather(
+        self,
+        inp: torch.Tensor,
+        *,
+        plan: Plan,
+        out: Optional[torch.Tensor] = None,
+        stream: object = None,
+        channel_id: Optional[str] = None,
+    ) -> torch.Tensor:
+        del channel_id
+        state = require_prepared(plan, "comm.pcie", self.device)
+        state.require_runtime(self)
+        if state.query.surface != "PCIeIslandRSAllReduce.all_gather":
+            raise ValueError("plan is not prepared for island all_gather")
+        if not self.should_all_gather(inp):
+            raise ValueError(
+                "input does not satisfy island all_gather requirements "
+                f"(shape={tuple(inp.shape)}, dtype={inp.dtype})"
+            )
+        if tuple(inp.shape) != tuple(state.query.call["inp"]["shape"]):
+            raise ValueError("input shape differs from the prepared island plan")
+        expected_shape = (self.world_size, *inp.shape)
+        if out is None:
+            out = torch.empty(expected_shape, dtype=inp.dtype, device=inp.device)
+        if (
+            out.dtype != inp.dtype
+            or out.device != inp.device
+            or tuple(out.shape) != expected_shape
+            or not out.is_contiguous()
+            or out.data_ptr() % 4 != 0
+        ):
+            raise ValueError(
+                "all_gather output must match [world, *shard] and be 4-byte aligned"
+            )
+        _validate_disjoint_output(inp, out)
+        return self._run_prepared(
+            state.launcher(),
+            inp,
+            out,
+            int(state.query.call["blocks"]),
+            stream,
+            active_blocks=int(state.query.call["active_blocks"]),
+        )
+
+    def row_to_col_all_to_all(
+        self,
+        inp: torch.Tensor,
+        *,
+        plan: Plan,
+        out: Optional[torch.Tensor] = None,
+        stream: object = None,
+        channel_id: Optional[str] = None,
+    ) -> torch.Tensor:
+        del channel_id
+        state = require_prepared(plan, "comm.pcie", self.device)
+        state.require_runtime(self)
+        if state.query.surface != "PCIeIslandRSAllReduce.row_to_col_all_to_all":
+            raise ValueError("plan is not prepared for island row_to_col_all_to_all")
+        if not self.should_row_to_col_all_to_all(inp):
+            raise ValueError(
+                "input does not satisfy island row_to_col_all_to_all requirements "
+                f"(shape={tuple(inp.shape)}, dtype={inp.dtype})"
+            )
+        if tuple(inp.shape) != tuple(state.query.call["inp"]["shape"]):
+            raise ValueError("input shape differs from the prepared island plan")
+        st, full_c = inp.shape
+        c = full_c // self.world_size
+        expected_shape = (st * self.world_size, c)
+        if out is None:
+            out = torch.empty(expected_shape, dtype=inp.dtype, device=inp.device)
+        if (
+            out.dtype != inp.dtype
+            or out.device != inp.device
+            or tuple(out.shape) != expected_shape
+            or not out.is_contiguous()
+            or out.data_ptr() % 4 != 0
+        ):
+            raise ValueError(
+                "row_to_col_all_to_all output must match [world * st, c] and be 4-byte aligned"
+            )
+        _validate_disjoint_output(inp, out)
+        return self._run_prepared_a2a(
+            state.launcher(),
+            inp,
+            out,
+            st,
+            c,
+            int(state.query.call["blocks"]),
+            stream,
+            active_blocks=int(state.query.call["active_blocks"]),
+        )
+
+    def _run_prepared_a2a(
+        self, launcher, inp, out, st, c, blocks, stream, *, active_blocks=None
+    ):
+        with torch.cuda.device(self.device):
+            launcher(
+                self._slab_ptrs,
+                inp.data_ptr(),
+                out.data_ptr(),
+                self.stage_offset,
+                self.part_offset,
+                self.final_offset,
+                self.quarter_capacity,
+                st,
+                c,
+                blocks,
+                stream,
+                active_blocks=active_blocks,
+            )
+        return out
 
     def packet_transport(self):
         from ._island_copy import PacketTransport

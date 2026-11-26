@@ -31,7 +31,7 @@ SURFACES = {
     "OneshotAllReduce.all_reduce_fused_add": (2, 3, 4, 6, 8, 10),
     "OneshotAllReducePool.all_reduce": (2, 3, 4, 6, 8, 10),
     "OneshotAllReducePool.all_reduce_fused_add_rms_norm": (2, 3, 4, 6, 8, 10),
-    "DmaAllReduce.all_reduce": (2, 3, 4, 6, 8, 10),
+    "DmaAllReduce.all_reduce": (2, 3, 4, 6, 8, 10, 16),
     "PCIeTwoShotBF16.all_reduce": (2, 3, 4, 6, 8, 10),
     "PCIeTwoShotBF16.reduce_scatter": (2, 3, 4, 6, 8, 10),
     "PCIeTwoShotBF16.all_gather": (2, 3, 4, 6, 8, 10),
@@ -52,6 +52,9 @@ SURFACES = {
     "VocabParallelArgmax.fused_add_argmax": (8, 12, 16),
     "PCIeHierarchicalAllReduce.all_reduce": (9, 10, 12, 16),
     "PCIeIslandRSAllReduce.all_reduce": (16,),
+    "PCIeIslandRSAllReduce.reduce_scatter": (16,),
+    "PCIeIslandRSAllReduce.all_gather": (16,),
+    "PCIeIslandRSAllReduce.row_to_col_all_to_all": (16,),
     "kimi_topk16": (1,),
 }
 
@@ -86,16 +89,24 @@ def _validate_query(query: PcieQuery, device) -> None:
         raise ValueError(f"{query.surface} supports world sizes {worlds}")
     if not 0 <= query.rank < query.world_size:
         raise ValueError("rank must belong to the caller's process group")
-    if query.surface == "PCIeIslandRSAllReduce.all_reduce":
+    if query.surface in (
+        "PCIeIslandRSAllReduce.all_reduce",
+        "PCIeIslandRSAllReduce.reduce_scatter",
+        "PCIeIslandRSAllReduce.all_gather",
+        "PCIeIslandRSAllReduce.row_to_col_all_to_all",
+    ):
         from ._island_rs_cute import MAX_BLOCKS
 
-        push = query.call.get("local_push", False)
-        scattered = query.call.get("cross_island_rsag", False)
-        dma = query.call.get("cross_island_dma", False)
-        if any(type(value) is not bool for value in (push, scattered, dma)):
-            raise TypeError("island protocol choices must be booleans")
-        if dma and not (push and scattered):
-            raise ValueError("cross-island DMA requires local push and scatter/gather")
+        if query.surface == "PCIeIslandRSAllReduce.all_reduce":
+            push = query.call.get("local_push", False)
+            scattered = query.call.get("cross_island_rsag", False)
+            dma = query.call.get("cross_island_dma", False)
+            if any(type(value) is not bool for value in (push, scattered, dma)):
+                raise TypeError("island protocol choices must be booleans")
+            if dma and not (push and scattered):
+                raise ValueError(
+                    "cross-island DMA requires local push and scatter/gather"
+                )
         blocks, active = query.call["blocks"], query.call["active_blocks"]
         if (
             type(blocks) is not int

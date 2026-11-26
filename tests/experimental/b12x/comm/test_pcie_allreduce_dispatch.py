@@ -463,3 +463,63 @@ def test_tp4_plan_only_offers_pairwise_for_push(
     with autotune_effort("off"):
         configured = plan.contract.configure(plan.query, device=device)
     assert configured.default.implementation == expected
+
+
+@pytest.mark.parametrize("attach_island", (True, False))
+def test_tp16_island_rs_caps_hierarchical_slab(monkeypatch, attach_island):
+    seen = {}
+    island_closed = []
+    island = (
+        SimpleNamespace(
+            rank=0,
+            world_size=16,
+            device=torch.device("cpu"),
+            close=lambda: island_closed.append(True),
+        )
+        if attach_island
+        else None
+    )
+
+    def hierarchy(**kwargs):
+        seen["max_elements"] = kwargs["max_elements"]
+        return SimpleNamespace(rank=0, world_size=16, device=torch.device("cpu"))
+
+    monkeypatch.setattr(dispatch.dist, "get_world_size", lambda group: 16)
+    monkeypatch.setattr(dispatch, "_algorithm_override", lambda: "island_rs")
+    monkeypatch.setattr(
+        dispatch.PCIeAllReduce, "_maybe_island_rs", lambda **kwargs: island
+    )
+    monkeypatch.setattr(dispatch, "PCIeHierarchicalAllReduce", hierarchy)
+    max_size = 28 << 20
+    manager = dispatch.PCIeAllReduce.from_exchange_group(
+        exchange_group=object(), device="cpu", max_size=max_size
+    )
+    expected = dispatch.ISLAND_RS_MAX_BYTES // 2 if attach_island else max_size // 2
+    assert seen["max_elements"] == expected
+    assert manager._island_rs is island
+    assert island_closed == []
+
+
+def test_tp16_hierarchical_failure_closes_attached_island(monkeypatch):
+    island_closed = []
+    island = SimpleNamespace(
+        rank=0,
+        world_size=16,
+        device=torch.device("cpu"),
+        close=lambda: island_closed.append(True),
+    )
+
+    def fail_hierarchy(**kwargs):
+        raise RuntimeError("injected hierarchical failure")
+
+    monkeypatch.setattr(dispatch.dist, "get_world_size", lambda group: 16)
+    monkeypatch.setattr(dispatch, "_algorithm_override", lambda: "island_rs")
+    monkeypatch.setattr(
+        dispatch.PCIeAllReduce, "_maybe_island_rs", lambda **kwargs: island
+    )
+    monkeypatch.setattr(dispatch, "PCIeHierarchicalAllReduce", fail_hierarchy)
+    with pytest.raises(RuntimeError, match="injected hierarchical failure"):
+        dispatch.PCIeAllReduce.from_exchange_group(
+            exchange_group=object(), device="cpu", max_size=28 << 20
+        )
+    assert island_closed == [True]

@@ -105,7 +105,17 @@ def compile_w4a16_fused_moe(
     small_m_occupancy: int | None = None,
     csf_inline_scales: bool = False,
     split_projections: bool = False,
+    reserve_sms: int = 0,
 ) -> W4A16FusedMoeCompileResult:
+    if (
+        isinstance(reserve_sms, bool)
+        or not isinstance(reserve_sms, int)
+        or reserve_sms < 0
+        or reserve_sms >= int(sms)
+    ):
+        raise ValueError(
+            f"reserve_sms must be an integer in [0, {sms}), got {reserve_sms!r}"
+        )
     if small_m_occupancy is None:
         small_m_occupancy = _w4a16_small_m_occupancy()
     scale_format = _normalize_scale_format(scale_format)
@@ -587,6 +597,7 @@ def compile_w4a16_fused_moe(
                 max_m_blocks=max_m_blocks,
                 blocks_per_sm=kernel.blocks_per_sm,
                 small_m_direct_launches=tuple(small_m_direct_launches),
+                reserve_sms=reserve_sms,
             ),
             cached.compiled,
             *(launch.compiled for launch in small_m_direct_launches),
@@ -806,6 +817,7 @@ def compile_w4a16_fused_moe(
         broadcast_suh=bool(broadcast_suh),
         small_m_direct_launches=tuple(small_m_direct_launches),
         trellis_direct_lut=kernel.trellis_direct_lut,
+        reserve_sms=reserve_sms,
     )
     attach_programs(
         result, compiled, *(launch.compiled for launch in small_m_direct_launches)
@@ -1159,7 +1171,10 @@ def _w4a16_fused_persistent_grid_x(
     barrier never deadlocks. Falls back to the default for the route-pack path
     where the host cannot know route_blocks ahead of the launch.
     """
-    cap = int(sms) * int(fused.blocks_per_sm)
+    reserve_sms = int(getattr(fused, "reserve_sms", 0))
+    if reserve_sms < 0 or reserve_sms >= int(sms):
+        raise ValueError(f"reserve_sms must be in [0, {sms}), got {reserve_sms}")
+    cap = (int(sms) - reserve_sms) * int(fused.blocks_per_sm)
     if (
         fused.weight_layout in BLOCK_CODECS and fused.moe_block_size == 8
     ) or _w4a16_small_m_splitk_enabled():

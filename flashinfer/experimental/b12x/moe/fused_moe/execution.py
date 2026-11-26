@@ -27,12 +27,19 @@ class ExecutionCapacity:
     route_num_experts: int | None = None
     output_layout: str = "token"
     input_format: str = "bf16"
+    reserve_sms: int = 0
 
     def __post_init__(self):
         if self.output_layout not in ("token", "routes"):
             raise ValueError("MoE output layout must be token or routes")
         if self.input_format not in ("bf16", "mxfp8"):
             raise ValueError("MoE input_format must be bf16 or mxfp8")
+        if (
+            isinstance(self.reserve_sms, bool)
+            or not isinstance(self.reserve_sms, int)
+            or self.reserve_sms < 0
+        ):
+            raise ValueError("reserve_sms must be a non-negative integer")
         max_tokens, top_k = int(self.max_tokens), int(self.top_k)
         if max_tokens <= 0 or top_k <= 0:
             raise ValueError("max_tokens and top_k must be positive")

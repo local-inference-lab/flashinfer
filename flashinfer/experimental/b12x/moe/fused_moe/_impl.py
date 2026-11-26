@@ -854,12 +854,19 @@ class TPMoEScratchCaps:
     w4a16_a4_prefill_terms: int = 1
     w4a16_a4_prefill_warps: int = 8
     prequantized_input: bool = False
+    reserve_sms: int = 0
     frozen: bool = True
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "max_tokens", max(int(self.max_tokens), 1))
         object.__setattr__(self, "num_topk", max(int(self.num_topk), 1))
         object.__setattr__(self, "device", torch.device(self.device))
+        if (
+            isinstance(self.reserve_sms, bool)
+            or not isinstance(self.reserve_sms, int)
+            or self.reserve_sms < 0
+        ):
+            raise ValueError("reserve_sms must be a non-negative integer")
         if not isinstance(self.decode_config, MoeDecodeConfig):
             raise TypeError("decode_config must be a concrete MoeDecodeConfig")
         if not isinstance(self.weight_plan, MoEWeightPreparationPlan):
@@ -8703,6 +8710,7 @@ def _plan_full_rotation_w4a16_launches(
                 intermediate_hadamard=core_plan.intermediate_hadamard,
                 rotation_input_dtype=rotation_input_dtype,
                 broadcast_suh=broadcast_suh,
+                reserve_sms=caps.reserve_sms,
             )
 
         fused_launches = tuple(

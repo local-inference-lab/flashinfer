@@ -219,6 +219,7 @@ class PCIeAllReduce:
                 )
             else:
                 algorithm = "oneshot"
+        island_rs = None
         if algorithm == "hierarchical":
             if int(max_concurrent_channels) != 1:
                 raise ValueError(
@@ -226,16 +227,6 @@ class PCIeAllReduce:
                 )
             if max_size < torch.bfloat16.itemsize:
                 raise ValueError("max_size must hold at least one BF16 element")
-            runtime = PCIeHierarchicalAllReduce(
-                exchange_group=exchange_group,
-                device=device,
-                max_elements=max_size // torch.bfloat16.itemsize,
-                ext_module=ext_module,
-                ipc=ipc,
-            )
-        island_rs = None
-        bf16_twoshot = None
-        try:
             island_rs = cls._maybe_island_rs(
                 exchange_group=exchange_group,
                 device=device,
@@ -243,6 +234,35 @@ class PCIeAllReduce:
                 algorithm_override=algorithm_override,
                 ipc=ipc,
             )
+            # When the equal-quarter island runtime attaches, the hierarchical
+            # fallback only handles messages up to ISLAND_RS_MAX_BYTES.
+            hierarchical_bytes = (
+                min(int(max_size), ISLAND_RS_MAX_BYTES)
+                if island_rs is not None
+                else int(max_size)
+            )
+            try:
+                runtime = PCIeHierarchicalAllReduce(
+                    exchange_group=exchange_group,
+                    device=device,
+                    max_elements=hierarchical_bytes // torch.bfloat16.itemsize,
+                    ext_module=ext_module,
+                    ipc=ipc,
+                )
+            except BaseException:
+                if island_rs is not None:
+                    island_rs.close()
+                raise
+        bf16_twoshot = None
+        try:
+            if algorithm != "hierarchical":
+                island_rs = cls._maybe_island_rs(
+                    exchange_group=exchange_group,
+                    device=device,
+                    max_size=max_size,
+                    algorithm_override=algorithm_override,
+                    ipc=ipc,
+                )
             if (
                 algorithm == "oneshot"
                 and single_channel
@@ -405,6 +425,23 @@ class PCIeAllReduce:
             return True
         return self._use_island_rs(inp)
 
+    def _island_row_shard_runtime(self):
+        if self._island_rs is None or self._algorithm_override == "hierarchical":
+            return None
+        return self._island_rs
+
+    def should_reduce_scatter(self, inp: torch.Tensor) -> bool:
+        target = self._island_row_shard_runtime()
+        return target is not None and target.should_reduce_scatter(inp)
+
+    def should_all_gather(self, inp: torch.Tensor) -> bool:
+        target = self._island_row_shard_runtime()
+        return target is not None and target.should_all_gather(inp)
+
+    def should_row_to_col_all_to_all(self, inp: torch.Tensor) -> bool:
+        target = self._island_row_shard_runtime()
+        return target is not None and target.should_row_to_col_all_to_all(inp)
+
     def _use_bf16_twoshot(self, inp: torch.Tensor, out: Optional[torch.Tensor]) -> bool:
         target = self._bf16_twoshot
         if (
@@ -501,8 +538,23 @@ class PCIeAllReduce:
             "all_reduce",
             "all_reduce_fused_add_rms_norm",
             "all_reduce_fused_add",
+            "reduce_scatter",
+            "all_gather",
+            "row_to_col_all_to_all",
         ):
             raise ValueError(f"unsupported all-reduce operation {operation!r}")
+        if operation in ("reduce_scatter", "all_gather", "row_to_col_all_to_all"):
+            target = self._island_row_shard_runtime()
+            if target is None:
+                raise ValueError(
+                    f"{operation} requires an active TP16 PCIe island runtime"
+                )
+            query = query_from_runtime(
+                target,
+                surface=f"PCIeIslandRSAllReduce.{operation}",
+                call={"inp": inp, **call},
+            )
+            return plan(query, runtime=target, invocation=invocation, override=override)
         if self.algorithm == "oneshot" and self.single_channel:
             from ._collective_tuning import (
                 oneshot_alternatives,
@@ -666,6 +718,58 @@ class PCIeAllReduce:
             peer_input_ptrs=peer_input_ptrs,
             stream=stream,
             channel_id=channel_id,
+        )
+
+    def reduce_scatter(
+        self,
+        inp: torch.Tensor,
+        *,
+        plan: Plan,
+        out: Optional[torch.Tensor] = None,
+        stream: object = None,
+        channel_id: Optional[str] = None,
+    ) -> torch.Tensor:
+        target = self._island_row_shard_runtime()
+        if target is None:
+            raise ValueError(
+                "reduce_scatter requires an active TP16 PCIe island runtime"
+            )
+        return target.reduce_scatter(
+            inp, plan=plan, out=out, stream=stream, channel_id=channel_id
+        )
+
+    def all_gather(
+        self,
+        inp: torch.Tensor,
+        *,
+        plan: Plan,
+        out: Optional[torch.Tensor] = None,
+        stream: object = None,
+        channel_id: Optional[str] = None,
+    ) -> torch.Tensor:
+        target = self._island_row_shard_runtime()
+        if target is None:
+            raise ValueError("all_gather requires an active TP16 PCIe island runtime")
+        return target.all_gather(
+            inp, plan=plan, out=out, stream=stream, channel_id=channel_id
+        )
+
+    def row_to_col_all_to_all(
+        self,
+        inp: torch.Tensor,
+        *,
+        plan: Plan,
+        out: Optional[torch.Tensor] = None,
+        stream: object = None,
+        channel_id: Optional[str] = None,
+    ) -> torch.Tensor:
+        target = self._island_row_shard_runtime()
+        if target is None:
+            raise ValueError(
+                "row_to_col_all_to_all requires an active TP16 PCIe island runtime"
+            )
+        return target.row_to_col_all_to_all(
+            inp, plan=plan, out=out, stream=stream, channel_id=channel_id
         )
 
     def all_reduce_fused_add_rms_norm(
