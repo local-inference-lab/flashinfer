@@ -7,6 +7,7 @@ from ..._lib.gating import default_is_supported
 from . import reference
 from .._shared.delta_prefill._cute_kernels import clear_caches
 from ._impl import Binding, Caps, Plan, bind, plan, run
+from ._segment import segment_finalize, segment_plan, segment_summarize
 from ._preparation import invocation_from_tensors
 from ._tuning import KdaPrefillConfig, KdaPrefillQuery
 
@@ -29,4 +30,7 @@ __all__ = [
     "invocation_from_tensors",
     "reference",
     "run",
+    "segment_finalize",
+    "segment_plan",
+    "segment_summarize",
 ]
