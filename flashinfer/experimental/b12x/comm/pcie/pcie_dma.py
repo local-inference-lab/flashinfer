@@ -55,8 +55,16 @@ _A2A_DONE_FLAG_BASE = 240
 
 
 def _create_high_priority_stream(device: torch.device) -> torch.cuda.ExternalStream:
-    """Create a dedicated non-pooled high-priority CUDA stream."""
+    """Create a dedicated non-pooled high-priority CUDA stream.
+
+    A pooled torch.cuda.Stream can alias a caller's later graph capture stream,
+    silently serializing DMA copies and flag kernels onto the capture stream.
+    Highest stream priority lets lightweight FlagLaunch/AddLaunch kernels
+    preempt concurrent multi-wave compute GEMMs instead of stalling the ring.
+    """
     with torch.cuda.device(device):
+        # Ensure the primary CUDA context is active on this device before driver calls.
+        torch.cuda.current_stream(device)
         pstatus, _least, greatest = cuda.cuCtxGetStreamPriorityRange()
         if pstatus == cuda.CUresult.CUDA_SUCCESS and greatest < 0:
             status, handle = cuda.cuStreamCreateWithPriority(
@@ -342,13 +350,21 @@ class PCIeDmaAllReduce:
             self._send_counters_base = self._send_counters.data_ptr()
             self._wait_counters_base = self._wait_counters.data_ptr()
             self._wait_done_base = self._wait_done.data_ptr()
-            self._copy_stream = torch.cuda.Stream(device=self.device)
-            self._flag_stream = torch.cuda.Stream(device=self.device)
+            self._copy_stream = _create_high_priority_stream(self.device)
+            self._flag_stream = _create_high_priority_stream(self.device)
             # Separate CE/flag streams for the a2a broadcast phase so allgather
             # traffic overlaps reduce-scatter traffic instead of queueing
             # behind it.
-            self._ag_copy_stream = torch.cuda.Stream(device=self.device)
-            self._ag_flag_stream = torch.cuda.Stream(device=self.device)
+            self._ag_copy_stream = _create_high_priority_stream(self.device)
+            self._ag_flag_stream = _create_high_priority_stream(self.device)
+            self._owned_streams.extend(
+                (
+                    self._copy_stream,
+                    self._flag_stream,
+                    self._ag_copy_stream,
+                    self._ag_flag_stream,
+                )
+            )
             # Persistent cross-stream events: captured graphs keep references to
             # recorded events, so per-call temporaries must not be destroyed.
             self._piece_events = [torch.cuda.Event() for _ in range(MAX_PIECES)]
