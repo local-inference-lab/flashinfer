@@ -604,6 +604,21 @@ def _swiglu_fake(
     del gate_up, out, limit, round_silu, plan_handle
 
 
+@torch.library.custom_op("b12x::hyperconnection_situ", mutates_args=("out",))
+def _situ_op(gate_up: torch.Tensor, out: torch.Tensor, plan_handle: int) -> None:
+    from ._impl import run_situ_impl
+
+    prepared = require_prepared(
+        plan_from_handle(plan_handle), "norm.hyperconnection", gate_up.device
+    )
+    run_situ_impl(gate_up, out=out, plan=prepared)
+
+
+@_situ_op.register_fake
+def _situ_fake(gate_up: torch.Tensor, out: torch.Tensor, plan_handle: int) -> None:
+    del gate_up, out, plan_handle
+
+
 @torch.library.custom_op("b12x::hyperconnection_relu2", mutates_args=("out",))
 def _relu2_op(source: torch.Tensor, out: torch.Tensor, plan_handle: int) -> None:
     from ._impl import run_relu2_impl

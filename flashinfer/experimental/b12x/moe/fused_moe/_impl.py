@@ -13196,7 +13196,7 @@ def _tiny_decode_supports(*, num_tokens: int, k: int, n: int, activation: str) -
     # works (e.g. 352 from GLM 2048/TP6, 192 from DS4-Pro 3072/TP16).
     return (
         1 <= num_tokens <= 4
-        and activation == "silu"
+        and activation in ("silu", SITU)
         and k % 256 == 0
         and n % 32 == 0
         and (k // 128) % 4 == 0
@@ -13232,6 +13232,7 @@ def _get_tiny_decode_kernel(
     *,
     device: torch.device | None = None,
     topk_ids_dtype: torch.dtype = torch.int32,
+    activation: str = "silu",
     swiglu_limit: float | None = None,
 ):
     from b12x.moe._shared.kernels.tiny_decode import (
@@ -13245,8 +13246,10 @@ def _get_tiny_decode_kernel(
     compiled_phases = []
     # Only FC2 applies the activation, so only phase 2 specializes the clamp.
     for kernel in (
-        MoETinyDecodeKernelBackendPhase1(),
-        MoETinyDecodeKernelBackendPhase2(swiglu_limit=swiglu_limit),
+        MoETinyDecodeKernelBackendPhase1(activation=activation),
+        MoETinyDecodeKernelBackendPhase2(
+            activation=activation, swiglu_limit=swiglu_limit
+        ),
     ):
         kernel.configure(m, k, n, num_topk, weight_E, device=device)
         cache_key = ("tiny_decode", str(topk_ids_dtype)) + kernel.__cache_key__
@@ -13303,6 +13306,7 @@ def _launch_tiny_decode_flat(
     k: int,
     n: int,
     num_topk: int,
+    activation: str = "silu",
     swiglu_limit: float | None = None,
 ) -> None:
     from b12x.moe._shared.kernels.tiny_decode import (
@@ -13318,6 +13322,7 @@ def _launch_tiny_decode_flat(
         num_topk,
         device=a.device,
         topk_ids_dtype=launch_ids.dtype,
+        activation=activation,
         swiglu_limit=swiglu_limit,
     )
     rt = m * num_topk
@@ -13358,6 +13363,7 @@ def _tp_moe_tiny_decode_launch_op(
     k: int,
     n: int,
     num_topk: int,
+    activation: str,
     swiglu_limit: float | None,
     volatile_launch_state: bool,
 ) -> None:
@@ -13379,6 +13385,7 @@ def _tp_moe_tiny_decode_launch_op(
         k=k,
         n=n,
         num_topk=num_topk,
+        activation=activation,
         swiglu_limit=swiglu_limit,
     )
 
@@ -13401,6 +13408,7 @@ def _tp_moe_tiny_decode_launch_fake(
     k: int,
     n: int,
     num_topk: int,
+    activation: str,
     swiglu_limit: float | None,
     volatile_launch_state: bool,
 ) -> None:
@@ -13573,6 +13581,7 @@ def _launch_micro(
             k,
             n,
             num_topk,
+            activation,
             swiglu_limit,
             workspace.volatile_launch_state,
         )

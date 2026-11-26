@@ -37,6 +37,7 @@ class WoProjectionQuery:
     sfb_k_replicated: bool = False
     wo_a_tiled: bool = False
     wo_b_tiled: bool = False
+    has_gate: bool = False
     autotune_effort: str = field(default_factory=capture_autotune_effort)
 
     def __post_init__(self) -> None:
@@ -82,6 +83,7 @@ def _a16_tc_gemv_eligible(query, device):
 def _decode_domain(query):
     return (
         not query.dynamic_tokens
+        and not query.has_gate
         and query.dtype == "bfloat16"
         and 1 <= query.max_tokens <= 8
         and query.groups * query.rank % 128 == 0
@@ -118,9 +120,14 @@ def _validate_query(query, device):
         raise TypeError("WO dynamic_tokens must be a boolean")
     if any(
         type(value) is not bool
-        for value in (query.sfb_k_replicated, query.wo_a_tiled, query.wo_b_tiled)
+        for value in (
+            query.sfb_k_replicated,
+            query.wo_a_tiled,
+            query.wo_b_tiled,
+            query.has_gate,
+        )
     ):
-        raise TypeError("WO packed-weight contracts must be boolean")
+        raise TypeError("WO packed-weight and gate contracts must be boolean")
     if query.wo_a_tiled and (query.groups, query.rank, query.group_width) != (
         4,
         1024,
@@ -270,7 +277,7 @@ def _parameters(query, device):
 
 TUNING = TuningContract(
     component_id="gemm.wo_projection",
-    query_schema_version=23,
+    query_schema_version=24,
     config_schema_version=23,
     query_fields=frozenset(WoProjectionQuery.__dataclass_fields__),
     config_fields=frozenset(WoProjectionConfig.__dataclass_fields__),

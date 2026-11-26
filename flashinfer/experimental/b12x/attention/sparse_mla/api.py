@@ -88,8 +88,6 @@ def bind(
         raise ValueError(
             "attention_sink presence must match plan.caps.has_attention_sink"
         )
-    if attention_sink is not None and caps.mode != "decode":
-        raise ValueError("attention_sink is supported only by sparse MLA decode")
     if attention_sink is not None:
         if attention_sink.shape != (caps.num_q_heads,):
             raise ValueError(

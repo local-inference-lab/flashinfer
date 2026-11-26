@@ -3245,6 +3245,7 @@ class MHCFinalizeGramKernel:
         active_source_splits: int = 0,
         lagged_mix: bool = False,
         lagged_prepared: bool = False,
+        rms_eps_outside_sqrt: bool = False,
     ):
         self.lagged_prepared = bool(lagged_prepared)
         if self.lagged_prepared and (
@@ -3313,6 +3314,7 @@ class MHCFinalizeGramKernel:
         _validate_split_k(self.hidden_size, self.split_k)
         self.gram_row0 = self.source_tiles
         self.rms_eps = float(rms_eps)
+        self.rms_eps_outside_sqrt = bool(rms_eps_outside_sqrt)
         self.hc_eps = float(hc_eps)
         self.sinkhorn_iters = int(sinkhorn_iters)
         self.norm_eps = float(norm_eps)
@@ -3603,11 +3605,16 @@ class MHCFinalizeGramKernel:
         if const_expr(self.single_cta):
             lane = tidx % Int32(32)
             if tidx == Int32(0):
-                s_post[0] = cute.math.rsqrt(
-                    Float32(source_values[0]) / Float32(self.total_k)
-                    + Float32(self.rms_eps),
-                    fastmath=True,
-                )
+                mean = Float32(source_values[0]) / Float32(self.total_k)
+                if const_expr(self.rms_eps_outside_sqrt):
+                    s_post[0] = Float32(1.0) / (
+                        cute.math.sqrt(mean, fastmath=True) + Float32(self.rms_eps)
+                    )
+                else:
+                    s_post[0] = cute.math.rsqrt(
+                        mean + Float32(self.rms_eps),
+                        fastmath=True,
+                    )
             cute.arch.sync_threads()
 
             mix_value = Float32(0.0)
@@ -3720,10 +3727,16 @@ class MHCFinalizeGramKernel:
             )
             for mix in cutlass.range_constexpr(_MIXES):
                 mixes[mix] = Float32(sums[mix + 1])
-            inv_rms = cute.math.rsqrt(
-                total_sqsum / Float32(self.total_k) + Float32(self.rms_eps),
-                fastmath=True,
-            )
+            mean = total_sqsum / Float32(self.total_k)
+            if const_expr(self.rms_eps_outside_sqrt):
+                inv_rms = Float32(1.0) / (
+                    cute.math.sqrt(mean, fastmath=True) + Float32(self.rms_eps)
+                )
+            else:
+                inv_rms = cute.math.rsqrt(
+                    mean + Float32(self.rms_eps),
+                    fastmath=True,
+                )
             for mix in cutlass.range_constexpr(_MIXES):
                 mixes[mix] = mixes[mix] * inv_rms
 
@@ -4290,6 +4303,7 @@ def _finalize_gram_kernel(
     active_source_splits: int = 0,
     lagged_mix: bool = False,
     lagged_prepared: bool = False,
+    rms_eps_outside_sqrt: bool = False,
 ) -> MHCFinalizeGramKernel:
     return MHCFinalizeGramKernel(
         hidden_size=hidden_size,
@@ -4307,6 +4321,7 @@ def _finalize_gram_kernel(
         active_source_splits=active_source_splits,
         lagged_mix=lagged_mix,
         lagged_prepared=lagged_prepared,
+        rms_eps_outside_sqrt=rms_eps_outside_sqrt,
     )
 
 
@@ -5478,6 +5493,7 @@ def _run_mhc_finalize_gram_launch(
     lagged_prepared: bool = False,
     single_cta_threads: int = 0,
     single_cta_groups: int = 1,
+    rms_eps_outside_sqrt: bool = False,
     _prepared=None,
 ) -> None:
     rms_eps = float(rms_eps)
@@ -5575,6 +5591,7 @@ def _run_mhc_finalize_gram_launch(
         active_source_splits,
         lagged_mix,
         bool(lagged_prepared),
+        bool(rms_eps_outside_sqrt),
     )
     common_key_tail = (
         (
@@ -5588,6 +5605,7 @@ def _run_mhc_finalize_gram_launch(
             ),
         ),
         ("math", "fast_exp_exact_sigmoid_rcp_approx_sinkhorn"),
+        ("rms_eps_outside_sqrt", bool(rms_eps_outside_sqrt)),
         ("fuse_norm", fuse_norm),
         ("lagged_mix", lagged_mix),
         ("lagged_prepared", bool(lagged_prepared)),

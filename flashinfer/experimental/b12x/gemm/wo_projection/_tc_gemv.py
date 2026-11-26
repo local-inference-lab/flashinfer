@@ -145,8 +145,20 @@ def _inv_rotate_bf16x2(
     )
 
 
+@cute.jit
+def _sigmoid(value: Float32) -> Float32:
+    return Float32(1.0) / (Float32(1.0) + cute.math.exp(-value, fastmath=True))
+
+
+@cute.jit
+def _apply_gate(val: Float32, gate: cute.Tensor, idx: Int64) -> BFloat16:
+    v_bf16 = val.to(BFloat16)
+    s_bf16 = _sigmoid(Float32(gate[idx])).to(BFloat16)
+    return (Float32(v_bf16) * Float32(s_bf16)).to(BFloat16)
+
+
 class GroupedWoaTCGemvKernel:
-    """Single-launch grouped MXFP8 A16 TC-GEMV for WO-A with optional fused inverse RoPE."""
+    """Single-launch grouped MXFP8 A16 TC-GEMV for WO-A with optional fused inverse RoPE and gate."""
 
     def __init__(
         self,
@@ -161,6 +173,7 @@ class GroupedWoaTCGemvKernel:
         nope_dim: int = 448,
         rope_dim: int = 64,
         positions_dtype: str = "int64",
+        has_gate: bool = False,
     ):
         self.groups = int(groups)
         self.rank = int(rank)
@@ -168,6 +181,7 @@ class GroupedWoaTCGemvKernel:
         self.max_m_tiles = int(max_m_tiles)
         self.split_k = int(split_k)
         self.fuse_inv_rope = bool(fuse_inv_rope)
+        self.has_gate = bool(has_gate)
         self.head_dim = int(head_dim)
         self.nope_dim = int(nope_dim)
         self.rope_dim = int(rope_dim)
@@ -206,6 +220,7 @@ class GroupedWoaTCGemvKernel:
         cos_sin: cute.Pointer,
         w_u8: cute.Pointer,
         s_u8: cute.Pointer,
+        gate: cute.Pointer,
         out: cute.Pointer,
         scratch: cute.Pointer,
         flags: cute.Pointer,
@@ -219,6 +234,7 @@ class GroupedWoaTCGemvKernel:
             cos_sin,
             w_u8,
             s_u8,
+            cute.make_tensor(gate, cute.make_layout((Int64(1) << Int64(50),))),
             cute.make_tensor(out, cute.make_layout((Int64(1) << Int64(50),))),
             scratch,
             flags,
@@ -238,6 +254,7 @@ class GroupedWoaTCGemvKernel:
         cos_sin: cute.Pointer,
         w_u8: cute.Pointer,
         s_u8: cute.Pointer,
+        gate: cute.Tensor,
         out: cute.Tensor,
         scratch: cute.Pointer,
         flags: cute.Pointer,
@@ -382,10 +399,14 @@ class GroupedWoaTCGemvKernel:
                         feature = first_n + group + (8 if e >= 2 else 0)
                         row = Int32(mt * 8) + quad * 2 + (e % 2)
                         if feature < self.rank and row < rows:
-                            out[
-                                Int64(row) * Int64(self.total_out_cols)
-                                + Int64(g_col_base + feature)
-                            ] = total.to(BFloat16)
+                            out_idx = Int64(row) * Int64(self.total_out_cols) + Int64(
+                                g_col_base + feature
+                            )
+                            out[out_idx] = (
+                                _apply_gate(total, gate, out_idx)
+                                if cutlass.const_expr(self.has_gate)
+                                else total.to(BFloat16)
+                            )
         else:
             tile_elems = self.max_m_tiles * 128
             scratch_base = Int64(scratch.toint())
@@ -456,26 +477,42 @@ class GroupedWoaTCGemvKernel:
                         r1 = r0 + 1
                         if f_lo < self.rank:
                             if r0 < rows:
-                                out[
-                                    Int64(r0) * Int64(self.total_out_cols)
-                                    + Int64(g_col_base + f_lo)
-                                ] = s0.to(BFloat16)
+                                i0 = Int64(r0) * Int64(self.total_out_cols) + Int64(
+                                    g_col_base + f_lo
+                                )
+                                out[i0] = (
+                                    _apply_gate(s0, gate, i0)
+                                    if cutlass.const_expr(self.has_gate)
+                                    else s0.to(BFloat16)
+                                )
                             if r1 < rows:
-                                out[
-                                    Int64(r1) * Int64(self.total_out_cols)
-                                    + Int64(g_col_base + f_lo)
-                                ] = s1.to(BFloat16)
+                                i1 = Int64(r1) * Int64(self.total_out_cols) + Int64(
+                                    g_col_base + f_lo
+                                )
+                                out[i1] = (
+                                    _apply_gate(s1, gate, i1)
+                                    if cutlass.const_expr(self.has_gate)
+                                    else s1.to(BFloat16)
+                                )
                         if f_hi < self.rank:
                             if r0 < rows:
-                                out[
-                                    Int64(r0) * Int64(self.total_out_cols)
-                                    + Int64(g_col_base + f_hi)
-                                ] = s2.to(BFloat16)
+                                i2 = Int64(r0) * Int64(self.total_out_cols) + Int64(
+                                    g_col_base + f_hi
+                                )
+                                out[i2] = (
+                                    _apply_gate(s2, gate, i2)
+                                    if cutlass.const_expr(self.has_gate)
+                                    else s2.to(BFloat16)
+                                )
                             if r1 < rows:
-                                out[
-                                    Int64(r1) * Int64(self.total_out_cols)
-                                    + Int64(g_col_base + f_hi)
-                                ] = s3.to(BFloat16)
+                                i3 = Int64(r1) * Int64(self.total_out_cols) + Int64(
+                                    g_col_base + f_hi
+                                )
+                                out[i3] = (
+                                    _apply_gate(s3, gate, i3)
+                                    if cutlass.const_expr(self.has_gate)
+                                    else s3.to(BFloat16)
+                                )
                 cute.arch.sync_threads()
                 if Int32(tid) == 0:
                     _st_global_release_u32(flag_addr, Uint32(0))
@@ -495,10 +532,12 @@ def compile_grouped_woa_tc_gemv(
     nope_dim: int = 448,
     rope_dim: int = 64,
     positions_dtype: str = "int64",
+    has_gate: bool = False,
 ):
     max_m_tiles = (int(max_rows) + 7) // 8
     eff_warps = effective_mxfp8_tc_gemv_warps(group_width, split_k, warps)
     fuse_inv_rope = bool(fuse_inv_rope)
+    has_gate = bool(has_gate)
     pos_ct = Int64 if positions_dtype == "int64" else Int32
     kernel = GroupedWoaTCGemvKernel(
         groups=groups,
@@ -512,6 +551,7 @@ def compile_grouped_woa_tc_gemv(
         nope_dim=nope_dim,
         rope_dim=rope_dim,
         positions_dtype=positions_dtype,
+        has_gate=has_gate,
     )
     key = (
         int(groups),
@@ -525,6 +565,7 @@ def compile_grouped_woa_tc_gemv(
         int(nope_dim) if fuse_inv_rope else 0,
         int(rope_dim) if fuse_inv_rope else 0,
         positions_dtype if fuse_inv_rope else "",
+        has_gate,
     )
     fake = (
         make_ptr(BFloat16, 16, cute.AddressSpace.gmem, assumed_align=16),
@@ -538,6 +579,7 @@ def compile_grouped_woa_tc_gemv(
         make_ptr(Uint8, 16, cute.AddressSpace.gmem, assumed_align=16),
         make_ptr(Uint8, 16, cute.AddressSpace.gmem, assumed_align=16),
         make_ptr(BFloat16, 16, cute.AddressSpace.gmem, assumed_align=16),
+        make_ptr(BFloat16, 16, cute.AddressSpace.gmem, assumed_align=16),
         make_ptr(Float32, 16, cute.AddressSpace.gmem, assumed_align=16),
         make_ptr(Uint32, 16, cute.AddressSpace.gmem, assumed_align=4),
     )
@@ -549,7 +591,7 @@ def compile_grouped_woa_tc_gemv(
             Int64(rope_dim),
             current_cuda_stream(),
             compile_spec=KernelCompileSpec.from_key(
-                "gemm.wo_projection.grouped_woa_tc_gemv", 1, key
+                "gemm.wo_projection.grouped_woa_tc_gemv", 2, key
             ),
         )
 
@@ -563,6 +605,7 @@ def compile_grouped_woa_tc_gemv(
         scratch,
         flags,
         stream,
+        gate=None,
     ):
         pos_ptr = (
             make_ptr(
@@ -586,6 +629,13 @@ def compile_grouped_woa_tc_gemv(
             )
         )
         cs_stride = Int64(cos_sin.stride(0)) if cos_sin is not None else Int64(rope_dim)
+        gate_ptr = (
+            make_ptr(BFloat16, gate.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
+            if gate is not None
+            else make_ptr(
+                BFloat16, tmp_out.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
+            )
+        )
         sc_ptr = (
             make_ptr(
                 Float32, scratch.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
@@ -622,6 +672,7 @@ def compile_grouped_woa_tc_gemv(
                     cute.AddressSpace.gmem,
                     assumed_align=16,
                 ),
+                gate_ptr,
                 make_ptr(
                     BFloat16,
                     tmp_out.data_ptr(),

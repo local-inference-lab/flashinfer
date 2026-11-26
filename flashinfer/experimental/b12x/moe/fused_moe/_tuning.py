@@ -414,7 +414,7 @@ def _csf_inline_eligible(query, config):
         return (
             (config.backend != "micro" or _compact_w4a8_query(query))
             and query.source_format == "fp4_e8m0_k32"
-            and query.activation == "silu"
+            and query.activation in {"silu", "situ"}
             and query.hidden_size % 256 == 0
             and query.intermediate_size % 64 == 0
         )

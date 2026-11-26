@@ -34,6 +34,12 @@ from __future__ import annotations
 
 import math
 
+from b12x.moe._shared.kernels.activations import (
+    SITU,
+    SITU_DEFAULT_BETA,
+    SITU_DEFAULT_LINEAR_BETA,
+)
+
 import cutlass
 import cutlass.cute as cute
 import torch
@@ -73,8 +79,8 @@ class MoETinyDecodeKernelBackend:
         compile_time_phase: int = 1,
         swiglu_limit: float | None = None,
     ):
-        if activation != "silu":
-            raise ValueError(f"tiny_decode supports silu only, got {activation!r}")
+        if activation not in ("silu", SITU):
+            raise ValueError(f"tiny_decode supports silu/situ only, got {activation!r}")
         if int(compile_time_phase) not in (1, 2):
             raise ValueError(f"unsupported tiny_decode phase {compile_time_phase!r}")
         if swiglu_limit is not None:
@@ -88,6 +94,7 @@ class MoETinyDecodeKernelBackend:
                 )
         self.compile_time_phase = int(compile_time_phase)
         self.activation = activation
+        self.is_situ = activation == SITU
         self.w13_layout = w13_layout
         self.swiglu_limit = swiglu_limit
         self._cfg_key = None
@@ -177,6 +184,19 @@ class MoETinyDecodeKernelBackend:
         gate = cutlass.min(gate, limit)
         up = cutlass.max(cutlass.min(up, limit), -limit)
         return gate, up
+
+    @cute.jit
+    def _activate(self, g: Float32, u: Float32, rw: Float32) -> Float32:
+        if cutlass.const_expr(self.swiglu_limit is not None):
+            g, u = self._clamp_gate_up(g, u)
+        sig = Float32(1.0) / (Float32(1.0) + cute.math.exp(-g, fastmath=False))
+        if cutlass.const_expr(self.is_situ):
+            beta = Float32(SITU_DEFAULT_BETA)
+            linear_beta = Float32(SITU_DEFAULT_LINEAR_BETA)
+            sg = beta * cute.math.tanh(g / beta, fastmath=False) * sig
+            su = linear_beta * cute.math.tanh(u / linear_beta, fastmath=False)
+            return sg * su * rw
+        return sig * g * u * rw
 
     @cute.jit
     def _row_block_dot(
@@ -407,17 +427,8 @@ class MoETinyDecodeKernelBackend:
                                 u1 = Float32(
                                     inter[ich + Int32(c["n"]) + Int32(2 * jp + 1)]
                                 )
-                                if cutlass.const_expr(self.swiglu_limit is not None):
-                                    g0, u0 = self._clamp_gate_up(g0, u0)
-                                    g1, u1 = self._clamp_gate_up(g1, u1)
-                                s0 = Float32(1.0) / (
-                                    Float32(1.0) + cute.math.exp(-g0, fastmath=False)
-                                )
-                                s1 = Float32(1.0) / (
-                                    Float32(1.0) + cute.math.exp(-g1, fastmath=False)
-                                )
-                                a0 = s0 * g0 * u0 * rw
-                                a1 = s1 * g1 * u1 * rw
+                                a0 = self._activate(g0, u0, rw)
+                                a1 = self._activate(g1, u1, rw)
                             quads.append(pack_f32x2_to_f16x2(a0, a1))
                         xs.append((quads[0], quads[1], quads[2], quads[3]))
                 else:
@@ -431,17 +442,8 @@ class MoETinyDecodeKernelBackend:
                             g1 = Float32(inter[ich + Int32(2 * jp + 1)])
                             u0 = Float32(inter[ich + Int32(c["n"]) + Int32(2 * jp)])
                             u1 = Float32(inter[ich + Int32(c["n"]) + Int32(2 * jp + 1)])
-                            if cutlass.const_expr(self.swiglu_limit is not None):
-                                g0, u0 = self._clamp_gate_up(g0, u0)
-                                g1, u1 = self._clamp_gate_up(g1, u1)
-                            s0 = Float32(1.0) / (
-                                Float32(1.0) + cute.math.exp(-g0, fastmath=False)
-                            )
-                            s1 = Float32(1.0) / (
-                                Float32(1.0) + cute.math.exp(-g1, fastmath=False)
-                            )
-                            a0 = s0 * g0 * u0 * rw
-                            a1 = s1 * g1 * u1 * rw
+                            a0 = self._activate(g0, u0, rw)
+                            a1 = self._activate(g1, u1, rw)
                             quads.append(pack_f32x2_to_f16x2(a0, a1))
                         xs.append((quads[0], quads[1], quads[2], quads[3]))
                 d0, d1, d2, d3 = self._row_block_dot(

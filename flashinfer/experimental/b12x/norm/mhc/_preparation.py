@@ -483,6 +483,7 @@ def _compile_mhc(query_payload, config_payload, native_payload, ordinal):
 def _fused_numerics(query):
     return dict(
         rms_eps=query.rms_eps,
+        rms_eps_outside_sqrt=query.rms_eps_outside_sqrt,
         hc_eps=query.hc_eps,
         norm_eps=query.norm_eps,
         sinkhorn_iters=query.sinkhorn_iters,
@@ -506,6 +507,7 @@ def _finalize_options(query, config, native):
     compact = native.route in ("tf32", "bf16_tma", "bf16_mma", "block_m", "compact")
     return dict(
         rms_eps=query.rms_eps,
+        rms_eps_outside_sqrt=query.rms_eps_outside_sqrt,
         hc_eps=query.hc_eps,
         sinkhorn_iters=query.sinkhorn_iters,
         norm_eps=query.norm_eps,
@@ -523,6 +525,7 @@ def _finalize_options(query, config, native):
 def _lagged_finalize_options(query, config, native):
     return dict(
         rms_eps=query.rms_eps,
+        rms_eps_outside_sqrt=query.rms_eps_outside_sqrt,
         hc_eps=query.hc_eps,
         sinkhorn_iters=query.sinkhorn_iters,
         norm_eps=query.norm_eps,

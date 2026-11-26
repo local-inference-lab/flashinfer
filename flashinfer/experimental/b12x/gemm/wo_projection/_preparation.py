@@ -48,6 +48,7 @@ def _query(
         "sfb_k_replicated",
         "wo_a_tiled",
         "wo_b_tiled",
+        "has_gate",
     }
     if set(invocation) - allowed:
         raise ValueError("unknown WO invocation field")
@@ -83,6 +84,7 @@ def _query(
         sfb_k_replicated=invocation.get("sfb_k_replicated", False),
         wo_a_tiled=invocation.get("wo_a_tiled", False),
         wo_b_tiled=invocation.get("wo_b_tiled", False),
+        has_gate=bool(invocation.get("has_gate", False)),
         codegen=FrozenMapping(
             {
                 "quant_chunks_per_program": _WO_QUANT_CHUNKS_PER_PROGRAM,
@@ -137,7 +139,9 @@ def plan(caps: WOProjectionScratchCaps, *, invocation=FrozenMapping(), override=
         raise TypeError("caps must be WOProjectionScratchCaps")
     invocation = FrozenMapping(invocation)
     query = _query(caps, invocation)
-    use_fused_b = caps.max_tokens <= 8 and not query.dynamic_tokens
+    use_fused_b = (
+        caps.max_tokens <= 8 and not query.dynamic_tokens and not query.has_gate
+    )
     fused = {}
 
     def fused_b(config, device):
@@ -307,6 +311,7 @@ def plan(caps: WOProjectionScratchCaps, *, invocation=FrozenMapping(), override=
             query.nope_dim if inv_rope else 448,
             query.rope_dim if inv_rope else 64,
             query.positions_dtype,
+            query.has_gate,
         )
 
     def _a16_wob_args(config):
@@ -512,6 +517,7 @@ class _A16WOScratchState:
         source_tgd,
         weights,
         out=None,
+        gate=None,
         return_3d=False,
         expected_m=None,
     ):
@@ -532,6 +538,7 @@ class _A16WOScratchState:
             tmp=tmp,
             tmp_q=splitk_flags,
             output=output,
+            gate=gate,
             return_3d=return_3d,
             expected_m=expected_m,
         )
@@ -546,6 +553,7 @@ class _A16WOScratchState:
         weights,
         heads_per_group,
         out=None,
+        gate=None,
         nope_dim=448,
         rope_dim=64,
         return_3d=False,
@@ -601,6 +609,7 @@ class _A16WOScratchState:
             heads_per_group=heads_per_group,
             nope_dim=nope_dim,
             rope_dim=rope_dim,
+            gate=gate,
             return_3d=return_3d,
             expected_m=expected_m,
         )
@@ -630,6 +639,7 @@ class _PreparedWO:
         if str(source.dtype).removeprefix("torch.") != self.query.dtype:
             raise ValueError("WO source dtype differs from declaration")
         self._check_tokens(source.shape[0])
+        self._check_gate(kwargs.get("gate"), source.shape[0], source.device)
         self._check_weights(kwargs["weights"])
         return self._scratch_state.bind(**kwargs)
 
@@ -659,8 +669,24 @@ class _PreparedWO:
         ):
             raise ValueError("inverse-RoPE WO tensor dtypes differ from declaration")
         self._check_tokens(o.shape[0])
+        self._check_gate(kwargs.get("gate"), o.shape[0], o.device)
         self._check_weights(kwargs["weights"])
         return self._scratch_state.bind_inv_rope(**kwargs)
+
+    def _check_gate(self, gate, tokens, device):
+        if (gate is not None) != self.query.has_gate:
+            raise ValueError("WO gate presence differs from declaration")
+        if gate is not None:
+            expected = (int(tokens), self.query.groups * self.query.rank)
+            if (
+                gate.device != device
+                or gate.dtype != torch.bfloat16
+                or tuple(gate.shape) != expected
+                or not gate.is_contiguous()
+            ):
+                raise ValueError(
+                    f"WO gate must be contiguous BF16 {expected} on {device}"
+                )
 
     def _check_weights(self, weights):
         if self.query.sfb_k_replicated and not weights.sfb_k_replicated:
@@ -776,6 +802,7 @@ class _PreparedWO:
                 binding.x_q if self.a16_split_k > 1 else None,
                 flags,
                 stream_int,
+                gate=binding.gate,
             )
             self.a16_wo_b(
                 binding.tmp,
@@ -827,7 +854,7 @@ class _PreparedWO:
                 ),
             )
         else:
-            self.quantizers.quantize_b(binding.tmp, binding.tmp_q)
+            self.quantizers.quantize_b(binding.tmp, binding.tmp_q, gate=binding.gate)
             self.ordinary_b.run(
                 (binding.tmp_q.values.unsqueeze(-1), binding.tmp_q.scale_mma),
                 (
@@ -864,6 +891,7 @@ class _PreparedWO:
                 binding.x_q if self.a16_split_k > 1 else None,
                 flags,
                 stream_int,
+                gate=binding.gate,
             )
             self.a16_wo_b(
                 binding.tmp,
@@ -925,7 +953,7 @@ class _PreparedWO:
                 ),
             )
         else:
-            self.quantizers.quantize_b(binding.tmp, binding.tmp_q)
+            self.quantizers.quantize_b(binding.tmp, binding.tmp_q, gate=binding.gate)
             self.ordinary_b.run(
                 (binding.tmp_q.values.unsqueeze(-1), binding.tmp_q.scale_mma),
                 (

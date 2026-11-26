@@ -28,12 +28,13 @@ def _run_out(
     weights: list[torch.Tensor],
     tiled_a: torch.Tensor | None,
     tiled_b: torch.Tensor | None,
+    gate: torch.Tensor | None,
     out: torch.Tensor,
     scratch: torch.Tensor,
     handle: int,
 ) -> None:
     require_disjoint(
-        out, (source, scratch, *weights, tiled_a, tiled_b), owner="WO output"
+        out, (source, scratch, *weights, tiled_a, tiled_b, gate), owner="WO output"
     )
     plan = plan_from_handle(handle)
     state = require_prepared(plan, "gemm.wo_projection", source.device)
@@ -59,6 +60,7 @@ def _run_out(
     binding = state.bind(
         source_tgd=source,
         weights=packed,
+        gate=gate,
         out=out,
         scratch=scratch,
         return_3d=q.return_3d,
@@ -67,11 +69,13 @@ def _run_out(
 
 
 @_run_out.register_fake
-def _run_out_fake(source, weights, tiled_a, tiled_b, out, scratch, handle) -> None:
+def _run_out_fake(
+    source, weights, tiled_a, tiled_b, gate, out, scratch, handle
+) -> None:
     pass
 
 
-def run_out(source, weights: Weights, *, out, scratch, plan: Plan):
+def run_out(source, weights: Weights, *, out, scratch, plan: Plan, gate=None):
     """Write a prepared projection into output with caller-owned private scratch."""
     operands = [
         tensor
@@ -87,6 +91,7 @@ def run_out(source, weights: Weights, *, out, scratch, plan: Plan):
         operands,
         weights.wo_a.values_tiled,
         weights.wo_b.values_tiled,
+        gate,
         out,
         scratch,
         plan.handle,
@@ -106,6 +111,7 @@ def _run_inv_rope_out(
     scale_rows_b: torch.Tensor | None,
     tiled_a: torch.Tensor | None,
     tiled_b: torch.Tensor | None,
+    gate: torch.Tensor | None,
     out: torch.Tensor,
     scratch: torch.Tensor,
     handle: int,
@@ -122,6 +128,7 @@ def _run_inv_rope_out(
             scale_rows_b,
             tiled_a,
             tiled_b,
+            gate,
         ),
         owner="WO inverse-RoPE output",
     )
@@ -154,6 +161,7 @@ def _run_inv_rope_out(
         heads_per_group=q.heads_per_group,
         nope_dim=q.nope_dim,
         rope_dim=q.rope_dim,
+        gate=gate,
         out=out,
         scratch=scratch,
         return_3d=q.return_3d,
@@ -171,6 +179,7 @@ def _run_inv_rope_out_fake(
     scale_rows_b,
     tiled_a,
     tiled_b,
+    gate,
     out,
     scratch,
     handle,
@@ -179,7 +188,15 @@ def _run_inv_rope_out_fake(
 
 
 def run_inv_rope_out(
-    o, positions, cos_sin_cache, weights: Weights, *, out, scratch, plan: Plan
+    o,
+    positions,
+    cos_sin_cache,
+    weights: Weights,
+    *,
+    out,
+    scratch,
+    plan: Plan,
+    gate=None,
 ):
     """Write a prepared inverse-RoPE projection into output with caller-owned scratch."""
     operands = [
@@ -209,6 +226,7 @@ def run_inv_rope_out(
         scale_rows_b,
         weights.wo_a.values_tiled,
         weights.wo_b.values_tiled,
+        gate,
         out,
         scratch,
         plan.handle,

@@ -732,6 +732,40 @@ def run_swiglu_impl(
     return out
 
 
+def run_situ_impl(
+    gate_up: torch.Tensor,
+    *,
+    out: torch.Tensor,
+    plan: _HyperConnectionState,
+) -> torch.Tensor:
+    """Compute SiTU-GLU (beta=4.0, linear_beta=25.0) on BF16 [T, 2I] -> [T, I]."""
+    _require_cuda(plan)
+    plan.require_operation("situ")
+    plan._live_tokens(gate_up.shape[0])
+    if out.shape[-1] != plan.query.hidden_size:
+        raise ValueError("activation width differs from prepared invocation")
+    if gate_up.ndim != 2 or gate_up.shape[1] <= 0 or gate_up.shape[1] % 2:
+        raise ValueError("gate_up must have shape [T, 2I] with I positive")
+    if gate_up.dtype != torch.bfloat16 or out.dtype != torch.bfloat16:
+        raise TypeError("gate_up and out must be BF16")
+    _validate_pointwise_tensor(
+        gate_up,
+        name="gate_up",
+        shape=tuple(gate_up.shape),
+        device=gate_up.device,
+    )
+    _validate_pointwise_tensor(
+        out,
+        name="out",
+        shape=(gate_up.shape[0], gate_up.shape[1] // 2),
+        device=gate_up.device,
+    )
+    _validate_output_disjoint("out", out, (("gate_up", gate_up),))
+    if out.numel():
+        plan.launch(gate_up, gate_up, out)
+    return out
+
+
 def run_relu2_impl(source, *, out, plan: _HyperConnectionState):
     """Apply squared ReLU to BF16 input with one final BF16 rounding."""
     _require_cuda(plan)
@@ -811,6 +845,7 @@ __all__ = [
     "run_combine_norm_impl",
     "run_engram_mix_impl",
     "run_swiglu_impl",
+    "run_situ_impl",
     "run_relu2_impl",
     "run_add_impl",
     "run_sigmoid_impl",

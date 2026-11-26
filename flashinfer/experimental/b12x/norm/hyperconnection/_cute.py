@@ -492,6 +492,22 @@ class _Pointwise:
                 if cutlass.const_expr(self.round_silu):
                     activated = Float32(BFloat16(activated))
                 value = activated * (up + Float32(self.swiglu_beta))
+            elif cutlass.const_expr(self.operation == "situ"):
+                source = (offset // Int64(self.width)) * Int64(2 * self.width)
+                source += offset % Int64(self.width)
+                gate = Float32(left[source])
+                up = Float32(left[source + Int64(self.width)])
+                beta = Float32(4.0)
+                linear_beta = Float32(25.0)
+                situ_gate = (
+                    beta
+                    * cute.math.tanh(gate / beta, fastmath=True)
+                    * _sigmoid(gate)
+                )
+                situ_up = linear_beta * cute.math.tanh(
+                    up / linear_beta, fastmath=True
+                )
+                value = situ_gate * situ_up
             elif cutlass.const_expr(self.operation == "add"):
                 value = Float32(left[offset]) + Float32(right[offset])
             elif cutlass.const_expr(self.operation == "relu2"):
