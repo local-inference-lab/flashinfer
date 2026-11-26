@@ -52,9 +52,11 @@ from b12x._lib.intrinsics.memory import (
     ld_shared_u16_offset,
     ld_shared_u8_offset,
     ld_shared_v4_u32,
+    ldmatrix_m8n8x2_b16,
     ldmatrix_m8n8x4_b16,
     quantize_scaled_store_shared_v2_e4m3,
     shared_ptr_to_u32,
+    st_shared_u8,
     st_shared_v4_u32,
 )
 from b12x._lib.intrinsics.conversion import (
@@ -63,18 +65,24 @@ from b12x._lib.intrinsics.conversion import (
     f16x2_to_f32x2,
     fp4_decode_2,
 )
-from b12x._lib.intrinsics.math import fmax_f32, fmin_f32, rcp_approx_ftz
+from b12x._lib.intrinsics.math import fabs_f32, fmax_f32, fmin_f32, rcp_approx_ftz
 from b12x._lib.intrinsics.constants import mma_m16n8k16_f32_bf16
-from b12x._lib.intrinsics.mma import mma_m16n8k32_f32_e4m3
+from b12x._lib.intrinsics.mma import mma_m16n8k32_f32_e4m3, mxfp8_mma_m16n8k32_f32_e4m3
 
 from .decode_math import (
     EPILOGUE_FINAL_BF16,
+    _cvt_e4m3x2_to_f16x2,
+    _cvt_f32x2_to_e4m3x2,
     _d2_load_b_fp8,
+    _d2_load_b_fp8_perm,
     _exp2_approx_ftz_f32,
+    _fp32_to_ue8m0_byte,
     _ld_u8_zext,
     _mixed_pairs_to_bf16x2_sm120,
     _nvfp4_pair_bfloat2,
+    _u32_to_f32,
     _ue8m0_zext_byte_to_fp32,
+    _w_perm_col,
     ld_shared_f32,
     ld_shared_u32,
     s0_quantize_q_to_smem,
@@ -2935,6 +2943,414 @@ def s6_xv_nope_mg_dsv4(
     return acc0, acc1
 
 
+
+@cute.jit
+def s1_qk_nope_glm_mg2(
+    qk0,
+    qk1,
+    q_fp8_g0: Int32,
+    q_fp8_g1: Int32,
+    kv_fp8_base_addr: Int32,
+    q_sc_g0: cute.Tensor,
+    q_sc_g1: cute.Tensor,
+    warp_first_cand: Int32,
+    lane: Int32,
+    *,
+    num_scales: cutlass.Constexpr,
+    quant_tile: cutlass.Constexpr,
+    q_nope_stride: cutlass.Constexpr,
+    kv_smem_stride: cutlass.Constexpr,
+    n_hg: cutlass.Constexpr = 2,
+    valid_hpb: cutlass.Constexpr = 16,
+):
+    """Fused GLM (ARBITRARY_FP32) MG QK-NoPE for 1 or 2 HPB head groups.
+
+    Loads the 4 inline FP32 K-group scales once per candidate via ld.shared.v4
+    (returned so s6_xv_nope_mg_glm reuses them without reloading from smem) and
+    shares each ldmatrix.x2 K operand across both head groups.
+    """
+    two = cutlass.const_expr(n_hg == 2)
+    hi0 = cutlass.const_expr(valid_hpb > 8)
+    gid = lane >> Int32(2)
+    tid = lane & Int32(3)
+    glm_c0 = warp_first_cand + tid * Int32(2)
+    glm_c1 = glm_c0 + Int32(1)
+    glm_scale_base = Int32(num_scales * quant_tile)
+
+    a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
+    a_col = (lane >> Int32(4)) * Int32(16)
+    b_row = lane & Int32(7)
+    b_col = ((lane >> Int32(3)) & Int32(1)) * Int32(16)
+    sfa_head = gid + (lane & Int32(1)) * Int32(8)
+
+    # Hoist all 4 inline FP32 scales per candidate in two 16B vectorized loads.
+    k0_u0, k0_u1, k0_u2, k0_u3 = ld_shared_v4_u32(
+        kv_fp8_base_addr + glm_c0 * Int32(kv_smem_stride) + glm_scale_base
+    )
+    k1_u0, k1_u1, k1_u2, k1_u3 = ld_shared_v4_u32(
+        kv_fp8_base_addr + glm_c1 * Int32(kv_smem_stride) + glm_scale_base
+    )
+    ks0 = [
+        _u32_to_f32(k0_u0),
+        _u32_to_f32(k0_u1),
+        _u32_to_f32(k0_u2),
+        _u32_to_f32(k0_u3),
+    ]
+    ks1 = [
+        _u32_to_f32(k1_u0),
+        _u32_to_f32(k1_u1),
+        _u32_to_f32(k1_u2),
+        _u32_to_f32(k1_u3),
+    ]
+
+    sfb = Uint32(0x7F)
+    k_base = (
+        kv_fp8_base_addr
+        + (warp_first_cand + b_row) * Int32(kv_smem_stride)
+        + b_col
+    )
+    q0_base = q_fp8_g0 + a_row * Int32(q_nope_stride) + a_col
+    q1_base = q_fp8_g1 + a_row * Int32(q_nope_stride) + a_col
+
+    for blk in cutlass.range_constexpr(num_scales):
+        sfa0 = _fp32_to_ue8m0_byte(q_sc_g0[sfa_head * Int32(num_scales) + Int32(blk)])
+        if cutlass.const_expr(two):
+            sfa1 = _fp32_to_ue8m0_byte(
+                q_sc_g1[sfa_head * Int32(num_scales) + Int32(blk)]
+            )
+        acc00 = Float32(0.0)
+        acc01 = Float32(0.0)
+        acc02 = Float32(0.0)
+        acc03 = Float32(0.0)
+        if cutlass.const_expr(two):
+            acc10 = Float32(0.0)
+            acc11 = Float32(0.0)
+            acc12 = Float32(0.0)
+            acc13 = Float32(0.0)
+        for ks in cutlass.range_constexpr(quant_tile // 32):
+            ko = Int32(blk * quant_tile + ks * 32)
+            b0, b1 = ldmatrix_m8n8x2_b16(k_base + ko)
+            a00, a01, a02, a03 = ldmatrix_m8n8x4_b16(q0_base + ko)
+            acc00, acc01, acc02, acc03 = mxfp8_mma_m16n8k32_f32_e4m3(
+                acc00, acc01, acc02, acc03, a00, a01, a02, a03, b0, b1, sfa0, sfb
+            )
+            if cutlass.const_expr(two):
+                a10, a11, a12, a13 = ldmatrix_m8n8x4_b16(q1_base + ko)
+                acc10, acc11, acc12, acc13 = mxfp8_mma_m16n8k32_f32_e4m3(
+                    acc10, acc11, acc12, acc13, a10, a11, a12, a13, b0, b1, sfa1, sfb
+                )
+        s0 = ks0[blk]
+        s1 = ks1[blk]
+        qk0[0] = qk0[0] + acc00 * s0
+        qk0[1] = qk0[1] + acc01 * s1
+        if cutlass.const_expr(hi0):
+            qk0[2] = qk0[2] + acc02 * s0
+            qk0[3] = qk0[3] + acc03 * s1
+        if cutlass.const_expr(two):
+            qk1[0] = qk1[0] + acc10 * s0
+            qk1[1] = qk1[1] + acc11 * s1
+            qk1[2] = qk1[2] + acc12 * s0
+            qk1[3] = qk1[3] + acc13 * s1
+    return qk0, qk1, [k0_u0, k0_u1, k0_u2, k0_u3], [k1_u0, k1_u1, k1_u2, k1_u3]
+
+
+@cute.jit
+def s3_mask_and_scale_global_glm_mg2(
+    qk0,
+    qk1,
+    ks0,
+    ks1,
+    index_base_ptr: Int64,
+    warp_first_cand: Int32,
+    split_cand_start: Int32,
+    split_cand_end: Int32,
+    section_len: Int32,
+    sm_scale_log2: Float32,
+    lane: Int32,
+    *,
+    n_hg: cutlass.Constexpr = 2,
+):
+    """Fused S3 mask/scale for 1 or 2 head groups; loads idx0/idx1 once and zeros
+    hoisted ks0/ks1 scales for masked candidates so invalid rows never inject NaN.
+    """
+    two = cutlass.const_expr(n_hg == 2)
+    tid = lane & Int32(3)
+    c0 = warp_first_cand + tid * Int32(2)
+    c1 = c0 + Int32(1)
+    abs_c0 = c0 + split_cand_start
+    abs_c1 = c1 + split_cand_start
+
+    idx0 = Int32(-1)
+    if abs_c0 < section_len:
+        idx0 = _ld_global_index_i32(index_base_ptr, c0)
+    idx1 = Int32(-1)
+    if abs_c1 < section_len:
+        idx1 = _ld_global_index_i32(index_base_ptr, c1)
+
+    m0 = Uint32(0xFFFFFFFF)
+    if abs_c0 >= split_cand_end or idx0 < Int32(0):
+        qk0[0] = Float32(-1.0e30)
+        qk0[2] = Float32(-1.0e30)
+        if cutlass.const_expr(two):
+            qk1[0] = Float32(-1.0e30)
+            qk1[2] = Float32(-1.0e30)
+        m0 = Uint32(0)
+    m1 = Uint32(0xFFFFFFFF)
+    if abs_c1 >= split_cand_end or idx1 < Int32(0):
+        qk0[1] = Float32(-1.0e30)
+        qk0[3] = Float32(-1.0e30)
+        if cutlass.const_expr(two):
+            qk1[1] = Float32(-1.0e30)
+            qk1[3] = Float32(-1.0e30)
+        m1 = Uint32(0)
+    ks0 = [
+        _u32_to_f32(ks0[0] & m0),
+        _u32_to_f32(ks0[1] & m0),
+        _u32_to_f32(ks0[2] & m0),
+        _u32_to_f32(ks0[3] & m0),
+    ]
+    ks1 = [
+        _u32_to_f32(ks1[0] & m1),
+        _u32_to_f32(ks1[1] & m1),
+        _u32_to_f32(ks1[2] & m1),
+        _u32_to_f32(ks1[3] & m1),
+    ]
+
+    qk0[0] = qk0[0] * sm_scale_log2
+    qk0[1] = qk0[1] * sm_scale_log2
+    qk0[2] = qk0[2] * sm_scale_log2
+    qk0[3] = qk0[3] * sm_scale_log2
+    if cutlass.const_expr(two):
+        qk1[0] = qk1[0] * sm_scale_log2
+        qk1[1] = qk1[1] * sm_scale_log2
+        qk1[2] = qk1[2] * sm_scale_log2
+        qk1[3] = qk1[3] * sm_scale_log2
+    return qk0, qk1, ks0, ks1
+
+
+@cute.jit
+def s6_xv_nope_mg_glm(
+    w_pre0,
+    w_pre1,
+    acc0,
+    acc1,
+    ks0,
+    ks1,
+    kv_fp8_base_addr: Int32,
+    w_head_sc_view: cute.Tensor,
+    w_fp8_base_addr: Int32,
+    warp_id: Int32,
+    lane: Int32,
+    *,
+    n_v_chunks: cutlass.Constexpr,
+    v_chunk: cutlass.Constexpr,
+    hpb: cutlass.Constexpr,
+    bi: cutlass.Constexpr,
+    kv_smem_stride: cutlass.Constexpr,
+    w_fp8_stride: cutlass.Constexpr,
+    n_warps: cutlass.Constexpr,
+    nt_per_warp_xv: cutlass.Constexpr,
+    num_threads: cutlass.Constexpr,
+    barrier_id: cutlass.Constexpr,
+    n_hg: cutlass.Constexpr = 2,
+):
+    """Fused GLM (ARBITRARY_FP32) two-pass W XV-NoPE for 1 or 2 HPB head groups.
+
+    Assumes ``w_head_sc_view`` and negative-index ``kv_fp8`` rows were already
+    zeroed before ``s4_online_softmax_mg2`` (riding on s4 CTA barriers),
+    reuses hoisted ``ks0/ks1`` V-scales (zero smem loads), warp-reduces absmax
+    before atomic_max (4x fewer smem atomics), skips the separate smem
+    normalization pass/barrier, batches 2 V-chunks per barrier across 4 W
+    staging slots, and shares each ``_d2_load_b_fp8_perm`` V fragment across
+    both head groups and both HI/LO passes (4 barriers/tile vs 19).
+    """
+    two = cutlass.const_expr(n_hg == 2)
+    bar_kw = dict(barrier_id=barrier_id, number_of_threads=num_threads)
+    gid = lane >> Int32(2)
+    tid = lane & Int32(3)
+    warp_first_cand = warp_id * Int32(8)
+    cand_e0 = warp_first_cand + tid * Int32(2)
+    cand_e1 = cand_e0 + Int32(1)
+    wcol_e0 = _w_perm_col(cand_e0)
+    wcol_e1 = _w_perm_col(cand_e1)
+
+    # --- (1) Warp-reduced absmax of |w_pre * vsc| -> w_head_sc (1 barrier). ---
+    w_head_sc_base = shared_ptr_to_u32(w_head_sc_view.iterator)
+    w_head_sc_lane_base = w_head_sc_base + gid * Int32(4)
+    g1_sc_bytes = n_v_chunks * hpb * 4
+
+    for vc in cutlass.range_constexpr(n_v_chunks):
+        vsc0 = ks0[vc]
+        vsc1 = ks1[vc]
+        m00 = fmax_f32(fabs_f32(w_pre0[0] * vsc0), fabs_f32(w_pre0[1] * vsc1))
+        m01 = fmax_f32(fabs_f32(w_pre0[2] * vsc0), fabs_f32(w_pre0[3] * vsc1))
+        m00 = fmax_f32(m00, cute.arch.shuffle_sync_bfly(m00, offset=2))
+        m01 = fmax_f32(m01, cute.arch.shuffle_sync_bfly(m01, offset=2))
+        m00 = fmax_f32(m00, cute.arch.shuffle_sync_bfly(m00, offset=1))
+        m01 = fmax_f32(m01, cute.arch.shuffle_sync_bfly(m01, offset=1))
+        if cutlass.const_expr(two):
+            m10 = fmax_f32(fabs_f32(w_pre1[0] * vsc0), fabs_f32(w_pre1[1] * vsc1))
+            m11 = fmax_f32(fabs_f32(w_pre1[2] * vsc0), fabs_f32(w_pre1[3] * vsc1))
+            m10 = fmax_f32(m10, cute.arch.shuffle_sync_bfly(m10, offset=2))
+            m11 = fmax_f32(m11, cute.arch.shuffle_sync_bfly(m11, offset=2))
+            m10 = fmax_f32(m10, cute.arch.shuffle_sync_bfly(m10, offset=1))
+            m11 = fmax_f32(m11, cute.arch.shuffle_sync_bfly(m11, offset=1))
+        if tid == Int32(0):
+            atomic_max_shared_f32_offset(w_head_sc_lane_base, vc * hpb * 4, m00)
+            atomic_max_shared_f32_offset(w_head_sc_lane_base, (vc * hpb + 8) * 4, m01)
+            if cutlass.const_expr(two):
+                atomic_max_shared_f32_offset(
+                    w_head_sc_lane_base, g1_sc_bytes + vc * hpb * 4, m10
+                )
+                atomic_max_shared_f32_offset(
+                    w_head_sc_lane_base, g1_sc_bytes + (vc * hpb + 8) * 4, m11
+                )
+    cute.arch.barrier(**bar_kw)
+
+    # --- (2) Batched 2-vc HI/LO W quantization + fused g0/g1 XV MMAs. ---
+    w_group_bytes = Int32(hpb * w_fp8_stride)
+    w_parity_bytes = Int32(n_hg * hpb * w_fp8_stride)
+    a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
+    a_col = (lane >> Int32(4)) * Int32(16)
+    inv_fp8_max = Float32(1.0 / 448.0)
+    fp8_min = Float32(-448.0)
+    fp8_max = Float32(448.0)
+
+    for pair in cutlass.range_constexpr(n_v_chunks // 2):
+        if cutlass.const_expr(pair > 0):
+            cute.arch.barrier(**bar_kw)
+        sc00_p = []
+        sc01_p = []
+        sc10_p = []
+        sc11_p = []
+        for vc_off in cutlass.range_constexpr(2):
+            vc = pair * 2 + vc_off
+            hi_g0 = w_fp8_base_addr + Int32(vc_off * 2) * w_parity_bytes
+            lo_g0 = hi_g0 + w_parity_bytes
+            vsc0 = ks0[vc]
+            vsc1 = ks1[vc]
+
+            raw00 = ld_shared_f32_offset(w_head_sc_lane_base, vc * hpb * 4)
+            raw01 = ld_shared_f32_offset(w_head_sc_lane_base, (vc * hpb + 8) * 4)
+            sc00 = fmax_f32(raw00, Float32(1e-10)) * inv_fp8_max
+            sc01 = fmax_f32(raw01, Float32(1e-10)) * inv_fp8_max
+            si00 = rcp_approx_ftz(sc00)
+            si01 = rcp_approx_ftz(sc01)
+            sc00_p.append(sc00)
+            sc01_p.append(sc01)
+
+            c00 = w_pre0[0] * vsc0 * si00
+            c01 = w_pre0[1] * vsc1 * si00
+            fhi = _cvt_f32x2_to_e4m3x2(c00, c01)
+            h00, h01 = f16x2_to_f32x2(_cvt_e4m3x2_to_f16x2(fhi))
+            flo = _cvt_f32x2_to_e4m3x2(c00 - h00, c01 - h01)
+            row0_off = gid * Int32(w_fp8_stride)
+            st_shared_u8(hi_g0 + row0_off + wcol_e0, (fhi & Uint32(0xFF)).to(cutlass.Uint8))
+            st_shared_u8(hi_g0 + row0_off + wcol_e1, ((fhi >> Uint32(8)) & Uint32(0xFF)).to(cutlass.Uint8))
+            st_shared_u8(lo_g0 + row0_off + wcol_e0, (flo & Uint32(0xFF)).to(cutlass.Uint8))
+            st_shared_u8(lo_g0 + row0_off + wcol_e1, ((flo >> Uint32(8)) & Uint32(0xFF)).to(cutlass.Uint8))
+
+            c02 = w_pre0[2] * vsc0 * si01
+            c03 = w_pre0[3] * vsc1 * si01
+            fhi = _cvt_f32x2_to_e4m3x2(c02, c03)
+            h02, h03 = f16x2_to_f32x2(_cvt_e4m3x2_to_f16x2(fhi))
+            flo = _cvt_f32x2_to_e4m3x2(c02 - h02, c03 - h03)
+            row1_off = (gid + Int32(8)) * Int32(w_fp8_stride)
+            st_shared_u8(hi_g0 + row1_off + wcol_e0, (fhi & Uint32(0xFF)).to(cutlass.Uint8))
+            st_shared_u8(hi_g0 + row1_off + wcol_e1, ((fhi >> Uint32(8)) & Uint32(0xFF)).to(cutlass.Uint8))
+            st_shared_u8(lo_g0 + row1_off + wcol_e0, (flo & Uint32(0xFF)).to(cutlass.Uint8))
+            st_shared_u8(lo_g0 + row1_off + wcol_e1, ((flo >> Uint32(8)) & Uint32(0xFF)).to(cutlass.Uint8))
+
+            if cutlass.const_expr(two):
+                hi_g1 = hi_g0 + w_group_bytes
+                lo_g1 = lo_g0 + w_group_bytes
+                raw10 = ld_shared_f32_offset(w_head_sc_lane_base, g1_sc_bytes + vc * hpb * 4)
+                raw11 = ld_shared_f32_offset(w_head_sc_lane_base, g1_sc_bytes + (vc * hpb + 8) * 4)
+                sc10 = fmax_f32(raw10, Float32(1e-10)) * inv_fp8_max
+                sc11 = fmax_f32(raw11, Float32(1e-10)) * inv_fp8_max
+                si10 = rcp_approx_ftz(sc10)
+                si11 = rcp_approx_ftz(sc11)
+                sc10_p.append(sc10)
+                sc11_p.append(sc11)
+
+                c10 = w_pre1[0] * vsc0 * si10
+                c11 = w_pre1[1] * vsc1 * si10
+                fhi = _cvt_f32x2_to_e4m3x2(c10, c11)
+                h10, h11 = f16x2_to_f32x2(_cvt_e4m3x2_to_f16x2(fhi))
+                flo = _cvt_f32x2_to_e4m3x2(c10 - h10, c11 - h11)
+                st_shared_u8(hi_g1 + row0_off + wcol_e0, (fhi & Uint32(0xFF)).to(cutlass.Uint8))
+                st_shared_u8(hi_g1 + row0_off + wcol_e1, ((fhi >> Uint32(8)) & Uint32(0xFF)).to(cutlass.Uint8))
+                st_shared_u8(lo_g1 + row0_off + wcol_e0, (flo & Uint32(0xFF)).to(cutlass.Uint8))
+                st_shared_u8(lo_g1 + row0_off + wcol_e1, ((flo >> Uint32(8)) & Uint32(0xFF)).to(cutlass.Uint8))
+
+                c12 = w_pre1[2] * vsc0 * si11
+                c13 = w_pre1[3] * vsc1 * si11
+                fhi = _cvt_f32x2_to_e4m3x2(c12, c13)
+                h12, h13 = f16x2_to_f32x2(_cvt_e4m3x2_to_f16x2(fhi))
+                flo = _cvt_f32x2_to_e4m3x2(c12 - h12, c13 - h13)
+                st_shared_u8(hi_g1 + row1_off + wcol_e0, (fhi & Uint32(0xFF)).to(cutlass.Uint8))
+                st_shared_u8(hi_g1 + row1_off + wcol_e1, ((fhi >> Uint32(8)) & Uint32(0xFF)).to(cutlass.Uint8))
+                st_shared_u8(lo_g1 + row1_off + wcol_e0, (flo & Uint32(0xFF)).to(cutlass.Uint8))
+                st_shared_u8(lo_g1 + row1_off + wcol_e1, ((flo >> Uint32(8)) & Uint32(0xFF)).to(cutlass.Uint8))
+
+        cute.arch.barrier(**bar_kw)
+
+        for vc_off in cutlass.range_constexpr(2):
+            vc = pair * 2 + vc_off
+            hi_g0 = w_fp8_base_addr + Int32(vc_off * 2) * w_parity_bytes + a_row * Int32(w_fp8_stride) + a_col
+            lo_g0 = hi_g0 + w_parity_bytes
+            sc00 = sc00_p[vc_off]
+            sc01 = sc01_p[vc_off]
+            if cutlass.const_expr(two):
+                hi_g1 = hi_g0 + w_group_bytes
+                lo_g1 = lo_g0 + w_group_bytes
+                sc10 = sc10_p[vc_off]
+                sc11 = sc11_p[vc_off]
+            for nt in cutlass.range_constexpr(nt_per_warp_xv):
+                at = vc * nt_per_warp_xv + nt
+                dim = Int32(vc * v_chunk) + (Int32(nt * n_warps) + warp_id) * Int32(8)
+                xv00 = Float32(0.0)
+                xv01 = Float32(0.0)
+                xv02 = Float32(0.0)
+                xv03 = Float32(0.0)
+                if cutlass.const_expr(two):
+                    xv10 = Float32(0.0)
+                    xv11 = Float32(0.0)
+                    xv12 = Float32(0.0)
+                    xv13 = Float32(0.0)
+                for kstep in cutlass.range_constexpr(bi // 32):
+                    ko = Int32(kstep * 32)
+                    b0, b1 = _d2_load_b_fp8_perm(
+                        kv_fp8_base_addr, ko, dim, lane, kv_smem_stride=kv_smem_stride
+                    )
+                    a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(hi_g0 + ko)
+                    xv00, xv01, xv02, xv03 = mma_m16n8k32_f32_e4m3(
+                        xv00, xv01, xv02, xv03, a0, a1, a2, a3, b0, b1
+                    )
+                    a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(lo_g0 + ko)
+                    xv00, xv01, xv02, xv03 = mma_m16n8k32_f32_e4m3(
+                        xv00, xv01, xv02, xv03, a0, a1, a2, a3, b0, b1
+                    )
+                    if cutlass.const_expr(two):
+                        a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(hi_g1 + ko)
+                        xv10, xv11, xv12, xv13 = mma_m16n8k32_f32_e4m3(
+                            xv10, xv11, xv12, xv13, a0, a1, a2, a3, b0, b1
+                        )
+                        a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(lo_g1 + ko)
+                        xv10, xv11, xv12, xv13 = mma_m16n8k32_f32_e4m3(
+                            xv10, xv11, xv12, xv13, a0, a1, a2, a3, b0, b1
+                        )
+                acc0[at][0] = acc0[at][0] + xv00 * sc00
+                acc0[at][1] = acc0[at][1] + xv01 * sc00
+                acc0[at][2] = acc0[at][2] + xv02 * sc01
+                acc0[at][3] = acc0[at][3] + xv03 * sc01
+                if cutlass.const_expr(two):
+                    acc1[at][0] = acc1[at][0] + xv10 * sc10
+                    acc1[at][1] = acc1[at][1] + xv11 * sc10
+                    acc1[at][2] = acc1[at][2] + xv12 * sc11
+                    acc1[at][3] = acc1[at][3] + xv13 * sc11
+    return acc0, acc1
+
 class UnifiedPrefillMGKernel:
     def __init__(
         self,
@@ -3256,6 +3672,15 @@ class UnifiedPrefillMGKernel:
         is_nvfp4 = cutlass.const_expr(t.scale_format == ScaleFormat.NVFP4_E4M3)
         dsv41_fp8_pv = cutlass.const_expr(
             t.model_type == ModelType.DSV41 and t.fp8_internal
+        )
+        fast_glm_arb = cutlass.const_expr(
+            is_glm
+            and not is_dsv41
+            and t.scale_format == ScaleFormat.ARBITRARY_FP32
+            and t.num_scales == 4
+            and t.n_v_chunks == 4
+            and not self.pack_hilo_rows
+            and L.w_fp8_bufs >= 4
         )
         q_head_dim = cutlass.const_expr(t.d_nope + t.d_rope)
         # Compile-time head-group count: 1 (heads==16) or 2 (heads % 32 == 0). All
@@ -3944,6 +4369,7 @@ class UnifiedPrefillMGKernel:
                     q_rope_stride=L.q_rope_stride,
                     num_threads=self.math_threads,
                     barrier_id=2,
+                    fused_subgroup_quant=fast_glm_arb,
                 )
                 if cutlass.const_expr(n_hg == 2):
                     s0_quantize_q_to_smem(
@@ -3965,6 +4391,7 @@ class UnifiedPrefillMGKernel:
                         q_rope_stride=L.q_rope_stride,
                         num_threads=self.math_threads,
                         barrier_id=2,
+                        fused_subgroup_quant=fast_glm_arb,
                     )
                 if cutlass.const_expr(is_glm and has_rope):
                     # GLM FP8 registerizes Q-rope (the smem scratch aliases W_FP8,
@@ -4184,11 +4611,14 @@ class UnifiedPrefillMGKernel:
                                 extra_row, split_cand_start
                             )
 
-                    if cutlass.const_expr(is_glm and not is_dsv41):
+                    if cutlass.const_expr(is_glm and not is_dsv41 and not fast_glm_arb):
+                        zero_end = split_cand_end
+                        if sec_len_now < zero_end:
+                            zero_end = sec_len_now
                         entry = tid // Int32(4)
                         if entry < Int32(t.bi):
                             index = _ld_valid_global_index_i32(
-                                index_base_ptr, entry, split_cand_end - split_cand_start
+                                index_base_ptr, entry, zero_end - split_cand_start
                             )
                             if index < Int32(0):
                                 for chunk in cutlass.range_constexpr(
@@ -4418,6 +4848,42 @@ class UnifiedPrefillMGKernel:
                                 kv_rope_regs,
                                 n_hg=n_hg,
                             )
+                    elif cutlass.const_expr(fast_glm_arb):
+                        qk0, qk1, glm_ks0, glm_ks1 = s1_qk_nope_glm_mg2(
+                            qk0,
+                            qk1,
+                            q_fp8_g0,
+                            q_fp8_g1,
+                            kv_fp8_b,
+                            q_sc_g0,
+                            q_sc_g1,
+                            warp_first_cand,
+                            lane,
+                            num_scales=t.num_scales,
+                            quant_tile=t.quant_tile,
+                            q_nope_stride=t.q_nope_stride,
+                            kv_smem_stride=L.kv_smem_stride,
+                            n_hg=n_hg,
+                            valid_hpb=self.valid_hpb,
+                        )
+                        if cutlass.const_expr(has_rope):
+                            qk0, qk1 = s2_qk_rope_regs_mg_glm(
+                                qk0,
+                                qk1,
+                                q_rope_regs0,
+                                q_rope_regs1,
+                                rope_cache,
+                                index_base_ptr,
+                                warp_first_cand,
+                                lane,
+                                rope_pbs,
+                                rope_stride,
+                                d_rope=t.d_rope,
+                                n_hg=n_hg,
+                                valid_hpb=self.valid_hpb,
+                                scale_format=t.scale_format,
+                                fp8_rope=t.fp8_rope,
+                            )
                     else:
                         qk0 = s1_qk_nope_block_scaled(
                             qk0,
@@ -4491,19 +4957,44 @@ class UnifiedPrefillMGKernel:
                                 n_hg=n_hg,
                                 valid_hpb=self.valid_hpb,
                             )
-                    qk0 = s3_mask_and_scale_global(
-                        qk0,
-                        index_base_ptr,
-                        warp_first_cand,
-                        split_cand_start,
-                        split_cand_end,
-                        sec_len_now,
-                        sm_scale_log2,
-                        lane,
-                    )
-                    if cutlass.const_expr(n_hg == 2):
-                        qk1 = s3_mask_and_scale_global(
+                    if cutlass.const_expr(fast_glm_arb):
+                        qk0, qk1, glm_ks0, glm_ks1 = s3_mask_and_scale_global_glm_mg2(
+                            qk0,
                             qk1,
+                            glm_ks0,
+                            glm_ks1,
+                            index_base_ptr,
+                            warp_first_cand,
+                            split_cand_start,
+                            split_cand_end,
+                            sec_len_now,
+                            sm_scale_log2,
+                            lane,
+                            n_hg=n_hg,
+                        )
+                        if tid < Int32(n_hg * t.n_v_chunks * t.hpb):
+                            w_head_sc_view_all[tid] = Float32(0.0)
+                        entry = tid // Int32(4)
+                        if entry < Int32(t.bi):
+                            index = _ld_valid_global_index_i32(
+                                index_base_ptr, entry, split_cand_end - split_cand_start
+                            )
+                            if index < Int32(0):
+                                for chunk in cutlass.range_constexpr(
+                                    L.kv_smem_stride // 16
+                                ):
+                                    offset = (tid % Int32(4)) * Int32(4) + Int32(
+                                        chunk * 16
+                                    )
+                                    st_shared_u32(
+                                        kv_fp8_b
+                                        + entry * Int32(L.kv_smem_stride)
+                                        + offset,
+                                        Uint32(0),
+                                    )
+                    else:
+                        qk0 = s3_mask_and_scale_global(
+                            qk0,
                             index_base_ptr,
                             warp_first_cand,
                             split_cand_start,
@@ -4512,6 +5003,17 @@ class UnifiedPrefillMGKernel:
                             sm_scale_log2,
                             lane,
                         )
+                        if cutlass.const_expr(n_hg == 2):
+                            qk1 = s3_mask_and_scale_global(
+                                qk1,
+                                index_base_ptr,
+                                warp_first_cand,
+                                split_cand_start,
+                                split_cand_end,
+                                sec_len_now,
+                                sm_scale_log2,
+                                lane,
+                            )
                     p0 = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
                     p1 = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
                     p0, p1, wr00, wr01, wr10, wr11 = s4_online_softmax_mg2(
@@ -4653,6 +5155,31 @@ class UnifiedPrefillMGKernel:
                                 sm_p_stride=L.sm_p_full_stride,
                                 latent_scale_per_token=t.latent_scale_per_token,
                             )
+                    elif cutlass.const_expr(fast_glm_arb):
+                        acc0, acc1 = s6_xv_nope_mg_glm(
+                            w_pre0,
+                            w_pre1,
+                            acc0,
+                            acc1,
+                            glm_ks0,
+                            glm_ks1,
+                            kv_fp8_b,
+                            w_head_sc_view_all,
+                            w_fp8_addr,
+                            warp_id,
+                            lane,
+                            n_v_chunks=t.n_v_chunks,
+                            v_chunk=t.quant_tile,
+                            hpb=t.hpb,
+                            bi=t.bi,
+                            kv_smem_stride=L.kv_smem_stride,
+                            w_fp8_stride=t.bi + 16,
+                            n_warps=8,
+                            nt_per_warp_xv=t.nt_per_warp_xv,
+                            num_threads=self.math_threads,
+                            barrier_id=3,
+                            n_hg=n_hg,
+                        )
                     elif cutlass.const_expr(is_glm):
                         i_hs = tid
                         while i_hs < Int32(n_hg * t.n_v_chunks * self.valid_hpb):

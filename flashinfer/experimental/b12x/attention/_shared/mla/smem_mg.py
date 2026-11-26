@@ -13,7 +13,7 @@ import cutlass
 import cutlass.cute as cute
 
 from .smem import SM120_SMEM_CARVEOUT_BYTES
-from .traits import ComputeMode, ModelType, UnifiedMLATraits
+from .traits import ComputeMode, ModelType, ScaleFormat, UnifiedMLATraits
 
 _MG_N_HG = 2
 _KV_BUF_COUNT = 2
@@ -274,7 +274,11 @@ def make_smem_layout_mg(
     w_fp8_stride = bi + _W_FP8_PAD
     w_fp8_group_bytes = hpb * w_fp8_stride
     w_fp8_parity_bytes = mg_n_hg * w_fp8_group_bytes
-    w_fp8_bufs = _W_FP8_BUF_COUNT
+    w_fp8_bufs = (
+        4
+        if (is_glm and traits.scale_format == ScaleFormat.ARBITRARY_FP32)
+        else _W_FP8_BUF_COUNT
+    )
     off = w_fp8_off + w_fp8_parity_bytes * w_fp8_bufs
 
     if alias_qrope:
