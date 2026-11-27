@@ -67,6 +67,9 @@ def _fused_semantics(
     output_dtype=None,
     zero_centered=False,
     reduction_dtype=None,
+    round_before_weight=False,
+    reduction_order="local",
+    trigger_dependents=False,
     input_addend=False,
     group_size=0,
     group_id_limit=0,
@@ -95,6 +98,10 @@ def _fused_semantics(
         raise ValueError(
             "fused RMSNorm operands and reduction rounding require FP16, BF16, or FP32"
         )
+    if type(round_before_weight) is not bool or type(trigger_dependents) is not bool:
+        raise TypeError("round_before_weight and trigger_dependents must be booleans")
+    if reduction_order not in ("local", "shard_owner"):
+        raise ValueError("fused reduction order must be local or shard_owner")
     if type(zero_centered) is not bool:
         raise TypeError("zero_centered must be a boolean")
     if type(input_addend) is not bool:
@@ -106,6 +113,9 @@ def _fused_semantics(
         "group_ids_dtype": group_ids_dtype,
         **{key: _dtype_name(value) for key, value in operands.items()},
         "zero_centered": zero_centered,
+        **({"round_before_weight": True} if round_before_weight else {}),
+        **({"trigger_dependents": True} if trigger_dependents else {}),
+        **({"reduction_order": reduction_order} if reduction_order != "local" else {}),
         "reduction_dtype": (
             None if reduction_dtype is None else _dtype_name(reduction_dtype)
         ),
@@ -290,6 +300,9 @@ def query_from_metadata(
     output_dtype: torch.dtype | None = None,
     zero_centered: bool = False,
     reduction_dtype: torch.dtype | None = None,
+    round_before_weight: bool = False,
+    reduction_order: str = "local",
+    trigger_dependents: bool = False,
     input_addend: bool = False,
     has_addend: bool = False,
     group_size: int = 0,
@@ -351,10 +364,24 @@ def query_from_metadata(
         pack_elems = 16 // tensor.element_size()
         hidden_packs = int(tensor.shape[-1]) // pack_elems
         rows = tensor.numel() // int(tensor.shape[-1])
-        min_ctas = (hidden_packs + threads * 3 - 1) // (threads * 3)
-        override = int(os.getenv("B12X_PCIE_FUSED_CTAS_PER_ROW", "0"))
-        ctas = override if override > 0 else max(max(1, 3 // rows), min_ctas)
-        ctas = max(1, min(ctas, 36 // rows))
+        reg_packs = 3
+        if reduction_order == "shard_owner":
+            mode = "stage_pull" if stage_input else "registered"
+            if (
+                hidden_packs <= 768
+                and int(os.getenv("B12X_PCIE_FUSED_THREADS", "0")) == 0
+                and int(os.getenv("B12X_PCIE_FUSED_CTAS_PER_ROW", "0")) == 0
+            ):
+                threads = 768
+                reg_packs = 1
+                ctas = 1
+                single_cta = True
+                register_normalize = True
+        if reg_packs == 3:
+            min_ctas = (hidden_packs + threads * 3 - 1) // (threads * 3)
+            override = int(os.getenv("B12X_PCIE_FUSED_CTAS_PER_ROW", "0"))
+            ctas = override if override > 0 else max(max(1, 3 // rows), min_ctas)
+            ctas = max(1, min(ctas, 36 // rows))
         launcher = {
             **_fused_semantics(
                 dtype,
@@ -363,6 +390,9 @@ def query_from_metadata(
                 output_dtype=output_dtype,
                 zero_centered=zero_centered,
                 reduction_dtype=reduction_dtype,
+                round_before_weight=round_before_weight,
+                reduction_order=reduction_order,
+                trigger_dependents=trigger_dependents,
                 input_addend=input_addend,
                 group_size=group_size,
                 group_id_limit=group_id_limit,
@@ -374,6 +404,7 @@ def query_from_metadata(
             "single_cta": single_cta,
             "register_normalize": register_normalize,
             "threads": threads,
+            **({"reg_packs": reg_packs} if reg_packs != 3 else {}),
             "device_index": backend._device_index(runtime.device),
             "payload_ready_region_packs": native.plain_payload_ready_region_packs,
             "hidden_packs": hidden_packs,
@@ -477,10 +508,24 @@ def query_from_runtime(runtime, *, surface, call) -> PcieQuery:
         pack_elems = 16 // inp.element_size()
         hidden_packs = int(inp.shape[-1]) // pack_elems
         rows = inp.numel() // int(inp.shape[-1])
-        min_ctas = (hidden_packs + threads * 3 - 1) // (threads * 3)
-        override = int(os.getenv("B12X_PCIE_FUSED_CTAS_PER_ROW", "0"))
-        ctas = override if override > 0 else max(max(1, 3 // rows), min_ctas)
-        ctas = max(1, min(ctas, 36 // rows))
+        reg_packs = 3
+        if values.get("reduction_order", "local") == "shard_owner":
+            mode = "stage_pull" if stage_input else "registered"
+            if (
+                hidden_packs <= 768
+                and int(os.getenv("B12X_PCIE_FUSED_THREADS", "0")) == 0
+                and int(os.getenv("B12X_PCIE_FUSED_CTAS_PER_ROW", "0")) == 0
+            ):
+                threads = 768
+                reg_packs = 1
+                ctas = 1
+                single_cta = True
+                register_normalize = True
+        if reg_packs == 3:
+            min_ctas = (hidden_packs + threads * 3 - 1) // (threads * 3)
+            override = int(os.getenv("B12X_PCIE_FUSED_CTAS_PER_ROW", "0"))
+            ctas = override if override > 0 else max(max(1, 3 // rows), min_ctas)
+            ctas = max(1, min(ctas, 36 // rows))
         launcher = {
             **_fused_semantics(
                 inp.dtype,
@@ -489,6 +534,9 @@ def query_from_runtime(runtime, *, surface, call) -> PcieQuery:
                 output_dtype=getattr(values.get("out"), "dtype", inp.dtype),
                 zero_centered=values.get("zero_centered", False),
                 reduction_dtype=values.get("reduction_dtype"),
+                round_before_weight=values.get("round_before_weight", False),
+                reduction_order=values.get("reduction_order", "local"),
+                trigger_dependents=values.get("trigger_dependents", False),
                 input_addend=input_addend,
                 group_size=group_size,
                 group_id_limit=group_id_limit,
@@ -500,6 +548,7 @@ def query_from_runtime(runtime, *, surface, call) -> PcieQuery:
             "single_cta": single_cta,
             "register_normalize": register_normalize,
             "threads": threads,
+            **({"reg_packs": reg_packs} if reg_packs != 3 else {}),
             "device_index": backend._device_index(inp.device),
             "payload_ready_region_packs": native.plain_payload_ready_region_packs,
             "hidden_packs": hidden_packs,
@@ -606,6 +655,10 @@ def compile_oneshot_surface(query_payload, ordinal):
                     group_id_limit=call["group_id_limit"],
                     group_ids_dtype=call["group_ids_dtype"],
                     normalize=call["normalize"],
+                    round_before_weight=call.get("round_before_weight", False),
+                    reduction_order=call.get("reduction_order", "local"),
+                    trigger_dependents=call.get("trigger_dependents", False),
+                    reg_packs=call.get("reg_packs", 3),
                 )
                 for variant in variants
             }

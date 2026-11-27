@@ -1257,6 +1257,10 @@ class _FusedOneshotLaunch(_PackedMath):
         group_id_limit: int = 0,
         group_ids_dtype: str = "int32",
         normalize: bool = True,
+        round_before_weight: bool = False,
+        reduction_order: str = "local",
+        trigger_dependents: bool = False,
+        reg_packs: int = _REG_PACKS,
     ) -> None:
         super().__init__(dtype_name)
         self._residual_dtype = residual_dtype or dtype_name
@@ -1269,12 +1273,36 @@ class _FusedOneshotLaunch(_PackedMath):
             raise ValueError(
                 f"unsupported reduction rounding dtype {reduction_dtype!r}"
             )
+        if int(reg_packs) not in (1, _REG_PACKS):
+            raise ValueError(f"unsupported fused register pack count {reg_packs!r}")
         self._zero_centered = bool(zero_centered)
         self._reduction_dtype = reduction_dtype
         self._group_size, self._group_id_limit = int(group_size), int(group_id_limit)
         self._group_ids_dtype = group_ids_dtype
         self._input_addend = bool(input_addend)
         self._apply_norm = bool(normalize)
+        self._round_before_weight = round_before_weight
+        self._shard_order = reduction_order == "shard_owner"
+        self._trigger_dependents = trigger_dependents
+        self._reg_packs = int(reg_packs)
+        self._scatter_gather = mode in (
+            "stage_scatter_gather",
+            "stage_scatter_gather_packed",
+        )
+        self._packed_gather = mode == "stage_scatter_gather_packed"
+        if reduction_order not in ("local", "shard_owner") or (
+            self._shard_order
+            and mode
+            not in (
+                "registered",
+                "stage_pull",
+                "stage_scatter_gather",
+                "stage_scatter_gather_packed",
+            )
+        ):
+            raise ValueError(
+                "shard-owner summation requires readable contributions from every rank"
+            )
         if (self._input_addend or self._group_size) and mode == "registered":
             raise ValueError("input addend requires staged collective storage")
         if mode not in (
@@ -1285,8 +1313,31 @@ class _FusedOneshotLaunch(_PackedMath):
             "stage_tp8_owner",
             "stage_tp4_owner",
             "stage_bf16_sentinel",
+            "stage_scatter_gather",
+            "stage_scatter_gather_packed",
         ):
             raise ValueError(f"invalid fused oneshot mode {mode!r}")
+        if self._scatter_gather:
+            if world_size not in (2, 4, 8):
+                raise ValueError(
+                    "fused scatter-gather transport requires world size 2, 4, or 8"
+                )
+            if dtype_name not in ("float16", "bfloat16"):
+                raise ValueError(
+                    "fused scatter-gather transport requires float16 or bfloat16"
+                )
+            if not (single_cta and register_normalize and self._reg_packs == 1):
+                raise ValueError(
+                    "fused scatter-gather transport requires one CTA per row holding one pack per thread"
+                )
+            if self._group_size != 0:
+                raise ValueError(
+                    "fused scatter-gather transport does not accept weighted route groups"
+                )
+            if self._packed_gather and reduction_dtype != dtype_name:
+                raise ValueError(
+                    "packed fused scatter-gather requires source-dtype reduction rounding"
+                )
         if mode == "stage_remote_push" and world_size not in (2, 4):
             raise ValueError("fused remote push requires TP2 or TP4")
         if mode == "stage_bf16_sentinel" and (
@@ -1389,6 +1440,15 @@ class _FusedOneshotLaunch(_PackedMath):
 
     @cute.jit
     def _normalize(self, value: Float32, scale: Float32, inv_rms: Float32) -> Float32:
+        if cutlass.const_expr(self._round_before_weight):
+            normalized = value * inv_rms
+            if cutlass.const_expr(self._residual_dtype == "bfloat16"):
+                normalized = normalized.to(cutlass.BFloat16).to(Float32)
+            elif cutlass.const_expr(self._residual_dtype == "float16"):
+                normalized = normalized.to(cutlass.Float16).to(Float32)
+            if cutlass.const_expr(self._zero_centered):
+                return normalized * (Float32(1.0) + scale)
+            return normalized * scale
         if cutlass.const_expr(self._zero_centered):
             return (value * inv_rms) * (Float32(1.0) + scale)
         return value * (inv_rms * scale)
@@ -1617,7 +1677,7 @@ class _FusedOneshotLaunch(_PackedMath):
                     payload_ready_region_packs + Int64(self._rank) * shard_packs + index
                 ) * Int64(16)
                 self._publish_bf16_words(address, words)
-        elif cutlass.const_expr(self._mode == "stage_pull"):
+        elif cutlass.const_expr(self._mode == "stage_pull" or self._scatter_gather):
             words = self._input_words(
                 input_base,
                 input_addend_base,
@@ -1854,6 +1914,31 @@ class _FusedOneshotLaunch(_PackedMath):
                 peer_ptrs[self._rank]
             ) + payload_ready_region_packs * Int64(16)
             self._receive_bf16_sum(local_base, shard_packs, index, accumulator)
+        elif cutlass.const_expr(self._scatter_gather):
+            slice_packs = hidden_packs // Int32(self._world_size)
+            row_idx = Int32(index // Int64(hidden_packs))
+            col_idx = Int32(index - Int64(row_idx) * Int64(hidden_packs))
+            slice_owner = col_idx // slice_packs
+            owner_slice_offset = Int64(row_idx) * Int64(slice_packs) + Int64(
+                col_idx - slice_owner * slice_packs
+            )
+            if cutlass.const_expr(self._packed_gather):
+                words = ld_global_v4_u32(
+                    Int64(peer_ptrs[Int64(slice_owner)])
+                    + (total_packs + owner_slice_offset) * Int64(16)
+                )
+                self._accumulate_words(
+                    accumulator, words[0], words[1], words[2], words[3], True
+                )
+            else:
+                gather_src = Int64(peer_ptrs[Int64(slice_owner)]) + (
+                    total_packs + owner_slice_offset * Int64(2)
+                ) * Int64(16)
+                low = ld_global_v4_u32(gather_src)
+                high = ld_global_v4_u32(gather_src + Int64(16))
+                for lane in cutlass.range_constexpr(4):
+                    accumulator[lane] = u32_as_f32(low[lane])
+                    accumulator[lane + 4] = u32_as_f32(high[lane])
         elif cutlass.const_expr(self._mode == "stage_tp8_owner"):
             part = total_packs // Int64(4)
             chunk = index // part
@@ -1922,6 +2007,27 @@ class _FusedOneshotLaunch(_PackedMath):
                         not initialized,
                     )
                     initialized = True
+        elif cutlass.const_expr(self._shard_order):
+            # A two-shot reduce-scatter starts with each element's shard owner,
+            # then visits the other ranks in cyclic order before rounding to BF16.
+            packs_per_owner = (total_packs + Int64(self._world_size - 1)) // Int64(
+                self._world_size
+            )
+            owner = index // packs_per_owner
+            for lane in cutlass.range_constexpr(self._pack_elems):
+                accumulator[lane] = Float32(0.0)
+            # Independent peer reads can be outstanding together. Accumulate their
+            # results in shard-owner order to retain the two-shot BF16 rounding.
+            offset = index * Int64(16)
+            peer_words = []
+            for step in cutlass.range_constexpr(self._world_size):
+                peer = (owner + Int64(step)) % Int64(self._world_size)
+                peer_words.append(ld_global_v4_u32(Int64(peer_ptrs[peer]) + offset))
+            for step in cutlass.range_constexpr(self._world_size):
+                words = peer_words[step]
+                self._accumulate_words(
+                    accumulator, words[0], words[1], words[2], words[3], False
+                )
         else:
             for peer_index in cutlass.range_constexpr(self._world_size):
                 peer_rank = (self._rank + peer_index) % self._world_size
@@ -1985,6 +2091,8 @@ class _FusedOneshotLaunch(_PackedMath):
         group_weights_ptr: cute.Pointer,
         group_ids_ptr: cute.Pointer,
     ) -> None:
+        if cutlass.const_expr(self._trigger_dependents):
+            cute.arch.griddepcontrol_launch_dependents()
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
         gdim, _, _ = cute.arch.grid_dim()
@@ -2066,7 +2174,7 @@ class _FusedOneshotLaunch(_PackedMath):
                 stage_row += Int32(gdim)
         elif cutlass.const_expr(not self._single_cta):
             if cutlass.const_expr(self._register_normalize):
-                for pack_number in cutlass.range_constexpr(_REG_PACKS):
+                for pack_number in cutlass.range_constexpr(self._reg_packs):
                     col = col0 + Int32(pack_number) * col_stride
                     if col < hidden_packs:
                         self._stage_pack(
@@ -2124,6 +2232,77 @@ class _FusedOneshotLaunch(_PackedMath):
         elif cutlass.const_expr(self._mode != "stage_bf16_sentinel"):
             self._multi_gpu_barrier(signal_ptrs)
 
+        if cutlass.const_expr(self._scatter_gather):
+            world = Int32(self._world_size)
+            slice_packs = hidden_packs // world
+            step = Int32(tidx) % world
+            slice_pack = Int32(tidx) // world
+            warp_lane = Int32(tidx) % Int32(32)
+            group_base = (warp_lane // world) * world
+            packs_per_owner = (total_packs + Int64(self._world_size - 1)) // Int64(
+                self._world_size
+            )
+            self_slot = Int64(peer_ptrs[self._rank])
+            rs_row = row
+            while rs_row < rows:
+                owned_col = Int32(self._rank) * slice_packs + slice_pack
+                owned_index = Int64(rs_row) * Int64(hidden_packs) + Int64(owned_col)
+                term = cute.make_rmem_tensor((self._pack_elems,), cutlass.Float32)
+                for elem in cutlass.range_constexpr(self._pack_elems):
+                    term[elem] = Float32(0.0)
+                if slice_pack < slice_packs:
+                    if cutlass.const_expr(self._shard_order):
+                        owner = Int32(owned_index // packs_per_owner)
+                        peer = (owner + step) % world
+                    else:
+                        peer = (Int32(self._rank) + step) % world
+                    self._load_accumulate(
+                        term,
+                        Int64(peer_ptrs[Int64(peer)]) + owned_index * Int64(16),
+                        True,
+                    )
+                reduced = cute.make_rmem_tensor((self._pack_elems,), cutlass.Float32)
+                for elem in cutlass.range_constexpr(self._pack_elems):
+                    acc_val = cute.arch.shuffle_sync(term[elem], offset=group_base)
+                    for s in cutlass.range_constexpr(1, self._world_size):
+                        acc_val = acc_val + cute.arch.shuffle_sync(
+                            term[elem], offset=group_base + Int32(s)
+                        )
+                    reduced[elem] = acc_val
+                if step == Int32(0) and slice_pack < slice_packs:
+                    slice_offset = Int64(rs_row) * Int64(slice_packs) + Int64(
+                        slice_pack
+                    )
+                    if cutlass.const_expr(self._packed_gather):
+                        packed_words = self._pack_input_values(reduced)
+                        st_global_v4_u32(
+                            self_slot + (total_packs + slice_offset) * Int64(16),
+                            packed_words[0],
+                            packed_words[1],
+                            packed_words[2],
+                            packed_words[3],
+                        )
+                    else:
+                        gather_dst = self_slot + (
+                            total_packs + slice_offset * Int64(2)
+                        ) * Int64(16)
+                        st_global_v4_f32(
+                            gather_dst,
+                            reduced[0],
+                            reduced[1],
+                            reduced[2],
+                            reduced[3],
+                        )
+                        st_global_v4_f32(
+                            gather_dst + Int64(16),
+                            reduced[4],
+                            reduced[5],
+                            reduced[6],
+                            reduced[7],
+                        )
+                rs_row += Int32(gdim)
+            self._multi_gpu_barrier(signal_ptrs)
+
         if cutlass.const_expr(self._mode == "stage_tp4_owner"):
             publish_row = row
             publish_col = Int32(col0)
@@ -2179,10 +2358,10 @@ class _FusedOneshotLaunch(_PackedMath):
                 row_offset = Int64(row) * Int64(hidden_packs)
                 square_sum = Float32(0.0)
                 values = cute.make_rmem_tensor(
-                    (_REG_PACKS, self._pack_elems), cutlass.Float32
+                    (self._reg_packs, self._pack_elems), cutlass.Float32
                 )
                 if cutlass.const_expr(self._register_normalize):
-                    for pack_number in cutlass.range_constexpr(_REG_PACKS):
+                    for pack_number in cutlass.range_constexpr(self._reg_packs):
                         col = col0 + Int32(pack_number) * col_stride
                         if col < hidden_packs:
                             index = row_offset + Int64(col)
@@ -2307,7 +2486,7 @@ class _FusedOneshotLaunch(_PackedMath):
                 inv_rms = inv_rms_smem[0]
 
                 if cutlass.const_expr(self._register_normalize):
-                    for pack_number in cutlass.range_constexpr(_REG_PACKS):
+                    for pack_number in cutlass.range_constexpr(self._reg_packs):
                         col = col0 + Int32(pack_number) * col_stride
                         if col < hidden_packs:
                             scale = cute.make_rmem_tensor(
@@ -2611,6 +2790,10 @@ def _fused_oneshot_process_key(
     group_id_limit: int = 0,
     group_ids_dtype: str = "int32",
     normalize: bool = True,
+    round_before_weight: bool = False,
+    reduction_order: str = "local",
+    trigger_dependents: bool = False,
+    reg_packs: int = _REG_PACKS,
 ) -> tuple[object, ...]:
     return (
         str(dtype_name),
@@ -2633,6 +2816,10 @@ def _fused_oneshot_process_key(
         int(group_id_limit),
         group_ids_dtype,
         bool(normalize),
+        round_before_weight,
+        reduction_order,
+        trigger_dependents,
+        int(reg_packs),
     )
 
 
@@ -2657,6 +2844,10 @@ def is_fused_oneshot_launcher_prepared(
     group_id_limit: int = 0,
     group_ids_dtype: str = "int32",
     normalize: bool = True,
+    round_before_weight: bool = False,
+    reduction_order: str = "local",
+    trigger_dependents: bool = False,
+    reg_packs: int = _REG_PACKS,
 ) -> bool:
     """Return whether this exact fused graph launcher is already loaded."""
 
@@ -2682,6 +2873,10 @@ def is_fused_oneshot_launcher_prepared(
             group_id_limit,
             group_ids_dtype,
             bool(normalize),
+            round_before_weight,
+            reduction_order,
+            trigger_dependents,
+            reg_packs,
         )
         in _PREPARED_FUSED_ONESHOT_LAUNCHERS
     )
@@ -2709,6 +2904,10 @@ def get_fused_oneshot_launcher(
     group_id_limit: int = 0,
     group_ids_dtype: str = "int32",
     normalize: bool = True,
+    round_before_weight: bool = False,
+    reduction_order: str = "local",
+    trigger_dependents: bool = False,
+    reg_packs: int = _REG_PACKS,
 ) -> Callable[..., None]:
     process_key = _fused_oneshot_process_key(
         dtype_name,
@@ -2731,6 +2930,10 @@ def get_fused_oneshot_launcher(
         int(group_id_limit),
         group_ids_dtype,
         bool(normalize),
+        round_before_weight,
+        reduction_order,
+        trigger_dependents,
+        reg_packs,
     )
     del device_index
     slot_bias = int(slot_bias) & 1 if device_slot_selection else 0
@@ -2754,6 +2957,10 @@ def get_fused_oneshot_launcher(
         int(group_id_limit),
         group_ids_dtype,
         bool(normalize),
+        round_before_weight,
+        reduction_order,
+        trigger_dependents,
+        reg_packs,
     )
     cache_key = (
         dtype_name,
@@ -2775,6 +2982,10 @@ def get_fused_oneshot_launcher(
         int(group_id_limit),
         group_ids_dtype,
         bool(normalize),
+        round_before_weight,
+        reduction_order,
+        trigger_dependents,
+        int(reg_packs),
     )
     raise_if_kernel_resolution_frozen(
         "cute.compile", target=launch, cache_key=cache_key
@@ -2800,7 +3011,7 @@ def get_fused_oneshot_launcher(
         _dummy(cutlass.Uint32, 4),
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
-            "comm.pcie.oneshot_fused_rmsnorm", 10, cache_key
+            "comm.pcie.oneshot_fused_rmsnorm", 12, cache_key
         ),
     )
 

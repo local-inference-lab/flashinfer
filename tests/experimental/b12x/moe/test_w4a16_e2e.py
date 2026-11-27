@@ -962,6 +962,78 @@ def _make_weights(
     return w13, w13_blockscale, w13_global_scale, w2, w2_blockscale, w2_global_scale
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    ("tokens", "topk", "hidden", "block_size"),
+    [(8, 8, 6144, 8), (4, 2, 512, 16)],
+    ids=["whole-k", "split-k"],
+)
+def test_packed_expert_projections_are_independent_of_other_token_routes(
+    tokens, topk, hidden, block_size
+):
+    if torch.cuda.get_device_capability() not in ((12, 0), (12, 1)):
+        pytest.skip("requires SM120 or SM121")
+    torch.manual_seed(5313)
+    experts, intermediate = 64, 256
+    weights = _make_weights(
+        experts=experts,
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+        activation="silu",
+    )
+    prepared = prepare_w4a16_weights(
+        *weights, activation="silu", params_dtype=torch.bfloat16
+    )
+    source = torch.randn(tokens, hidden, dtype=torch.bfloat16, device="cuda")
+    ids = torch.tensor(
+        [3, 8, 15, 22, 35, 40, 50, 61][:topk], device="cuda", dtype=torch.int32
+    ).repeat(tokens, 1)
+    gates = torch.randn(tokens, topk, device="cuda").softmax(1)
+    buffers = make_w4a16_packed_buffers(
+        prepared,
+        m=tokens,
+        topk=topk,
+        dtype=source.dtype,
+        device=source.device,
+        block_size_m=block_size,
+    )
+
+    def run():
+        return run_w4a16_moe(
+            source,
+            prepared,
+            gates,
+            ids,
+            activation="silu",
+            route_mode="packed",
+            route_block_size_m=block_size,
+            intermediate_cache13=buffers.intermediate_cache13,
+            intermediate_cache2=buffers.intermediate_cache2,
+            output=buffers.output,
+            fc1_c_tmp=buffers.fc1_c_tmp,
+            fc2_c_tmp=buffers.fc2_c_tmp,
+            packed_route_indices=buffers.packed_route_indices,
+            block_expert_ids=buffers.block_expert_ids,
+            packed_route_count=buffers.packed_route_count,
+            expert_offsets=buffers.expert_offsets,
+        )
+
+    expected = run()[0].clone()
+    # Without fused summation, FC2 stores one projection per token and route here.
+    routes = buffers.intermediate_cache13.view(-1, hidden)[:topk]
+    expected_routes = routes.clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = run()
+    for neighbors in (16, 32, 64):
+        ids[1:] = torch.stack(
+            [torch.randperm(neighbors, device="cuda")[:topk] for _ in range(tokens - 1)]
+        )
+        graph.replay()
+        torch.testing.assert_close(routes, expected_routes, atol=0, rtol=0)
+        torch.testing.assert_close(actual[0], expected, atol=0, rtol=0)
+
+
 def _run_w4a16(
     x: torch.Tensor,
     w13: torch.Tensor,

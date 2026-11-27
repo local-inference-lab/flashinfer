@@ -138,3 +138,116 @@ def test_run_decode_masks_padded_selection() -> None:
     active.fill_(width // 2)
     out, ref = _run_public_decode(q, kv, sel, lens, active, width=width)
     _assert_matches(out, ref)
+
+
+def test_bound_caller_output_and_head_major_view() -> None:
+    from cuda.bindings import runtime as cudart
+
+    require_b12x()
+    rows, heads, width = 4, 8, 128
+    q, kv, sel, lens, active = _make_case(
+        rows=rows, heads=heads, cache_tokens=512, width=width
+    )
+    active[-1] = 0
+    lens[-1] = 0
+    sel[-1] = -1
+    sm_scale = HEAD_DIM**-0.5
+
+    def run_variant(head_major: bool) -> tuple[torch.Tensor, int]:
+        declaration = sparse_mla.plan(
+            sparse_mla.Caps(
+                device=q.device,
+                num_q_heads=heads,
+                max_q_rows=rows,
+                max_width=width,
+                softmax_scale=sm_scale,
+                kv_dtype=torch.uint8,
+                head_major_output=head_major,
+            )
+        )
+        caller_out = (
+            torch.full(
+                (heads, rows, V_HEAD_DIM), 7.0, dtype=torch.bfloat16, device=q.device
+            ).transpose(0, 1)
+            if head_major
+            else torch.full(
+                (rows, heads, V_HEAD_DIM), 7.0, dtype=torch.bfloat16, device=q.device
+            )
+        )
+        owned = {}
+
+        def prepare_call(state):
+            spec = state.scratch_specs()[0]
+            scratch = torch.empty(spec.shape, dtype=spec.dtype, device=q.device)
+            runtime = state.bind(
+                scratch=scratch,
+                q=q,
+                kv_cache=kv,
+                selected_indices=sel,
+                cache_seqlens_int32=lens,
+                nsa_cache_seqlens_int32=active,
+            )
+            owned["scratch"] = scratch
+            state.prime(runtime, kv_cache=kv)
+            return PreparedCall(
+                run=lambda: state.run(runtime, kv_cache=kv, out=caller_out)
+            )
+
+        session = PreparationSession(device=q.device)
+        result = session.prepare(
+            (
+                declaration.request(
+                    name=f"sparse-mla-out-{head_major}", prepare_call=prepare_call
+                ),
+            )
+        )
+        plan = result.plans[f"sparse-mla-out-{head_major}"]
+        binding = sparse_mla.bind(
+            plan,
+            scratch=owned["scratch"],
+            q=q,
+            kv_cache=kv,
+            selected_indices=sel,
+            cache_lengths=lens,
+            selected_lengths=active,
+        )
+        sparse_mla.run(binding, out=caller_out)
+        caller_out.fill_(float("nan"))
+        graph = torch.cuda.CUDAGraph(keep_graph=True)
+        with torch.cuda.graph(graph):
+            returned = sparse_mla.run(binding, out=caller_out)
+        assert returned.data_ptr() == caller_out.data_ptr()
+        raw = graph.raw_cuda_graph()
+        err, _, count = cudart.cudaGraphGetNodes(raw)
+        assert err == cudart.cudaError_t.cudaSuccess
+        err, nodes, _ = cudart.cudaGraphGetNodes(raw, count)
+        assert err == cudart.cudaError_t.cudaSuccess
+        memcpy_nodes = sum(
+            1
+            for node in nodes[:count]
+            if cudart.cudaGraphNodeGetType(node)[1]
+            == cudart.cudaGraphNodeType.cudaGraphNodeTypeMemcpy
+        )
+        graph.replay()
+        torch.cuda.synchronize()
+        graph.reset()
+        result.close()
+        session.close()
+        return caller_out.clone(), memcpy_nodes
+
+    contiguous_out, contiguous_memcpys = run_variant(False)
+    head_major_out, head_major_memcpys = run_variant(True)
+    assert contiguous_memcpys == 0
+    assert head_major_memcpys == 0
+    assert head_major_out.stride() == (V_HEAD_DIM, rows * V_HEAD_DIM, 1)
+    assert torch.equal(head_major_out.contiguous(), contiguous_out)
+    assert not head_major_out[-1].count_nonzero()
+    ref = sparse_mla_reference(
+        q_all=q[:-1],
+        kv_cache=kv,
+        page_table_1=sel[:-1],
+        active_token_counts=active[:-1],
+        sm_scale=sm_scale,
+        v_head_dim=V_HEAD_DIM,
+    )
+    _assert_matches(head_major_out[:-1].contiguous(), ref)

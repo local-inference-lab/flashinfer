@@ -726,6 +726,48 @@ def oneshot_alternatives(query, runtime):
     alternatives[selected] = (query, runtime)
     if not query.call["stage_input"]:
         return alternatives
+    if (
+        field == "mode"
+        and query.call.get("reduction_order") == "shard_owner"
+        and query.world_size in (2, 4, 8)
+    ):
+        dtype = query.call["dtype"]
+        reduction_dtype = query.call["reduction_dtype"]
+        hidden_packs = int(query.call["hidden_packs"])
+        rows = int(query.call["rows"])
+        shard_packs = int(query.setup.get("eager_buffer_bytes") or 0) // 16
+        packed = reduction_dtype == dtype
+        unpacked = reduction_dtype is None
+        if (
+            dtype in ("float16", "bfloat16")
+            and query.call["group_size"] == 0
+            and hidden_packs <= 768
+            and hidden_packs % query.world_size == 0
+            and 1 <= rows <= 36
+            and (packed or unpacked)
+        ):
+            slice_packs = hidden_packs // query.world_size
+            required = rows * hidden_packs + rows * slice_packs * (1 if packed else 2)
+            if required <= shard_packs:
+                sg_mode = (
+                    "stage_scatter_gather_packed" if packed else "stage_scatter_gather"
+                )
+                sg_call = {
+                    **query.call,
+                    "mode": sg_mode,
+                    "threads": 768,
+                    "reg_packs": 1,
+                    "single_cta": True,
+                    "register_normalize": True,
+                    "ctas_per_row": 1,
+                    "blocks": rows,
+                }
+                alternatives[sg_mode] = (
+                    replace(query, call=FrozenMapping(sg_call)),
+                    runtime,
+                )
+    if query.call.get("reduction_order") == "shard_owner":
+        return alternatives
     modes = ["pull"] if field == "transport" else ["stage_pull"]
     if field == "transport":
         capacity = int(query.setup.get("eager_buffer_bytes") or 0) // 16

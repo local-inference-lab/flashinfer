@@ -3431,8 +3431,15 @@ def run_unified_decode(
             raise ValueError(
                 "SM120 sparse MLA decode out must be on the same device as q_all"
             )
-        if not out.is_contiguous():
-            raise ValueError("SM120 sparse MLA decode out must be contiguous")
+        expected_stride = workspace.output_buffer.as_strided(
+            (rows, heads, d_v), workspace.output_buffer.stride()
+        ).stride()
+        if out.data_ptr() % 16 != 0 or (
+            not out.is_contiguous() and out.stride() != expected_stride
+        ):
+            raise ValueError(
+                "SM120 sparse MLA decode out must be 16-byte aligned and match the planned output layout"
+            )
         output = out
     else:
         output = workspace.output_buffer.as_strided(
