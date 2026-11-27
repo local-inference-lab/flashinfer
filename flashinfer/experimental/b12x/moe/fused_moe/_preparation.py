@@ -809,7 +809,7 @@ def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
                 hidden_size=core.k,
                 intermediate_size=core.n,
                 num_experts=core.weight_E,
-                sms=int(props.multi_processor_count),
+                sms=max(1, int(props.multi_processor_count) - int(caps.reserve_sms)),
                 ordinal=core.device.index,
                 fast_math=bool(caps.w4a16_fast_math),
                 terms=caps.w4a16_a4_prefill_terms,
