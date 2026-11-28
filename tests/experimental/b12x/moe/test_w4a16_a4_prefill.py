@@ -437,8 +437,62 @@ def test_a4_prefill_matches_float64_emulation(
         assert not torch.equal(ref, _emulate(unclamped, x, ids, wts, a1g, a2g, terms))
     assert torch.isfinite(out.float()).all() and out.float().abs().max() > 0
     rel = ((out.double() - ref).norm() / ref.norm()).item()
-    # BF16 output rounding plus the BF16 top-k sum bound the difference.
+    # Fused BF16x2 scatter-add rounds each route accumulation to BF16
+    # (matching A4_dynamic's scatter-add contract); deterministic mode keeps
+    # the separate FP32 top-k sum under 4e-3.
+    bound = 6e-3 if top_k > 4 else 4e-3
+    assert rel < bound, rel
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_a4_prefill_deterministic_uses_fp32_topk_sum(monkeypatch):
+    require_b12x()
+    _env(monkeypatch, True, 1)
+    case = _make_case(11, 320, 2560, 16, 10)
+    a1g, a2g = _scales(case)
+    experts = _prepare(case, a1g, a2g)
+    from b12x.moe import fused_moe as moe
+
+    xp = moe.plan_execution(
+        experts=experts,
+        capacity=moe.ExecutionCapacity(max_tokens=192, top_k=10),
+        routing=moe.RoutingSpec(deterministic_output=True),
+        invocation={"fast_math": True},
+    )
+    x, ids, wts = _inputs(16, 5, 2560, 16, 10)
+    scratch = tuple(
+        torch.empty(s.shape, dtype=s.dtype, device=x.device) for s in xp.scratch_specs()
+    )
+    out = torch.empty_like(x)
+    binding = _bind(xp, x, ids, wts, out, scratch, a4_prefill=True)
+    launches = getattr(binding, "_impl", binding).a4_prefill_launches
+    assert launches is not None and not launches.fused_topk_sum
+    moe.run(binding=binding)
+    torch.cuda.synchronize()
+    ref = _emulate(case, x, ids, wts, a1g, a2g, 1)
+    rel = ((out.double() - ref).norm() / ref.norm()).item()
     assert rel < 4e-3, rel
+
+
+def test_gb10_dynamic_nvfp4_caps_tile_m_at_64():
+    from b12x.moe.fused_moe._impl import _select_dynamic_tile_mn
+
+    assert _select_dynamic_tile_mn(
+        8192 * 10,
+        640,
+        "nvfp4",
+        num_experts=512,
+        activation="silu",
+        compute_capability=(12, 1),
+    ) == (64, 128)
+    assert _select_dynamic_tile_mn(
+        8192 * 10,
+        640,
+        "nvfp4",
+        num_experts=512,
+        activation="silu",
+        compute_capability=(12, 0),
+    ) == (128, 128)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

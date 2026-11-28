@@ -66,7 +66,13 @@ from b12x._lib.intrinsics.memory import (
 )
 from b12x._lib.intrinsics.math import fabs_f32, fmax_f32
 from b12x._lib.intrinsics.conversion import fp8_e4m3_to_f32
-from b12x._lib.intrinsics.atomics import ld_shared_u32, st_shared_u32
+from b12x._lib.intrinsics.atomics import (
+    ld_shared_f32,
+    ld_shared_u32,
+    red_add_global_v4_bf16x2_packed,
+    st_shared_f32,
+    st_shared_u32,
+)
 from b12x._lib.intrinsics.mma import nvfp4_mma_m16n8k64_f32_e2m1
 from b12x._lib.intrinsics.quantization import (
     quantize_block_fp4,
@@ -358,6 +364,7 @@ class A4PackedPrefillGemm:
         warps: int = NUM_WARPS,
         swiglu_limit: float | None = None,
         swiglu_clamp_after_silu: bool = False,
+        fused_topk_sum: bool = False,
     ):
         if phase not in ("fc1", "fc2"):
             raise ValueError(f"unknown A4 prefill phase {phase!r}")
@@ -367,8 +374,11 @@ class A4PackedPrefillGemm:
             raise ValueError("terms must be 1 or 2")
         if warps not in (8, 16):
             raise ValueError("warps must be 8 or 16")
+        if fused_topk_sum and phase != "fc2":
+            raise ValueError("fused_topk_sum applies only to A4 prefill FC2")
         self.phase = phase
         self.fc1 = phase == "fc1"
+        self.fused_topk_sum = bool(fused_topk_sum)
         self.hidden_size = int(hidden_size)
         self.intermediate_size = int(intermediate_size)
         self.fc1_half_slab = self.fc1 and self.intermediate_size % 128 != 0
@@ -401,7 +411,15 @@ class A4PackedPrefillGemm:
         self.s_off = self.b_off + B_STAGE_BYTES
         self.stage_bytes = self.s_off + S_STAGE_BYTES
         self.pipeline_bytes = self.stages * self.stage_bytes
-        self.route_off = max(self.pipeline_bytes, BLOCK_M * EPI_ROW_BYTES)
+        epi_end = max(self.pipeline_bytes, BLOCK_M * EPI_ROW_BYTES)
+        # Keep route_off at shared_bytes - ROUTE_BYTES so _mainloop addresses it
+        # identically regardless of fused_topk_sum.
+        if self.fused_topk_sum:
+            self.weight_off = epi_end
+            self.route_off = self.weight_off + ROUTE_BYTES
+        else:
+            self.weight_off = epi_end
+            self.route_off = epi_end
         self.shared_bytes = self.route_off + ROUTE_BYTES
 
     @property
@@ -418,6 +436,7 @@ class A4PackedPrefillGemm:
             self.has_swiglu_limit,
             self.swiglu_limit,
             self.swiglu_clamp_after_silu,
+            self.fused_topk_sum,
             BLOCK_M,
             TILE_K,
             self.warps,
@@ -822,6 +841,7 @@ class A4PackedPrefillGemm:
         """[128, 256] BF16 tile of ``acc * alpha`` (columns in chunk-slot order)."""
         q = lane >> Int32(2)
         col0 = (slot << Int32(6)) + ((lane & Int32(3)) << Int32(1))
+        weight_base = smem_base + Int32(self.weight_off)
         for mb in cutlass.range_constexpr(self.mb_per_warp):
             for half_row in cutlass.range_constexpr(2):
                 row = (
@@ -829,6 +849,9 @@ class A4PackedPrefillGemm:
                     + Int32(16 * mb + 8 * half_row)
                     + q
                 )
+                row_scale = alpha
+                if cutlass.const_expr(self.fused_topk_sum):
+                    row_scale = alpha * ld_shared_f32(weight_base + (row << Int32(2)))
                 for jj in cutlass.range_constexpr(4):
                     for t in cutlass.range_constexpr(2):
                         idx = ((mb * 4 + jj) * 2 + t) * 4 + 2 * half_row
@@ -836,7 +859,7 @@ class A4PackedPrefillGemm:
                         st_shared_u32(
                             smem_base + row * Int32(EPI_ROW_BYTES) + (col << Int32(1)),
                             pack_f32x2_to_bfloat2(
-                                acc[idx] * alpha, acc[idx + 1] * alpha
+                                acc[idx] * row_scale, acc[idx + 1] * row_scale
                             ),
                         )
         cute.arch.sync_threads()
@@ -867,10 +890,19 @@ class A4PackedPrefillGemm:
                 v0, v1, v2, v3 = ld_shared_v4_u32(
                     smem_base + row * Int32(EPI_ROW_BYTES) + (vec << Int32(4))
                 )
-                dst = Int64(route) * Int64(self.hidden_size) + Int64(
-                    n_tile * Int32(256) + (vec << Int32(3))
-                )
-                st_global_v4_u32(get_ptr_as_int64(out_bf16, dst), v0, v1, v2, v3)
+                if cutlass.const_expr(self.fused_topk_sum):
+                    tok = route // Int32(self.top_k)
+                    dst = Int64(tok) * Int64(self.hidden_size) + Int64(
+                        n_tile * Int32(256) + (vec << Int32(3))
+                    )
+                    red_add_global_v4_bf16x2_packed(
+                        get_ptr_as_int64(out_bf16, dst), v0, v1, v2, v3
+                    )
+                else:
+                    dst = Int64(route) * Int64(self.hidden_size) + Int64(
+                        n_tile * Int32(256) + (vec << Int32(3))
+                    )
+                    st_global_v4_u32(get_ptr_as_int64(out_bf16, dst), v0, v1, v2, v3)
 
     @cute.jit
     def _store_fc1(
@@ -1078,9 +1110,16 @@ class A4PackedPrefillGemm:
                 cute.arch.cp_async_wait_group(0)
                 cute.arch.sync_threads()
                 # The epilogue reads route ids, not gather rows.
+                # For fused FC2 scatter-add, q_gscale carries topk_weights[live_routes].
+                weight_base = smem_base + Int32(self.weight_off)
                 if tid < Int32(BLOCK_M):
                     route = packed_route_indices[block * Int32(BLOCK_M) + tid].to(Int32)
                     st_shared_u32(route_base + (tid << Int32(2)), Uint32(route))
+                    if cutlass.const_expr(self.fused_topk_sum):
+                        w = Float32(0.0)
+                        if route < live_routes:
+                            w = q_gscale[route].to(Float32)
+                        st_shared_f32(weight_base + (tid << Int32(2)), w)
                 cute.arch.sync_threads()
                 if cutlass.const_expr(self.fc1):
                     self._store_fc1(
@@ -1194,6 +1233,7 @@ class W4A16A4PrefillLaunches:
     fc2: object
     topk_sum: dict[torch.dtype, object]
     route_pack: object
+    fused_topk_sum: bool = False
 
     def carriers(self) -> tuple[object, ...]:
         return (
@@ -1209,11 +1249,10 @@ class W4A16A4PrefillLaunches:
         return _carve_layout(self, int(tokens))[-1]
 
     def fits_buffers(self, tokens: int, cache13_bytes: int, cache2_bytes: int) -> bool:
-        return cache13_bytes >= int(
+        c13_ok = self.fused_topk_sum or cache13_bytes >= int(
             tokens
-        ) * self.topk * self.hidden_size * 2 and cache2_bytes >= self.scratch_bytes(
-            tokens
-        )
+        ) * self.topk * self.hidden_size * 2
+        return c13_ok and cache2_bytes >= self.scratch_bytes(tokens)
 
 
 def _fake(dtype, align=16):
@@ -1232,6 +1271,7 @@ def _compile_a4_kernels(
     warps: int,
     swiglu_limit: float | None,
     swiglu_clamp_after_silu: bool = False,
+    fused_topk_sum: bool = False,
 ):
     from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
     from b12x._lib.utils.device import current_cuda_stream
@@ -1262,6 +1302,8 @@ def _compile_a4_kernels(
     )
     gemms = []
     for phase in ("fc1", "fc2"):
+        phase_fused = bool(fused_topk_sum) and phase == "fc2"
+        phase_key = (*key, phase_fused) if phase == "fc2" else key
         gemms.append(
             b12x_compile(
                 A4PackedPrefillGemm(
@@ -1274,6 +1316,7 @@ def _compile_a4_kernels(
                     warps=warps,
                     swiglu_limit=swiglu_limit,
                     swiglu_clamp_after_silu=swiglu_clamp_after_silu,
+                    fused_topk_sum=phase_fused,
                 ),
                 _fake(cutlass.Uint32),
                 _fake(cutlass.Uint32, 4),
@@ -1297,7 +1340,7 @@ def _compile_a4_kernels(
                 Int32(1),
                 stream,
                 compile_spec=KernelCompileSpec.from_key(
-                    f"moe.w4a16.a4_prefill.{phase}", 5, key
+                    f"moe.w4a16.a4_prefill.{phase}", 6, phase_key
                 ),
             )
         )
@@ -1318,6 +1361,7 @@ def compile_w4a16_a4_prefill(
     warps: int = NUM_WARPS,
     swiglu_limit: float | None = None,
     swiglu_clamp_after_silu: bool = False,
+    fused_topk_sum: bool = False,
 ) -> W4A16A4PrefillLaunches:
     from b12x.moe._shared.kernels.w4a16.kernel.sum_launch import compile_w4a16_topk_sum
     from b12x.moe._shared.kernels.w4a16.route_pack import (
@@ -1333,18 +1377,23 @@ def compile_w4a16_a4_prefill(
         warps=warps,
         swiglu_limit=swiglu_limit,
         swiglu_clamp_after_silu=swiglu_clamp_after_silu,
+        fused_topk_sum=fused_topk_sum,
     )
-    topk_sum = {
-        ids_dtype: compile_w4a16_topk_sum(
-            m=tokens,
-            topk=topk,
-            hidden_size=hidden_size,
-            element_dtype="bf16",
-            apply_topk_weights=True,
-            route_ids_dtype=ids_dtype,
-        )
-        for ids_dtype in (torch.int32, torch.int64)
-    }
+    topk_sum = (
+        {}
+        if fused_topk_sum
+        else {
+            ids_dtype: compile_w4a16_topk_sum(
+                m=tokens,
+                topk=topk,
+                hidden_size=hidden_size,
+                element_dtype="bf16",
+                apply_topk_weights=True,
+                route_ids_dtype=ids_dtype,
+            )
+            for ids_dtype in (torch.int32, torch.int64)
+        }
+    )
     route_pack = compile_w4a16_route_pack_launches(
         tokens=tokens,
         topk=topk,
@@ -1365,6 +1414,7 @@ def compile_w4a16_a4_prefill(
         fc2=fc2,
         topk_sum=topk_sum,
         route_pack=route_pack,
+        fused_topk_sum=bool(fused_topk_sum),
     )
 
 
@@ -1428,11 +1478,14 @@ def run_w4a16_a4_prefill(
     output: torch.Tensor,
     launches: W4A16A4PrefillLaunches,
 ) -> torch.Tensor:
-    """Route pack (128) -> NVFP4 quant -> A4 FC1 -> A4 FC2 -> FP32-weighted top-k sum.
+    """Route pack (128) -> NVFP4 quant -> A4 FC1 -> A4 FC2 [-> FP32 top-k sum].
 
     Every buffer is a view of caller scratch: ``intermediate_cache2`` holds the
-    NVFP4 activations and the route pack, ``intermediate_cache13`` the per-route
-    BF16 FC2 rows.
+    NVFP4 activations and the route pack, and ``intermediate_cache13`` holds
+    per-route BF16 FC2 rows when ``launches.fused_topk_sum`` is False. When
+    ``launches.fused_topk_sum`` is True, FC2 scales each route in the epilogue
+    and scatter-adds directly into ``output`` without touching
+    ``intermediate_cache13``.
     """
     from cutlass.cute.runtime import make_ptr
 
@@ -1455,7 +1508,11 @@ def run_w4a16_a4_prefill(
     x_sf, x_sf2 = _planes(x_sf, launches.terms)
     act_q, act_q2 = _planes(act_q, launches.terms)
     act_sf, act_sf2 = _planes(act_sf, launches.terms)
-    y = intermediate_cache13.view(-1).narrow(0, 0, routes * launches.hidden_size)
+    y = (
+        output.view(-1)
+        if launches.fused_topk_sum
+        else intermediate_cache13.view(-1).narrow(0, 0, routes * launches.hidden_size)
+    )
     pack_topk_routes_by_expert(
         topk_ids,
         A4_PREFILL_ROUTE_BLOCK,
@@ -1515,6 +1572,13 @@ def run_w4a16_a4_prefill(
         Int32(launches.grid),
         stream,
     )
+    if launches.fused_topk_sum:
+        if topk_weights.dtype != torch.float32:
+            raise ValueError("fused A4 prefill top-k sum requires FP32 topk_weights")
+        fc2_epilogue_scale = topk_weights.view(-1)
+        output.zero_()
+    else:
+        fc2_epilogue_scale = a2
     launches.fc2(
         ptr(u32, act_q),
         ptr(u32, act_sf, 4),
@@ -1524,7 +1588,7 @@ def run_w4a16_a4_prefill(
         ptr(cutlass.Uint8, s2),
         ptr(cutlass.Float32, prepared.w2_global_scale, 4),
         ptr(cutlass.Float32, a2, 4),
-        ptr(cutlass.Float32, a2, 4),
+        ptr(cutlass.Float32, fc2_epilogue_scale, 4),
         ptr(cutlass.Int32, pir, 4),
         ptr(cutlass.Int32, beid, 4),
         ptr(cutlass.Int32, prc, 4),
@@ -1538,19 +1602,20 @@ def run_w4a16_a4_prefill(
         Int32(launches.grid),
         stream,
     )
-    _w4a16_topk_sum_launch_flat(
-        y,
-        output.view(-1),
-        tokens,
-        launches.topk,
-        launches.hidden_size,
-        "bf16",
-        torch.cuda.current_stream().cuda_stream,
-        topk_weights=topk_weights.view(-1),
-        route_expert_ids=topk_ids.view(-1),
-        num_experts=launches.num_experts,
-        launcher=launches.topk_sum[topk_ids.dtype],
-    )
+    if not launches.fused_topk_sum:
+        _w4a16_topk_sum_launch_flat(
+            y,
+            output.view(-1),
+            tokens,
+            launches.topk,
+            launches.hidden_size,
+            "bf16",
+            torch.cuda.current_stream().cuda_stream,
+            topk_weights=topk_weights.view(-1),
+            route_expert_ids=topk_ids.view(-1),
+            num_experts=launches.num_experts,
+            launcher=launches.topk_sum[topk_ids.dtype],
+        )
     return output
 
 

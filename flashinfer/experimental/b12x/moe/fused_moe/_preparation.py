@@ -816,6 +816,7 @@ def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
                 warps=caps.w4a16_a4_prefill_warps,
                 swiglu_limit=core.swiglu_limit,
                 swiglu_clamp_after_silu=core.swiglu_clamp_after_silu,
+                fused_topk_sum=not caps.deterministic_output,
             )
             a4_prefill = compile_w4a16_a4_prefill(
                 **a4_args,
