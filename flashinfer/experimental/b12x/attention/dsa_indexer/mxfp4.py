@@ -2094,8 +2094,8 @@ class MultiQueryFusedMXFP4:
                 prow = _resolve_request_row(r, request_meta, request_mode, num_requests)
             q_extents[tx] = ext
             q_page_rows[tx] = prow
-            scalars[Int32(4) + tx] = Int32(0)
-            scalars[Int32(4 + self.q_tile) + tx] = Int32(0x007F)
+            _smem_st_i32(scalars_addr, Int32(4) + tx, Int32(0))
+            _smem_st_i32(scalars_addr, Int32(4 + self.q_tile) + tx, Int32(0x007F))
 
         total_q_words = Int32(self.q_tile * num_ht * 128)
         idx = tx
@@ -2403,7 +2403,9 @@ class MultiQueryFusedMXFP4:
                     u1 = f32_to_raw_bits(f1) >> Uint32(16)
                     k0 = _bf16_bits_to_ordered(u0)
                     k1 = _bf16_bits_to_ordered(u1)
-                    cut_q = Uint32(scalars[Int32(4 + self.q_tile) + ql])
+                    cut_q = Uint32(
+                        _smem_ld_i32(scalars_addr, Int32(4 + self.q_tile) + ql)
+                    )
                     acc0 = v0_ok & (k0 > cut_q)
                     acc1 = v1_ok & (k1 > cut_q)
                     m0 = cute.arch.vote_ballot_sync(acc0)
@@ -2428,7 +2430,7 @@ class MultiQueryFusedMXFP4:
 
             cute.arch.sync_threads()
             for ql in cutlass.range(self.q_tile, unroll=1):
-                cnt = Int32(scalars[Int32(4) + ql])
+                cnt = _smem_ld_i32(scalars_addr, Int32(4) + ql)
                 if cnt > Int32(carry_cap - 512):
                     new_cnt, new_cut = _trim_smem_u16_512(
                         carry_val,
@@ -2442,8 +2444,10 @@ class MultiQueryFusedMXFP4:
                         threads=1024,
                     )
                     if tx == Int32(0):
-                        scalars[Int32(4) + ql] = new_cnt
-                        scalars[Int32(4 + self.q_tile) + ql] = Int32(new_cut)
+                        _smem_st_i32(scalars_addr, Int32(4) + ql, new_cnt)
+                        _smem_st_i32(
+                            scalars_addr, Int32(4 + self.q_tile) + ql, Int32(new_cut)
+                        )
                     cute.arch.sync_threads()
             cute.arch.sync_threads()
             tile += Int32(512)
@@ -2451,7 +2455,7 @@ class MultiQueryFusedMXFP4:
         for ql in cutlass.range(self.q_tile, unroll=1):
             r = row_base + ql
             if r < rows:
-                cnt = Int32(scalars[Int32(4) + ql])
+                cnt = _smem_ld_i32(scalars_addr, Int32(4) + ql)
                 if cnt > Int32(512):
                     cnt, _ = _trim_smem_u16_512(
                         carry_val,
@@ -2524,14 +2528,14 @@ class MultiQueryFusedMXFP4:
         scalars_addr = shared_ptr_to_u32(scalars.iterator)
 
         if tx == Int32(0):
-            scalars[4] = Int32(0)
+            _smem_st_i32(scalars_addr, Int32(4), Int32(0))
         cute.arch.sync_threads()
         cutoff = Uint32(0x007F)
 
         for part in cutlass.range(self.ctas):
             pbase = (Int64(row) * Int64(self.ctas) + Int64(part)) * Int64(512)
             cnt = Int32(partial_counts[Int64(row) * Int64(self.ctas) + Int64(part)])
-            on = Int32(scalars[4])
+            on = _smem_ld_i32(scalars_addr, Int32(4))
             if on + cnt > Int32(2048):
                 on, cutoff = _trim_smem_u16_512(
                     carry_val,
@@ -2545,8 +2549,8 @@ class MultiQueryFusedMXFP4:
                     threads=512,
                 )
                 if tx == Int32(0):
-                    scalars[4] = on
-                cute.arch.sync_threads()
+                    _smem_st_i32(scalars_addr, Int32(4), on)
+            cute.arch.sync_threads()
             if cnt > Int32(0):
                 u = Uint32(0xFF80)
                 idx_v = Int32(-1)
@@ -2567,7 +2571,7 @@ class MultiQueryFusedMXFP4:
                     carry_idx[slot] = idx_v
                 cute.arch.sync_threads()
 
-        on = Int32(scalars[4])
+        on = _smem_ld_i32(scalars_addr, Int32(4))
         if on > Int32(512):
             on, _ = _trim_smem_u16_512(
                 carry_val,

@@ -32,6 +32,8 @@ from .mxfp4 import (
     _packed_word,
     _radix_select_u16_to_slots,
     _resolve_request_row,
+    _smem_ld_i32,
+    _smem_st_i32,
     _smem_xadd_i32,
     _TensorCorePagedScore,
     _trim_smem_u16_512,
@@ -342,12 +344,12 @@ class HierarchicalFusedMXFP4:
                             + Int64(tx * Int32(2) + Int32(1))
                         ]
                     w_smem[tx] = _fused_bf16_pack_weights(w0, w1)
+                scalars_addr = shared_ptr_to_u32(scalars.iterator)
                 if tx == Int32(0):
-                    scalars[4] = Int32(0)
-                    scalars[5] = Int32(0)
+                    _smem_st_i32(scalars_addr, Int32(4), Int32(0))
+                    _smem_st_i32(scalars_addr, Int32(5), Int32(0))
                 cute.arch.sync_threads()
 
-                scalars_addr = shared_ptr_to_u32(scalars.iterator)
                 warp = tx // Int32(32)
                 lane = tx % Int32(32)
                 byte_off = Int64(lane % Int32(4)) * Int64(4)
@@ -384,10 +386,10 @@ class HierarchicalFusedMXFP4:
                                     cute.arch.shuffle_sync_bfly(mk, offset=1 << delta),
                                 )
                             if lane == Int32(0):
-                                scalars[6] = Int32(mk)
-                                scalars[4] = on
+                                _smem_st_i32(scalars_addr, Int32(6), Int32(mk))
+                                _smem_st_i32(scalars_addr, Int32(4), on)
                         cute.arch.sync_threads()
-                        tok_cutoff = Uint32(scalars[6])
+                        tok_cutoff = Uint32(_smem_ld_i32(scalars_addr, Int32(6)))
                     if bn + Int32(64) > Int32(4096):
                         bn = _trim(
                             bv,
@@ -425,10 +427,10 @@ class HierarchicalFusedMXFP4:
                                     cute.arch.shuffle_sync_bfly(mk, offset=1 << delta),
                                 )
                             if lane == Int32(0):
-                                scalars[7] = Int32(mk)
-                                scalars[5] = bn
+                                _smem_st_i32(scalars_addr, Int32(7), Int32(mk))
+                                _smem_st_i32(scalars_addr, Int32(5), bn)
                         cute.arch.sync_threads()
-                        blk_cutoff = Uint32(scalars[7])
+                        blk_cutoff = Uint32(_smem_ld_i32(scalars_addr, Int32(7)))
 
                     base_col = tile + Int64(warp) * Int64(16)
                     if base_col < end:
@@ -637,8 +639,9 @@ class HierarchicalFusedMXFP4:
                                     bv[bslot] = bm1
                                     bi[bslot] = blk1
                     cute.arch.sync_threads()
-                    on = Int32(scalars[4])
-                    bn = Int32(scalars[5])
+                    on = _smem_ld_i32(scalars_addr, Int32(4))
+                    bn = _smem_ld_i32(scalars_addr, Int32(5))
+                    cute.arch.sync_threads()
                     tile += Int64(512)
             else:
                 tile = Int32(begin)
@@ -1118,8 +1121,8 @@ class MultiQueryHierarchicalMXFP4:
             q_extents[tx] = ext
             q_newest[tx] = newest
             q_page_rows[tx] = prow
-            scalars[Int32(4) + tx] = Int32(0)
-            scalars[Int32(4 + self.q_tile) + tx] = Int32(0x007F)
+            _smem_st_i32(scalars_addr, Int32(4) + tx, Int32(0))
+            _smem_st_i32(scalars_addr, Int32(4 + self.q_tile) + tx, Int32(0x007F))
 
         total_q_words = Int32(self.q_tile * num_ht * 128)
         idx = tx
@@ -1427,7 +1430,9 @@ class MultiQueryHierarchicalMXFP4:
                     u1 = f32_to_raw_bits(f1) >> Uint32(16)
                     k0 = _bf16_bits_to_ordered(u0)
                     k1 = _bf16_bits_to_ordered(u1)
-                    cut_q = Uint32(scalars[Int32(4 + self.q_tile) + ql])
+                    cut_q = Uint32(
+                        _smem_ld_i32(scalars_addr, Int32(4 + self.q_tile) + ql)
+                    )
                     acc0 = v0_ok & (k0 > cut_q)
                     acc1 = v1_ok & (k1 > cut_q)
                     m0 = cute.arch.vote_ballot_sync(acc0)
@@ -1486,7 +1491,7 @@ class MultiQueryHierarchicalMXFP4:
                         Uint16(blk_smem[tx])
                     )
             for ql in cutlass.range(self.q_tile, unroll=1):
-                cnt = Int32(scalars[Int32(4) + ql])
+                cnt = _smem_ld_i32(scalars_addr, Int32(4) + ql)
                 if cnt > Int32(carry_cap - 512):
                     new_cnt, new_cut = _trim_smem_u16_512(
                         carry_val,
@@ -1500,8 +1505,10 @@ class MultiQueryHierarchicalMXFP4:
                         threads=1024,
                     )
                     if tx == Int32(0):
-                        scalars[Int32(4) + ql] = new_cnt
-                        scalars[Int32(4 + self.q_tile) + ql] = Int32(new_cut)
+                        _smem_st_i32(scalars_addr, Int32(4) + ql, new_cnt)
+                        _smem_st_i32(
+                            scalars_addr, Int32(4 + self.q_tile) + ql, Int32(new_cut)
+                        )
                     cute.arch.sync_threads()
             cute.arch.sync_threads()
             tile += Int32(512)
@@ -1509,7 +1516,7 @@ class MultiQueryHierarchicalMXFP4:
         for ql in cutlass.range(self.q_tile, unroll=1):
             r = row_base + ql
             if r < rows:
-                cnt = Int32(scalars[Int32(4) + ql])
+                cnt = _smem_ld_i32(scalars_addr, Int32(4) + ql)
                 if cnt > Int32(512):
                     cnt, _ = _trim_smem_u16_512(
                         carry_val,
@@ -1595,7 +1602,7 @@ class MultiQueryHierarchicalMXFP4:
         # processing two partitions per step across all 1024 threads.
         if cutlass.const_expr(self.ctas > 1):
             if tx == Int32(0):
-                scalars[4] = Int32(0)
+                _smem_st_i32(scalars_addr, Int32(4), Int32(0))
             cute.arch.sync_threads()
             cutoff = Uint32(0x007F)
             half = tx >> Int32(9)
@@ -1611,7 +1618,7 @@ class MultiQueryHierarchicalMXFP4:
                     cnt1 = Int32(
                         partial_counts[Int64(row) * Int64(self.ctas) + Int64(part1)]
                     )
-                on = Int32(scalars[4])
+                on = _smem_ld_i32(scalars_addr, Int32(4))
                 if on + cnt0 + cnt1 > Int32(2048):
                     on, cutoff = _trim_smem_u16_512(
                         carry_val,
@@ -1625,8 +1632,8 @@ class MultiQueryHierarchicalMXFP4:
                         threads=1024,
                     )
                     if tx == Int32(0):
-                        scalars[4] = on
-                    cute.arch.sync_threads()
+                        _smem_st_i32(scalars_addr, Int32(4), on)
+                cute.arch.sync_threads()
                 if cnt0 + cnt1 > Int32(0):
                     my_part = part0 + half
                     my_cnt = cnt0 if half == Int32(0) else cnt1
@@ -1653,7 +1660,7 @@ class MultiQueryHierarchicalMXFP4:
                             carry_idx[slot] = idx_v
                     cute.arch.sync_threads()
 
-            on = Int32(scalars[4])
+            on = _smem_ld_i32(scalars_addr, Int32(4))
             if on > Int32(512):
                 on, _ = _trim_smem_u16_512(
                     carry_val,
