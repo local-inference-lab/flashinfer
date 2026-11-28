@@ -29,7 +29,9 @@ from ._tuning import (
     validate_query,
 )
 
-_COMPILE_VERSION = 2
+_COMPILE_VERSION = 3
+_SMALL_BUILD_TASKS_MAX_ROUTES = 512
+_SMALL_BUILD_TASKS_MAX_EXPERTS = 1024
 
 
 def _fake_operand(dtype, rank: int, align: int):
@@ -66,6 +68,7 @@ def compile_situ_moe(query_payload, config_payload, ordinal):
         SituPrefillNVFP4Kernel,
         SituPrefillRouteClearKernel,
         SituPrefillRoutePackKernel,
+        SituSmallPrefillBuildTasksKernel,
     )
     from ._quant import (
         SituInputQuantMXFP8Kernel,
@@ -268,42 +271,64 @@ def compile_situ_moe(query_payload, config_payload, ordinal):
         else:
             bm = config.prefill_tile_m
             max_tasks = (query.max_routes + bm - 1) // bm + query.num_experts
-            programs["route_clear"] = b12x_compile(
-                SituPrefillRouteClearKernel(query.num_experts, max_tasks),
-                _fake_operand(cutlass.Int32, 1, 4),
-                _fake_operand(cutlass.Int32, 1, 4),
-                stream,
-                compile_spec=KernelCompileSpec.from_key(
-                    "moe.situ_moe.route_clear",
-                    _COMPILE_VERSION,
-                    (query.num_experts, max_tasks),
-                ),
-            )
-            programs["route_pack"] = b12x_compile(
-                SituPrefillRoutePackKernel(query.num_experts, query.max_routes),
-                _fake_operand(cutlass.Int32, 1, 4),
-                _fake_operand(cutlass.Int32, 1, 4),
-                _fake_operand(cutlass.Int32, 2, 4),
-                cutlass.Int32(query.max_routes),
-                stream,
-                compile_spec=KernelCompileSpec.from_key(
-                    "moe.situ_moe.route_pack",
-                    _COMPILE_VERSION,
-                    (query.num_experts, query.max_routes),
-                ),
-            )
-            programs["build_tasks"] = b12x_compile(
-                SituPrefillBuildTasksKernel(query.num_experts, bm),
-                _fake_operand(cutlass.Int32, 1, 4),
-                _fake_operand(cutlass.Int32, 1, 4),
-                _fake_operand(cutlass.Int32, 1, 4),
-                stream,
-                compile_spec=KernelCompileSpec.from_key(
-                    "moe.situ_moe.build_tasks",
-                    _COMPILE_VERSION,
-                    (query.num_experts, bm),
-                ),
-            )
+            if (
+                query.max_routes <= _SMALL_BUILD_TASKS_MAX_ROUTES
+                and query.num_experts <= _SMALL_BUILD_TASKS_MAX_EXPERTS
+            ):
+                programs["small_build_tasks"] = b12x_compile(
+                    SituSmallPrefillBuildTasksKernel(
+                        query.num_experts, query.max_routes, bm, max_tasks
+                    ),
+                    _fake_operand(cutlass.Int32, 1, 4),
+                    _fake_operand(cutlass.Int32, 1, 4),
+                    _fake_operand(cutlass.Int32, 2, 4),
+                    _fake_operand(cutlass.Int32, 1, 4),
+                    _fake_operand(cutlass.Int32, 1, 4),
+                    cutlass.Int32(query.max_routes),
+                    stream,
+                    compile_spec=KernelCompileSpec.from_key(
+                        "moe.situ_moe.small_build_tasks",
+                        _COMPILE_VERSION,
+                        (query.num_experts, query.max_routes, bm, max_tasks),
+                    ),
+                )
+            else:
+                programs["route_clear"] = b12x_compile(
+                    SituPrefillRouteClearKernel(query.num_experts, max_tasks),
+                    _fake_operand(cutlass.Int32, 1, 4),
+                    _fake_operand(cutlass.Int32, 1, 4),
+                    stream,
+                    compile_spec=KernelCompileSpec.from_key(
+                        "moe.situ_moe.route_clear",
+                        _COMPILE_VERSION,
+                        (query.num_experts, max_tasks),
+                    ),
+                )
+                programs["route_pack"] = b12x_compile(
+                    SituPrefillRoutePackKernel(query.num_experts, query.max_routes),
+                    _fake_operand(cutlass.Int32, 1, 4),
+                    _fake_operand(cutlass.Int32, 1, 4),
+                    _fake_operand(cutlass.Int32, 2, 4),
+                    cutlass.Int32(query.max_routes),
+                    stream,
+                    compile_spec=KernelCompileSpec.from_key(
+                        "moe.situ_moe.route_pack",
+                        _COMPILE_VERSION,
+                        (query.num_experts, query.max_routes),
+                    ),
+                )
+                programs["build_tasks"] = b12x_compile(
+                    SituPrefillBuildTasksKernel(query.num_experts, bm),
+                    _fake_operand(cutlass.Int32, 1, 4),
+                    _fake_operand(cutlass.Int32, 1, 4),
+                    _fake_operand(cutlass.Int32, 1, 4),
+                    stream,
+                    compile_spec=KernelCompileSpec.from_key(
+                        "moe.situ_moe.build_tasks",
+                        _COMPILE_VERSION,
+                        (query.num_experts, bm),
+                    ),
+                )
             if is_nvfp4:
                 prefill_args = (
                     _fake_operand(cutlass.Uint8, 2, 16),
@@ -779,33 +804,47 @@ class PreparedSituMoe:
                 cur_tasks = (r + bm - 1) // bm + q.num_experts
                 task_exp = sv["task_expert"][:cur_tasks]
                 task_beg = sv["task_begin"][:cur_tasks]
-                run_compiled(
-                    self.programs["route_clear"],
-                    (
-                        _kernel_operand(counts, cutlass.Int32, 4),
-                        _kernel_operand(sv["task_expert"], cutlass.Int32, 4),
-                        stream,
-                    ),
-                )
-                run_compiled(
-                    self.programs["route_pack"],
-                    (
-                        _kernel_operand(binding.ids, cutlass.Int32, 4),
-                        _kernel_operand(counts, cutlass.Int32, 4),
-                        _kernel_operand(rows, cutlass.Int32, 4),
-                        cutlass.Int32(r),
-                        stream,
-                    ),
-                )
-                run_compiled(
-                    self.programs["build_tasks"],
-                    (
-                        _kernel_operand(counts, cutlass.Int32, 4),
-                        _kernel_operand(task_exp, cutlass.Int32, 4),
-                        _kernel_operand(task_beg, cutlass.Int32, 4),
-                        stream,
-                    ),
-                )
+                if "small_build_tasks" in self.programs:
+                    run_compiled(
+                        self.programs["small_build_tasks"],
+                        (
+                            _kernel_operand(binding.ids, cutlass.Int32, 4),
+                            _kernel_operand(counts, cutlass.Int32, 4),
+                            _kernel_operand(rows, cutlass.Int32, 4),
+                            _kernel_operand(sv["task_expert"], cutlass.Int32, 4),
+                            _kernel_operand(sv["task_begin"], cutlass.Int32, 4),
+                            cutlass.Int32(r),
+                            stream,
+                        ),
+                    )
+                else:
+                    run_compiled(
+                        self.programs["route_clear"],
+                        (
+                            _kernel_operand(counts, cutlass.Int32, 4),
+                            _kernel_operand(sv["task_expert"], cutlass.Int32, 4),
+                            stream,
+                        ),
+                    )
+                    run_compiled(
+                        self.programs["route_pack"],
+                        (
+                            _kernel_operand(binding.ids, cutlass.Int32, 4),
+                            _kernel_operand(counts, cutlass.Int32, 4),
+                            _kernel_operand(rows, cutlass.Int32, 4),
+                            cutlass.Int32(r),
+                            stream,
+                        ),
+                    )
+                    run_compiled(
+                        self.programs["build_tasks"],
+                        (
+                            _kernel_operand(counts, cutlass.Int32, 4),
+                            _kernel_operand(task_exp, cutlass.Int32, 4),
+                            _kernel_operand(task_beg, cutlass.Int32, 4),
+                            stream,
+                        ),
+                    )
                 if is_nvfp4:
                     s13_flat = binding.s13.view(torch.uint8).reshape(-1)
                     s2_flat = binding.s2.view(torch.uint8).reshape(-1)
