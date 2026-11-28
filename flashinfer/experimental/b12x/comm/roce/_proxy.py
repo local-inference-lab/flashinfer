@@ -23,8 +23,13 @@ _LIB: ctypes.CDLL | None = None
 
 BLOB_STRUCT_ERR = "roce proxy blob size mismatch"
 # Region layout, doorbell protocol and connection blob of ``_roce_proxy.c``; native runtimes vendor
-# the same file.
-ABI_VERSION = 14
+# the same file. ABI 15 supports open-chain all-gather broadcast and its ring mailbox geometry.
+# The region layout and every doorbell word match ABI 14, and the CuTe kernel sources match
+# those used by ABI 11 through 14, so kernels exported at those ABIs retain their captured
+# addresses. Every rank of a group must run the same proxy source: the setup configuration
+# the ranks compare includes this number, and ``roce_connect`` rejects ranks whose ring window,
+# packet size or protocol tag differ.
+ABI_VERSION = 15
 # Reliable queue pairs per rail (``ROCE_MAX_LANES``): consecutive chunks of one peer and rail use
 # separate lanes.
 MAX_LANES = 4
@@ -114,6 +119,8 @@ def load() -> ctypes.CDLL:
         lib.roce_layout.argtypes = [ctypes.c_int, u64, u64, u64, ctypes.POINTER(u64)]
         lib.roce_blob_bytes.restype = u64
         lib.roce_blob_bytes.argtypes = []
+        lib.roce_ring_bytes.restype = u64
+        lib.roce_ring_bytes.argtypes = [ctypes.c_int, ctypes.c_int]
         lib.roce_create.restype = p
         lib.roce_create.argtypes = [
             ctypes.c_int,
@@ -165,6 +172,17 @@ def load() -> ctypes.CDLL:
             raise RuntimeError("unexpected b12x RoCE proxy ABI version")
         _LIB = lib
         return lib
+
+
+def ring_bytes(world: int, ring_open: bool = False) -> int:
+    """Startup-owned ring mailbox bytes for ``world`` ranks and topology; zero for an invalid world.
+
+    ``ring_open`` is the topology the caller will enable: only an open chain of four ranks or more
+    broadcasts, and only that block carries the larger packets. A runtime that restores a ring
+    transport must reserve this before creating the context, since ``roce_create`` itself does not
+    include it in the captured region layout.
+    """
+    return int(load().roce_ring_bytes(int(world), int(bool(ring_open))))
 
 
 def _neighbor_ranks(rank: int, world: int, *, ring_open: bool) -> set[int]:
@@ -375,12 +393,14 @@ class Proxy:
             raise RuntimeError(f"RoCE all-gather relay setup failed: {self.error()}")
 
     def start(self) -> None:
-        """Start the proxy thread; a restart resumes from the last posted sequence."""
+        """Start the proxy thread. A quiescent restart resumes from the last posted sequence; a
+        failed context, or one stopped inside an operation, is terminal and must be destroyed."""
         if self._lib.roce_start(self._ctx) != 0:
             raise RuntimeError(f"RoCE proxy thread failed to start: {self.error()}")
 
     def stop(self) -> None:
-        """Stop the proxy thread; ``start`` resumes from the last posted op."""
+        """Stop the proxy thread at an operation boundary, or mark the context terminal if an
+        operation was in progress. A terminal context must be destroyed and recreated."""
         self._lib.roce_stop(self._ctx)
 
     def failed(self) -> bool:
@@ -424,4 +444,4 @@ class Proxy:
             self.close()
 
 
-__all__ = ["ABI_VERSION", "Layout", "Proxy", "load"]
+__all__ = ["ABI_VERSION", "Layout", "Proxy", "load", "ring_bytes"]

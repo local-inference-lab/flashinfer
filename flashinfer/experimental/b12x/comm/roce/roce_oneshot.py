@@ -42,7 +42,7 @@ from torch.distributed import ProcessGroup
 
 from . import _allgather_cute, _scatter_gather_cute, _twoshot_cute, _varlen_cute
 from ._oneshot_cute import PACK_BYTES, get_launcher
-from ._proxy import MAX_LANES, Layout, Proxy, load as _load_proxy_library
+from ._proxy import MAX_LANES, Layout, Proxy, load as _load_proxy_library, ring_bytes
 from ._routes import MAX_RAILS, local_endpoints, plan_routes, relay_plan
 
 logger = logging.getLogger(__name__)
@@ -262,9 +262,12 @@ class RoceOneshotAllReduce:
         the shorter path. ``ring_open=True`` is the same transport over a line in
         rank order: rank 0 and the last rank have one neighbor each and share
         no link, and every write to a non-neighbor is forwarded toward it along
-        the line. Every rank must select the same mode. The proxy owns
-        about 1 MiB of additional registered host memory per rank in the world
-        (8.0 MiB at eight ranks), allocated at setup.
+        the line. Every rank must select the same mode. For either mode the
+        proxy allocates and registers a mailbox block at setup. Only an open
+        chain of four ranks or more broadcasts, so only its block carries the
+        larger packets (``_proxy.ring_bytes(world, ring_open)``: 192.2 MiB per
+        rank at four ranks, 896.9 MiB at eight, 3.75 GiB at sixteen, against
+        4.0 MiB, 8.0 MiB and 16.1 MiB for a ring that relays per destination).
         This is a software relay, not ConnectX hardware hairpin forwarding.
 
         ``pipe_bytes`` (default 0: none) sizes the pipelined two-shot path, which
@@ -1208,6 +1211,9 @@ class RoceOneshotAllReduce:
             "rank": self.rank,
             "ring": self.ring,
             "ring_open": self.ring_open,
+            "ring_bytes": ring_bytes(self.world_size, self.ring_open)
+            if (self.ring or self.ring_open)
+            else 0,
             "region": {
                 "address": self._region.data_ptr(),
                 "nbytes": layout.total_bytes,
