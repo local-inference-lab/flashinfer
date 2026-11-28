@@ -19,6 +19,45 @@ from b12x.preparation._efficiency import capture_autotune_effort
 FORMATS = ("nvfp4", "mxfp8")
 DECODE_MAX_TOKENS = 16
 DEFAULT_DECODE_MAX_TOKENS = 4
+SMEM_LIMIT_BYTES = 99 * 1024
+
+
+def _prefill_nvfp4_smem_bytes(k_dim: int, tile_m: int, has_csf: bool) -> int:
+    tile_n = 64 if (tile_m in (16, 32) and k_dim % 256 == 0) else 128
+    tile_k = 256 if tile_n == 64 else 128
+    k_bytes = tile_k // 2
+    k_sf_bytes = tile_k // 16
+    off_stage0 = ((tile_m * 4 + 15) // 16) * 16
+    st_off_sfa = tile_m * k_bytes + tile_n * k_bytes
+    st_off_sfb = st_off_sfa + ((tile_m * k_sf_bytes + 15) // 16) * 16
+    stage_end = st_off_sfb + (0 if has_csf else tile_n * k_sf_bytes)
+    stage_stride = ((stage_end + 15) // 16) * 16
+    csf_bytes = tile_n * (k_dim // 16) if has_csf else 0
+    return ((off_stage0 + 2 * stage_stride + csf_bytes + 15) // 16) * 16
+
+
+def _prefill_tile_fits_smem(query: "SituMoeQuery", tile_m: int) -> bool:
+    if query.weight_format != "nvfp4":
+        return True
+    fc1_ok = _prefill_nvfp4_smem_bytes(query.hidden, tile_m, query.has_csf) <= SMEM_LIMIT_BYTES
+    fc2_ok = _prefill_nvfp4_smem_bytes(query.intermediate, tile_m, query.has_csf) <= SMEM_LIMIT_BYTES
+    return fc1_ok and fc2_ok
+
+
+def _decode_fits_smem(query: "SituMoeQuery") -> bool:
+    if query.weight_format == "nvfp4":
+        for k_dim in (query.hidden, query.intermediate):
+            k_blocks = k_dim // 16
+            scale_padded = ((16 * k_blocks + 15) // 16) * 16
+            act_stride = k_dim * 2 + k_blocks * 4
+            if scale_padded + act_stride > SMEM_LIMIT_BYTES:
+                return False
+        return True
+    for k_dim in (query.hidden, query.intermediate):
+        act_stride = ((k_dim + (k_dim // 32) * 4 + 15) // 16) * 16
+        if act_stride > SMEM_LIMIT_BYTES:
+            return False
+    return True
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -77,6 +116,10 @@ def validate_query(query: SituMoeQuery) -> None:
         raise ValueError("inline CSF scale decoding is only supported for nvfp4")
     if query.num_experts <= 0 or query.top_k <= 0 or query.max_tokens <= 0:
         raise ValueError("num_experts, top_k, and max_tokens must be positive")
+    if query.hidden <= 0 or query.intermediate <= 0:
+        raise ValueError(
+            f"hidden and intermediate must be positive, got hidden={query.hidden}, intermediate={query.intermediate}"
+        )
     if query.top_k > query.num_experts:
         raise ValueError("top_k cannot exceed num_experts")
     if query.sm_count <= 0:
@@ -99,6 +142,13 @@ def validate_query(query: SituMoeQuery) -> None:
             raise ValueError(
                 f"mxfp8 situ_moe requires intermediate % 64 == 0, got {query.intermediate}"
             )
+    if not any(_prefill_tile_fits_smem(query, tm) for tm in (16, 32, 64, 128)) and not (
+        query.max_tokens <= DECODE_MAX_TOKENS and _decode_fits_smem(query)
+    ):
+        raise ValueError(
+            f"situ_moe geometry (hidden={query.hidden}, intermediate={query.intermediate}, "
+            f"has_csf={query.has_csf}) exceeds SM120 99 KiB per-block shared memory limit"
+        )
 
 
 def default_config(query: SituMoeQuery, device=None) -> SituMoeConfig:
@@ -107,12 +157,20 @@ def default_config(query: SituMoeQuery, device=None) -> SituMoeConfig:
     # At M >= 8, skewed/concentrated routing puts 4-16 tokens on hot experts where
     # the Tensor-Core BM=16 kernel processes all routed tokens in one weight pass.
     # At M >= 2048, BM=128 halves HBM weight streaming across active experts.
-    use_decode = query.max_tokens <= DEFAULT_DECODE_MAX_TOKENS
-    tile_m = (
+    use_decode = (
+        query.max_tokens <= DEFAULT_DECODE_MAX_TOKENS and _decode_fits_smem(query)
+    )
+    preferred_m = (
         16
         if query.max_tokens <= 256
         else (128 if query.max_tokens >= 2048 else 64)
     )
+    fitting = [tm for tm in (16, 32, 64, 128) if _prefill_tile_fits_smem(query, tm)]
+    if fitting:
+        below = [tm for tm in fitting if tm <= preferred_m]
+        tile_m = below[-1] if below else fitting[0]
+    else:
+        tile_m = 16
     fused_sum = not use_decode and not query.deterministic_output
     return SituMoeConfig(
         use_decode_kernel=use_decode,
@@ -128,6 +186,11 @@ def validate_config(query: SituMoeQuery, config: SituMoeConfig, device=None) -> 
     if config.use_decode_kernel and query.max_tokens > DECODE_MAX_TOKENS:
         raise ValueError(
             f"use_decode_kernel requires max_tokens <= {DECODE_MAX_TOKENS}, got {query.max_tokens}"
+        )
+    if config.use_decode_kernel and not _decode_fits_smem(query):
+        raise ValueError(
+            f"decode kernel for hidden={query.hidden}, intermediate={query.intermediate} "
+            f"exceeds SM120 99 KiB shared memory limit"
         )
     if config.use_decode_kernel and config.fused_route_sum:
         raise ValueError("fused_route_sum is only supported on prefill MMA kernels")
@@ -146,6 +209,11 @@ def validate_config(query: SituMoeQuery, config: SituMoeConfig, device=None) -> 
             raise ValueError(
                 "prefill MMA kernels require hidden % 128 == 0 and intermediate % 64 == 0"
             )
+        if not _prefill_tile_fits_smem(query, config.prefill_tile_m):
+            raise ValueError(
+                f"prefill_tile_m={config.prefill_tile_m} exceeds SM120 99 KiB shared memory "
+                f"limit for hidden={query.hidden}, intermediate={query.intermediate}, has_csf={query.has_csf}"
+            )
 
 
 def _validate_query(query, device):
@@ -155,10 +223,19 @@ def _validate_query(query, device):
 
 def _parameters(query: SituMoeQuery, device):
     base = default_config(query, device)
-    decode_choices = (
-        (True, False) if query.max_tokens <= DECODE_MAX_TOKENS else (False,)
+    can_decode = query.max_tokens <= DECODE_MAX_TOKENS and _decode_fits_smem(query)
+    fitting_tiles = tuple(
+        tm for tm in (16, 32, 64, 128) if _prefill_tile_fits_smem(query, tm)
     )
-    tile_m_choices = (16, 32, 64, 128)
+    if can_decode and fitting_tiles:
+        decode_choices = (True, False)
+        tile_m_choices = fitting_tiles
+    elif can_decode:
+        decode_choices = (True,)
+        tile_m_choices = (16,)
+    else:
+        decode_choices = (False,)
+        tile_m_choices = fitting_tiles
     fused_choices = (False,) if query.deterministic_output else (False, True)
     return ParameterSpace.create(
         TUNING.knobs,

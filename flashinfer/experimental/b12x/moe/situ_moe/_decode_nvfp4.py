@@ -112,18 +112,25 @@ class SituDecodeFC1NVFP4Kernel:
         self.k_blocks = self.hidden // 16
         self.k_iters = self.k_blocks // 16  # 16 lanes/row -> 128B coalesced line
         self.threads = 256
-        # Tile up to 4 active tokens per expert in one HBM weight pass (covers >99% of C=1..16).
-        self.token_chunk = min(4, self.max_tokens)
-
         self.scale_bytes = 16 * self.k_blocks
         self.act_f16_bytes_per_tok = self.hidden * 2  # K * 2B
         self.act_scale_bytes_per_tok = self.k_blocks * 4  # stored as u32 E4M3 byte
         self.act_stride_bytes = (
             self.act_f16_bytes_per_tok + self.act_scale_bytes_per_tok
         )
-        self.smem_bytes = (
-            (self.scale_bytes + 15) // 16
-        ) * 16 + self.token_chunk * self.act_stride_bytes
+        scale_padded = ((self.scale_bytes + 15) // 16) * 16
+        # Tile up to 4 active tokens per expert when SMEM permits (SM120 limit = 99 KiB).
+        smem_limit = 99 * 1024
+        chunk = min(4, self.max_tokens)
+        while chunk > 1 and scale_padded + chunk * self.act_stride_bytes > smem_limit:
+            chunk -= 1
+        self.token_chunk = chunk
+        self.smem_bytes = scale_padded + self.token_chunk * self.act_stride_bytes
+        if self.smem_bytes > smem_limit:
+            raise ValueError(
+                f"NVFP4 FC1 decode requires {self.smem_bytes} B shared memory for "
+                f"hidden={self.hidden}, exceeding SM120 limit {smem_limit} B"
+            )
 
     def _get_shared_storage_cls(self):
         nbytes = self.smem_bytes
@@ -365,17 +372,24 @@ class SituDecodeFC2NVFP4Kernel:
         self.k_blocks = self.intermediate // 16
         self.k_iters = self.k_blocks // 8  # 8 lanes/row -> 64B coalesced line
         self.threads = 128
-        self.token_chunk = min(4, self.max_tokens)
-
         self.scale_bytes = 16 * self.k_blocks
         self.act_f16_bytes_per_tok = self.intermediate * 2
         self.act_scale_bytes_per_tok = self.k_blocks * 4
         self.act_stride_bytes = (
             self.act_f16_bytes_per_tok + self.act_scale_bytes_per_tok
         )
-        self.smem_bytes = (
-            (self.scale_bytes + 15) // 16
-        ) * 16 + self.token_chunk * self.act_stride_bytes
+        scale_padded = ((self.scale_bytes + 15) // 16) * 16
+        smem_limit = 99 * 1024
+        chunk = min(4, self.max_tokens)
+        while chunk > 1 and scale_padded + chunk * self.act_stride_bytes > smem_limit:
+            chunk -= 1
+        self.token_chunk = chunk
+        self.smem_bytes = scale_padded + self.token_chunk * self.act_stride_bytes
+        if self.smem_bytes > smem_limit:
+            raise ValueError(
+                f"NVFP4 FC2 decode requires {self.smem_bytes} B shared memory for "
+                f"intermediate={self.intermediate}, exceeding SM120 limit {smem_limit} B"
+            )
 
     def _get_shared_storage_cls(self):
         nbytes = self.smem_bytes

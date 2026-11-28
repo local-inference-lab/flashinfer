@@ -454,13 +454,16 @@ class SituSmallRoutePackKernel:
     @cute.jit
     def __call__(
         self,
-        mIds: cute.Tensor,  # [R] i32
-        mActiveExperts: cute.Tensor,  # [max_slots] i32
-        mActiveCounts: cute.Tensor,  # [max_slots] i32
-        mActiveRoutes: cute.Tensor,  # [max_slots, R] i32
+        mIds: cute.Tensor,  # [live_routes] i32
+        mActiveExperts: cute.Tensor,  # [live_slots] i32
+        mActiveCounts: cute.Tensor,  # [live_slots] i32
+        mActiveRoutes: cute.Tensor,  # [live_slots, max_routes] i32
+        live_routes: Int32,
         stream: cuda.CUstream,
     ):
-        self.kernel(mIds, mActiveExperts, mActiveCounts, mActiveRoutes).launch(
+        self.kernel(
+            mIds, mActiveExperts, mActiveCounts, mActiveRoutes, live_routes
+        ).launch(
             grid=(1, 1, 1),
             block=[128, 1, 1],
             smem=self._get_shared_storage_cls().size_in_bytes(),
@@ -474,6 +477,7 @@ class SituSmallRoutePackKernel:
         mActiveExperts: cute.Tensor,
         mActiveCounts: cute.Tensor,
         mActiveRoutes: cute.Tensor,
+        live_routes: Int32,
     ):
         tid = Int32(cute.arch.thread_idx()[0])
         smem = cutlass.memory.SmemAllocator()
@@ -484,7 +488,10 @@ class SituSmallRoutePackKernel:
         s_cursor = storage.cursor.get_tensor(cute.make_layout((self.num_experts,)))
         s_num_active = storage.num_active.get_tensor(cute.make_layout((1,)))
 
-        # Parallel load & clear
+        n_routes = cutlass.min(live_routes, Int32(self.num_routes))
+        live_slots = cutlass.min(Int32(self.num_experts), n_routes)
+
+        # Parallel load & clear (bounded by live_routes and live_slots)
         e_iters: cutlass.Constexpr = (self.num_experts + 127) // 128
         for it in cutlass.range_constexpr(e_iters):
             e = tid + Int32(it * 128)
@@ -495,20 +502,21 @@ class SituSmallRoutePackKernel:
         r_iters: cutlass.Constexpr = (self.num_routes + 127) // 128
         for it in cutlass.range_constexpr(r_iters):
             r = tid + Int32(it * 128)
-            if r < Int32(self.num_routes):
+            if r < n_routes:
                 s_ids[r] = mIds[r]
         s_iters: cutlass.Constexpr = (self.max_slots + 127) // 128
         for it in cutlass.range_constexpr(s_iters):
             sl = tid + Int32(it * 128)
-            if sl < Int32(self.max_slots):
+            if sl < live_slots:
                 mActiveExperts[sl] = Int32(-1)
                 mActiveCounts[sl] = Int32(0)
         cute.arch.barrier()
 
-        # Thread 0 packs <= 128 routes deterministically in ~150 cycles (zero atomics).
+        # Thread 0 packs <= live_routes deterministically (zero atomics).
         if tid == Int32(0):
             n_act = Int32(0)
-            for r in range(self.num_routes):
+            r = Int32(0)
+            while r < n_routes:
                 e = s_ids[r]
                 if e >= Int32(0) and e < Int32(self.num_experts):
                     sl = s_slot[e]
@@ -518,9 +526,10 @@ class SituSmallRoutePackKernel:
                         mActiveExperts[sl] = e
                         n_act = n_act + Int32(1)
                     pos = s_cursor[e]
-                    mActiveRoutes[sl, pos] = Int32(r)
+                    mActiveRoutes[sl, pos] = r
                     s_cursor[e] = pos + Int32(1)
                     s_counts[e] = pos + Int32(1)
+                r = r + Int32(1)
             s_num_active[0] = n_act
         cute.arch.barrier()
 
@@ -535,11 +544,12 @@ class SituSmallRoutePackKernel:
 class SituRouteSumKernel:
     """Deterministic FP32 reduction across top-K route outputs -> BF16 ``[M, H]``."""
 
-    def __init__(self, hidden: int, top_k: int):
+    def __init__(self, hidden: int, top_k: int, num_experts: int):
         if hidden % 2 != 0:
             raise ValueError("hidden must be even")
         self.hidden = int(hidden)
         self.top_k = int(top_k)
+        self.num_experts = int(num_experts)
         self.threads = 128
         self.pairs_per_cta = 128  # 256 BF16 elements per CTA
 
@@ -571,7 +581,8 @@ class SituRouteSumKernel:
             base_route = tok * Int32(self.top_k)
             for k in cutlass.range_constexpr(self.top_k):
                 r = base_route + Int32(k)
-                if mIds[r] >= Int32(0):
+                eid = mIds[r]
+                if eid >= Int32(0) and eid < Int32(self.num_experts):
                     ptr = get_ptr_as_int64(
                         mRouteOut,
                         Int64(r) * Int64(self.hidden) + Int64(pair_col) * Int64(2),

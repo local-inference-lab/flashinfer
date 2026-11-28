@@ -98,8 +98,12 @@ def _quant_nvfp4_4o6_ref(x: torch.Tensor) -> torch.Tensor:
         sf = raw.to(torch.float8_e4m3fn).to(torch.float32)
         inv = torch.clamp(1.0 / (sf * decoder.unsqueeze(-1)), max=3.4028234663852886e38)
         scaled = xb * inv
-        # Nearest E2M1 value (round-to-nearest-even ties break identically on typical floats)
-        idx = (scaled.unsqueeze(-1) - lut).abs().argmin(dim=-1)
+        # Nearest E2M1 value with round-to-nearest-even tie breaking (even E2M1 code wins).
+        dist = (scaled.unsqueeze(-1) - lut).abs()
+        min_dist = dist.amin(dim=-1, keepdim=True)
+        is_odd = (torch.arange(16, device=x.device) & 1).to(torch.int32)
+        tie_rank = torch.where(dist == min_dist, is_odd, torch.full_like(is_odd, 2))
+        idx = tie_rank.argmin(dim=-1)
         rec = lut[idx] * (sf * outer.unsqueeze(-1))
         err = (rec - xb).abs().sum(dim=-1, keepdim=True)
         return rec, err
@@ -548,3 +552,146 @@ def test_cuda_graph_capture_and_bit_exact_replay(
     assert torch.equal(out_graph, out_eager), (
         "CUDA graph replay must be bit-exact with eager"
     )
+
+    # Verify live-tensor contract: mutating ids in place changes replayed CUDA-graph output.
+    ids.fill_(0)
+    situ_moe.run(b_eager)
+    out_graph.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out_graph, out_eager), (
+        "CUDA graph replay must observe in-place updates to live ids"
+    )
+
+
+def test_nvfp4_reference_nearest_even_tie_breaking():
+    device = torch.device("cuda")
+    block = torch.zeros((1, 256), dtype=torch.bfloat16, device=device)
+    block[0, 0] = 6.0
+    block[0, 1] = 0.75
+    block[0, 2] = 1.0
+    block[0, 3] = 1.0
+    rec = _quant_nvfp4_4o6_ref(block)
+    assert abs(rec[0, 1].item() - 1.0) < 1e-4, f"expected 0.75 -> 1.0 (even tie), got {rec[0, 1].item()}"
+
+
+def test_validation_rejects_invalid_queries_configs_and_bindings():
+    device = torch.device("cuda")
+    # Nonpositive hidden/intermediate rejected during query validation.
+    assert not situ_moe.supports(
+        weight_format="nvfp4", hidden=-256, intermediate=128, num_experts=1, top_k=1, max_tokens=1
+    )
+    assert not situ_moe.supports(
+        weight_format="nvfp4", hidden=256, intermediate=0, num_experts=1, top_k=1, max_tokens=1
+    )
+
+    # CSF prefill tile SMEM overflow (hidden=12288, intermediate=256, prefill_tile_m=128 -> 133,632 B > 99 KiB).
+    big_caps = situ_moe.Caps(
+        device=device, weight_format="nvfp4", hidden=12288, intermediate=256,
+        num_experts=4, top_k=1, max_tokens=128, has_csf=True,
+    )
+    with pytest.raises(ValueError, match="99 KiB"):
+        plan_bad = situ_moe.plan(
+            big_caps,
+            override=situ_moe.SituMoeConfig(use_decode_kernel=False, prefill_tile_m=128, fused_route_sum=False),
+        )
+        _prepare(plan_bad, device)
+    # Default config automatically picks a fitting tile (BM <= 32, BN=64).
+    plan_ok = situ_moe.plan(big_caps)
+    assert plan_ok.query.hidden == 12288
+
+    # Bind-time rejections: exceeding max_tokens, missing gains, padded/misaligned operands, strided ids, wrong expert dim.
+    e, h, inter, top_k = 16, 512, 256, 4
+    caps = situ_moe.Caps(
+        device=device, weight_format="nvfp4", hidden=h, intermediate=inter,
+        num_experts=e, top_k=top_k, max_tokens=4, has_csf=False, deterministic_output=True,
+    )
+    plan = situ_moe.plan(caps)
+    _prepare(plan, device)
+    scratch = [torch.empty(s.shape, dtype=s.dtype, device=s.device) for s in plan.scratch_specs()]
+    w13, s13, g13, w2, s2, g2 = _make_nvfp4_weights(e, h, inter, device)
+    x = torch.randn((2, h), dtype=torch.bfloat16, device=device)
+    out = torch.empty_like(x)
+    ids = torch.zeros((2, top_k), dtype=torch.int32, device=device)
+    weights = torch.full((2, top_k), 0.25, dtype=torch.float32, device=device)
+
+    with pytest.raises(ValueError, match="max_tokens"):
+        x_big = torch.randn((5, h), dtype=torch.bfloat16, device=device)
+        situ_moe.bind(
+            plan, scratch=scratch, x=x_big, ids=torch.zeros((5, top_k), dtype=torch.int32, device=device),
+            weights=torch.ones((5, top_k), dtype=torch.float32, device=device),
+            w13=w13, s13=s13, w2=w2, s2=s2, output=torch.empty_like(x_big), g13=g13, g2=g2,
+        )
+    with pytest.raises(ValueError, match="g13 and g2"):
+        situ_moe.bind(plan, scratch=scratch, x=x, ids=ids, weights=weights, w13=w13, s13=s13, w2=w2, s2=s2, output=out)
+    with pytest.raises(ValueError, match="contiguous"):
+        x_pad = torch.randn((2, h + 8), dtype=torch.bfloat16, device=device)[:, :h]
+        situ_moe.bind(plan, scratch=scratch, x=x_pad, ids=ids, weights=weights, w13=w13, s13=s13, w2=w2, s2=s2, output=out, g13=g13, g2=g2)
+    with pytest.raises(ValueError, match="aligned"):
+        x_mis = torch.randn((2 * h + 1,), dtype=torch.bfloat16, device=device)[1:].view(2, h)
+        situ_moe.bind(plan, scratch=scratch, x=x_mis, ids=ids, weights=weights, w13=w13, s13=s13, w2=w2, s2=s2, output=out, g13=g13, g2=g2)
+    with pytest.raises(ValueError, match="contiguous"):
+        ids_strided = torch.zeros((top_k, 2), dtype=torch.int32, device=device).t()
+        situ_moe.bind(plan, scratch=scratch, x=x, ids=ids_strided, weights=weights, w13=w13, s13=s13, w2=w2, s2=s2, output=out, g13=g13, g2=g2)
+    with pytest.raises(ValueError, match="w13"):
+        situ_moe.bind(plan, scratch=scratch, x=x, ids=ids, weights=weights, w13=w13[: e - 1], s13=s13, w2=w2, s2=s2, output=out, g13=g13, g2=g2)
+
+
+def test_smaller_live_decode_batch_and_out_of_range_expert_ids():
+    """Verify M < max_tokens decode packing and out-of-range expert ID masking in route_sum."""
+    device = torch.device("cuda")
+    e, h, inter, top_k = 16, 512, 256, 4
+    w13, s13, g13, w2, s2, g2 = _make_nvfp4_weights(e, h, inter, device)
+    caps = situ_moe.Caps(
+        device=device, weight_format="nvfp4", hidden=h, intermediate=inter,
+        num_experts=e, top_k=top_k, max_tokens=4, has_csf=False, deterministic_output=True,
+    )
+    plan = situ_moe.plan(caps)
+    _prepare(plan, device)
+    scratch = [torch.empty(s.shape, dtype=s.dtype, device=s.device) for s in plan.scratch_specs()]
+    # Poison scratch with NaN to prove unwritten routes are never summed when eid == e.
+    scratch[0].fill_(0xFF)
+    x = (torch.randn((1, h), device=device) * 0.5).to(torch.bfloat16)
+    ids = torch.tensor([[0, e, -1, 2]], dtype=torch.int32, device=device)
+    weights = torch.tensor([[0.5, 0.25, 0.1, 0.5]], dtype=torch.float32, device=device)
+    out = torch.empty_like(x)
+    binding = situ_moe.bind(
+        plan, scratch=scratch, x=x, ids=ids, weights=weights,
+        w13=w13, s13=s13, w2=w2, s2=s2, output=out, g13=g13, g2=g2,
+    )
+    situ_moe.run(binding)
+    torch.cuda.synchronize()
+    assert torch.isfinite(out).all()
+    ids_ref = ids.clone()
+    ids_ref[ids_ref >= e] = -1
+    ref = _reference_situ_moe(x, ids_ref, weights, _dequant_nvfp4(w13, s13, g13), _dequant_nvfp4(w2, s2, g2), is_nvfp4=True)
+    cos = torch.nn.functional.cosine_similarity(out.float().flatten(), ref.float().flatten(), dim=0).item()
+    assert cos > 0.999
+
+
+def test_mxfp8_decode_zero_weight_extreme_scale_no_nan():
+    """Verify 0 * (2^8 * 2^127) does not produce NaN in MXFP8 decode."""
+    device = torch.device("cuda")
+    e, h, inter, top_k = 4, 256, 128, 2
+    w13 = torch.zeros((e, 2 * inter, h), dtype=torch.uint8, device=device)
+    w2 = torch.zeros((e, h, inter), dtype=torch.uint8, device=device)
+    s13 = torch.full((e, 2 * inter, h // 32), 254, dtype=torch.uint8, device=device)
+    s2 = torch.full((e, h, inter // 32), 254, dtype=torch.uint8, device=device)
+    x = torch.full((1, h), 32768.0, dtype=torch.bfloat16, device=device)
+    ids = torch.tensor([[0, 1]], dtype=torch.int32, device=device)
+    weights = torch.tensor([[0.5, 0.5]], dtype=torch.float32, device=device)
+    caps = situ_moe.Caps(
+        device=device, weight_format="mxfp8", hidden=h, intermediate=inter,
+        num_experts=e, top_k=top_k, max_tokens=1,
+    )
+    plan = situ_moe.plan(caps)
+    _prepare(plan, device)
+    scratch = [torch.empty(s.shape, dtype=s.dtype, device=s.device) for s in plan.scratch_specs()]
+    out = torch.empty_like(x)
+    situ_moe.run(situ_moe.bind(
+        plan, scratch=scratch, x=x, ids=ids, weights=weights,
+        w13=w13, s13=s13, w2=w2, s2=s2, output=out,
+    ))
+    torch.cuda.synchronize()
+    assert torch.isfinite(out).all()
+    assert out.abs().max().item() == 0.0

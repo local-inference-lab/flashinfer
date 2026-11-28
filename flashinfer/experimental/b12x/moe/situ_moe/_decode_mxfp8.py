@@ -31,6 +31,25 @@ from ._math import (
 )
 
 
+SMEM_LIMIT_BYTES = 99 * 1024
+
+
+@cute.jit
+def _scale_dot_ue8m0(dot: Float32, sa_byte: Uint32, sw_byte: Uint32) -> Float32:
+    """Scale ``dot`` by ``2^(sa_byte - 127) * 2^(sw_byte - 127)`` without ``0 * Inf`` overflow."""
+    total_exp = Int32(sa_byte) + Int32(sw_byte) - Int32(254)
+    out = Float32(0.0)
+    if total_exp >= Int32(-126) and total_exp <= Int32(127):
+        out = dot * ue8m0_byte_to_f32((total_exp + Int32(127)).to(Uint32))
+    else:
+        e1 = total_exp // Int32(2)
+        e2 = total_exp - e1
+        s1 = ue8m0_byte_to_f32((e1 + Int32(127)).to(Uint32))
+        s2 = ue8m0_byte_to_f32((e2 + Int32(127)).to(Uint32))
+        out = (dot * s1) * s2
+    return out
+
+
 @cute.jit
 def _stage_mxfp8_act_to_smem(
     mAQ: cute.Tensor,  # [M_act, K] u8 (E4M3FN bits)
@@ -209,24 +228,20 @@ class SituDecodeFC1MXFP8Kernel:
                     byte_off = (Int32(ki * 16) + lane16) * Int32(8)
                     blk = Int32(ki * 4) + blk_in_iter
                     w_lo, w_hi = ld_global_nc_v2_u32(w_row_ptr + Int64(byte_off))
-                    sw_f = ue8m0_byte_to_f32(
-                        mS13[expert, row_in_expert, blk].to(Uint32)
-                    )
+                    sw_b = mS13[expert, row_in_expert, blk].to(Uint32)
 
                     for ci in cutlass.range_constexpr(self.token_chunk):
                         if Int32(ci) < chunk_n:
                             c_base = act_base + Int32(ci * self.act_stride_bytes)
                             a_lo = ld_shared_u32(c_base + byte_off)
                             a_hi = ld_shared_u32(c_base + byte_off + Int32(4))
-                            sa_f = ue8m0_byte_to_f32(
-                                ld_shared_u32(
-                                    c_base + Int32(self.act_q_bytes) + blk * Int32(4)
-                                )
+                            sa_b = ld_shared_u32(
+                                c_base + Int32(self.act_q_bytes) + blk * Int32(4)
                             )
                             dot = e4m3x4_dot_f32(w_lo, a_lo) + e4m3x4_dot_f32(
                                 w_hi, a_hi
                             )
-                            acc[ci] = acc[ci] + dot * (sa_f * sw_f)
+                            acc[ci] = acc[ci] + _scale_dot_ue8m0(dot, sa_b, sw_b)
 
                 out_col = tile * Int32(4) + warp
                 for ci in cutlass.range_constexpr(self.token_chunk):
@@ -387,22 +402,20 @@ class SituDecodeFC2MXFP8Kernel:
                     byte_off = (Int32(ki * 8) + lane8) * Int32(8)
                     blk = Int32(ki * 2) + blk_in_iter
                     w_lo, w_hi = ld_global_nc_v2_u32(w_row_ptr + Int64(byte_off))
-                    sw_f = ue8m0_byte_to_f32(mS2[expert, out_row, blk].to(Uint32))
+                    sw_b = mS2[expert, out_row, blk].to(Uint32)
 
                     for ci in cutlass.range_constexpr(self.token_chunk):
                         if Int32(ci) < chunk_n:
                             c_base = act_base + Int32(ci * self.act_stride_bytes)
                             a_lo = ld_shared_u32(c_base + byte_off)
                             a_hi = ld_shared_u32(c_base + byte_off + Int32(4))
-                            sa_f = ue8m0_byte_to_f32(
-                                ld_shared_u32(
-                                    c_base + Int32(self.act_q_bytes) + blk * Int32(4)
-                                )
+                            sa_b = ld_shared_u32(
+                                c_base + Int32(self.act_q_bytes) + blk * Int32(4)
                             )
                             dot = e4m3x4_dot_f32(w_lo, a_lo) + e4m3x4_dot_f32(
                                 w_hi, a_hi
                             )
-                            acc[ci] = acc[ci] + dot * (sa_f * sw_f)
+                            acc[ci] = acc[ci] + _scale_dot_ue8m0(dot, sa_b, sw_b)
 
                 for ci in cutlass.range_constexpr(self.token_chunk):
                     if Int32(ci) < chunk_n:

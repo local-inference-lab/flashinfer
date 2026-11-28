@@ -400,6 +400,13 @@ class SituPrefillNVFP4Kernel:
         self.off_csf_sfb = self.off_stage0 + 2 * self.stage_stride
         csf_bytes = self.tile_n * self.k_blocks if self.has_csf else 0
         self.smem_bytes = ((self.off_csf_sfb + csf_bytes + 15) // 16) * 16
+        smem_limit = 99 * 1024
+        if self.smem_bytes > smem_limit:
+            raise ValueError(
+                f"NVFP4 prefill (BM={self.tile_m}, BN={self.tile_n}, K={self.k_dim}, "
+                f"has_csf={self.has_csf}) requires {self.smem_bytes} B shared memory, "
+                f"exceeding SM120 limit {smem_limit} B"
+            )
 
     def _get_shared_storage_cls(self):
         nbytes = self.smem_bytes

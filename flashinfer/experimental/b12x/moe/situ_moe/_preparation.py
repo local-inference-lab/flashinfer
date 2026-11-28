@@ -29,7 +29,7 @@ from ._tuning import (
     validate_query,
 )
 
-_COMPILE_VERSION = 3
+_COMPILE_VERSION = 4
 _SMALL_BUILD_TASKS_MAX_ROUTES = 512
 _SMALL_BUILD_TASKS_MAX_EXPERTS = 1024
 
@@ -40,10 +40,25 @@ def _fake_operand(dtype, rank: int, align: int):
     return make_fake_tensor(dtype, shape, strides, assumed_align=align)
 
 
-def _kernel_operand(tensor: torch.Tensor, dtype, align: int):
-    if tensor.stride(-1) != 1:
+def _validate_packed_aligned(name: str, tensor: torch.Tensor, align: int) -> None:
+    if not tensor.is_contiguous():
         raise ValueError(
-            f"situ_moe operands require unit inner stride, got {tensor.stride()}"
+            f"{name} must be contiguous (packed rows), got shape={tuple(tensor.shape)}, stride={tensor.stride()}"
+        )
+    if tensor.numel() and (tensor.data_ptr() % align) != 0:
+        raise ValueError(
+            f"{name} data pointer {hex(tensor.data_ptr())} is not {align}-byte aligned"
+        )
+
+
+def _kernel_operand(tensor: torch.Tensor, dtype, align: int):
+    if not tensor.is_contiguous():
+        raise ValueError(
+            f"situ_moe operands must be contiguous, got shape={tuple(tensor.shape)}, stride={tensor.stride()}"
+        )
+    if tensor.numel() and (tensor.data_ptr() % align) != 0:
+        raise ValueError(
+            f"situ_moe operand pointer {hex(tensor.data_ptr())} is not {align}-byte aligned"
         )
     converted = from_dlpack(tensor, assumed_align=align)
     converted.element_type = dtype
@@ -137,7 +152,7 @@ def compile_situ_moe(query_payload, config_payload, ordinal):
         # 2. Route reduction (only needed when FC2 does not fuse scatter-add)
         if not config.fused_route_sum:
             programs["route_sum"] = b12x_compile(
-                SituRouteSumKernel(query.hidden, query.top_k),
+                SituRouteSumKernel(query.hidden, query.top_k, query.num_experts),
                 _fake_operand(cutlass.BFloat16, 2, 16),
                 _fake_operand(cutlass.Int32, 1, 4),
                 _fake_operand(cutlass.BFloat16, 2, 16),
@@ -155,6 +170,7 @@ def compile_situ_moe(query_payload, config_payload, ordinal):
                 _fake_operand(cutlass.Int32, 1, 4),
                 _fake_operand(cutlass.Int32, 1, 4),
                 _fake_operand(cutlass.Int32, 2, 4),
+                cutlass.Int32(query.max_routes),
                 stream,
                 compile_spec=KernelCompileSpec.from_key(
                     "moe.situ_moe.small_pack", _COMPILE_VERSION, key
@@ -573,6 +589,7 @@ class PreparedSituMoe:
         s2_exc: torch.Tensor | None = None,
         s2_slab_offsets: torch.Tensor | None = None,
     ) -> Binding:
+        """Bind live contiguous, aligned operands and scratch for execution or CUDA-graph capture."""
         q = self.query
         if x.device != self.device or output.device != self.device:
             raise ValueError(f"x and output must be on {self.device}")
@@ -588,6 +605,10 @@ class PreparedSituMoe:
             raise ValueError(
                 f"output shape {tuple(output.shape)} must match x {tuple(x.shape)}"
             )
+        _validate_packed_aligned("x", x, 16)
+        _validate_packed_aligned("output", output, 16)
+        if ids.device != self.device or weights.device != self.device:
+            raise ValueError(f"ids and weights must be on {self.device}")
         if ids.dtype != torch.int32 or weights.dtype != torch.float32:
             raise ValueError("ids must be int32 and weights must be float32")
         if (
@@ -595,25 +616,81 @@ class PreparedSituMoe:
             or weights.numel() != x.shape[0] * q.top_k
         ):
             raise ValueError("ids and weights must have M * top_k elements")
-        if q.weight_format == "nvfp4" and (g13 is None or g2 is None):
-            raise ValueError("nvfp4 situ_moe requires g13 and g2 global scale tensors")
-        if q.has_csf:
-            if (
-                s13_exc is None
-                or s13_slab_offsets is None
-                or s2_exc is None
-                or s2_slab_offsets is None
-            ):
-                raise ValueError(
-                    "CSF situ_moe requires s13_exc, s13_slab_offsets, s2_exc, and s2_slab_offsets"
-                )
+        _validate_packed_aligned("ids", ids, 4)
+        _validate_packed_aligned("weights", weights, 4)
+
+        e, h, inter = q.num_experts, q.hidden, q.intermediate
+        _validate_packed_aligned("w13", w13, 16)
+        _validate_packed_aligned("w2", w2, 16)
+        if q.weight_format == "nvfp4":
+            if g13 is None or g2 is None:
+                raise ValueError("nvfp4 situ_moe requires g13 and g2 global scale tensors")
+            expected_w13 = (e, 2 * inter, h // 2)
+            expected_w2 = (e, h, inter // 2)
+            if tuple(w13.shape) != expected_w13:
+                raise ValueError(f"nvfp4 w13 must have shape {expected_w13}, got {tuple(w13.shape)}")
+            if tuple(w2.shape) != expected_w2:
+                raise ValueError(f"nvfp4 w2 must have shape {expected_w2}, got {tuple(w2.shape)}")
+            _validate_packed_aligned("s13", s13, 16)
+            _validate_packed_aligned("s2", s2, 16)
+            _validate_packed_aligned("g13", g13, 4)
+            _validate_packed_aligned("g2", g2, 4)
+            if g13.numel() != 2 * e or g2.numel() != 2 * e:
+                raise ValueError(f"g13 and g2 must have {2 * e} elements")
+            if q.has_csf:
+                if (
+                    s13_exc is None
+                    or s13_slab_offsets is None
+                    or s2_exc is None
+                    or s2_slab_offsets is None
+                ):
+                    raise ValueError(
+                        "CSF situ_moe requires s13_exc, s13_slab_offsets, s2_exc, and s2_slab_offsets"
+                    )
+                expected_s13 = (e, (2 * inter) // 16, 16 * (1 + ((h // 16) * 4 + 7) // 8))
+                expected_s2 = (e, h // 16, 16 * (1 + ((inter // 16) * 4 + 7) // 8))
+                if tuple(s13.shape) != expected_s13:
+                    raise ValueError(f"CSF s13 must have shape {expected_s13}, got {tuple(s13.shape)}")
+                if tuple(s2.shape) != expected_s2:
+                    raise ValueError(f"CSF s2 must have shape {expected_s2}, got {tuple(s2.shape)}")
+                if s13_slab_offsets.numel() != e * ((2 * inter) // 16) + 1:
+                    raise ValueError("s13_slab_offsets length mismatch")
+                if s2_slab_offsets.numel() != e * (h // 16) + 1:
+                    raise ValueError("s2_slab_offsets length mismatch")
+                _validate_packed_aligned("s13_exc", s13_exc, 4)
+                _validate_packed_aligned("s13_slab_offsets", s13_slab_offsets, 4)
+                _validate_packed_aligned("s2_exc", s2_exc, 4)
+                _validate_packed_aligned("s2_slab_offsets", s2_slab_offsets, 4)
+            else:
+                expected_s13 = (e, 2 * inter, h // 16)
+                expected_s2 = (e, h, inter // 16)
+                if tuple(s13.shape) != expected_s13:
+                    raise ValueError(f"nvfp4 s13 must have shape {expected_s13}, got {tuple(s13.shape)}")
+                if tuple(s2.shape) != expected_s2:
+                    raise ValueError(f"nvfp4 s2 must have shape {expected_s2}, got {tuple(s2.shape)}")
+        else:
+            expected_w13 = (e, 2 * inter, h)
+            expected_w2 = (e, h, inter)
+            expected_s13 = (e, 2 * inter, h // 32)
+            expected_s2 = (e, h, inter // 32)
+            if tuple(w13.shape) != expected_w13:
+                raise ValueError(f"mxfp8 w13 must have shape {expected_w13}, got {tuple(w13.shape)}")
+            if tuple(w2.shape) != expected_w2:
+                raise ValueError(f"mxfp8 w2 must have shape {expected_w2}, got {tuple(w2.shape)}")
+            if tuple(s13.shape) != expected_s13:
+                raise ValueError(f"mxfp8 s13 must have shape {expected_s13}, got {tuple(s13.shape)}")
+            if tuple(s2.shape) != expected_s2:
+                raise ValueError(f"mxfp8 s2 must have shape {expected_s2}, got {tuple(s2.shape)}")
+            _validate_packed_aligned("s13", s13, 8)
+            _validate_packed_aligned("s2", s2, 8)
+
         arena = scratch_tensor(scratch, self._specs, owner="situ_moe")
         views = _slice_scratch(arena, self._layout)
         return Binding(
             plan=plan,
             x=x,
-            ids=ids.reshape(-1),
-            weights=weights.reshape(-1),
+            ids=ids.view(-1),
+            weights=weights.view(-1),
             w13=w13,
             s13=s13,
             w2=w2,
@@ -689,6 +766,7 @@ class PreparedSituMoe:
                         _kernel_operand(act_exp, cutlass.Int32, 4),
                         _kernel_operand(act_cnt, cutlass.Int32, 4),
                         _kernel_operand(act_rts, cutlass.Int32, 4),
+                        cutlass.Int32(r),
                         stream,
                     ),
                 )
