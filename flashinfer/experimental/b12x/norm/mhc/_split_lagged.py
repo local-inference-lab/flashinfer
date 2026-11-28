@@ -79,20 +79,98 @@ from ._kernels import (
 SPLIT_LAGGED_MAX_TOKENS = 128
 SPLIT_LAGGED_HIDDEN_SIZES = (4096, 5120, 7168)
 CLUSTER_AR_MHC_MAX_TOKENS = 128
-CLUSTER_AR_MHC_ONESHOT_MAX_TOKENS = 4
+CLUSTER_AR_MHC_ONESHOT_MAX_TOKENS = 1
 CLUSTER_AR_MHC_WORLD_SIZES = (2, 3, 4, 6, 8)
 _CLUSTER_AR_MHC_TRANSPORTS = ("oneshot", "rsag")
 _PARTIAL_STRIDE = 32
 
 
+def cluster_allreduce_cluster_size(tokens: int) -> int:
+    """Return the SM120 CTA-per-row cluster size for ``ClusterMhcAllReducePostYNorm``.
+
+    On SM120 PCIe links, a 4-CTA cluster minimizes tiny-batch latency (``M <= 4``),
+    while single-CTA-per-row (``cluster_size=1``) eliminates hardware DSM cluster
+    barriers and keeps every warp full-width (32 lanes = 512B coalesced PCIe TLP
+    bursts) for ``M >= 5``.
+    """
+    return 4 if int(tokens) <= 4 else 1
+
+
+def _is_legal_cluster_allreduce_size(packs: int, cluster_size: int) -> bool:
+    cs = int(cluster_size)
+    if cs < 1 or packs % cs != 0:
+        return False
+    packs_per_cta = packs // cs
+    if packs_per_cta % 4 != 0:
+        return False
+    threads = ((packs_per_cta + 31) // 32) * 32
+    return threads <= 1024
+
+
+def _device_sm_count(device_or_ordinal: torch.device | int | None) -> int | None:
+    if device_or_ordinal is None:
+        return None
+    if isinstance(device_or_ordinal, torch.device) and device_or_ordinal.type != "cuda":
+        return None
+    try:
+        sm_count = int(
+            torch.cuda.get_device_properties(device_or_ordinal).multi_processor_count
+        )
+    except Exception:
+        return None
+    return sm_count if sm_count > 0 else None
+
+
+def _safe_cluster_allreduce_size(
+    tokens: int,
+    requested_cs: int,
+    sm_count: int | None,
+    *,
+    hidden: int = 5120,
+) -> int:
+    """Resolve a rank-uniform cluster size capped by ``cluster_allreduce_cluster_size`` and validate SM co-residency.
+
+    Clamping depends solely on ``tokens`` and ``hidden`` (never on local ``sm_count``),
+    so every rank in a collective group selects the identical ``cluster_size`` and
+    RSAG pack ownership even on heterogeneous SM counts, then fails closed if the
+    agreed grid exceeds local SM capacity.
+    """
+    tokens_i = int(tokens)
+    cs = int(requested_cs)
+    if cs < 1:
+        raise ValueError(f"cluster_size must be >= 1, got {cs}")
+    if tokens_i <= 0:
+        return cs
+    cap = cluster_allreduce_cluster_size(tokens_i)
+    if cs > cap:
+        packs = int(hidden) // 8
+        if _is_legal_cluster_allreduce_size(packs, cap):
+            cs = cap
+        elif _is_legal_cluster_allreduce_size(packs, 1):
+            cs = 1
+        else:
+            raise ValueError(
+                f"no legal cluster_size <= {cap} fits hidden={hidden} at tokens={tokens_i}"
+            )
+    if sm_count is not None:
+        sm_count_i = int(sm_count)
+        if tokens_i * cs > sm_count_i:
+            raise ValueError(
+                f"ClusterMhcAllReducePostYNorm requires tokens * cluster_size "
+                f"({tokens_i} * {cs} = {tokens_i * cs}) <= device SM count "
+                f"({sm_count_i}) for full-grid Lamport co-residency"
+            )
+    return cs
+
+
 def cluster_allreduce_transport(tokens: int, world_size: int) -> str:
     """Return the Lamport PCIe transport for ``ClusterMhcAllReducePostYNorm``.
 
-    For TP2 (where 1-hop and 2-hop move identical byte volume) or tiny batches
-    (``tokens <= 4``), 1-hop ``"oneshot"`` minimizes round-trip latency. For
-    wider batches (``5 <= tokens <= 128``) with ``world_size >= 3``, 2-hop
-    Lamport reduce-scatter + all-gather (``"rsag"``) halves per-rank PCIe TX
-    traffic on TP4 (1.5x vs 3.0x payload) while keeping the entire AllReduce +
+    For TP2 (where 1-hop and 2-hop move identical byte volume) or single-token
+    batches (``tokens <= 1``), 1-hop ``"oneshot"`` minimizes round-trip latency.
+    For multi-token batches (``2 <= tokens <= 128``) with ``world_size >= 3``,
+    2-hop Lamport reduce-scatter + all-gather (``"rsag"``) halves per-rank PCIe
+    TX traffic on TP4 (1.5x vs 3.0x payload) while keeping the entire AllReduce +
     mHC + RMSNorm + MXFP8 sequence fused in a single kernel launch.
     """
     if int(world_size) <= 2 or int(tokens) <= CLUSTER_AR_MHC_ONESHOT_MAX_TOKENS:
@@ -187,6 +265,8 @@ class ClusterMhcPostYNorm:
         self.norm_is_bf16 = bool(norm_is_bf16)
         self.packs = self.hidden // 8
         self.cluster_size = int(cluster_size)
+        if self.cluster_size < 1:
+            raise ValueError(f"cluster_size must be >= 1, got {self.cluster_size}")
         if self.packs % self.cluster_size != 0:
             raise ValueError(
                 f"hidden packs ({self.packs}) must be divisible by cluster_size ({self.cluster_size})"
@@ -1310,6 +1390,7 @@ def supports_cluster_allreduce_post_y_norm(
     hidden_size: int,
     norm_dtype: torch.dtype,
     world_size: int,
+    cluster_size: int | None = None,
 ) -> bool:
     """Return True when fused Lamport-sentinel AllReduce + ClusterMhcPostYNorm is supported.
 
@@ -1323,11 +1404,17 @@ def supports_cluster_allreduce_post_y_norm(
         and int(world_size) in CLUSTER_AR_MHC_WORLD_SIZES
     ):
         return False
+    eff_cluster_size = (
+        cluster_allreduce_cluster_size(max_tokens_i)
+        if cluster_size is None
+        else int(cluster_size)
+    )
+    if not _is_legal_cluster_allreduce_size(int(hidden_size) // 8, eff_cluster_size):
+        return False
     sm_count = int(torch.cuda.get_device_properties(device).multi_processor_count)
-    # ClusterMhcAllReducePostYNorm launches 1 CTA/row (cs=1, M>48, 1 CTA/SM),
-    # 4 CTAs/row (cs=4, 17<=M<=48, >=4 CTAs/SM), or 8 CTAs/row (cs=8, M<=16, >=8 CTAs/SM).
-    # Requiring sm_count >= max(36, max_tokens) guarantees full grid residency.
-    return sm_count >= max(36, max_tokens_i)
+    # Grid is (eff_cluster_size, max_tokens, 1); peer-spinning Lamport CTAs require
+    # every CTA in the grid to co-reside simultaneously across SMs.
+    return sm_count >= max(36, max_tokens_i * eff_cluster_size)
 
 
 def oneshot_channel_sentinel_params(
@@ -1436,6 +1523,8 @@ class ClusterMhcAllReducePostYNorm:
         self.norm_is_bf16 = bool(norm_is_bf16)
         self.packs = self.hidden // 8
         self.cluster_size = int(cluster_size)
+        if self.cluster_size < 1:
+            raise ValueError(f"cluster_size must be >= 1, got {self.cluster_size}")
         if self.packs % self.cluster_size != 0:
             raise ValueError(
                 f"hidden packs ({self.packs}) must be divisible by cluster_size ({self.cluster_size})"
@@ -2032,18 +2121,40 @@ def compile_cluster_allreduce_post_y_norm(
             f"transport must be 'auto' or in {_CLUSTER_AR_MHC_TRANSPORTS}, got {transport!r}"
         )
     norm_cute_dt = BFloat16 if norm_is_bf16 else Float32
-    cluster_sizes = (8, 4, 1) if cluster_size is None else (int(cluster_size),)
+    packs = hidden // 8
+    if cluster_size is None:
+        cluster_sizes = (4, 1)
+    else:
+        requested_cs_init = int(cluster_size)
+        if requested_cs_init < 1:
+            raise ValueError(f"cluster_size must be >= 1, got {requested_cs_init}")
+        stepdowns = tuple(
+            candidate
+            for candidate in (4, 1)
+            if candidate < requested_cs_init
+            and _is_legal_cluster_allreduce_size(packs, candidate)
+        )
+        cluster_sizes = (requested_cs_init, *stepdowns)
+
+    compile_sm_count = _device_sm_count(ordinal)
     specs: list[tuple[int, str]] = []
-    for cs in cluster_sizes:
-        if transport != "auto":
+    if transport != "auto":
+        for cs in cluster_sizes:
             specs.append((cs, transport))
-        elif world_size <= 2:
+    elif world_size <= 2:
+        for cs in cluster_sizes:
             specs.append((cs, "oneshot"))
-        elif cs == 8:
-            specs.append((8, "oneshot"))
-            specs.append((8, "rsag"))
-        else:
+    else:
+        m1_req = 4 if cluster_size is None else int(cluster_size)
+        m1_cs = (
+            _safe_cluster_allreduce_size(1, m1_req, compile_sm_count, hidden=hidden)
+            if _is_legal_cluster_allreduce_size(packs, m1_req)
+            else m1_req
+        )
+        specs.append((m1_cs, "oneshot"))
+        for cs in cluster_sizes:
             specs.append((cs, "rsag"))
+    specs = list(dict.fromkeys(specs))
 
     fake = (
         make_ptr(cutlass.Uint64, 16, cute.AddressSpace.gmem, assumed_align=8),
@@ -2102,7 +2213,6 @@ def compile_cluster_allreduce_post_y_norm(
                     "norm.mhc.cluster_allreduce_post_y_norm", 2, key
                 ),
             )
-    fixed_raw = compiled_by_spec[specs[0]] if len(specs) == 1 else None
 
     def run(
         peer_table_address: int,
@@ -2144,20 +2254,25 @@ def compile_cluster_allreduce_post_y_norm(
             raise ValueError(
                 f"shard_packs ({shard_packs}) must cover payload packs ({tokens * (hidden // 8)})"
             )
-        if fixed_raw is not None:
-            raw = fixed_raw
-        else:
-            cs = (
-                int(cluster_size)
-                if cluster_size is not None
-                else split_lagged_cluster_size(tokens)
-            )
-            resolved_t = (
-                cluster_allreduce_transport(tokens, world_size)
-                if transport == "auto"
-                else transport
-            )
-            raw = compiled_by_spec[(cs, resolved_t)]
+        requested_cs = (
+            int(cluster_size)
+            if cluster_size is not None
+            else cluster_allreduce_cluster_size(tokens)
+        )
+        eff_sm_count = (
+            compile_sm_count
+            if compile_sm_count is not None
+            else _device_sm_count(getattr(residual, "device", None))
+        )
+        cs = _safe_cluster_allreduce_size(
+            tokens, requested_cs, eff_sm_count, hidden=hidden
+        )
+        resolved_t = (
+            cluster_allreduce_transport(tokens, world_size)
+            if transport == "auto"
+            else transport
+        )
+        raw = compiled_by_spec[(cs, resolved_t)]
         add_t = input_addend if has_addend else x
         av_t = a_values if (emit_mxfp8 and a_values is not None) else y
         as_t = a_scales if (emit_mxfp8 and a_scales is not None) else y
@@ -2247,6 +2362,7 @@ __all__ = [
     "ClusterMhcAllReducePostYNorm",
     "SPLIT_LAGGED_HIDDEN_SIZES",
     "SPLIT_LAGGED_MAX_TOKENS",
+    "cluster_allreduce_cluster_size",
     "cluster_allreduce_transport",
     "compile_cluster_allreduce_post_y_norm",
     "compile_cluster_post_y_norm",
