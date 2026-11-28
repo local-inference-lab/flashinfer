@@ -38,6 +38,7 @@ from ._cute_intrinsics import (
     ld_generic_f32,
     ld_relaxed_gpu_u32,
     pack_f32x2_to_bf16x2,
+    sync_threads_after_u32,
 )
 
 
@@ -514,14 +515,13 @@ class _TwoShotLaunch:
             else:
                 self_signal = self._select_address(signals, local_rank)
             generation = ld_relaxed_gpu_u32(self_signal + Int64(_GRAPH_EPOCH_OFFSET))
+            # Force every thread's epoch load to complete before the CTA
+            # barrier, then retire this CTA's epoch contribution on the last
+            # warp so other warps overlap the remote push with the atomic.
+            generation = sync_threads_after_u32(generation)
             staging_slot_offset = (
                 Int64((generation + Uint32(self._slot_bias)) % Uint32(2)) * slot_bytes
             )
-            # Once every thread in the CTA has selected this launch's slot,
-            # retire its epoch contribution on the last warp.  Other warps
-            # can start the remote push while the contended atomic completes,
-            # hiding graph accounting under the full phase-one transfer.
-            cute.arch.barrier()
             if Int32(tidx) == Int32(self._threads - 1):
                 graph_epoch_arrive_serialized(
                     self_signal + Int64(_GRAPH_EPOCH_OFFSET),
@@ -788,7 +788,7 @@ def get_twoshot_launcher(
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             f"comm.pcie.twoshot.{operation}",
-            1,
+            2,
             cache_key,
         ),
     )

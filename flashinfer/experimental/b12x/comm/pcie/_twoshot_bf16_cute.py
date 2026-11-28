@@ -42,6 +42,7 @@ from ._cute_intrinsics import (
     graph_epoch_arrive_serialized,
     ld_relaxed_gpu_u32,
     pack_f32x2_to_bf16x2,
+    sync_threads_after_u32,
     unpack_bf16x2,
 )
 from ._twoshot_cute import (
@@ -437,10 +438,10 @@ class _TwoShotBf16Launch:
             else:
                 self_signal = self._select_address(signals, local_rank)
             generation = ld_relaxed_gpu_u32(self_signal + Int64(_GRAPH_EPOCH_OFFSET))
+            generation = sync_threads_after_u32(generation)
             staging_slot_offset = (
                 Int64((generation + Uint32(self._slot_bias)) % Uint32(2)) * slot_bytes
             )
-            cute.arch.barrier()
             if Int32(tidx) == Int32(self._threads - 1):
                 graph_epoch_arrive_serialized(
                     self_signal + Int64(_GRAPH_EPOCH_OFFSET),
@@ -695,7 +696,7 @@ def get_twoshot_bf16_launcher(
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             f"comm.pcie.twoshot_bf16.{operation}",
-            3,
+            4,
             cache_key,
         ),
     )
@@ -1013,10 +1014,10 @@ class _TwoShotPullAllReduceLaunch(_TwoShotBf16Launch):
         self_signal = self._select_address(signals, local_rank)
         if cutlass.const_expr(self._device_slot_selection):
             generation = ld_relaxed_gpu_u32(self_signal + Int64(_GRAPH_EPOCH_OFFSET))
+            generation = sync_threads_after_u32(generation)
             staging_slot_offset = (
                 Int64((generation + Uint32(self._slot_bias)) % Uint32(2)) * slot_bytes
             )
-            cute.arch.barrier()
             if Int32(tidx) == Int32(self._threads - 1):
                 graph_epoch_arrive_serialized(
                     self_signal + Int64(_GRAPH_EPOCH_OFFSET),
@@ -1202,7 +1203,7 @@ def get_twoshot_bf16_allreduce_launcher(
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "comm.pcie.twoshot_bf16.all_reduce_pull",
-            5,
+            6,
             cache_key,
         ),
     )

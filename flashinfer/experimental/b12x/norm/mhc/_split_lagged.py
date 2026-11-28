@@ -58,6 +58,7 @@ from b12x.comm.pcie._cute_intrinsics import (
     pack_f32x2_to_bf16x2,
     plain_graph_epoch_arrive,
     st_relaxed_sys_global_v4_u32,
+    sync_threads_after_u32,
     unpack_bf16x2,
 )
 from b12x.comm.pcie._oneshot_cute import (
@@ -1548,10 +1549,11 @@ class ClusterMhcAllReducePostYNorm:
             generation = ld_relaxed_gpu_u32(
                 self_signal + Int64(_PLAIN_GRAPH_EPOCH_OFFSET)
             )
+            # Every thread's epoch load must complete before the CTA barrier so
+            # the final CTA cannot advance the epoch ahead of a pending load.
+            generation = sync_threads_after_u32(generation)
             slot = (generation + Uint32(self.slot_bias)) % Uint32(2)
             slot_table = peer_ptrs + Int64(slot) * Int64(_MAX_RANKS)
-            # Every thread retains the epoch before the final CTA advances it.
-            cute.arch.sync_threads()
             if tid == Int32(0):
                 plain_graph_epoch_arrive(
                     self_signal + Int64(_PLAIN_GRAPH_EPOCH_OFFSET),
@@ -2099,7 +2101,7 @@ def compile_cluster_allreduce_post_y_norm(
                 Int32(1),
                 current_cuda_stream(),
                 compile_spec=KernelCompileSpec.from_key(
-                    "norm.mhc.cluster_allreduce_post_y_norm", 2, key
+                    "norm.mhc.cluster_allreduce_post_y_norm", 3, key
                 ),
             )
     fixed_raw = compiled_by_spec[specs[0]] if len(specs) == 1 else None
