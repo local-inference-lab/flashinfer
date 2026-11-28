@@ -78,15 +78,20 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         # Cover aligned Kimi shapes plus small unaligned edge cases.
         rs_inp_large = make_tensor((1024, 7168), 101)
         rs_out_large = torch.empty((64, 7168), dtype=torch.bfloat16, device=device)
+        rs_out_large_ce = torch.empty((64, 7168), dtype=torch.bfloat16, device=device)
         rs_inp_moe = make_tensor((2048, 3584), 102)
         rs_out_moe = torch.empty((128, 3584), dtype=torch.bfloat16, device=device)
+        rs_out_moe_ce = torch.empty((128, 3584), dtype=torch.bfloat16, device=device)
         rs_inp_small = make_tensor((48, 6), 103)
         rs_out_small = torch.empty((3, 6), dtype=torch.bfloat16, device=device)
+        rs_out_small_ce = torch.empty((3, 6), dtype=torch.bfloat16, device=device)
 
         ag_inp_large = make_tensor((64, 7168), 201)
         ag_out_large = torch.empty((16, 64, 7168), dtype=torch.bfloat16, device=device)
+        ag_out_large_ce = torch.empty((16, 64, 7168), dtype=torch.bfloat16, device=device)
         ag_inp_small = make_tensor((3, 6), 202)
         ag_out_small = torch.empty((16, 3, 6), dtype=torch.bfloat16, device=device)
+        ag_out_small_ce = torch.empty((16, 3, 6), dtype=torch.bfloat16, device=device)
 
         a2a_inp_moe = make_tensor((128, 3584), 301)
         a2a_out_moe = torch.empty((2048, 224), dtype=torch.bfloat16, device=device)
@@ -101,17 +106,47 @@ def _worker(rank: int, world_size: int, port: int) -> None:
             p_rs_large = runtime.plan(
                 rs_inp_large, operation="reduce_scatter", out=rs_out_large
             )
+            p_rs_large_ce = runtime.plan(
+                rs_inp_large,
+                operation="reduce_scatter",
+                out=rs_out_large_ce,
+                transport="ce_local",
+            )
             p_rs_moe = runtime.plan(
                 rs_inp_moe, operation="reduce_scatter", out=rs_out_moe
+            )
+            p_rs_moe_ce = runtime.plan(
+                rs_inp_moe,
+                operation="reduce_scatter",
+                out=rs_out_moe_ce,
+                transport="ce_local",
             )
             p_rs_small = runtime.plan(
                 rs_inp_small, operation="reduce_scatter", out=rs_out_small
             )
+            p_rs_small_ce = runtime.plan(
+                rs_inp_small,
+                operation="reduce_scatter",
+                out=rs_out_small_ce,
+                transport="ce_local",
+            )
             p_ag_large = runtime.plan(
                 ag_inp_large, operation="all_gather", out=ag_out_large
             )
+            p_ag_large_ce = runtime.plan(
+                ag_inp_large,
+                operation="all_gather",
+                out=ag_out_large_ce,
+                transport="ce_local",
+            )
             p_ag_small = runtime.plan(
                 ag_inp_small, operation="all_gather", out=ag_out_small
+            )
+            p_ag_small_ce = runtime.plan(
+                ag_inp_small,
+                operation="all_gather",
+                out=ag_out_small_ce,
+                transport="ce_local",
             )
             p_a2a_moe = runtime.plan(
                 a2a_inp_moe, operation="row_to_col_all_to_all", out=a2a_out_moe
@@ -148,10 +183,22 @@ def _worker(rank: int, world_size: int, port: int) -> None:
                         s, inp=rs_inp_large, out=rs_out_large
                     ),
                 ),
+                p_rs_large_ce.request(
+                    name="rs_large_ce",
+                    prepare_call=lambda s: prepared_call(
+                        s, inp=rs_inp_large, out=rs_out_large_ce
+                    ),
+                ),
                 p_rs_moe.request(
                     name="rs_moe",
                     prepare_call=lambda s: prepared_call(
                         s, inp=rs_inp_moe, out=rs_out_moe
+                    ),
+                ),
+                p_rs_moe_ce.request(
+                    name="rs_moe_ce",
+                    prepare_call=lambda s: prepared_call(
+                        s, inp=rs_inp_moe, out=rs_out_moe_ce
                     ),
                 ),
                 p_rs_small.request(
@@ -160,16 +207,34 @@ def _worker(rank: int, world_size: int, port: int) -> None:
                         s, inp=rs_inp_small, out=rs_out_small
                     ),
                 ),
+                p_rs_small_ce.request(
+                    name="rs_small_ce",
+                    prepare_call=lambda s: prepared_call(
+                        s, inp=rs_inp_small, out=rs_out_small_ce
+                    ),
+                ),
                 p_ag_large.request(
                     name="ag_large",
                     prepare_call=lambda s: prepared_call(
                         s, inp=ag_inp_large, out=ag_out_large
                     ),
                 ),
+                p_ag_large_ce.request(
+                    name="ag_large_ce",
+                    prepare_call=lambda s: prepared_call(
+                        s, inp=ag_inp_large, out=ag_out_large_ce
+                    ),
+                ),
                 p_ag_small.request(
                     name="ag_small",
                     prepare_call=lambda s: prepared_call(
                         s, inp=ag_inp_small, out=ag_out_small
+                    ),
+                ),
+                p_ag_small_ce.request(
+                    name="ag_small_ce",
+                    prepare_call=lambda s: prepared_call(
+                        s, inp=ag_inp_small, out=ag_out_small_ce
                     ),
                 ),
                 p_a2a_moe.request(
@@ -207,8 +272,11 @@ def _worker(rank: int, world_size: int, port: int) -> None:
                     # RS: exact match to two-level island FP32->BF16 reduction.
                     for inp, out in (
                         (rs_inp_large, rs_out_large),
+                        (rs_inp_large, rs_out_large_ce),
                         (rs_inp_moe, rs_out_moe),
+                        (rs_inp_moe, rs_out_moe_ce),
                         (rs_inp_small, rs_out_small),
+                        (rs_inp_small, rs_out_small_ce),
                     ):
                         full = _ordered_island_sum(gather_all(inp))
                         st = inp.shape[0] // world_size
@@ -220,7 +288,9 @@ def _worker(rank: int, world_size: int, port: int) -> None:
                     # AG: bit-exact rank-major gather.
                     for inp, out in (
                         (ag_inp_large, ag_out_large),
+                        (ag_inp_large, ag_out_large_ce),
                         (ag_inp_small, ag_out_small),
+                        (ag_inp_small, ag_out_small_ce),
                     ):
                         expected = torch.stack(gather_all(inp), dim=0)
                         assert torch.equal(out, expected), (
@@ -249,15 +319,30 @@ def _worker(rank: int, world_size: int, port: int) -> None:
                     )
 
                 def run_interleaved_sequence(stream=None):
-                    # Exercises every transition pair across {RS, AG, A2A, AR_hybrid, AR_sm}.
+                    # Exercises every transition pair across {RS_sm, RS_ce, AG_sm, AG_ce, A2A, AR_hybrid, AR_sm}.
                     runtime.reduce_scatter(
                         rs_inp_large, plan=p_rs_large, out=rs_out_large, stream=stream
                     )
                     runtime.reduce_scatter(
+                        rs_inp_large,
+                        plan=p_rs_large_ce,
+                        out=rs_out_large_ce,
+                        stream=stream,
+                    )
+                    runtime.reduce_scatter(
                         rs_inp_moe, plan=p_rs_moe, out=rs_out_moe, stream=stream
+                    )
+                    runtime.reduce_scatter(
+                        rs_inp_moe, plan=p_rs_moe_ce, out=rs_out_moe_ce, stream=stream
                     )
                     runtime.all_gather(
                         ag_inp_large, plan=p_ag_large, out=ag_out_large, stream=stream
+                    )
+                    runtime.all_gather(
+                        ag_inp_large,
+                        plan=p_ag_large_ce,
+                        out=ag_out_large_ce,
+                        stream=stream,
                     )
                     runtime.row_to_col_all_to_all(
                         a2a_inp_moe, plan=p_a2a_moe, out=a2a_out_moe, stream=stream
@@ -272,7 +357,19 @@ def _worker(rank: int, world_size: int, port: int) -> None:
                         stream=stream,
                     )
                     runtime.all_gather(
+                        ag_inp_small,
+                        plan=p_ag_small_ce,
+                        out=ag_out_small_ce,
+                        stream=stream,
+                    )
+                    runtime.all_gather(
                         ag_inp_small, plan=p_ag_small, out=ag_out_small, stream=stream
+                    )
+                    runtime.reduce_scatter(
+                        rs_inp_small,
+                        plan=p_rs_small_ce,
+                        out=rs_out_small_ce,
+                        stream=stream,
                     )
                     runtime.reduce_scatter(
                         rs_inp_small, plan=p_rs_small, out=rs_out_small, stream=stream
@@ -280,12 +377,21 @@ def _worker(rank: int, world_size: int, port: int) -> None:
                     runtime.all_reduce(
                         ar_inp, plan=p_ar_sm, out=ar_out_sm, stream=stream
                     )
-                    # Follow SM op back into RS/AG/A2A.
+                    # Follow SM op back into RS/AG/A2A (both sm_local and ce_local).
+                    runtime.all_gather(
+                        ag_inp_large,
+                        plan=p_ag_large_ce,
+                        out=ag_out_large_ce,
+                        stream=stream,
+                    )
                     runtime.all_gather(
                         ag_inp_large, plan=p_ag_large, out=ag_out_large, stream=stream
                     )
                     runtime.reduce_scatter(
-                        rs_inp_large, plan=p_rs_large, out=rs_out_large, stream=stream
+                        rs_inp_large,
+                        plan=p_rs_large_ce,
+                        out=rs_out_large_ce,
+                        stream=stream,
                     )
                     runtime.row_to_col_all_to_all(
                         a2a_inp_moe, plan=p_a2a_moe, out=a2a_out_moe, stream=stream
@@ -309,10 +415,15 @@ def _worker(rank: int, world_size: int, port: int) -> None:
 
                 outputs = (
                     rs_out_large,
+                    rs_out_large_ce,
                     rs_out_moe,
+                    rs_out_moe_ce,
                     rs_out_small,
+                    rs_out_small_ce,
                     ag_out_large,
+                    ag_out_large_ce,
                     ag_out_small,
+                    ag_out_small_ce,
                     a2a_out_moe,
                     a2a_out_small,
                     ar_out_hybrid,
