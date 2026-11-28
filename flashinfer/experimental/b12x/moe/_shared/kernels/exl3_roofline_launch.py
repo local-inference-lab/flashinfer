@@ -657,7 +657,9 @@ def compile_exl3_roofline_launches(
         c_in_mxfp8=c_in_mxfp8,
         c_mx_fc1=c_mx_fc1,
         c_mx_fc2=c_mx_fc2,
-        direct_lut=lut_e4m3_direct_table(device),
+        direct_lut=(
+            lut_e4m3_direct_table(device) if torch.cuda.is_initialized() else None
+        ),
     )
 
 
