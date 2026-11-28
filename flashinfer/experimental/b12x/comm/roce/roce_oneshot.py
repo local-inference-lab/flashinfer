@@ -303,6 +303,7 @@ class RoceOneshotAllReduce:
         self._gather_buffers: Optional[tuple[torch.Tensor, torch.Tensor]] = None
         self._align_buffers: Optional[tuple[torch.Tensor, torch.Tensor]] = None
         self._stream_event = torch.cuda.Event()
+        self._capture_event = torch.cuda.Event()
         self._last_stream: Optional[torch.cuda.Stream] = None
         self._capture_stream: Optional[torch.cuda.Stream] = None
         self._capture_id = 0
@@ -843,6 +844,7 @@ class RoceOneshotAllReduce:
                 if self._uses_pipe(nbytes):
                     self._launch_twoshot(inp, out, nbytes, prepared, capturing)
                 else:
+                    self._order_stream(capturing)
                     src = inp
                     if inp.data_ptr() % PACK_BYTES != 0:
                         src = self._aligned_scratch(0, inp)
@@ -856,7 +858,6 @@ class RoceOneshotAllReduce:
                         nbytes // PACK_BYTES, self._threads, self._blocks
                     )
                     stage_counter, tail_counter = self._counter_addresses(grid_blocks)
-                    self._order_stream(capturing)
                     launcher(
                         src.data_ptr(),
                         dst.data_ptr(),
@@ -903,6 +904,8 @@ class RoceOneshotAllReduce:
         out: torch.Tensor,
         nbytes: int,
         capturing: bool,
+        *,
+        col_row_packs: Optional[int] = None,
     ) -> None:
         """Launch one pipelined kernel (two-shot, reduce-scatter or shard gather) over an ``nbytes`` message."""
         if inp.data_ptr() % PACK_BYTES or out.data_ptr() % PACK_BYTES:
@@ -911,7 +914,7 @@ class RoceOneshotAllReduce:
         chunk_packs, chunks = self._pipe_geometry(nbytes)
         base = self._region.data_ptr()
         self._order_stream(capturing)
-        launcher(
+        args = (
             inp.data_ptr(),
             out.data_ptr(),
             nbytes // PACK_BYTES,
@@ -929,6 +932,10 @@ class RoceOneshotAllReduce:
             self.spin_limit,
             self._pipe_blocks,
         )
+        if col_row_packs is not None:
+            launcher(*args, col_row_packs)
+        else:
+            launcher(*args)
 
     # -- reduce-scatter and shard gather ------------------------------------------
 
@@ -995,12 +1002,14 @@ class RoceOneshotAllReduce:
         out: Optional[torch.Tensor] = None,
         stream: object = None,
         plan,
+        col_row_bytes: int = 0,
     ) -> torch.Tensor:
         """Run a published prepared RoCE shard gather: ``out`` is every rank's ``inp`` along dimension 0.
 
-        The inverse of ``reduce_scatter``: ``out`` holds rank 0's shard, then
-        rank 1's, and so on, through the pipelined path.  ``inp`` must satisfy
-        ``should_gather_shards``.
+        When ``col_row_bytes`` is positive, each rank's shard is viewed as rows of
+        ``col_row_bytes`` bytes (16-byte aligned) and concatenated along the row width
+        directly into ``out`` (equivalent to ``view(W, rows, row_bytes).transpose(0, 1).contiguous()``)
+        with zero intermediate copy.
         """
         from b12x.preparation.types import require_prepared
 
@@ -1008,7 +1017,7 @@ class RoceOneshotAllReduce:
         if prepared.runtime is not self:
             raise ValueError("RoCE plan belongs to another runtime")
         return self._run_prepared_gather_shards(
-            inp, prepared=prepared, out=out, stream=stream
+            inp, prepared=prepared, out=out, stream=stream, col_row_bytes=col_row_bytes
         )
 
     def _run_prepared_sharded(
@@ -1021,12 +1030,38 @@ class RoceOneshotAllReduce:
         prepared: object,
         out: Optional[torch.Tensor],
         stream: object,
+        col_row_bytes: int = 0,
     ) -> torch.Tensor:
         """Run a materialized reduce-scatter or shard-gather launcher over an ``nbytes`` message."""
+        col_row_packs = 0
+        if col_row_bytes:
+            if operation != "gather_shards":
+                raise ValueError("col_row_bytes is supported only for gather_shards")
+            shard_bytes = inp.numel() * inp.element_size()
+            if (
+                col_row_bytes < 0
+                or col_row_bytes % PACK_BYTES != 0
+                or shard_bytes % col_row_bytes != 0
+            ):
+                raise ValueError(
+                    f"col_row_bytes ({col_row_bytes}) must be a positive 16-byte-aligned divisor of shard size ({shard_bytes})"
+                )
+            col_row_packs = col_row_bytes // PACK_BYTES
         with self._lock:
             self.check_health()
             if out is None:
                 out = torch.empty(shape, dtype=inp.dtype, device=inp.device)
+            elif col_row_bytes:
+                expected_elems = inp.numel() * self.world_size
+                if (
+                    out.numel() != expected_elems
+                    or out.dtype != inp.dtype
+                    or out.device != inp.device
+                    or not out.is_contiguous()
+                ):
+                    raise ValueError(
+                        f"out must be a contiguous tensor on the input's device with {expected_elems} elements"
+                    )
             elif (
                 tuple(out.shape) != shape
                 or out.dtype != inp.dtype
@@ -1048,7 +1083,14 @@ class RoceOneshotAllReduce:
                     raise ValueError(
                         f"RoCE {operation} of {inp.dtype} was not prepared"
                     )
-                self._launch_pipelined(launcher, inp, out, nbytes, capturing)
+                self._launch_pipelined(
+                    launcher,
+                    inp,
+                    out,
+                    nbytes,
+                    capturing,
+                    col_row_packs=col_row_packs,
+                )
                 self._mark_stream(capturing)
         if not capturing:
             self.check_health()
@@ -1082,6 +1124,7 @@ class RoceOneshotAllReduce:
         prepared: object,
         out: Optional[torch.Tensor] = None,
         stream: object = None,
+        col_row_bytes: int = 0,
     ) -> torch.Tensor:
         if not self.should_gather_shards(inp):
             raise ValueError("input is not eligible for the RoCE shard gather")
@@ -1094,6 +1137,7 @@ class RoceOneshotAllReduce:
             prepared=prepared,
             out=out,
             stream=stream,
+            col_row_bytes=col_row_bytes,
         )
 
     def _aligned_scratch(self, which: int, like: torch.Tensor) -> torch.Tensor:
@@ -1121,21 +1165,23 @@ class RoceOneshotAllReduce:
 
         The runtime has one epoch, one doorbell and two transport slots, so
         collectives must execute in launch order even across streams.  Under
-        capture no event is used: every collective must be on the capture
-        stream, which keeps the graph's own ordering; captures are told apart
-        by CUDA's capture id, so consecutive captures may use different streams.
+        capture, cross-stream switches wait on ``_capture_event`` (never on the
+        eager ``_stream_event``), and distinct captures are told apart by CUDA's
+        capture id so consecutive captures may use different streams.
         """
 
         current = torch.cuda.current_stream(self.device)
         if capturing:
             capture_id = _capture_id(current)
-            if capture_id != self._capture_id:
+            if capture_id == 0:
+                raise RuntimeError("active CUDA graph capture returned capture id 0")
+            if self._capture_stream is None or capture_id != self._capture_id:
                 self._capture_id = capture_id
                 self._capture_stream = current
+                self._last_stream = None
             elif current != self._capture_stream:
-                raise RuntimeError(
-                    "RoCE collectives must all be captured on one stream"
-                )
+                current.wait_event(self._capture_event)
+                self._capture_stream = current
             return
         if self._last_stream is not None and current != self._last_stream:
             current.wait_event(self._stream_event)
@@ -1143,11 +1189,12 @@ class RoceOneshotAllReduce:
     def _mark_stream(self, capturing: bool) -> None:
         """Record the ordering event on the current stream after a launch."""
 
-        if capturing:
-            return
         current = torch.cuda.current_stream(self.device)
-        self._stream_event.record(current)
-        self._last_stream = current
+        if capturing:
+            self._capture_event.record(current)
+        else:
+            self._stream_event.record(current)
+            self._last_stream = current
 
     def check_health(self) -> None:
         """Raise if the proxy thread died or a kernel wait timed out.
@@ -1354,9 +1401,9 @@ class RoceOneshotAllReduce:
                 # requested layout.
                 nbytes = inp.numel() * inp.element_size()
                 padded = _align_up(nbytes, PACK_BYTES)
+                self._order_stream(capturing)
                 staged, gathered = self._gather_scratch(padded)
                 staged[:nbytes].copy_(inp.reshape(-1).view(torch.uint8))
-                self._order_stream(capturing)
                 self._launch_gather(
                     prepared.gather_launcher,
                     staged.data_ptr(),
@@ -1364,7 +1411,6 @@ class RoceOneshotAllReduce:
                     padded,
                     padded // PACK_BYTES,
                 )
-                self._mark_stream(capturing)
                 stacked = (
                     gathered.view(self.world_size, padded)[:, :nbytes]
                     .reshape(-1)
@@ -1373,8 +1419,10 @@ class RoceOneshotAllReduce:
                 )
                 result = stacked.movedim(0, dim).reshape(shape)
                 if out is None:
-                    return result.contiguous()
-                out.copy_(result)
+                    out = result.contiguous()
+                else:
+                    out.copy_(result)
+                self._mark_stream(capturing)
                 return out
 
     def _gather_scratch(self, padded: int) -> tuple[torch.Tensor, torch.Tensor]:

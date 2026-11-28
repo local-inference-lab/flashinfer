@@ -686,6 +686,11 @@ class _PrepareKernel:
                 layout=cute.make_layout((_CHUNK,), stride=(1,)),
                 byte_alignment=16,
             )
+            s_finite = allocator.allocate_tensor(
+                element_type=Float32,
+                layout=cute.make_layout((_PREPARE_THREADS // 32,), stride=(1,)),
+                byte_alignment=16,
+            )
             if cutlass.const_expr(self.is_gdn):
                 s_gate = allocator.allocate_tensor(
                     element_type=Float32,
@@ -900,14 +905,13 @@ class _PrepareKernel:
                 last = g_cum[_CHUNK - 1]
                 lambda_c = _exp2_approx_ftz_f32(last)
             ws_f32[rec_f32 + Int64(REC.LAMBDA_C // 4) + column.to(Int64)] = lambda_c
-            if cutlass.const_expr(self.is_gdn):
-                beta_value = s_beta[column % Int32(_CHUNK)]
-                summary_finite = (
-                    (lambda_c > Float32(float("-inf")))
-                    & (lambda_c < Float32(float("inf")))
-                    & (beta_value > Float32(float("-inf")))
-                    & (beta_value < Float32(float("inf")))
-                )
+            beta_value = s_beta[column % Int32(_CHUNK)]
+            summary_finite = (
+                (lambda_c > Float32(float("-inf")))
+                & (lambda_c < Float32(float("inf")))
+                & (beta_value > Float32(float("-inf")))
+                & (beta_value < Float32(float("inf")))
+            )
             if column < Int32(_CHUNK):
                 ws_f32[rec_f32 + Int64(REC.BETA // 4) + column.to(Int64)] = s_beta[
                     column
@@ -932,14 +936,13 @@ class _PrepareKernel:
                 q_tilde = BFloat16(q_values[t] * rinv_q * lam * scale)
                 k_tilde = BFloat16(k_values[t] * rinv_k * lam)
                 k_r = BFloat16(k_values[t] * rinv_k * lam_r)
-                if cutlass.const_expr(self.is_gdn):
-                    summary_finite = (
-                        summary_finite
-                        & (Float32(k_tilde) > Float32(float("-inf")))
-                        & (Float32(k_tilde) < Float32(float("inf")))
-                        & (Float32(k_r) > Float32(float("-inf")))
-                        & (Float32(k_r) < Float32(float("inf")))
-                    )
+                summary_finite = (
+                    summary_finite
+                    & (Float32(k_tilde) > Float32(float("-inf")))
+                    & (Float32(k_tilde) < Float32(float("inf")))
+                    & (Float32(k_r) > Float32(float("-inf")))
+                    & (Float32(k_r) < Float32(float("inf")))
+                )
                 physical = Int32(t * _HEAD_DIM) + (
                     (((column >> Int32(3)) ^ Int32(t & 7)) << Int32(3))
                     | (column & Int32(7))
@@ -1101,26 +1104,23 @@ class _PrepareKernel:
                 index = column + Int32(entry * _PREPARE_THREADS)
                 inverse = BFloat16(s_inv[index])
                 ws_bf16[rec_bf16 + Int64(REC.INV // 2) + index.to(Int64)] = inverse
-                if cutlass.const_expr(self.is_gdn):
-                    summary_finite = (
-                        summary_finite
-                        & (Float32(inverse) > Float32(float("-inf")))
-                        & (Float32(inverse) < Float32(float("inf")))
-                    )
-            if cutlass.const_expr(self.is_gdn):
-                warp_finite = cute.arch.vote_all_sync(summary_finite)
-                if lane == Int32(0):
-                    s_gate[Int32(_CHUNK) + warp] = warp_finite.to(Float32)
+                summary_finite = (
+                    summary_finite
+                    & (Float32(inverse) > Float32(float("-inf")))
+                    & (Float32(inverse) < Float32(float("inf")))
+                )
+            warp_finite = cute.arch.vote_all_sync(summary_finite)
+            if lane == Int32(0):
+                s_finite[warp] = warp_finite.to(Float32)
             # Publish the record: every thread's stores are ordered before the
             # barrier, and the fence makes them visible at GPU scope before
             # the release store of the flag.
             cute.arch.sync_threads()
             if column == Int32(0):
-                if cutlass.const_expr(self.is_gdn):
-                    all_finite = Float32(1.0)
-                    for w in cutlass.range_constexpr(_PREPARE_THREADS // 32):
-                        all_finite *= s_gate[Int32(_CHUNK + w)]
-                    ws_f32[rec_f32 + Int64(REC.SUMMARY_FINITE // 4)] = all_finite
+                all_finite = Float32(1.0)
+                for w in cutlass.range_constexpr(_PREPARE_THREADS // 32):
+                    all_finite *= s_finite[Int32(w)]
+                ws_f32[rec_f32 + Int64(REC.SUMMARY_FINITE // 4)] = all_finite
                 cute.arch.fence_acq_rel_gpu()
                 _st_release_gpu_i32(_pointer_address(ready, record), window + Int32(1))
 
@@ -2402,8 +2402,7 @@ def _compile_recurrence(
     if summary_mode not in (0, 1, 2, 3, 4, 5):
         raise ValueError("unsupported GDN parallel recurrence mode")
     if summary_mode and (
-        not caps.is_gdn
-        or plan.max_windows != 1
+        plan.max_windows != 1
         or caps.null_state_index != 0
         or plan.max_sequence_tiles <= 0
         or plan.recurrence_rows != caps.max_seqs

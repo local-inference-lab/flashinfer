@@ -53,6 +53,9 @@ META = OpMeta(
         "invocation_from_tensors",
         "reference",
         "run",
+        "segment_finalize",
+        "segment_plan",
+        "segment_summarize",
     ),
     dtypes=("bf16", "fp32", "int32", "int64"),
     recipes=("lower_bounded_kda",),
@@ -86,6 +89,9 @@ if TYPE_CHECKING:
         invocation_from_tensors,
         reference,
         run,
+        segment_finalize,
+        segment_plan,
+        segment_summarize,
     )
 
 install_lazy_api(globals(), META)

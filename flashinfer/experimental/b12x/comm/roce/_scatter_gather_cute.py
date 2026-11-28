@@ -104,9 +104,71 @@ class _RoceScatterGatherLaunch(_RoceTwoshotLaunch):
         self._operation = operation
 
     @cute.jit
+    def __call__(
+        self,
+        input_ptr: cute.Pointer,
+        output_ptr: cute.Pointer,
+        size_packs: Int32,
+        nbytes: Int32,
+        chunk_packs: Int32,
+        chunks: Int32,
+        send_base: Int64,
+        recv_base: Int64,
+        flag_base: Int64,
+        shard_cap: Int64,
+        ctrl_base: Int64,
+        epoch_ptr: Int64,
+        counter_base: Int64,
+        poison_ptr: Int64,
+        spin_limit: Uint32,
+        col_row_packs: Int32,
+        grid_x: Int32,
+        stream: cuda.CUstream,
+    ) -> None:
+        """Host entry: launch the scatter/gather kernel with runtime scalars."""
+        self.kernel(
+            input_ptr,
+            output_ptr,
+            size_packs,
+            nbytes,
+            chunk_packs,
+            chunks,
+            send_base,
+            recv_base,
+            flag_base,
+            shard_cap,
+            ctrl_base,
+            epoch_ptr,
+            counter_base,
+            poison_ptr,
+            spin_limit,
+            col_row_packs,
+        ).launch(
+            grid=(grid_x, 1, 1),
+            block=[self._threads, 1, 1],
+            cluster=(1, 1, 1),
+            stream=stream,
+        )
+
+    @cute.jit
     def _copy_pack(self, source: Int64, destination: Int64) -> None:
         words = ld_global_v4_u32(source)
         st_global_v4_u32(destination, words[0], words[1], words[2], words[3])
+
+    @cute.jit
+    def _gather_dst_offset(
+        self,
+        flat_index: Int32,
+        local_index: Int32,
+        shard: Int32,
+        col_row_packs: Int32,
+    ) -> Int64:
+        dst_pack = flat_index
+        if col_row_packs > Int32(0):
+            row = local_index // col_row_packs
+            col = local_index - row * col_row_packs
+            dst_pack = (row * Int32(self._world_size) + shard) * col_row_packs + col
+        return Int64(dst_pack) * Int64(PACK_BYTES)
 
     @cute.kernel
     def kernel(
@@ -126,6 +188,7 @@ class _RoceScatterGatherLaunch(_RoceTwoshotLaunch):
         counter_base: Int64,
         poison_ptr: Int64,
         spin_limit: Uint32,
+        col_row_packs: Int32,
     ) -> None:
         """Device kernel: doorbell, then the stage/reduce or stage/gather phases, then the epoch.
 
@@ -244,15 +307,21 @@ class _RoceScatterGatherLaunch(_RoceTwoshotLaunch):
                     stage_index = lo + index
                     while stage_index < hi:
                         offset = Int64(stage_index) * Int64(PACK_BYTES)
-                        shard_offset = Int64(stage_index - own_first) * Int64(
-                            PACK_BYTES
+                        local_index = stage_index - own_first
+                        shard_offset = Int64(local_index) * Int64(PACK_BYTES)
+                        dst_offset = self._gather_dst_offset(
+                            stage_index, local_index, Int32(self._rank), col_row_packs
                         )
                         words = ld_global_v4_u32(input_base + shard_offset)
                         st_global_v4_u32(
                             send_base + offset, words[0], words[1], words[2], words[3]
                         )
                         st_global_v4_u32(
-                            output_base + offset, words[0], words[1], words[2], words[3]
+                            output_base + dst_offset,
+                            words[0],
+                            words[1],
+                            words[2],
+                            words[3],
                         )
                         stage_index += stride
                     cute.arch.sync_threads()
@@ -280,15 +349,20 @@ class _RoceScatterGatherLaunch(_RoceTwoshotLaunch):
                                 hi = cutlass.min(end, lo + chunk_packs)
                                 gather_index = lo + index
                                 while gather_index < hi:
+                                    local_index = gather_index - first
                                     words = ld_relaxed_sys_v4_u32(
                                         recv_base
                                         + Int64(shard * 2 + 1) * shard_cap
-                                        + Int64(gather_index - first)
-                                        * Int64(PACK_BYTES)
+                                        + Int64(local_index) * Int64(PACK_BYTES)
+                                    )
+                                    dst_offset = self._gather_dst_offset(
+                                        gather_index,
+                                        local_index,
+                                        Int32(shard),
+                                        col_row_packs,
                                     )
                                     st_global_v4_u32(
-                                        output_base
-                                        + Int64(gather_index) * Int64(PACK_BYTES),
+                                        output_base + dst_offset,
                                         words[0],
                                         words[1],
                                         words[2],
@@ -392,10 +466,11 @@ def get_launcher(
         16,
         16,
         1,
+        0,
         1,
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
-            "comm.roce.scatter_gather", 1, cache_key
+            "comm.roce.scatter_gather", 2, cache_key
         ),
     )
 
@@ -416,6 +491,7 @@ def get_launcher(
         poison_address: int,
         spin_limit: int,
         grid_x: int,
+        col_row_packs: int = 0,
     ) -> None:
         """Launch the compiled kernel with runtime scalar arguments."""
         raw(
@@ -438,6 +514,7 @@ def get_launcher(
             int(counter_base),
             int(poison_address),
             int(spin_limit),
+            int(col_row_packs),
             int(grid_x),
             current_cuda_stream(),
         )
