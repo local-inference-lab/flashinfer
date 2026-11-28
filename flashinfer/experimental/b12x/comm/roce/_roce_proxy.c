@@ -171,7 +171,7 @@ _Static_assert(CTRL_CREDIT >= CTRL_READY_VL + ROCE_VARLEN_MAX_CHUNKS &&
 // The startup region, sized for the world, holds per (origin, rail, slot):
 // mailboxes, then 8-byte acknowledgment words, then outgoing descriptors.
 #define RING_CHUNK_BYTES 65536
-#define RING_WINDOW 8
+#define RING_WINDOW 16
 #define RING_COMPLETION (UINT64_C(1) << 63)
 typedef struct {
   uint64_t serial, target, offset, flag_offset, flag_value, nbytes, previous;
@@ -1347,6 +1347,9 @@ static int run_pipe_op(roce_ctx_t* c, uint32_t seq, uint32_t nbytes, uint32_t ch
       }
     }
     if (posted) {
+      if (c->ring != NULL && drain_all(c) != 0) {
+        return -1;
+      }
       idle = 0;
       continue;
     }
