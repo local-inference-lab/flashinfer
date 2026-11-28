@@ -589,7 +589,7 @@ def _compile_multiquery_dense(query, q_tile, ctas, facts):
         Int32(1),
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
-            "attention.indexer.mxfp4_multiquery_local", 4, spec_key
+            "attention.indexer.mxfp4_multiquery_local", 5, spec_key
         ),
     )
     merge = None
@@ -600,7 +600,7 @@ def _compile_multiquery_dense(query, q_tile, ctas, facts):
             Int32(query.max_q_rows),
             current_cuda_stream(),
             compile_spec=KernelCompileSpec.from_key(
-                "attention.indexer.mxfp4_multiquery_merge", 4, spec_key
+                "attention.indexer.mxfp4_multiquery_merge", 5, spec_key
             ),
         )
     return local, merge
@@ -645,7 +645,7 @@ def _compile_multiquery_hierarchical(query, q_tile, ctas, facts):
         Int32(1),
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
-            "attention.indexer.mxfp4_mq_hier_local", 4, spec_key
+            "attention.indexer.mxfp4_mq_hier_local", 5, spec_key
         ),
     )
     merge_expand = b12x_compile(
@@ -658,7 +658,7 @@ def _compile_multiquery_hierarchical(query, q_tile, ctas, facts):
         Int64(1),
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
-            "attention.indexer.mxfp4_mq_hier_merge_expand", 4, spec_key
+            "attention.indexer.mxfp4_mq_hier_merge_expand", 5, spec_key
         ),
     )
     return local, merge_expand
@@ -704,7 +704,7 @@ def _compile_hierarchical(query, config, facts):
         obj.local,
         *args,
         compile_spec=KernelCompileSpec.from_key(
-            "attention.indexer.mxfp4_hierarchical_local", 3, (facts.to_dict(),)
+            "attention.indexer.mxfp4_hierarchical_local", 4, (facts.to_dict(),)
         ),
     )
     merge = None

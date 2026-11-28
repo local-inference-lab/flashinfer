@@ -281,12 +281,17 @@ def _prepare_and_run(
     request_ids: torch.Tensor | None = None,
     query_start_loc: torch.Tensor | None = None,
     poison_scratch: bool = True,
+    override=None,
 ):
     device = caps.device
     with PreparationSession(
         device=device, autotune=False, compile_workers=1
     ) as session:
-        plan = api.plan(caps, invocation=api.invocation_from_tensors(caps, **arguments))
+        plan = api.plan(
+            caps,
+            invocation=api.invocation_from_tensors(caps, **arguments),
+            override=override,
+        )
         retained = []
 
         def prepare(state):
@@ -1081,3 +1086,147 @@ def test_multiquery_validation_errors():
         )
     with pytest.raises(ValueError, match="one shared row or one row per query"):
         _prepare_and_run(caps, args)
+
+
+@pytest.mark.parametrize("hierarchical", [False, True])
+def test_multiquery_q256_ctas32_repeated_merge_no_war_race(hierarchical: bool):
+    """Repeated Q=256, ctas=32 multi-partition merge with carry trims (WAR barrier regression)."""
+    from b12x.attention.dsa_indexer._mxfp4_preparation import (
+        _multiquery_dense_spec,
+        _multiquery_hierarchical_spec,
+    )
+    from b12x.attention.dsa_indexer._mxfp4_tuning import default_fused_config
+    from b12x.attention.dsa_indexer._preparation import _query
+    from b12x.attention.dsa_indexer._tuning import DsaIndexerConfig
+    from b12x.preparation.device import detect_device
+
+    device = torch.device("cuda:0")
+    rows = 256
+    batch = 4
+    heads = 32
+    page_size = 64
+    page_width = 256  # width = 16384 (32 x 512-token partitions)
+    width = page_width * page_size
+    pool_pages = 64
+    q_mxfp4, q_scales, query_weights, pool = _make_mxfp4_inputs(
+        rows=rows,
+        heads=heads,
+        width=width,
+        page_size=page_size,
+        pool_pages=pool_pages,
+        seed=4096 + int(hierarchical),
+        device=device,
+    )
+    gen = torch.Generator(device=device).manual_seed(4099 + int(hierarchical))
+    page_table = torch.randint(
+        0,
+        pool_pages,
+        (batch, page_width),
+        dtype=torch.int32,
+        device=device,
+        generator=gen,
+    )
+    request_ids = (
+        torch.arange(batch, dtype=torch.int32, device=device)
+        .repeat_interleave(rows // batch)
+        .contiguous()
+    )
+    cache_lengths = torch.randint(
+        12288, width + 1, (rows,), dtype=torch.int32, device=device, generator=gen
+    )
+    active_width = torch.tensor([width], dtype=torch.int32, device=device)
+    out_i = torch.empty((rows, 512), dtype=torch.int32, device=device)
+    out_v = torch.empty((rows, 512), dtype=torch.float32, device=device)
+    extra = {}
+    if hierarchical:
+        extra["candidate_output"] = torch.empty(
+            (rows, 16384), dtype=torch.int32, device=device
+        )
+        extra["candidate_output_lengths"] = torch.empty(
+            (rows,), dtype=torch.int32, device=device
+        )
+    caps = api.Caps(
+        device=device,
+        num_q_heads=heads,
+        max_q_rows=rows,
+        max_page_table_width=page_width,
+        topk=512,
+        page_size=page_size,
+        cache_format="mxfp4",
+        mode="decode",
+        candidate_topk_blocks=2048 if hierarchical else 0,
+    )
+    args = dict(
+        q_mxfp4=q_mxfp4,
+        q_scales=q_scales,
+        query_weights=query_weights,
+        index_k_cache=pool,
+        page_table=page_table,
+        cache_lengths=cache_lengths,
+        active_width=active_width,
+        output_indices=out_i,
+        output_scores=out_v,
+        **extra,
+    )
+    detected = detect_device(device)
+    invocation = api.invocation_from_tensors(caps, **args)
+    query = _query(caps, invocation)
+    override = DsaIndexerConfig(
+        backend="native",
+        mxfp4=default_fused_config(query, detected.identity, ctas_per_row=32),
+    )
+    spec = (
+        _multiquery_hierarchical_spec(query, override, detected)
+        if hierarchical
+        else _multiquery_dense_spec(query, override, detected)
+    )
+    assert spec is not None and spec[1] == 32
+
+    state, binding, scratch = _prepare_and_run(
+        caps, args, request_ids=request_ids, override=override
+    )
+    ref = _reference_scores(
+        q_mxfp4,
+        q_scales,
+        query_weights,
+        pool,
+        page_table,
+        cache_lengths,
+        width,
+        page_size,
+        width=width,
+        row_to_req=request_ids,
+    )
+    expected_scores = ref.topk(512, dim=1).values
+    lengths = cache_lengths.cpu()
+    if hierarchical:
+        # Width fits in 2048 eight-token blocks and every visible token is valid.
+        positions = torch.arange(width, dtype=torch.int32)
+        expected_candidates = torch.where(positions < lengths[:, None], positions, -1)
+
+    for _ in range(10):
+        scratch.fill_(0xA5)
+        out_i.fill_(-17)
+        out_v.fill_(float("nan"))
+        if hierarchical:
+            extra["candidate_output"].fill_(-17)
+            extra["candidate_output_lengths"].fill_(-17)
+        state.run(binding)
+        torch.cuda.synchronize()
+        indices = out_i.cpu().long()
+        scores = out_v.cpu()
+        assert torch.all((indices >= 0) & (indices < lengths[:, None]))
+        assert torch.all(indices[:, 1:] > indices[:, :-1])
+        assert torch.equal(
+            scores.view(torch.int32), ref.gather(1, indices).view(torch.int32)
+        )
+        # Warps reserve equal-score slots with atomics before sorting by position.
+        # Require the exact score multiset and unique matching positions, so only
+        # the choice among equal scores at the cutoff can vary between launches.
+        assert torch.equal(
+            scores.sort(dim=1, descending=True).values.view(torch.int32),
+            expected_scores.view(torch.int32),
+        )
+        if hierarchical:
+            assert torch.equal(extra["candidate_output"].cpu(), expected_candidates)
+            assert torch.equal(extra["candidate_output_lengths"].cpu(), lengths)
