@@ -532,8 +532,6 @@ def segment_summarize(
 def segment_finalize(
     plan: Plan,
     *,
-    q: torch.Tensor,
-    k: torch.Tensor,
     v: torch.Tensor,
     raw_g: torch.Tensor,
     raw_beta: torch.Tensor,
@@ -547,11 +545,15 @@ def segment_finalize(
     scratch: torch.Tensor,
     pool: torch.Tensor,
     output: torch.Tensor,
+    q: torch.Tensor | None = None,
+    k: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    q_buf = v if q is None else q
+    k_buf = v if k is None else k
     _segment_finalize_op(
         [
-            q,
-            k,
+            q_buf,
+            k_buf,
             v,
             raw_g,
             raw_beta,

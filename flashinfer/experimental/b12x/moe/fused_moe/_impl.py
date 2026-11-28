@@ -823,6 +823,7 @@ class TPMoEPlan:
     max_tokens_per_launch: int
     dynamic_physical_tiles: int | None = None
     dynamic_task_capacity: int | None = None
+    reserve_sms: int = 0
 
     @property
     def deterministic_output(self) -> bool:
@@ -7950,6 +7951,7 @@ def plan_tp_moe_execution(
     apply_router_weight_on_input: bool = False,
     deterministic_output: bool | None = None,
     decode_config: MoeDecodeConfig,
+    reserve_sms: int = 0,
 ) -> TPMoEPlan:
     """Lower one recipe from an authoritative weight-preparation plan.
 
@@ -8156,6 +8158,7 @@ def plan_tp_moe_execution(
         dynamic_physical_tiles=dynamic_physical_tiles,
         dynamic_task_capacity=dynamic_task_capacity,
         decode_config=decode_config,
+        reserve_sms=reserve_sms,
     )
 
 
@@ -9754,6 +9757,7 @@ def plan_tp_moe_scratch(
         apply_router_weight_on_input=caps.apply_router_weight_on_input,
         deterministic_output=deterministic_output,
         decode_config=caps.decode_config,
+        reserve_sms=caps.reserve_sms,
     )
     resolved_block_size_m = _resolve_trellis_route_block_size(caps)
     core_workspace_plan = _plan_core_workspace(
@@ -10394,6 +10398,7 @@ def materialize_tp_moe_arena_workspaces(
             apply_router_weight_on_input=apply_router_weight_on_input,
             deterministic_output=deterministic_output,
             decode_config=caps.decode_config,
+            reserve_sms=caps.reserve_sms,
         )
         core_plan = _plan_core_workspace(
             plan.implementation,
@@ -12570,6 +12575,7 @@ def _launch_dynamic_flat(
     planned_tile_m: int,
     planned_direct_routing: bool,
     planned_num_tokens: int,
+    reserve_sms: int = 0,
 ) -> None:
     """Launch the compiled dynamic MoE kernel over bound workspace and weight views."""
     quant_mode = _normalize_quant_mode(quant_mode)
@@ -12762,6 +12768,8 @@ def _launch_dynamic_flat(
             effective_mac,
             policy_max_active_clusters,
         )
+    if reserve_sms > 0 and effective_mac > reserve_sms:
+        effective_mac = max(1, effective_mac - reserve_sms)
     # Do not enlarge this grid beyond the measured resident count: the fused
     # kernel has a resident-grid barrier, so over-launching would deadlock.
     # Native gate scales are E4M3 views; absent storage uses int32 routing scratch.
@@ -13007,8 +13015,11 @@ def _launch_dynamic_flat(
 
 _DYNAMIC_TILE_M_POLICY_CODES = {16: 0, 32: 1, 64: 2, 128: 3}
 _DYNAMIC_POLICY_TILE_MS = tuple(_DYNAMIC_TILE_M_POLICY_CODES)
-# Bits 10..61 encode the cluster limit; bit 62 selects FC1 budget three.
+# Bits 10..52 encode the cluster limit; bits 53..60 encode reserve_sms (0..255);
+# bit 61 selects prequantized input; bit 62 selects FC1 budget three.
 # The signed high bit selects unweighted route output storage.
+_DYNAMIC_RESERVE_SMS_SHIFT = 53
+_DYNAMIC_RESERVE_SMS_MASK = 0xFF << _DYNAMIC_RESERVE_SMS_SHIFT
 _DYNAMIC_PREQUANTIZED_INPUT_BIT = 1 << 61
 _DYNAMIC_FC1_BUDGET3_BIT = 1 << 62
 _DYNAMIC_RAW_ROUTES_BIT = 1 << 63
@@ -13028,6 +13039,7 @@ def _encode_dynamic_launch_policy(
     materialized_fc1_cta_budget: int = 2,
     swiglu_clamp_after_silu: bool = False,
     prequantized_input: bool = False,
+    reserve_sms: int = 0,
 ) -> int:
     try:
         tile_code = _DYNAMIC_TILE_M_POLICY_CODES[int(planned_tile_m)]
@@ -13037,8 +13049,10 @@ def _encode_dynamic_launch_policy(
         ) from exc
     if policy_max_active_clusters < -1:
         raise ValueError("policy_max_active_clusters must be -1 or nonnegative")
-    if policy_max_active_clusters > (1 << 51) - 2:
+    if policy_max_active_clusters > (1 << (_DYNAMIC_RESERVE_SMS_SHIFT - 10)) - 2:
         raise ValueError("policy_max_active_clusters exceeds the launch policy field")
+    if reserve_sms < 0 or reserve_sms > 255:
+        raise ValueError("reserve_sms must be in [0, 255]")
     if type(
         materialized_fc1_cta_budget
     ) is not int or materialized_fc1_cta_budget not in (2, 3):
@@ -13056,6 +13070,7 @@ def _encode_dynamic_launch_policy(
         | (int(bool(swiglu_clamp_after_silu)) << 8)
         | (int(bool(csf_inline_scales)) << 9)
         | ((int(policy_max_active_clusters) + 1) << 10)
+        | (int(reserve_sms) << _DYNAMIC_RESERVE_SMS_SHIFT)
         | (_DYNAMIC_PREQUANTIZED_INPUT_BIT if prequantized_input else 0)
         | (_DYNAMIC_FC1_BUDGET3_BIT if materialized_fc1_cta_budget == 3 else 0)
     )
@@ -13073,7 +13088,7 @@ def _decode_dynamic_launch_policy(
         bool(value & 32),
         bool(value & 64),
         4 if value & 128 else None,
-        ((value & (_DYNAMIC_PREQUANTIZED_INPUT_BIT - 1)) >> 10) - 1,
+        ((value & ((1 << _DYNAMIC_RESERVE_SMS_SHIFT) - 1)) >> 10) - 1,
     )
 
 
@@ -13187,6 +13202,7 @@ def _tp_moe_dynamic_launch_op(
     ) = _decode_dynamic_launch_policy(launch_policy)
     swiglu_clamp_after_silu = bool(launch_policy & 256)
     prequantized_input = bool(launch_policy & _DYNAMIC_PREQUANTIZED_INPUT_BIT)
+    reserve_sms = (launch_policy & _DYNAMIC_RESERVE_SMS_MASK) >> _DYNAMIC_RESERVE_SMS_SHIFT
     _launch_dynamic_flat(
         packed_a_view=packed_a_view,
         packed_a_flat=packed_a_flat,
@@ -13266,6 +13282,7 @@ def _tp_moe_dynamic_launch_op(
         planned_tile_m=planned_tile_m,
         planned_direct_routing=planned_direct_routing,
         planned_num_tokens=planned_num_tokens,
+        reserve_sms=reserve_sms,
     )
 
 
@@ -13380,6 +13397,7 @@ def _launch_dynamic(
     planned_tile_m: int = 128,
     dynamic_route_mode: str = "grouped",
     planned_num_tokens: int | None = None,
+    reserve_sms: int = 0,
 ) -> None:
     del stream
     if dynamic_route_mode not in {"direct", "grouped"}:
@@ -13397,6 +13415,7 @@ def _launch_dynamic(
         materialized_fc1_cta_budget=materialized_fc1_cta_budget,
         swiglu_clamp_after_silu=swiglu_clamp_after_silu,
         prequantized_input=prequantized_input,
+        reserve_sms=reserve_sms,
     )
     if raw_routes:
         launch_policy -= _DYNAMIC_RAW_ROUTES_BIT
@@ -15053,6 +15072,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             dynamic_route_mode=decode_config.dynamic_route_mode or "",
             prequantized_input=prequantized_input,
             prequantized_scales=binding.a_scales,
+            reserve_sms=plan.reserve_sms,
             share_input_across_experts=(
                 (quant_mode == "nvfp4" and decode_config.nvfp4_share_input)
                 or (
