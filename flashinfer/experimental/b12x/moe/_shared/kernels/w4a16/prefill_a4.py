@@ -72,6 +72,11 @@ from b12x._lib.intrinsics.quantization import (
     quantize_block_fp4,
     quantize_block_fp4_fast,
 )
+from b12x.moe._shared.kernels.activations import (
+    SITU,
+    SITU_DEFAULT_BETA,
+    SITU_DEFAULT_LINEAR_BETA,
+)
 
 # Position m of a 16-group holds physical K offset PI[m].
 PI = (0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15)
@@ -356,6 +361,7 @@ class A4PackedPrefillGemm:
         fast_quant: bool = False,
         terms: int = 1,
         warps: int = NUM_WARPS,
+        activation: str = "silu",
         swiglu_limit: float | None = None,
         swiglu_clamp_after_silu: bool = False,
     ):
@@ -367,6 +373,10 @@ class A4PackedPrefillGemm:
             raise ValueError("terms must be 1 or 2")
         if warps not in (8, 16):
             raise ValueError("warps must be 8 or 16")
+        if activation not in ("silu", SITU):
+            raise ValueError(f"A4 prefill supports 'silu' or 'situ', got {activation!r}")
+        if activation == SITU and (swiglu_limit is not None or swiglu_clamp_after_silu):
+            raise ValueError("swiglu_limit and swiglu_clamp_after_silu are invalid for situ")
         self.phase = phase
         self.fc1 = phase == "fc1"
         self.hidden_size = int(hidden_size)
@@ -377,6 +387,8 @@ class A4PackedPrefillGemm:
         self.fast_math = bool(fast_math)
         self.fast_quant = bool(fast_quant)
         self.terms = int(terms)
+        self.activation = str(activation)
+        self.is_situ = self.activation == SITU
         self.has_swiglu_limit = swiglu_limit is not None
         self.swiglu_clamp_after_silu = bool(swiglu_clamp_after_silu)
         self.swiglu_limit = 0.0 if swiglu_limit is None else float(swiglu_limit)
@@ -415,6 +427,7 @@ class A4PackedPrefillGemm:
             self.fast_math,
             self.fast_quant,
             self.terms,
+            self.activation,
             self.has_swiglu_limit,
             self.swiglu_limit,
             self.swiglu_clamp_after_silu,
@@ -966,6 +979,16 @@ class A4PackedPrefillGemm:
         sigmoid = cute.arch.rcp_approx(
             Float32(1.0) + cute.math.exp(-gate, fastmath=self.fast_math)
         )
+        if cutlass.const_expr(self.is_situ):
+            beta = Float32(SITU_DEFAULT_BETA)
+            linear_beta = Float32(SITU_DEFAULT_LINEAR_BETA)
+            situ_gate = (
+                beta * cute.math.tanh(gate / beta, fastmath=self.fast_math) * sigmoid
+            )
+            situ_up = linear_beta * cute.math.tanh(
+                up / linear_beta, fastmath=self.fast_math
+            )
+            return self._round(situ_gate * situ_up)
         activated = gate * sigmoid
         if cutlass.const_expr(self.has_swiglu_limit and self.swiglu_clamp_after_silu):
             if activated > Float32(self.swiglu_limit):
@@ -1169,10 +1192,13 @@ def a4_prefill_supported(
     return (
         prepared_layout == "packed"
         and scale_format == "e4m3_k16"
-        and activation == "silu"
+        and activation in ("silu", SITU)
         and bool(is_gated)
         and dtype == torch.bfloat16
-        and (swiglu_limit is None or (math.isfinite(swiglu_limit) and swiglu_limit > 0))
+        and (
+            swiglu_limit is None
+            or (activation != SITU and math.isfinite(swiglu_limit) and swiglu_limit > 0)
+        )
         and hidden_size % 256 == 0
         and intermediate_size % 64 == 0
     )
@@ -1230,6 +1256,7 @@ def _compile_a4_kernels(
     fast_math: bool,
     terms: int,
     warps: int,
+    activation: str = "silu",
     swiglu_limit: float | None,
     swiglu_clamp_after_silu: bool = False,
 ):
@@ -1241,9 +1268,10 @@ def _compile_a4_kernels(
         int(intermediate_size),
         int(topk),
         bool(fast_math),
-        5,
+        6,
         int(terms),
         warps,
+        str(activation),
         swiglu_limit,
         swiglu_clamp_after_silu,
     )
@@ -1272,6 +1300,7 @@ def _compile_a4_kernels(
                     fast_math=fast_math,
                     terms=terms,
                     warps=warps,
+                    activation=activation,
                     swiglu_limit=swiglu_limit,
                     swiglu_clamp_after_silu=swiglu_clamp_after_silu,
                 ),
@@ -1297,7 +1326,7 @@ def _compile_a4_kernels(
                 Int32(1),
                 stream,
                 compile_spec=KernelCompileSpec.from_key(
-                    f"moe.w4a16.a4_prefill.{phase}", 5, key
+                    f"moe.w4a16.a4_prefill.{phase}", 6, key
                 ),
             )
         )
@@ -1316,6 +1345,7 @@ def compile_w4a16_a4_prefill(
     fast_math: bool,
     terms: int = 1,
     warps: int = NUM_WARPS,
+    activation: str = "silu",
     swiglu_limit: float | None = None,
     swiglu_clamp_after_silu: bool = False,
 ) -> W4A16A4PrefillLaunches:
@@ -1331,6 +1361,7 @@ def compile_w4a16_a4_prefill(
         fast_math=fast_math,
         terms=terms,
         warps=warps,
+        activation=activation,
         swiglu_limit=swiglu_limit,
         swiglu_clamp_after_silu=swiglu_clamp_after_silu,
     )

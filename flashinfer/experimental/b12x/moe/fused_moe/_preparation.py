@@ -23,6 +23,7 @@ from b12x.preparation.types import (
     _CompositePlan,
 )
 
+from b12x.moe._shared.kernels.activations import is_gated_moe_activation
 from ._impl import (
     TPMoEScratchCaps,
     plan_b12x_fp4_moe_weights,
@@ -796,7 +797,7 @@ def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
                 prepared_layout=weight_layout,
                 scale_format=scale_format,
                 activation=core.activation,
-                is_gated=core.activation == "silu",
+                is_gated=is_gated_moe_activation(core.activation),
                 swiglu_limit=core.swiglu_limit,
                 dtype=core.dtype,
                 hidden_size=core.k,
@@ -814,6 +815,7 @@ def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
                 fast_math=bool(caps.w4a16_fast_math),
                 terms=caps.w4a16_a4_prefill_terms,
                 warps=caps.w4a16_a4_prefill_warps,
+                activation=core.activation,
                 swiglu_limit=core.swiglu_limit,
                 swiglu_clamp_after_silu=core.swiglu_clamp_after_silu,
             )
