@@ -51,6 +51,60 @@ def test_head_gate_validates_only_addressed_row_strides(monkeypatch, rows, row_s
         assert launches == [True]
 
 
+@pytest.mark.parametrize(
+    "weight_dtype,expected_fp32",
+    (("float32", True), ("bfloat16", False)),
+)
+def test_compile_hyperconnection_grouped_rmsnorm_passes_fp32_weight(
+    monkeypatch, weight_dtype, expected_fp32
+):
+    from b12x.norm.hyperconnection import _cute, _preparation
+    from b12x.norm.hyperconnection._tuning import (
+        HyperConnectionConfig,
+        HyperConnectionQuery,
+        TUNING,
+    )
+
+    query = HyperConnectionQuery(
+        dtype="bfloat16",
+        max_tokens=16,
+        hidden_size=2560,
+        streams=4,
+        lowrank=1,
+        operation="grouped_rmsnorm",
+        zero_centered=False,
+        weight_dtype=weight_dtype,
+    )
+    config = HyperConnectionConfig(
+        backend="cutedsl",
+        reduction_block_h=4096,
+        pointwise_block=256,
+        reduction_num_warps=8,
+    )
+    captured = {}
+
+    def fake_compile(key, entry, arg_count, device, **kwargs):
+        captured["key"] = key
+        captured["entry"] = entry
+        captured["pointer_dtypes"] = kwargs.get("pointer_dtypes")
+        return "compiled"
+
+    monkeypatch.setattr(_cute, "_compile", fake_compile)
+    result = _preparation._compile_hyperconnection.__wrapped__(
+        _preparation._program_query_payload(TUNING.encode_query(query)),
+        config.to_dict(),
+        0,
+    )
+    assert result == "compiled"
+    assert isinstance(captured["entry"], _cute._GroupedRmsNorm)
+    assert captured["entry"].fp32_weight is expected_fp32
+    assert captured["pointer_dtypes"] == (
+        torch.bfloat16,
+        getattr(torch, weight_dtype),
+        torch.bfloat16,
+    )
+
+
 @pytest.mark.parametrize("rows,width", [(1, 768), (7, 3072), (4096, 768)])
 def test_prepared_swiglu_oai_replays_changed_inputs(rows, width):
     device = require_b12x()
