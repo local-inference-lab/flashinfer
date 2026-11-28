@@ -658,23 +658,23 @@ def get_packet_programs(rank, threads, device_index):
                 copies.append((ptr32(src), ptr32(dst), count))
             sources, destinations, lengths = zip(*copies)
             transfer(sources, destinations, lengths, active_blocks, stream)
-            if batch == 7:
-                # Publish SM owner-epoch updates before the final 6-peer rendezvous so
-                # subsequent SM calls observe updated counters without a 9th barrier.
-                advance_owner(
-                    ptr32(slab_addresses[rank]), blocks, active_blocks, stream
-                )
             if 1 <= batch <= 6:
                 main.wait_event(finished)
                 barrier()
             elif batch == 0:
                 barrier_local()
             else:
+                # Batch 7 only writes intra-island slots of assembled; settle them
+                # with a 3-peer local barrier so the output copy and SM owner-epoch
+                # advance both retire before the final 6-peer rendezvous.
+                barrier_local()
+                link.ipc.cudaMemcpyAsync(
+                    output_address, local_base + assembled, pairs * 4, int(stream)
+                )
+                advance_owner(
+                    ptr32(slab_addresses[rank]), blocks, active_blocks, stream
+                )
                 barrier()
-
-        link.ipc.cudaMemcpyAsync(
-            output_address, local_base + assembled, pairs * 4, int(stream)
-        )
 
     return attach_programs(
         PacketPrograms(run),
@@ -746,12 +746,19 @@ def _setup_packet_context(
     arrivals3 = tuple(ptr32(local_base + 132 + 4 * p) for p in local)
     publications3 = tuple(ptr32(bases[p] + 132 + 4 * rank) for p in local)
     counter3 = ptr32(local_base + 128)
+    # Bytes [208..223] inside _FLAG_BYTES=256 hold disjoint 3-peer cross-island rendezvous slots.
+    arrivals3_cross = tuple(ptr32(local_base + 212 + 4 * i) for i in range(3))
+    publications3_cross = tuple(ptr32(bases[p] + 212 + 4 * i) for i, p in enumerate(cross))
+    counter3_cross = ptr32(local_base + 208)
 
     def barrier():
         rendezvous(counter, publications, arrivals, cu_stream)
 
     def barrier_local():
         rendezvous3(counter3, publications3, arrivals3, cu_stream)
+
+    def barrier_cross():
+        rendezvous3(counter3_cross, publications3_cross, arrivals3_cross, cu_stream)
 
     return (
         main,
@@ -771,6 +778,7 @@ def _setup_packet_context(
         ptr32,
         barrier,
         barrier_local,
+        barrier_cross,
     )
 
 
@@ -880,6 +888,7 @@ def get_reduce_scatter_programs(rank, threads, device_index, transport="sm_local
             ptr32,
             barrier,
             barrier_local,
+            _barrier_cross,
         ) = _setup_packet_context(
             rank,
             link,
@@ -1164,7 +1173,8 @@ def get_all_gather_programs(rank, threads, device_index, transport="sm_local"):
             local_base,
             ptr32,
             barrier,
-            _barrier_local,
+            barrier_local,
+            _barrier_cross,
         ) = _setup_packet_context(
             rank,
             link,
@@ -1204,8 +1214,6 @@ def get_all_gather_programs(rank, threads, device_index, transport="sm_local"):
                 )
 
         own_offset, _ = rank_shard(lane, island)
-        # Ensure any preceding collective's trailing copy out of assembled has retired.
-        barrier()
 
         if transport == "ce_local":
             for step in range(4):
@@ -1239,27 +1247,30 @@ def get_all_gather_programs(rank, threads, device_index, transport="sm_local"):
                         1,
                         cu_stream,
                     )
+                if step == 0:
+                    if shard_bytes:
+                        link.ipc.cudaMemcpyAsync(
+                            output_address + own_offset,
+                            input_address,
+                            shard_bytes,
+                            int(cu_stream),
+                        )
+                else:
+                    copy_spans(step_copy_spans[step], int(cu_stream))
 
                 main.wait_event(finished)
-                if step == 3:
+                if step < 3:
+                    barrier()
+                else:
+                    # Step 3 only writes intra-island slots of assembled; settle them
+                    # with a 3-peer local barrier, drain the final spans into output,
+                    # then retire assembled and advance SM owner epochs together.
+                    barrier_local()
+                    copy_spans(tail_copy_spans, int(cu_stream))
                     advance_owner(
                         ptr32(slab_addresses[rank]), blocks, active_blocks, cu_stream
                     )
-                barrier()
-
-            if shard_bytes:
-                link.ipc.cudaMemcpyAsync(
-                    output_address,
-                    local_base + assembled,
-                    16 * shard_bytes,
-                    int(cu_stream),
-                )
-                link.ipc.cudaMemcpyAsync(
-                    output_address + own_offset,
-                    input_address,
-                    shard_bytes,
-                    int(cu_stream),
-                )
+                    barrier()
             return
 
         for step in range(4):
@@ -1306,13 +1317,15 @@ def get_all_gather_programs(rank, threads, device_index, transport="sm_local"):
             sources, destinations, lengths = zip(*copies)
             transfer(sources, destinations, lengths, active_blocks, cu_stream)
             main.wait_event(finished)
-            if step == 3:
+            if step < 3:
+                barrier()
+            else:
+                barrier_local()
+                copy_spans(tail_copy_spans, int(cu_stream))
                 advance_owner(
                     ptr32(slab_addresses[rank]), blocks, active_blocks, cu_stream
                 )
-            barrier()
-
-        copy_spans(tail_copy_spans, int(cu_stream))
+                barrier()
 
     return attach_programs(
         PacketPrograms(run), advance_owner, transfer, rendezvous, rendezvous3
@@ -1401,6 +1414,7 @@ def get_row_to_col_all_to_all_programs(rank, threads, device_index):
             ptr32,
             barrier,
             barrier_local,
+            barrier_cross,
         ) = _setup_packet_context(
             rank,
             link,
@@ -1426,9 +1440,6 @@ def get_row_to_col_all_to_all_programs(rank, threads, device_index):
                 "island row_to_col_all_to_all payload exceeds half of assembled slab"
             )
         chunk_bytes = total_bytes // 4
-
-        # Ensure any preceding collective's trailing copy out of assembled has retired.
-        barrier()
 
         # Hop 1: pack and push columns to all four lanes in our own island.
         local_dsts = tuple(
@@ -1464,9 +1475,9 @@ def get_row_to_col_all_to_all_programs(rank, threads, device_index):
             int(cu_stream),
         )
         main.wait_event(finished)
-        advance_owner(ptr32(slab_addresses[rank]), blocks, active_blocks, cu_stream)
-        barrier()
-
+        # Settle cross-island writes into hop2, copy them out of assembled, then retire
+        # assembled and publish SM owner-epoch updates before returning.
+        barrier_cross()
         for begin_island, count_islands in _coalesced_shard_spans(
             [j for j in range(4) if j != island]
         ):
@@ -1477,6 +1488,8 @@ def get_row_to_col_all_to_all_programs(rank, threads, device_index):
                 count_islands * chunk_bytes,
                 int(cu_stream),
             )
+        advance_owner(ptr32(slab_addresses[rank]), blocks, active_blocks, cu_stream)
+        barrier()
 
     return attach_programs(
         PacketPrograms(run), advance_owner, pack_local, rendezvous, rendezvous3
