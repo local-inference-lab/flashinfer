@@ -1006,3 +1006,109 @@ def test_a4_csf_scale_readers_preserve_dense_graph_output(
                     )
     finally:
         graph.reset()
+
+
+def _emulate_situ(case, x, ids, wts, a1g, a2g, terms=1):
+    from b12x.moe._shared.kernels.activations import (
+        SITU_DEFAULT_BETA,
+        SITU_DEFAULT_LINEAR_BETA,
+    )
+
+    H = x.shape[-1]
+    TOPK = ids.shape[-1]
+    I = case["plan"].geometry.intermediate_size
+    tokens = x.shape[0]
+    flat = ids.flatten().long()
+    xq = _qdq(x.float(), a1g.amin().reshape(1), terms).double()
+    y = torch.zeros(tokens * TOPK, H, device=x.device, dtype=torch.float64)
+    for e in torch.unique(flat).tolist():
+        r = (flat == e).nonzero().flatten()
+        w13 = _dequant_weight(case["w13"][e], case["s13_log"][e], case["g13"][e])
+        gate = (xq[r // TOPK] @ w13[I:].T).float().to(torch.bfloat16).float()
+        up = (xq[r // TOPK] @ w13[:I].T).float().to(torch.bfloat16).float()
+        situ_gate = (
+            SITU_DEFAULT_BETA
+            * torch.tanh(gate / SITU_DEFAULT_BETA)
+            * torch.sigmoid(gate)
+        )
+        situ_up = SITU_DEFAULT_LINEAR_BETA * torch.tanh(up / SITU_DEFAULT_LINEAR_BETA)
+        act = (situ_gate * situ_up).to(torch.bfloat16).float()
+        act = _qdq(act, a2g[e].reshape(1), terms).double()
+        w2 = _dequant_weight(case["w2"][e], case["s2_log"][e], case["g2"][e])
+        y[r] = (act @ w2.T).float().to(torch.bfloat16).double()
+    return (y.view(tokens, TOPK, H) * wts.double().view(tokens, TOPK, 1)).sum(dim=1)
+
+
+@pytest.mark.parametrize("intermediate_size", (256, 576))
+@pytest.mark.parametrize("csf", (False, True))
+def test_situ_a4_prefill_matches_emulation_and_replays(intermediate_size, csf):
+    device = require_b12x()
+    from b12x.moe import fused_moe as moe
+
+    case = _make_case(
+        73 + intermediate_size,
+        hidden_size=512,
+        intermediate_size=intermediate_size,
+        num_experts=8,
+        top_k=2,
+    )
+    case["plan"] = moe.plan_weights(
+        source=case["plan"].source,
+        activation=moe.ActivationSpec(
+            mode="a16",
+            nonlinearity="situ",
+            io_dtype=torch.bfloat16,
+            a4_prefill=True,
+        ),
+        geometry=case["plan"].geometry,
+    )
+    a1g, a2g = _scales(case)
+    experts = _prepare(case, a1g, a2g, csf=csf)
+    tokens = 256
+    x, ids, wts = _inputs(tokens, 81, hidden_size=512, num_experts=8, top_k=2)
+
+    plan_a4 = moe.plan_execution(
+        experts=experts,
+        capacity=moe.ExecutionCapacity(max_tokens=tokens, top_k=2),
+        invocation={"a4_prefill": True, "fast_math": False},
+    )
+    plan_a16 = moe.plan_execution(
+        experts=experts,
+        capacity=moe.ExecutionCapacity(max_tokens=tokens, top_k=2),
+        invocation={"a4_prefill": False, "fast_math": False},
+    )
+    sc_a4 = tuple(
+        torch.empty(s.shape, dtype=s.dtype, device=device)
+        for s in plan_a4.scratch_specs()
+    )
+    sc_a16 = tuple(
+        torch.empty(s.shape, dtype=s.dtype, device=device)
+        for s in plan_a16.scratch_specs()
+    )
+    out_a4 = torch.empty_like(x)
+    out_a16 = torch.empty_like(x)
+    b_a4 = _bind(plan_a4, x, ids, wts, out_a4, sc_a4, a4_prefill=True)
+    b_a16 = _bind(plan_a16, x, ids, wts, out_a16, sc_a16, a4_prefill=False)
+    assert b_a4.a4_prefill_launches is not None
+    assert b_a16.a4_prefill_launches is None
+
+    moe.run(binding=b_a4)
+    moe.run(binding=b_a16)
+    torch.cuda.synchronize()
+    expected = _emulate_situ(case, x, ids, wts, a1g, a2g, 1)
+    rel_l2 = ((out_a4.double() - expected).norm() / expected.norm()).item()
+    assert rel_l2 < 5e-3, f"situ A4 prefill rel_l2={rel_l2}"
+    assert torch.isfinite(out_a16).all() and torch.count_nonzero(out_a16)
+
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            moe.run(binding=b_a4)
+        out_a4.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        rel_l2_g = ((out_a4.double() - expected).norm() / expected.norm()).item()
+        assert rel_l2_g < 5e-3, f"situ A4 graph replay rel_l2={rel_l2_g}"
+    finally:
+        graph.reset()
+
