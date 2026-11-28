@@ -37,6 +37,7 @@ _OPS: tuple[str, ...] = (
     "attention.paged",
     "attention.paged_decode",
     "attention.paged_kv_write",
+    "attention.paged_nvfp4",
     "attention.dense_mla",
     "attention.sparse_mla",
     "attention.compressed_sparse_mla",

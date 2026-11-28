@@ -5,6 +5,8 @@
 - ``paged_decode``: warp-specialized split-KV paged decode/verify (192/128 or
   128/128 heads, FP8 KV, sinks, windows, non-causal, ragged verify).
 - ``paged_kv_write``: prepared BF16/FP8 cache writes with independent head dimensions.
+- ``paged_nvfp4``: SM120 block-16 NVFP4 (4-or-6 MAE K, max/6 V) paged KV writer,
+  warp-specialized split-KV decode/verify, and FP8-MMA tiled prefill attention.
 - ``dense_mla``: dense compressed-cache MLA with strided physical records and
   optional causal sliding-window masking.
 - ``sparse_mla``: top-k-selected MLA, including strided physical records.
@@ -26,6 +28,7 @@ _OP_MODULES = (
     "paged",
     "paged_decode",
     "paged_kv_write",
+    "paged_nvfp4",
     "dense_mla",
     "sparse_mla",
     "compressed_sparse_mla",
