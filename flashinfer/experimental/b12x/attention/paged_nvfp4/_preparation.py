@@ -36,7 +36,7 @@ _DECODE_ID = "attention.paged_nvfp4.decode"
 _MERGE_ID = "attention.paged_nvfp4.merge"
 _PREFILL_ID = "attention.paged_nvfp4.prefill"
 _KV_WRITE_ID = "attention.paged_nvfp4.kv_write"
-_COMPILE_VERSION = 5
+_COMPILE_VERSION = 8
 
 _DECODE_OPERANDS = (
     ("q", 3, cutlass.BFloat16, 16),

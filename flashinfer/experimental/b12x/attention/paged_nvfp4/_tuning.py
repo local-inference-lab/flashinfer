@@ -31,7 +31,7 @@ SMEM_HEADROOM_BYTES = 2048
 
 def _consumer_warps(query: "PagedNVFP4Query") -> int:
     if query.mode == "prefill":
-        return 4
+        return 8
     rows = query.group_size * query.max_q_per_req
     return 4 if (rows + 15) // 16 <= 4 else 8
 
@@ -106,10 +106,11 @@ def _rows_fit(query: PagedNVFP4Query, head_splits: int) -> bool:
 
 
 def _stage_bytes(query: PagedNVFP4Query, stage_rows: int, num_stages: int) -> int:
+    if query.mode == "prefill":
+        # Swizzled E4M3 K + V stages (1 byte/elem each) dequantized once by producer warps.
+        return num_stages * stage_rows * (query.head_dim_qk + query.head_dim_vo)
     *_, per_stage = kv_stage_sizes(stage_rows, query.head_dim_qk, query.head_dim_vo)
     ring = num_stages * per_stage
-    if query.mode == "prefill":
-        return ring
     ncw = _consumer_warps(query)
     combine = (ncw * (query.head_dim_vo // 16) * 8 * 32 + 2 * ncw * 2 * 32) * 4
     return max(ring, combine)
@@ -168,7 +169,7 @@ def validate_query(query: PagedNVFP4Query) -> None:
 def default_config(query: PagedNVFP4Query, device=None) -> PagedNVFP4Config:
     del device
     if query.mode == "prefill":
-        stages = 6
+        stages = 4
         while (
             stages > 2
             and _stage_bytes(query, 32, stages) + SMEM_HEADROOM_BYTES > SMEM_LIMIT
