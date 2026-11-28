@@ -583,6 +583,42 @@ def graph_epoch_arrive(
 
 
 @dsl_user_op
+def sync_threads_after_u32(val: Uint32, *, loc=None, ip=None) -> Uint32:
+    """CTA barrier with a hardware data dependency on ``val``.
+
+    A plain ``bar.sync 0`` does not take ``val`` as an operand, so ``ptxas``
+    may schedule ``BAR.SYNC.DEFER_BLOCKING`` before waiting on the scoreboard
+    of a prior ``ld.relaxed.gpu.global.u32`` whose result is only consumed
+    after the barrier.  Routing ``val`` through ``bar.red.and.pred`` forces
+    every warp to complete the load of ``val`` before arriving at the CTA
+    barrier while acting as an exact mathematical identity on all 32-bit
+    values of ``val`` (``selp`` returns ``0xffffffff`` only when every thread
+    in the CTA observed ``0xffffffff``).
+    """
+
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Uint32(val).ir_value(loc=loc, ip=ip)],
+            """
+            {
+                .reg .pred p, q;
+                setp.eq.u32 p, $1, 0xffffffff;
+                bar.red.and.pred q, 0, p;
+                selp.u32 $0, 0xffffffff, $1, q;
+            }
+            """,
+            "=r,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def graph_epoch_arrive_serialized(
     epoch_addr: Int64,
     arrived_addr: Int64,
@@ -593,10 +629,15 @@ def graph_epoch_arrive_serialized(
 ) -> None:
     """Advance an epoch for execution-ordered kernels on one local GPU.
 
-    Every CTA must call this exactly once after all of its threads have loaded
-    the current epoch.  ``atom.inc`` resets the arrival count on the final CTA;
-    that CTA is the sole epoch writer.  Kernel execution ordering publishes the
-    plain epoch store before the next launch, so no payload fence is required.
+    Every CTA must call this once after all epoch-loading threads have
+    completed their ``ld.relaxed.gpu.global`` epoch load and passed
+    ``sync_threads_after_u32``.  ``atom.release.gpu.global.inc`` releases
+    every arriving CTA's prior epoch loads into the arrival counter's release
+    sequence; the final CTA executes ``fence.acquire.gpu`` before its
+    ``st.relaxed.gpu.global`` epoch update, establishing GPU-scope
+    happens-before without invalidating L1 caches on non-final CTAs.
+    Same-stream kernel execution ordering publishes the updated epoch before
+    the next launch.
     """
 
     llvm.inline_asm(
@@ -611,12 +652,13 @@ def graph_epoch_arrive_serialized(
             .reg .pred not_last;
             .reg .b32 prior, last, generation;
             sub.u32 last, $2, 1;
-            atom.relaxed.gpu.global.inc.u32 prior, [$1], last;
+            atom.release.gpu.global.inc.u32 prior, [$1], last;
             setp.ne.u32 not_last, prior, last;
             @not_last bra serialized_epoch_arrive_done;
+            fence.acquire.gpu;
             ld.relaxed.gpu.global.u32 generation, [$0];
             add.u32 generation, generation, 1;
-            st.global.u32 [$0], generation;
+            st.relaxed.gpu.global.u32 [$0], generation;
         serialized_epoch_arrive_done:
         }
         """,
@@ -640,8 +682,15 @@ def plain_graph_epoch_arrive(
 ) -> None:
     """Advance a plain peer-push epoch, reserving wire tags zero and one.
 
-    The final epoch's kernel drains peers and clears both incoming slots before
-    returning. Pull and fused collectives use separate counters.
+    Every CTA must call this once after all epoch-loading threads have
+    completed their ``ld.relaxed.gpu.global`` epoch load and passed
+    ``sync_threads_after_u32``.  ``atom.release.gpu.global.inc`` releases
+    every CTA's epoch loads into the arrival counter's release sequence; the
+    final CTA executes ``fence.acquire.gpu`` before its
+    ``st.relaxed.gpu.global`` epoch advance, establishing GPU-scope
+    happens-before without issuing an L1 invalidation on non-final CTAs.
+    The final epoch's kernel drains peers and clears both incoming slots
+    before returning.  Pull and fused collectives use separate counters.
     """
 
     llvm.inline_asm(
@@ -656,14 +705,15 @@ def plain_graph_epoch_arrive(
             .reg .pred not_last, rollover;
             .reg .b32 prior, last, generation, next_generation;
             sub.u32 last, $2, 1;
-            atom.relaxed.gpu.global.inc.u32 prior, [$1], last;
+            atom.release.gpu.global.inc.u32 prior, [$1], last;
             setp.ne.u32 not_last, prior, last;
             @not_last bra plain_epoch_arrive_done;
+            fence.acquire.gpu;
             ld.relaxed.gpu.global.u32 generation, [$0];
             setp.eq.u32 rollover, generation, 0xfffffffd;
             add.u32 next_generation, generation, 1;
             selp.u32 next_generation, 0, next_generation, rollover;
-            st.global.u32 [$0], next_generation;
+            st.relaxed.gpu.global.u32 [$0], next_generation;
         plain_epoch_arrive_done:
         }
         """,

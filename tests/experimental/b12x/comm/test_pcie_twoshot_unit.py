@@ -87,10 +87,11 @@ def test_twoshot_graph_slot_retires_epoch_before_remote_push() -> None:
     assert _twoshot_cute._GRAPH_EPOCH_OFFSET == 4096 + 4
     assert _twoshot_cute._GRAPH_BLOCKS_ARRIVED_OFFSET == 4096 + 8
     assert _twoshot_cute._GRAPH_BLOCKS_ARRIVED_OFFSET < 4096 + 32 * 4
-    # Retire only after a graph-only CTA barrier proves every thread observed
-    # the slot, but before phase one so its atomic latency overlaps the push.
+    # Retire only after a data-dependent CTA barrier proves every thread's
+    # epoch load has completed, but before phase one so its atomic latency
+    # overlaps the push.
     generation_load = source.index("generation = ld_relaxed_gpu_u32(")
-    graph_barrier = source.index("cute.arch.barrier()", generation_load)
+    graph_barrier = source.index("sync_threads_after_u32(generation)", generation_load)
     arrive = source.index("graph_epoch_arrive_serialized(", graph_barrier)
     remote_push = source.index("# Push remote shards", arrive)
     assert generation_load < graph_barrier < arrive < remote_push
@@ -98,13 +99,38 @@ def test_twoshot_graph_slot_retires_epoch_before_remote_push() -> None:
     assert "_finish_device_slot_round" not in source
 
 
-def test_twoshot_serialized_epoch_arrival_uses_one_relaxed_atomic() -> None:
-    source = inspect.getsource(_twoshot_cute.graph_epoch_arrive_serialized)
-    assert source.count("atom.relaxed.gpu.global.inc.u32") == 1
-    assert "atom.global.add" not in source
-    assert "ld.relaxed.gpu.global.u32" in source
-    assert "st.global.u32 [$0], generation;" in source
-    assert "fence." not in source
+def test_twoshot_serialized_epoch_arrival_orders_reads_before_advance() -> None:
+    from b12x.comm.pcie import _cute_intrinsics, _oneshot_cute, _twoshot_bf16_cute
+    from b12x.norm.mhc import _split_lagged
+
+    sync_source = inspect.getsource(_cute_intrinsics.sync_threads_after_u32)
+    assert "bar.red.and.pred" in sync_source
+
+    for fn in (
+        _twoshot_cute.graph_epoch_arrive_serialized,
+        _cute_intrinsics.plain_graph_epoch_arrive,
+    ):
+        source = inspect.getsource(fn)
+        assert source.count("atom.release.gpu.global.inc.u32") == 1
+        assert "atom.relaxed.gpu.global.inc.u32" not in source
+        assert "atom.global.add" not in source
+        assert "fence.acquire.gpu;" in source
+        assert "ld.relaxed.gpu.global.u32" in source
+        assert "st.relaxed.gpu.global.u32 [$0]," in source
+        assert "st.global.u32 [$0]," not in source
+        # Only the final CTA branches past @not_last to execute fence.acquire.gpu.
+        assert source.index("@not_last bra") < source.index("fence.acquire.gpu;") < source.index("st.relaxed.gpu.global.u32")
+
+    for kernel_fn in (
+        _twoshot_cute._TwoShotLaunch.kernel,
+        _twoshot_bf16_cute._TwoShotBf16Launch.kernel,
+        _twoshot_bf16_cute._TwoShotPullAllReduceLaunch.kernel,
+        _oneshot_cute._OneshotLaunch.kernel,
+        _oneshot_cute._FusedOneshotLaunch.kernel,
+        _split_lagged.ClusterMhcAllReducePostYNorm.kernel,
+    ):
+        ksrc = inspect.getsource(kernel_fn)
+        assert "sync_threads_after_u32(generation)" in ksrc
 
 
 def test_twoshot_graph_slot_size_is_a_precomputed_kernel_argument() -> None:

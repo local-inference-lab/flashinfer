@@ -56,6 +56,7 @@ from ._cute_intrinsics import (
     st_global_u32,
     st_release_sys_global_v4_u32,
     st_relaxed_sys_global_v4_u32,
+    sync_threads_after_u32,
     threadfence_gpu,
     unpack_bf16x2,
     unpack_f16x2,
@@ -556,22 +557,24 @@ class _OneshotLaunch(_PackedMath):
         generation = Uint32(0)
         slot = Uint32(0)
         if cutlass.const_expr(self._device_slot_selection):
+            self_signal = Int64(signal_ptrs[self._rank])
             if cutlass.const_expr(self._transport == "pull"):
                 generation = ld_relaxed_gpu_u32(
-                    Int64(signal_ptrs[self._rank]) + Int64(_GRAPH_EPOCH_OFFSET)
+                    self_signal + Int64(_GRAPH_EPOCH_OFFSET)
                 )
-            else:
-                generation = ld_relaxed_gpu_u32(
-                    Int64(signal_ptrs[self._rank]) + Int64(_PLAIN_GRAPH_EPOCH_OFFSET)
-                )
-            slot = (generation + Uint32(self._slot_bias)) % Uint32(2)
-            if cutlass.const_expr(self._transport == "pull"):
+                slot = (generation + Uint32(self._slot_bias)) % Uint32(2)
                 peer_ptrs = peer_ptrs + Int64(slot) * Int64(_MAX_RANKS)
             else:
-                # All threads retain the epoch before the final CTA advances it.
-                cute.arch.sync_threads()
-                if Int32(tidx) == Int32(0):
-                    self_signal = Int64(signal_ptrs[self._rank])
+                generation = ld_relaxed_gpu_u32(
+                    self_signal + Int64(_PLAIN_GRAPH_EPOCH_OFFSET)
+                )
+                # Every thread's epoch load must complete before the CTA barrier
+                # so the final CTA cannot advance the epoch ahead of a pending load.
+                # Retire on the last warp so warp 0 can start small-payload pushes
+                # immediately without waiting for the release atomic.
+                generation = sync_threads_after_u32(generation)
+                slot = (generation + Uint32(self._slot_bias)) % Uint32(2)
+                if Int32(tidx) == Int32(self._threads - 1):
                     plain_graph_epoch_arrive(
                         self_signal + Int64(_PLAIN_GRAPH_EPOCH_OFFSET),
                         self_signal + Int64(_PLAIN_GRAPH_ARRIVED_OFFSET),
@@ -626,7 +629,6 @@ class _OneshotLaunch(_PackedMath):
 
             if cutlass.const_expr(self._device_slot_selection):
                 if Int32(tidx) == Int32(0):
-                    self_signal = Int64(signal_ptrs[self._rank])
                     graph_epoch_arrive(
                         self_signal + Int64(_GRAPH_EPOCH_OFFSET),
                         self_signal + Int64(_GRAPH_ARRIVED_OFFSET),
@@ -2010,20 +2012,21 @@ class _FusedOneshotLaunch(_PackedMath):
                 generation = ld_relaxed_gpu_u32(
                     self_signal + Int64(_PLAIN_GRAPH_EPOCH_OFFSET)
                 )
-            else:
-                generation = ld_relaxed_gpu_u32(
-                    self_signal + Int64(_GRAPH_EPOCH_OFFSET)
-                )
-            slot = (generation + Uint32(self._slot_bias)) % Uint32(2)
-            peer_ptrs = peer_ptrs + Int64(slot) * Int64(_MAX_RANKS)
-            if cutlass.const_expr(self._mode == "stage_bf16_sentinel"):
-                cute.arch.sync_threads()
-                if Int32(tidx) == Int32(0):
+                generation = sync_threads_after_u32(generation)
+                slot = (generation + Uint32(self._slot_bias)) % Uint32(2)
+                peer_ptrs = peer_ptrs + Int64(slot) * Int64(_MAX_RANKS)
+                if Int32(tidx) == Int32(self._threads - 1):
                     plain_graph_epoch_arrive(
                         self_signal + Int64(_PLAIN_GRAPH_EPOCH_OFFSET),
                         self_signal + Int64(_PLAIN_GRAPH_ARRIVED_OFFSET),
                         Uint32(gdim),
                     )
+            else:
+                generation = ld_relaxed_gpu_u32(
+                    self_signal + Int64(_GRAPH_EPOCH_OFFSET)
+                )
+                slot = (generation + Uint32(self._slot_bias)) % Uint32(2)
+                peer_ptrs = peer_ptrs + Int64(slot) * Int64(_MAX_RANKS)
 
         smem = cutlass.utils.SmemAllocator()
         warp_sums = smem.allocate_tensor(
@@ -2508,7 +2511,7 @@ def get_oneshot_launcher(
         1,
         1,
         current_cuda_stream(),
-        compile_spec=KernelCompileSpec.from_key("comm.pcie.oneshot", 7, cache_key),
+        compile_spec=KernelCompileSpec.from_key("comm.pcie.oneshot", 8, cache_key),
     )
 
     def run(
@@ -2800,7 +2803,7 @@ def get_fused_oneshot_launcher(
         _dummy(cutlass.Uint32, 4),
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
-            "comm.pcie.oneshot_fused_rmsnorm", 10, cache_key
+            "comm.pcie.oneshot_fused_rmsnorm", 11, cache_key
         ),
     )
 
